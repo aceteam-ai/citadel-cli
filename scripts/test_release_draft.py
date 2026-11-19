@@ -106,6 +106,7 @@ class Fake(release.Runner):
         self.listed = True
         self.fault = None
         self.release_reads = 0
+        self.remote_tags = ''
 
     def sync_assets(self):
         self.release['assets'] = [
@@ -155,7 +156,7 @@ class Fake(release.Runner):
         if args[0] == 'rev-parse':
             return SHA
         if args[0] == 'ls-remote':
-            return ''
+            return self.remote_tags if '--tags' in args else ''
         return ''
 
     def download(self, asset_id, path, size):
@@ -258,6 +259,7 @@ class ReleaseDraftTests(unittest.TestCase):
             command for command in commands if command[:3] == ['gh', 'api', '--method']
         )
         self.assertIn('repos/aceteam-ai/citadel-cli/releases/8', publish)
+        self.assertIn('make_latest=legacy', publish)
         self.assertFalse(any('--clobber' in command for command in commands))
 
     def test_archive_and_manifest_tampering_stop_before_key_use(self):
@@ -315,6 +317,54 @@ class ReleaseDraftTests(unittest.TestCase):
                 self.sign()
             self.assertFalse(self.fake.has_command(['gh', 'api', '--method']))
             self.assertFalse(self.fake.has_command(['bash']))
+
+    def test_asset_changed_after_signature_upload_never_publishes(self):
+        original = self.fake.api
+
+        def late_change(path):
+            result = original(path)
+            if path == 'releases/8' and self.fake.release_reads == 4:
+                result['assets'][0]['id'] += 100
+            return result
+
+        with mock.patch.object(self.fake, 'api', side_effect=late_change):
+            with self.assertRaisesRegex(release.Refused, 'immediately before'):
+                self.sign()
+        self.assertTrue(self.fake.has_command(['gh', 'release', 'upload']))
+        self.assertFalse(self.fake.has_command(['gh', 'api', '--method']))
+        self.assertFalse(self.fake.has_command(['bash']))
+
+    def test_remote_floor_blocks_legacy_jumps_and_old_published_retries(self):
+        for signed in (False, True):
+            self.fake = Fake(pathlib.Path(self.tmp.name))
+            self.fake.remote_tags = SHA + '\trefs/tags/v2.999.0\n'
+            if signed:
+                self.fake.bytes['checksums.txt.sig'] = b'synthetic signature'
+                self.fake.sync_assets()
+                self.fake.release['draft'] = False
+            with self.assertRaisesRegex(release.Refused, 'remote version floor'):
+                self.sign()
+            self.assertFalse(any(k == 'download' for k, _ in self.fake.calls))
+            self.assertFalse(self.fake.has_command(['go']))
+            self.assertFalse(self.fake.has_command(['bash']))
+
+        for remote in ('v2.242.0', 'v2.242.0-rc.9', 'v2.241.0'):
+            self.fake.remote_tags = SHA + '\trefs/tags/' + remote
+            release.require_version_floor(self.fake, TAG)
+        self.fake.remote_tags = SHA + '\trefs/tags/v2.243.0-rc.1'
+        with self.assertRaises(release.Refused):
+            release.require_version_floor(self.fake, TAG)
+
+    def test_ci_remote_floor_refuses_before_build_or_tag_push(self):
+        self.fake.remote_tags = SHA + '\trefs/tags/v2.999.0\n'
+        self.fake.listed = False
+        with mock.patch.object(
+            release.version, 'plan', return_value={'candidate': True, 'tag': TAG}
+        ):
+            with self.assertRaisesRegex(release.Refused, 'remote version floor'):
+                release.ci_draft(self.fake, SHA, '11', '12')
+        self.assertFalse(self.fake.has_command(['go', 'build']))
+        self.assertFalse(any(k == 'git' and v[0] == 'push' for k, v in self.fake.calls))
 
     def test_published_signed_retry_only_verifies_and_finishes_tap(self):
         self.fake.bytes['checksums.txt.sig'] = b'synthetic signature'
@@ -529,11 +579,18 @@ class ReleaseDraftTests(unittest.TestCase):
             "GOMAXPROCS: '4'",
             "GOFLAGS: '-p=4'",
             'ref: ${{ github.event.workflow_run.head_sha }}',
+            'actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683',
+            'actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5',
+            'cache: false',
         ):
             self.assertIn(required, workflow)
         self.assertNotIn('secrets.', workflow)
         self.assertNotIn('upload-artifact', workflow)
         self.assertNotIn('release.sh', workflow)
+        self.assertNotIn('cache: true', workflow)
+        self.assertNotIn(
+            '-trimpath', release.go_build_args(TAG, 'out', './cmd/citadel')
+        )
         self.assertIn(
             'test_release_*.py', (root / '.github/workflows/ci.yml').read_text()
         )

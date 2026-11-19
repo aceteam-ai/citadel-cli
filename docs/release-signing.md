@@ -7,13 +7,17 @@ the release flow produces it, how the updater checks it, and how keys rotate.
 
 ## What is signed
 
-Every release publishes, in the same `gh release create` call:
+Every published release contains these assets before it becomes immutable:
 
 - the platform archives (`citadel_<tag>_<os>_<arch>.tar.gz` / `.zip`);
 - `checksums.txt`: `sha256sum` output, one `<64 hex>  <archive name>` line per
   archive;
 - `checksums.txt.sig`: a detached signature over the **exact bytes** of
   `checksums.txt`.
+
+In the primary flow, CI creates the unsigned draft with archives and checksums;
+the operator attaches the signature before publication. The emergency legacy
+flow supplies all three asset kinds in its single release-create operation.
 
 `checksums.txt.sig` is a single-line JSON object:
 
@@ -58,7 +62,10 @@ No release key is stored in GitHub or given to the CI workflow.
    The initial VERSION baseline and ordinary no-bump main merges draft nothing.
 2. CI builds all six archives, including the Windows launcher, and writes
    `checksums.txt`. Go uses GOMAXPROCS=4 and package parallelism 4, with a hard
-   four-CPU container cap. CI verifies archive consistency, rechecks fresh main
+   four-CPU container cap. It deliberately does not use `-trimpath`: Go would
+   omit the linker flags required by the updater's non-executing version parser.
+   CI verifies archive consistency and each CLI's recorded main package, exact
+   version stamp and OS/architecture using that same parser, rechecks fresh main
    and the gates, pushes only the exact commit's version tag, and creates an
    unsigned **draft** release. It never signs, publishes or updates Homebrew.
 3. CI prints a `CITADEL_DRAFT_RECEIPT` in its Actions log binding the tag,
@@ -181,6 +188,30 @@ Archive consistency is a separate check
 with `releasesign verify-assets`; it does not establish source/CI provenance or
 signature trust. The updater's compiled-key and exact-tag verification is
 unchanged.
+
+Both CI and the local signer compare against remote version tags, not just
+VERSION. After an emergency legacy release, prepare a bump above that remote
+floor. A signed older-release retry is refused too, so it cannot roll back the
+Homebrew tap. Publication uses GitHub's semver-based latest selection instead
+of forcing an older release to become latest. The write-scoped CI job pins
+action revisions and does not restore a build/module cache.
+
+Never re-run the source CI or drafting workflow after a successful draft
+receipt. This first version requires the successful original runs and their
+latest logs/checks; a later failed attempt deliberately invalidates signing.
+If a run was accidentally re-run, or main moved before drafting, leave that
+draft untouched and prepare a new reviewed VERSION bump above the remote
+floor. Do not edit the receipt, overwrite assets or weaken the green-check
+gate to recover. A retry of the local sign-draft command is different: after
+manual reconciliation it can reuse a verified uploaded signature or finish
+the tap update, without re-running CI, re-signing or replacing assets.
+
+The signer checks the asset snapshot again immediately before publication.
+GitHub does not offer an atomic asset-set precondition on the release PATCH,
+so a concurrent trusted release writer can still cause an availability failure
+in that final interval. Immutable publication plus the updater's signature and
+archive checks prevent altered bytes from being installed; they cannot ensure
+that every raced release remains usable. Do not edit a draft being signed.
 
 ## Updater verification
 

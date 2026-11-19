@@ -220,6 +220,42 @@ def digest(path):
         return hashlib.file_digest(file, 'sha256').hexdigest()
 
 
+def go_build_args(tag, output, package):
+    # The updater reads the recorded -ldflags stamp without executing the file.
+    # Go omits those flags with -trimpath, which makes provenance ambiguous.
+    return [
+        'go',
+        'build',
+        '-buildvcs=false',
+        '-ldflags',
+        f'-X github.com/aceteam-ai/citadel-cli/cmd.version={tag[1:]}',
+        '-o',
+        str(output),
+        package,
+    ]
+
+
+def require_version_floor(runner, tag):
+    """Legacy releases may move beyond committed VERSION. Never move back."""
+    candidate = version.parse_version((tag[1:] + '\n').encode('ascii'))
+    rows = runner.git('ls-remote', '--refs', '--tags', 'origin', 'refs/tags/v*')
+    for line in rows.splitlines():
+        fields = line.split()
+        require(len(fields) == 2, 'invalid remote version inventory')
+        remote = fields[1].removeprefix('refs/tags/')
+        match = re.fullmatch(r'v([0-9]+\.[0-9]+\.[0-9]+)([-+].*)?', remote)
+        if not match:
+            continue  # Non-version labels are not release tags.
+        floor = version.parse_version((match[1] + '\n').encode('ascii'))
+        # A stable candidate outranks a prerelease with the same core. Equal
+        # exact tags are allowed only for the separately source-bound retry.
+        prerelease = bool(match[2] and match[2].startswith('-'))
+        require(
+            candidate > floor or (candidate == floor and (remote == tag or prerelease)),
+            'release is below the remote version floor; prepare a newer bump',
+        )
+
+
 def build_archives(runner, tag, directory):
     names = archive_names(tag)
     # Same gentle Go limits as release.sh, plus the CI container's hard CPU cap.
@@ -240,17 +276,7 @@ def build_archives(runner, tag, directory):
                     else './cmd/citadel'
                 )
                 runner.run(
-                    [
-                        'go',
-                        'build',
-                        '-trimpath',
-                        '-buildvcs=false',
-                        '-ldflags',
-                        f'-X github.com/aceteam-ai/citadel-cli/cmd.version={tag[1:]}',
-                        '-o',
-                        str(temporary / member),
-                        package,
-                    ],
+                    go_build_args(tag, temporary / member, package),
                     env=dict(environment, GOOS=system, GOARCH=arch),
                     timeout=900,
                 )
@@ -297,6 +323,7 @@ def ci_draft(runner, commit, ci_run, run_id):
         print(json.dumps(candidate))
         return
     tag = candidate['tag']
+    require_version_floor(runner, tag)
     ci_identity(
         runner.api(f'actions/runs/{ci_run}'), commit, '.github/workflows/ci.yml', 'push'
     )
@@ -331,6 +358,7 @@ def ci_draft(runner, commit, ci_run, run_id):
             runner.pages(f'commits/{commit}/check-runs?filter=all', 'check_runs'),
             own['check_suite_id'],
         )
+        require_version_floor(runner, tag)
         # A tag may survive a failed draft creation. Retry only at the exact SHA.
         remote = runner.git('ls-remote', '--refs', 'origin', f'refs/tags/{tag}')
         if remote:
@@ -442,6 +470,7 @@ def sign_draft(runner, tag):
     archive_names(tag)
     require(os.environ.get('GITHUB_ACTIONS') != 'true', 'signing is forbidden in CI')
     clean_main(runner)
+    require_version_floor(runner, tag)
     releases = [r for r in runner.pages('releases') if r['tag_name'] == tag]
     require(len(releases) == 1, 'expected one release for the tag')
     release = runner.api(f'releases/{releases[0]["id"]}')
@@ -570,6 +599,21 @@ def sign_draft(runner, tag):
                 == 'sha256:' + digest(signature),
                 'signature upload or draft state is uncertain',
             )
+        else:
+            snapshot = initial
+        # The release API has no transactional asset-set condition on publish.
+        # Minimize the window; immutable publication and updater signature/hash
+        # verification still fail closed if another trusted writer races it.
+        require_version_floor(runner, tag)
+        final = runner.api(f'releases/{release["id"]}')
+        require(
+            final['id'] == release['id']
+            and final['body'] == release['body']
+            and final['draft'] == release['draft']
+            and final['target_commitish'] == release['target_commitish']
+            and asset_snapshot(final, tag) == snapshot,
+            'release changed immediately before publication',
+        )
         if release['draft']:
             runner.run(
                 [
@@ -581,11 +625,12 @@ def sign_draft(runner, tag):
                     '-F',
                     'draft=false',
                     '-f',
-                    'make_latest=true',
+                    'make_latest=legacy',
                 ]
             )
         # Published, verified retries can finish a failed tap update without
         # republishing, replacing any asset, or resigning.
+        require_version_floor(runner, tag)
         runner.run(
             ['bash', 'scripts/update-homebrew-tap.sh', tag[1:]],
             env=dict(os.environ, CHECKSUMS_FILE=str(checksums)),
