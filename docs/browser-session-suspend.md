@@ -114,6 +114,12 @@ caller still owns registry exclusion and must revalidate around its own awaits;
 it must not re-enter ordinary actions or teardown. Cancellation after a durable
 effect is an unacknowledged result, not permission to delete referenced data.
 The manager transaction is not wired to this continuation yet.
+The private throwaway capture-to-intent composition additionally holds registry
+exclusion, pins the pre-capture runtime pointer and record, and checks a trusted
+manager-incarnation fence during publication. Its continuation starts only after
+durable intent staging. Failures retain any referenced intent and capture; a
+successful fake stop continuation is a component test, not a runtime proof.
+Saved-profile handling and the production manager transaction remain unwired.
 
 Reopen retains the session ID, increments generation without wraparound, keeps
 the driver, and consumes a live slot. A persistent session requires a successful
