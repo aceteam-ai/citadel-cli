@@ -35,7 +35,11 @@ type suspendIntentStore struct {
 }
 
 func openSuspendIntentStore(regDir string) (*suspendIntentStore, error) {
-	payloads, err := openSuspendManifestStore(regDir, true)
+	return openSuspendIntentStoreWithCreate(regDir, true)
+}
+
+func openSuspendIntentStoreWithCreate(regDir string, create bool) (*suspendIntentStore, error) {
+	payloads, err := openSuspendManifestStore(regDir, create)
 	if err != nil {
 		return nil, err
 	}

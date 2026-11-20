@@ -8,6 +8,14 @@ import "testing"
 // storage/OS-lock contract there without changing or bypassing the workflow.
 func TestWindowsSuspendManifestStorage(t *testing.T) {
 	for name, test := range map[string]func(*testing.T){
+		"maintenance-schedule":     TestSuspendMaintenanceScheduleBudgetAndBackoff,
+		"maintenance-unused":       TestSuspendMaintenanceMissingStoreAndLocalMode,
+		"maintenance-open-mode":    TestSuspendMaintenanceNonCreatingStoreOpen,
+		"maintenance-batches":      TestSuspendMaintenanceBatchedExpiryAndOrphans,
+		"maintenance-progress":     TestSuspendMaintenancePartialFailureRetainsCursor,
+		"maintenance-in-flight":    TestSuspendMaintenanceRetainsTransitionalCaptures,
+		"maintenance-exclusion":    TestSuspendMaintenanceOwnershipAndRegistryWaitBudget,
+		"maintenance-cancellation": TestSuspendMaintenanceSingleSchedulerAndCancellation,
 		"dormant-status-lifecycle": TestSuspendDormantStatusLifecycleProjection,
 		"dormant-status-expiry":    TestSuspendDormantStatusExpiryIsReadOnly,
 		"dormant-status-invalid":   TestSuspendDormantStatusRejectsInvalidMetadata,

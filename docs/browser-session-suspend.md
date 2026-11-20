@@ -7,7 +7,7 @@ start-owner metadata, bounded manifest encryption, private file storage and
 per-page CDP capture primitives. Suspend and
 reopen have no production caller yet: no new job action,
 browser close/relaunch, profile snapshot, sweep timer or advertised capability.
-Existing browser behavior is unchanged. This is not a completed suspend feature
+Existing live-browser launch/action behavior is unchanged. This is not a completed suspend feature
 or native acceptance proof.
 
 The existing node-wide status and list methods now project validated dormant
@@ -21,6 +21,16 @@ availability without claiming physical deletion; durable expiry and pruning
 still belong to the unfinished housekeeping integration. Old expiry metadata
 is hidden after its seven-day retention window. This is status wiring, not an
 enabled suspend/reopen action or real node-restart acceptance.
+
+The managed worker also owns metadata-only housekeeping under its root context.
+It runs a bounded pass on startup and hourly, with one-second follow-ups only
+after a successful full batch. Errors back off to the hourly cadence. Each pass
+has a five-second cooperative budget, retains separate progress cursors for TTL
+and orphan work, and takes the existing store/process and registry exclusions.
+An unused registry/payload directory is never created. Local mode does not start
+the loop. Cancellation stops waiting and future passes. Cleanup does not stop or
+adopt a browser, recover an in-flight transition, unlock a profile, or remove a
+saved profile. Those integrations remain unfinished.
 
 ## Contract being built
 
@@ -117,8 +127,9 @@ history stacks and browser process memory are not preserved.
 3. Relaunch under the existing ID with generation fencing, restore tabs through
    live URL policy, and restore scroll best effort. Do not consume or replay a
    stored unlock credential. Wrong unlock/profile-busy leaves suspension intact.
-4. Reuse registry recovery, with suspended/resuming/interrupted-suspend handling,
-   bounded deletion, tombstones, hourly sweep and error reporting. Do not let the
+4. Finish registry recovery with suspended/resuming/interrupted-suspend handling;
+   metadata-only bounded expiry/orphan scheduling is wired, but process-aware
+   recovery remains incomplete. Do not let the
    old live-record retention path prune suspend tombstones after one day.
 5. Add job results/status/capability wiring only when all effects and refusal
    tests are complete. Local mode does not expose suspend in this version.

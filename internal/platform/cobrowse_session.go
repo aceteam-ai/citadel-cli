@@ -269,7 +269,8 @@ type CobrowseSessionManager struct {
 	filesAllowed func() bool
 	// useResolver is set on the process-wide manager only, so its registry
 	// follows registryDirResolver; other managers keep a sibling of baseDir.
-	useResolver bool
+	useResolver        bool
+	suspendMaintenance suspendMaintenanceState
 }
 
 // SessionProfile is an encrypted, PIN-unlocked persistent profile bound to one
