@@ -17,11 +17,11 @@ const maxSuspendRecoveryTransitions = 16
 // Metadata-only, level-triggered progress. Completed includes an idempotent
 // durability reconciliation, not a claim that a new teardown happened. Keep
 // Cursor even when a partial error is returned, so broken entries cannot
-// monopolize later passes. Missing captures remain failed/recoverable here;
-// terminal failure and orphan cleanup require a separate manager decision.
+// monopolize later passes. Terminated requires durable capture absence and
+// verified teardown, not a provider error. Orphan cleanup is separate.
 type suspendIntentRecoveryResult struct {
-	Scanned, Attempted, Completed, Failed int
-	Cursor                                string
+	Scanned, Attempted, Completed, Terminated, Failed int
+	Cursor                                            string
 }
 
 func (s *suspendIntentStore) recoverSuspending(ctx context.Context, now time.Time, cursor string,
@@ -66,7 +66,11 @@ func (s *suspendIntentStore) recoverSuspending(ctx context.Context, now time.Tim
 		}
 		result.Attempted++
 		if _, err := s.completeSuspending(ctx, rec, now, stopAndVerify); err != nil {
-			result.Failed++
+			if _, err := s.failSuspending(ctx, rec, now, stopAndVerify); err != nil {
+				result.Failed++
+			} else {
+				result.Terminated++
+			}
 		} else {
 			result.Completed++
 		}

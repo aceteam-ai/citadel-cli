@@ -69,7 +69,14 @@ func TestWindowsSuspendManifestStorage(t *testing.T) {
 		"recovery-pass-refusals":   TestSuspendRecoveryPassAdmissionAndOtherStates,
 		"recovery-pass-cancel":     TestSuspendRecoveryPassCancellationPreservesCursor,
 		"recovery-pass-visible":    TestSuspendRecoveryPassReconcilesVisibleMetadata,
-		"recovery-pass-payload":    TestSuspendRecoveryPassMissingCaptureRemainsRecoverable,
+		"recovery-pass-payload":    TestSuspendRecoveryPassMissingCaptureRequiresVerifiedTeardown,
+		"failure-stop-proof":       TestSuspendFailureRequiresVerifiedTeardown,
+		"failure-refusals":         TestSuspendFailureRefusalsLeaveIntent,
+		"failure-commit-retry":     TestSuspendFailureCommitReplay,
+		"failure-reappeared":       TestSuspendFailureReappearingCaptureRemainsRecoverable,
+		"failure-visible-refusal":  TestSuspendFailureVisibleReceiptRefusals,
+		"failure-absence-recheck":  TestSuspendFailureAbsenceRecheckedBeforeStop,
+		"failure-profile-keep":     TestSuspendFailureRetainsSavedProfileDescriptor,
 		"recovery-pass-scan-error": TestSuspendRecoveryPassKeepsCursorOnInitialFailure,
 	} {
 		t.Run(name, test)

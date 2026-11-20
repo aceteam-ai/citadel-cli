@@ -214,24 +214,37 @@ func TestSuspendRecoveryPassReconcilesVisibleMetadata(t *testing.T) {
 	}
 }
 
-func TestSuspendRecoveryPassMissingCaptureRemainsRecoverable(t *testing.T) {
-	s, records, now := suspendRecoveryPassFixture(t, 3)
-	name, err := suspendManifestName(records[0])
-	if err != nil || s.payloads.root.Remove(name) != nil {
-		t.Fatal("could not prepare synthetic missing payload")
-	}
-	var calls []string
-	result, err := s.recoverSuspending(suspendPagesContext(t), now, "", func(_ context.Context, identity suspendStopIdentity) error {
-		calls = append(calls, identity.SessionID)
-		return nil
-	})
-	if err == nil || result.Attempted != 3 || result.Failed != 1 || result.Completed != 2 ||
-		!reflect.DeepEqual(calls, []string{records[1].ID, records[2].ID}) {
-		t.Fatal("missing capture was silently completed or blocked healthy siblings")
-	}
-	current, err := s.read(records[0].ID)
-	if err != nil || !reflect.DeepEqual(current, records[0]) {
-		t.Fatal("missing capture caused an irreversible terminal decision")
+func TestSuspendRecoveryPassMissingCaptureRequiresVerifiedTeardown(t *testing.T) {
+	for _, verified := range []bool{false, true} {
+		t.Run(fmt.Sprint(verified), func(t *testing.T) {
+			s, records, now := suspendRecoveryPassFixture(t, 3)
+			name, err := suspendManifestName(records[0])
+			if err != nil || s.payloads.root.Remove(name) != nil {
+				t.Fatal("could not prepare synthetic missing payload")
+			}
+			var calls []string
+			result, err := s.recoverSuspending(suspendPagesContext(t), now, "", func(_ context.Context, identity suspendStopIdentity) error {
+				calls = append(calls, identity.SessionID)
+				if identity.SessionID == records[0].ID && !verified {
+					return errors.New("synthetic unverified teardown")
+				}
+				return nil
+			})
+			wantFailed, wantTerminated := 1, 0
+			if verified {
+				wantFailed, wantTerminated = 0, 1
+			}
+			if (err == nil) != verified || result.Attempted != 3 || result.Failed != wantFailed ||
+				result.Terminated != wantTerminated || result.Completed != 2 ||
+				!reflect.DeepEqual(calls, []string{records[0].ID, records[1].ID, records[2].ID}) {
+				t.Fatal("missing capture lost teardown proof or blocked healthy siblings")
+			}
+			current, err := s.read(records[0].ID)
+			if err != nil || (!verified && !reflect.DeepEqual(current, records[0])) ||
+				(verified && (current.State != RecordExpired || current.EndedReason != "suspend_failed")) {
+				t.Fatal("missing-capture outcome disagrees with verified teardown")
+			}
+		})
 	}
 }
 
