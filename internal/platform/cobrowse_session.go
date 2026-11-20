@@ -829,6 +829,12 @@ func (s *cobrowseSession) teardown() error {
 	}
 	if proc != nil {
 		dropTargetSet(proc.debugPort)
+		// The main process is dead; its helpers may not be yet, and they
+		// recreate files under the profile. Nothing is sealed or removed
+		// until they are gone (citadel-cli#1836).
+		if rerr := reapProfileUsers(profile); rerr != nil && err == nil {
+			err = rerr
+		}
 	}
 	// Again after the browser is gone (it may have held a staged file open),
 	// and always before Persist seals anything. A dir that cannot be removed
