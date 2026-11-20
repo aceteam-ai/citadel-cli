@@ -39,6 +39,17 @@ func TestWindowsSuspendManifestStorage(t *testing.T) {
 		"intent-write-capacity":    TestSuspendIntentReservesAtomicReplacementCapacity,
 		"intent-accounting":        TestSuspendIntentCapacityAndUnparseableRecords,
 		"intent-concurrency":       TestSuspendIntentSerializesCompetingCaptures,
+		"completion-order":         TestSuspendCompletionPersistsAfterVerifiedTeardown,
+		"completion-replay":        TestSuspendCompletionFailureReplay,
+		"completion-refusals":      TestSuspendCompletionRequiresCaptureAndIntent,
+		"completion-visible":       TestSuspendCompletionVisibleRecordStillRequiresDurability,
+		"completion-accounting":    TestSuspendCompletionRefusesUnaccountableRegistry,
+		"completion-concurrency":   TestSuspendCompletionConcurrentRetryStopsOnlyOnce,
+		"reopen-intent-order":      TestSuspendReopenIntentDurableSameIDAndCapture,
+		"reopen-intent-replay":     TestSuspendReopenIntentFailureReplay,
+		"reopen-intent-refusals":   TestSuspendReopenIntentRequiresCurrentPlanAndPayload,
+		"reopen-intent-visible":    TestSuspendReopenIntentVisibleRecordStillNeedsDurability,
+		"reopen-concurrency":       TestSuspendReopenIntentConcurrentRetryPublishesOnce,
 		"expiry-clock":             TestSuspendExpiryClockAndProfileRetention,
 		"expiry-replay":            TestSuspendExpiryFailureReplay,
 		"expiry-flush-retry":       TestSuspendExpiryReconcilesVisibleTombstone,
@@ -50,6 +61,8 @@ func TestWindowsSuspendManifestStorage(t *testing.T) {
 		"ttl-batch-progress":       TestSuspendTTLSweepFailedEntryDoesNotStarveSiblings,
 		"ttl-batch-empty":          TestSuspendTTLSweepBudgetAndEmptyRegistry,
 		"ttl-batch-flush-retry":    TestSuspendTTLSweepFlushesUncertainMetadataOnNextPass,
+		"ttl-recovery-retention":   TestSuspendRecoveryLeavesTombstonesToDurableSweep,
+		"ttl-ended-lookup":         TestSuspendExpiredLookupKeepsSevenDayReason,
 	} {
 		t.Run(name, test)
 	}

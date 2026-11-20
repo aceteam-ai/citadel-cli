@@ -208,17 +208,59 @@ func TestSuspendCompletionVisibleRecordStillRequiresDurability(t *testing.T) {
 	}
 }
 
+func TestSuspendCompletionRefusesUnaccountableRegistry(t *testing.T) {
+	for _, kind := range []string{"unknown-entry", "malformed-record", "oversized-record"} {
+		t.Run(kind, func(t *testing.T) {
+			s, _, intent, _ := suspendCompletionFixture(t)
+			name := "cb-extra.json"
+			if kind == "unknown-entry" {
+				name = "unrecognized-entry"
+			}
+			f, err := s.root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if kind == "oversized-record" {
+				err = f.Truncate(maxSuspendRegistryRecordBytes + 1)
+			} else {
+				_, err = f.WriteString("not-a-lifecycle-record")
+			}
+			closeErr := f.Close()
+			if err != nil || closeErr != nil {
+				t.Fatal("could not prepare the synthetic registry entry")
+			}
+			calls := 0
+			if _, err := s.completeSuspending(suspendPagesContext(t), intent, suspendTestNow,
+				func(context.Context, suspendStopIdentity) error { calls++; return nil }); err == nil || calls != 0 {
+				t.Fatal("unaccountable registry crossed the teardown boundary")
+			}
+			current, err := s.read(intent.ID)
+			if err != nil || !reflect.DeepEqual(current, intent) {
+				t.Fatal("refused completion changed its recoverable intent")
+			}
+		})
+	}
+}
+
 func TestSuspendCompletionConcurrentRetryStopsOnlyOnce(t *testing.T) {
 	s, _, intent, _ := suspendCompletionFixture(t)
-	ctx := suspendPagesContext(t)
+	ctx, cancel := context.WithTimeout(suspendPagesContext(t), 10*time.Second)
+	defer cancel()
 	entered, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
 	var calls atomic.Int32
 	stop := func(context.Context, suspendStopIdentity) error {
 		if calls.Add(1) == 1 {
 			close(entered)
 		}
-		<-release
-		return nil
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	var wg sync.WaitGroup
 	results := make(chan error, 2)
@@ -231,13 +273,17 @@ func TestSuspendCompletionConcurrentRetryStopsOnlyOnce(t *testing.T) {
 		}()
 	}
 	launch()
-	<-entered
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("completion never reached its bounded teardown callback")
+	}
 	locked := !s.mu.TryLock()
 	if !locked {
 		s.mu.Unlock()
 	}
 	launch()
-	close(release)
+	unblock()
 	wg.Wait()
 	close(results)
 	if !locked {

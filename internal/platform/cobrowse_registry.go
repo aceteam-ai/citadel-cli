@@ -598,6 +598,12 @@ func (m *CobrowseSessionManager) recoverSessions() {
 		case RecordSuspended:
 			continue
 		case RecordExpired:
+			if rec.EndedReason == "suspend_expired" {
+				// The bounded TTL writer owns these seven-day tombstones and
+				// their durable prune. Legacy 24h retention and its count cap
+				// must not remove them early or bypass prune reconciliation.
+				continue
+			}
 			if t, err := time.Parse(time.RFC3339, rec.EndedAt); err != nil || now.Sub(t) >= expiredRetention {
 				deleteRecord(regDir, rec.ID)
 			} else {
