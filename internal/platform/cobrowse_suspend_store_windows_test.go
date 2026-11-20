@@ -26,6 +26,19 @@ func TestWindowsSuspendManifestStorage(t *testing.T) {
 		"capture-provider-failure": TestSuspendCaptureOpaqueProviderRefusals,
 		"capture-values":           TestSuspendCaptureRejectsMalformedValues,
 		"capture-deadline":         TestSuspendCaptureRequiresDeadlineBeforeConnecting,
+		"capture-all-pages":        TestSuspendPagesCompletePinnedCapture,
+		"capture-admission":        TestSuspendPagesAdmissionBeforeIO,
+		"capture-page-fences":      TestSuspendPagesFencesEachProviderAwait,
+		"capture-page-population":  TestSuspendPagesBoundsAndChangedPopulation,
+		"intent-durability":        TestSuspendIntentPayloadBeforeDurableIntent,
+		"intent-authority":         TestSuspendIntentAdmissionAndFinalAuthority,
+		"intent-failures":          TestSuspendIntentPersistenceFailuresRetainAccounting,
+		"intent-cancelled-commit":  TestSuspendIntentAuthorityLostAfterPublicationIsUnacknowledged,
+		"intent-saved-profile":     TestSuspendIntentSavedProfileAndFakeClock,
+		"intent-bounds":            TestSuspendIntentRegistryByteBounds,
+		"intent-write-capacity":    TestSuspendIntentReservesAtomicReplacementCapacity,
+		"intent-accounting":        TestSuspendIntentCapacityAndUnparseableRecords,
+		"intent-concurrency":       TestSuspendIntentSerializesCompetingCaptures,
 	} {
 		t.Run(name, test)
 	}
