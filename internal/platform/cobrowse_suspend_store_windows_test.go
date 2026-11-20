@@ -39,6 +39,17 @@ func TestWindowsSuspendManifestStorage(t *testing.T) {
 		"intent-write-capacity":    TestSuspendIntentReservesAtomicReplacementCapacity,
 		"intent-accounting":        TestSuspendIntentCapacityAndUnparseableRecords,
 		"intent-concurrency":       TestSuspendIntentSerializesCompetingCaptures,
+		"expiry-clock":             TestSuspendExpiryClockAndProfileRetention,
+		"expiry-replay":            TestSuspendExpiryFailureReplay,
+		"expiry-flush-retry":       TestSuspendExpiryReconcilesVisibleTombstone,
+		"expiry-sibling":           TestSuspendExpiryKeepsSiblingPayload,
+		"expiry-refusals":          TestSuspendExpiryRefusalsLeavePayload,
+		"tombstone-retention":      TestSuspendTombstoneRetentionAndIdempotentPrune,
+		"tombstone-failures":       TestSuspendTombstoneOtherReasonsAndDeleteFailures,
+		"ttl-batch-budget":         TestSuspendTTLSweepBoundedLevelTriggeredPasses,
+		"ttl-batch-progress":       TestSuspendTTLSweepFailedEntryDoesNotStarveSiblings,
+		"ttl-batch-empty":          TestSuspendTTLSweepBudgetAndEmptyRegistry,
+		"ttl-batch-flush-retry":    TestSuspendTTLSweepFlushesUncertainMetadataOnNextPass,
 	} {
 		t.Run(name, test)
 	}

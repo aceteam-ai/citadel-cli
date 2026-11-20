@@ -25,12 +25,13 @@ const maxSuspendRegistryBytes = 8 * 1024 * 1024
 const maxSuspendRegistryEntries = 1024
 
 type suspendIntentStore struct {
-	mu       sync.Mutex
-	root     *os.Root
-	payloads *suspendManifestStore
-	syncFile func(*os.File) error
-	syncDir  func() error
-	rename   func(string, string) error
+	mu           sync.Mutex
+	root         *os.Root
+	payloads     *suspendManifestStore
+	syncFile     func(*os.File) error
+	syncDir      func() error
+	rename       func(string, string) error
+	removeRecord func(string) error
 }
 
 func openSuspendIntentStore(regDir string) (*suspendIntentStore, error) {
@@ -43,7 +44,7 @@ func openSuspendIntentStore(regDir string) (*suspendIntentStore, error) {
 		_ = payloads.close()
 		return nil, errors.New("open browser lifecycle registry")
 	}
-	s := &suspendIntentStore{root: root, payloads: payloads, syncFile: func(f *os.File) error { return f.Sync() }, rename: root.Rename}
+	s := &suspendIntentStore{root: root, payloads: payloads, syncFile: func(f *os.File) error { return f.Sync() }, rename: root.Rename, removeRecord: root.Remove}
 	s.syncDir = func() error {
 		if runtime.GOOS == "windows" {
 			// File flush plus atomic replacement covers process restart, not
@@ -215,7 +216,22 @@ func (s *suspendIntentStore) stage(ctx context.Context, expected sessionRecord, 
 	intent := expected
 	intent.State, intent.Suspension = "suspending", final.Suspension
 	intent.UpdatedAt = now.UTC().Format(time.RFC3339Nano)
-	data, err := json.Marshal(intent)
+	if err := s.replaceRecord(expected, intent, check); err != nil {
+		return fail()
+	}
+	return intent, nil
+}
+
+// replaceRecord runs under mu and the caller's lifecycle exclusion. It does
+// not allocate capacity: callers reserve an atomic replacement slot via
+// snapshot before reaching it. Shared by staging and TTL transitions, with
+// the same file-flush, compare, atomic-replace and directory-flush ordering.
+func (s *suspendIntentStore) replaceRecord(expected, next sessionRecord, check func() bool) error {
+	fail := func() error { return errors.New("could not persist browser lifecycle transition") }
+	if next.ID != expected.ID || next.Version != sessionRecordVersion || check == nil || !check() {
+		return fail()
+	}
+	data, err := json.Marshal(next)
 	if err != nil || len(data) > maxSuspendRegistryRecordBytes {
 		return fail()
 	}
@@ -237,9 +253,9 @@ func (s *suspendIntentStore) stage(ctx context.Context, expected sessionRecord, 
 	if err != nil || closeErr != nil || !check() {
 		return fail()
 	}
-	current, err = s.read(expected.ID)
+	current, err := s.read(expected.ID)
 	if err != nil || !reflect.DeepEqual(current, expected) || !check() || s.rename(name, expected.ID+".json") != nil || s.syncDir() != nil || !check() {
 		return fail()
 	}
-	return intent, nil
+	return nil
 }
