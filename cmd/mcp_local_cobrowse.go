@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -444,6 +445,85 @@ func decodeArgs(args json.RawMessage, into any) error {
 	return nil
 }
 
+// receivedKeys lists the top-level key names of args, sorted and bounded.
+// Never values.
+func receivedKeys(args json.RawMessage) string {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(args, &m) != nil {
+		return "(none)"
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		if len(k) > 64 {
+			k = k[:64] + "..."
+		}
+		keys = append(keys, strconv.Quote(k))
+	}
+	sort.Strings(keys)
+	if len(keys) > 32 {
+		keys = append(keys[:32], "...")
+	}
+	return "[" + strings.Join(keys, ", ") + "]"
+}
+
+// withReceivedKeys names the keys a refused call actually sent (as received,
+// before normalization), so a client that renames arguments is diagnosable.
+// Other errors pass through.
+func withReceivedKeys(raw json.RawMessage, err error) error {
+	var ae argError
+	if !errors.As(err, &ae) {
+		return err
+	}
+	return argError{fmt.Errorf("%w; received argument keys: %s", ae.error, receivedKeys(raw))}
+}
+
+// argKeyCanon folds a property name or a client's spelling of it to one form,
+// so session_id, sessionId, sessionID and session-id compare equal.
+func argKeyCanon(k string) string {
+	return strings.ToLower(strings.NewReplacer("_", "", "-", "").Replace(k))
+}
+
+// normalizeArgKeys maps top-level argument keys that are another-case spelling
+// of a declared property (some MCP clients send camelCase) to the declared
+// name. A variant next to the declared name, or two variants of one name, is
+// refused rather than guessed. Unknown keys and non-object arguments pass
+// through for decodeArgs to handle. Values are never inspected.
+func normalizeArgKeys(args json.RawMessage, declared map[string]any) (json.RawMessage, error) {
+	var m map[string]json.RawMessage
+	if len(args) == 0 || json.Unmarshal(args, &m) != nil || m == nil {
+		return args, nil
+	}
+	byCanon := make(map[string]string, len(declared))
+	for name := range declared {
+		byCanon[argKeyCanon(name)] = name
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make(map[string]json.RawMessage, len(m))
+	changed := false
+	for _, k := range keys {
+		name := k
+		if d, ok := byCanon[argKeyCanon(k)]; ok && d != k {
+			name, changed = d, true
+		}
+		if _, dup := out[name]; dup {
+			return nil, argError{fmt.Errorf("duplicate argument %q (sent more than once under different spellings)", name)}
+		}
+		out[name] = m[k]
+	}
+	if !changed {
+		return args, nil
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return args, nil
+	}
+	return b, nil
+}
+
 func requireSession(id string) (string, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -503,9 +583,15 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				if err != nil {
 					return "", err
 				}
-				v, err := do(ctx, s, args)
+				raw := args
+				var v any
+				args, err = normalizeArgKeys(raw, props)
+				if err == nil {
+					v, err = do(ctx, s, args)
+				}
 				if err != nil {
-					recordArgRefusal(s, name, args, err)
+					err = withReceivedKeys(raw, err)
+					recordArgRefusal(s, name, raw, err)
 					return "", err
 				}
 				return jsonText(v)
@@ -513,6 +599,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 		}
 	}
 
+	screenshotProps := map[string]any{"session_id": strProp(descSession), "goal": strProp(descGoal)}
 	writeNote := " A WRITE: needs the user's approval for the site (its registrable domain) in the Citadel viewer. Without it the call returns approval_required; then call local_cobrowse_wait with until=approved. Anything that sends, posts, submits, pays or deletes (a Send or Post button, Enter in a message or form field, an unlabeled or unidentifiable target) needs the user's approval every time, whatever was approved: the call returns commit_approval_required; call local_cobrowse_wait with until=commit, then repeat the same call. Refused while the user has control."
 	readNote := " A READ: no approval needed. Refused while the user has control, so you never see what they type."
 
@@ -699,7 +786,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 		{
 			Name:        "local_cobrowse_screenshot",
 			Description: "Capture the session's current viewport as a PNG image." + readNote,
-			InputSchema: objSchema(map[string]any{"session_id": strProp(descSession), "goal": strProp(descGoal)}, "session_id"),
+			InputSchema: objSchema(screenshotProps, "session_id"),
 			Async:       true,
 			CallContent: func(ctx context.Context, args json.RawMessage) ([]map[string]any, error) {
 				s, err := svc()
@@ -710,13 +797,20 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 					SessionID string `json:"session_id"`
 					Goal      string `json:"goal"`
 				}
-				if err := decodeArgs(args, &in); err != nil {
-					recordArgRefusal(s, "local_cobrowse_screenshot", args, err)
+				raw := args
+				args, err = normalizeArgKeys(raw, screenshotProps)
+				if err == nil {
+					err = decodeArgs(args, &in)
+				}
+				if err != nil {
+					err = withReceivedKeys(raw, err)
+					recordArgRefusal(s, "local_cobrowse_screenshot", raw, err)
 					return nil, err
 				}
 				id, err := requireSession(in.SessionID)
 				if err != nil {
-					recordArgRefusal(s, "local_cobrowse_screenshot", args, err)
+					err = withReceivedKeys(raw, err)
+					recordArgRefusal(s, "local_cobrowse_screenshot", raw, err)
 					return nil, err
 				}
 				png, err := s.Screenshot(ctx, id, in.Goal)
