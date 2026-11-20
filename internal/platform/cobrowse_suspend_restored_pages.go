@@ -27,8 +27,12 @@ type suspendRestoredPageSource struct {
 }
 
 func verifySuspendRestoredPages(ctx context.Context, plan suspendRestoredPagePlan, active func() (string, error), fence func() error) error {
+	return verifySuspendRestoredPagesWith(ctx, plan, active, fence, browserSuspendRestoredPageSource(false))
+}
+
+func browserSuspendRestoredPageSource(restore bool) suspendRestoredPageSource {
 	base := browserSuspendPageSource()
-	return verifySuspendRestoredPagesWith(ctx, plan, active, fence, suspendRestoredPageSource{
+	return suspendRestoredPageSource{
 		verify: base.verify, list: base.list,
 		position: func(ctx context.Context, p pin, tab suspendTab, fence func() error) error {
 			c, err := openSuspendCaptureConn(ctx, p)
@@ -36,9 +40,9 @@ func verifySuspendRestoredPages(ctx context.Context, plan suspendRestoredPagePla
 				return err
 			}
 			defer c.Close()
-			return verifySuspendTabScrollOn(ctx, c, tab, fence)
+			return suspendTabScrollOn(ctx, c, tab, fence, restore)
 		},
-	})
+	}
 }
 
 // Unwired bounded final observations for reopen completion. Discovery must be

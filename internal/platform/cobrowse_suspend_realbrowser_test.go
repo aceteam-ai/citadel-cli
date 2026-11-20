@@ -177,8 +177,10 @@ func runSuspendPagesRealBrowser(t *testing.T, m *CobrowseSessionManager) {
 			t.Fatal("read-only observation repaired or changed an unrestored page")
 		}
 	}
+	awaitSuspendFixture(t, ctx, "whole-manifest scroll restoration", func(ctx context.Context) bool {
+		return restoreSuspendPageScrolls(ctx, plan, active, fence) == nil
+	})
 	for i, id := range ids {
-		restore(id, manifest.Tabs[i])
 		got := read(id)
 		if math.Abs(got.ScrollX-manifest.Tabs[i].ScrollX) > 1 || math.Abs(got.ScrollY-manifest.Tabs[i].ScrollY) > 1 {
 			t.Fatal("actual scroll restoration lost an axis")
@@ -187,7 +189,7 @@ func runSuspendPagesRealBrowser(t *testing.T, m *CobrowseSessionManager) {
 	if err := verify(); err != nil {
 		t.Fatal("restored real page set was not acknowledged", err)
 	}
-	t.Log("read-only rejection left zero scroll unchanged; both-axis restoration confirmed")
+	t.Log("read-only rejection left zero scroll unchanged; whole-manifest restore and final observation confirmed both axes")
 
 	// A same-origin document whose query or fragment differs is still not
 	// the captured document. Restore its scroll first so a refusal cannot be
