@@ -351,3 +351,57 @@ func TestLocalToolArgumentRefusalNamesKeysNotValues(t *testing.T) {
 		}
 	}
 }
+
+func TestLocalCobrowseSessionParamAlias(t *testing.T) {
+	ownerDir := t.TempDir()
+	rt := newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: func() string { return ownerDir }, browser: newCmdFakeBrowser(), policy: allowAllURLs})
+	defer rt.close()
+	runLocalBridge(t, rt, nil, call(1, "local_cobrowse_start", nil))
+
+	// tools/list declares cobrowse_session and requires it where session_id was.
+	resp := runLocalBridge(t, rt, nil, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
+	for _, raw := range resp["2"]["result"].(map[string]any)["tools"].([]any) {
+		tool := raw.(map[string]any)
+		schema := tool["inputSchema"].(map[string]any)
+		props := schema["properties"].(map[string]any)
+		if _, ok := props["session_id"]; ok {
+			t.Errorf("%v still declares session_id", tool["name"])
+		}
+		if _, ok := props["cobrowse_session"]; !ok {
+			continue
+		}
+		if tool["name"] == "local_cobrowse_screenshot" {
+			if req, _ := schema["required"].([]any); len(req) != 1 || req[0] != "cobrowse_session" {
+				t.Errorf("screenshot required: %v", schema["required"])
+			}
+		}
+	}
+
+	for _, key := range []string{"cobrowse_session", "session_id"} {
+		r := runLocalBridge(t, rt, nil, call(3, "local_cobrowse_screenshot", map[string]any{key: "cb-1"}))
+		if content, isErr := toolResult(t, r["3"]); isErr {
+			t.Errorf("%s screenshot refused: %s", key, firstText(content))
+		}
+		r = runLocalBridge(t, rt, nil, call(4, "local_cobrowse_status", map[string]any{key: "cb-1"}))
+		if content, isErr := toolResult(t, r["4"]); isErr || !strings.Contains(firstText(content), "cb-1") {
+			t.Errorf("%s status: %v %s", key, isErr, firstText(content))
+		}
+	}
+	// Same value under both names is fine.
+	r := runLocalBridge(t, rt, nil, call(5, "local_cobrowse_screenshot", map[string]any{"cobrowse_session": "cb-1", "session_id": "cb-1"}))
+	if content, isErr := toolResult(t, r["5"]); isErr {
+		t.Errorf("same value refused: %s", firstText(content))
+	}
+	// Differing values are refused, naming the parameter.
+	r = runLocalBridge(t, rt, nil, call(6, "local_cobrowse_click", map[string]any{"cobrowse_session": "cb-1", "session_id": "cb-9", "selector": "#a"}))
+	content, isErr := toolResult(t, r["6"])
+	if txt := firstText(content); !isErr || !strings.Contains(txt, "different values") || strings.Contains(txt, "cb-9") {
+		t.Errorf("conflict: %v %q", isErr, txt)
+	}
+	// Missing: the error names cobrowse_session.
+	r = runLocalBridge(t, rt, nil, call(7, "local_cobrowse_screenshot", map[string]any{"goal": "x"}))
+	content, isErr = toolResult(t, r["7"])
+	if txt := firstText(content); !isErr || !strings.Contains(txt, "'cobrowse_session' is required") {
+		t.Errorf("missing: %v %q", isErr, txt)
+	}
+}

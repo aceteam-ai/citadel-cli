@@ -284,7 +284,7 @@ human's press or an approval (Q3).
 **The human**, through either source in Q1.
 
 **The agent, with acceptance (decision 3).** The tool is
-`local_cobrowse_stage_file {session_id, name, size, sha256, offset,
+`local_cobrowse_stage_file {cobrowse_session, name, size, sha256, offset,
 data_base64, goal}`.
 
 - Bytes arrive in chunks of at most 4 MiB decoded (about 5.4 MiB as base64),
@@ -348,7 +348,7 @@ plainly: "The page on <site> receives this file and can send it anywhere."
 
 ### Agent attach
 
-`local_cobrowse_set_file_input {session_id, staged_name, selector?, goal}`
+`local_cobrowse_set_file_input {cobrowse_session, staged_name, selector?, goal}`
 (decisions 4 and 5).
 
 - It targets the pending chooser by default, or a file input matched by
