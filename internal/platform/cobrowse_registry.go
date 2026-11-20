@@ -657,7 +657,7 @@ func (m *CobrowseSessionManager) recoverSessions() {
 				continue
 			}
 			if t, err := time.Parse(time.RFC3339, rec.EndedAt); err != nil || now.Sub(t) >= expiredRetention {
-				deleteRecord(regDir, rec.ID)
+				_, _ = mutateRecordIfCurrent(regDir, rec, nil)
 			} else {
 				expired = append(expired, rec)
 			}
@@ -697,6 +697,7 @@ func (m *CobrowseSessionManager) recoverSessions() {
 		if err != nil {
 			log.Printf("[cobrowse] not adopting session %s: %v", rec.ID, err)
 			stopRecordScopes(rec) // identity-checked; the sweep reaps anything left
+			expected := rec
 			rec.State = RecordExpired
 			rec.EndedReason, rec.EndedDetail = endedReasonLost, ""
 			if rec.PendingEnd != nil {
@@ -704,8 +705,9 @@ func (m *CobrowseSessionManager) recoverSessions() {
 			}
 			rec.PendingEnd = nil
 			rec.EndedAt = now.UTC().Format(time.RFC3339)
-			_ = saveRecord(regDir, rec)
-			expired = append(expired, rec)
+			if saved, err := mutateRecordIfCurrent(regDir, expected, &rec); err == nil {
+				expired = append(expired, saved)
+			}
 			continue
 		}
 		s := &cobrowseSession{
@@ -744,7 +746,7 @@ func (m *CobrowseSessionManager) recoverSessions() {
 	if len(expired) > expiredMaxRecords {
 		sort.Slice(expired, func(i, j int) bool { return expired[i].EndedAt > expired[j].EndedAt })
 		for _, r := range expired[expiredMaxRecords:] {
-			deleteRecord(regDir, r.ID)
+			_, _ = mutateRecordIfCurrent(regDir, r, nil)
 		}
 	}
 }
