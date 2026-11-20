@@ -63,6 +63,13 @@ func TestWindowsSuspendManifestStorage(t *testing.T) {
 		"ttl-batch-flush-retry":    TestSuspendTTLSweepFlushesUncertainMetadataOnNextPass,
 		"ttl-recovery-retention":   TestSuspendRecoveryLeavesTombstonesToDurableSweep,
 		"ttl-ended-lookup":         TestSuspendExpiredLookupKeepsSevenDayReason,
+		"recovery-pass-bounds":     TestSuspendRecoveryPassBoundedRestartAndRetry,
+		"recovery-pass-progress":   TestSuspendRecoveryPassFailuresDoNotStarveSiblings,
+		"recovery-pass-refusals":   TestSuspendRecoveryPassAdmissionAndOtherStates,
+		"recovery-pass-cancel":     TestSuspendRecoveryPassCancellationPreservesCursor,
+		"recovery-pass-visible":    TestSuspendRecoveryPassReconcilesVisibleMetadata,
+		"recovery-pass-payload":    TestSuspendRecoveryPassMissingCaptureRemainsRecoverable,
+		"recovery-pass-scan-error": TestSuspendRecoveryPassKeepsCursorOnInitialFailure,
 	} {
 		t.Run(name, test)
 	}
