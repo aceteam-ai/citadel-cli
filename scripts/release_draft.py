@@ -56,9 +56,37 @@ def archive_names(tag):
     ]
 
 
+GIT_STEPS = frozenset(
+    {'status', 'fetch', 'rev-parse', 'ls-remote', 'push', 'merge-base'}
+)
+GH_STEPS = frozenset({'api', 'run', 'release'})
+GO_STEPS = frozenset({'build', 'run'})
+
+
+def step_label(argv):
+    """Closed set of fixed labels. Never derived from argument values."""
+    try:
+        tool = argv[0]
+        if tool == 'git':
+            rest = argv[1:]
+            if rest[:1] == ['-c']:
+                rest = rest[2:]
+            if rest[0] in GIT_STEPS:
+                return f'git {rest[0]}'
+        elif tool == 'gh' and argv[1] in GH_STEPS:
+            return f'gh {argv[1]}'
+        elif tool == 'go' and argv[1] in GO_STEPS:
+            return f'go {argv[1]}'
+        elif tool == 'bash':
+            return 'homebrew tap'
+    except IndexError:
+        pass
+    return 'release command'
+
+
 class Runner:
     def __init__(self, root):
-        self.root = pathlib.Path(root)
+        self.root = pathlib.Path(root).resolve()
 
     def run(self, argv, *, env=None, timeout=60):
         # Fixed errors only: gh stderr can contain remote data, and signing
@@ -78,9 +106,12 @@ class Runner:
                 data = output.read((16 << 20) + 1)
                 require(len(data) <= 16 << 20, 'release command output exceeds bound')
                 return data.decode()
-        except (OSError, UnicodeError, subprocess.SubprocessError):
+        except (OSError, UnicodeError, subprocess.SubprocessError) as error:
+            code = getattr(error, 'returncode', None)
+            detail = f'exit {code}' if isinstance(code, int) else 'no exit status'
             raise Refused(
-                'release command failed; inspect state before retrying'
+                f'release command failed: {step_label(argv)} ({detail}); '
+                'inspect state before retrying, no automatic retries'
             ) from None
 
     def api(self, path):
@@ -100,7 +131,11 @@ class Runner:
         raise Refused('forge pagination bound exceeded')
 
     def git(self, *args):
-        return self.run(['git', *args]).strip()
+        # Trust exactly this checkout. The CI container runs as a different uid
+        # than the workspace owner; never use '*' or global config.
+        return self.run(
+            ['git', '-c', f'safe.directory={self.root}', *args]
+        ).strip()
 
     def download(self, asset_id, path, size):
         # Download immutable asset IDs with an independent byte/time bound.
