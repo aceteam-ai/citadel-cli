@@ -505,6 +505,14 @@ func normalizeArgKeys(args json.RawMessage, declared map[string]any) (json.RawMe
 	out := make(map[string]json.RawMessage, len(m))
 	changed := false
 	for _, k := range keys {
+		// encoding/json folds struct-tag matches with Unicode simple folding
+		// (long s, Kelvin sign), which argKeyCanon does not see. Refuse any
+		// non-ASCII key so no spelling can slip past the duplicate check.
+		for i := 0; i < len(k); i++ {
+			if k[i] >= 0x80 {
+				return nil, argError{fmt.Errorf("argument key %s contains non-ASCII characters", strconv.QuoteToASCII(truncKey(k)))}
+			}
+		}
 		name := k
 		if d, ok := byCanon[argKeyCanon(k)]; ok && d != k {
 			name, changed = d, true
@@ -567,6 +575,13 @@ func sameSessionValue(a, b json.RawMessage) bool {
 	return string(a) == string(b)
 }
 
+func truncKey(k string) string {
+	if len(k) > 64 {
+		return k[:64]
+	}
+	return k
+}
+
 func requireSession(id string) (string, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -584,6 +599,9 @@ func recordArgRefusal(s *localcobrowse.Service, tool string, args json.RawMessag
 	var in struct {
 		SessionID    string `json:"session_id"`
 		CobrowseSess string `json:"cobrowse_session"`
+	}
+	if norm, nerr := normalizeLocalArgs(args, map[string]any{"cobrowse_session": nil}); nerr == nil {
+		args = norm
 	}
 	_ = json.Unmarshal(args, &in)
 	id := strings.TrimSpace(in.CobrowseSess)

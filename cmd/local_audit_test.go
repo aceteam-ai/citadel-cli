@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -403,5 +404,51 @@ func TestLocalCobrowseSessionParamAlias(t *testing.T) {
 	content, isErr = toolResult(t, r["7"])
 	if txt := firstText(content); !isErr || !strings.Contains(txt, "'cobrowse_session' is required") {
 		t.Errorf("missing: %v %q", isErr, txt)
+	}
+}
+
+func TestLocalCobrowseRoutesToNamedSession(t *testing.T) {
+	for _, key := range []string{"cobrowse_session", "session_id"} {
+		ownerDir := t.TempDir()
+		rt := newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: func() string { return ownerDir }, browser: newCmdFakeBrowser(), policy: allowAllURLs})
+		runLocalBridge(t, rt, nil, call(1, "local_cobrowse_start", nil), call(2, "local_cobrowse_start", nil))
+		r := runLocalBridge(t, rt, nil, call(3, "local_cobrowse_stop", map[string]any{key: "cb-2"}))
+		if content, isErr := toolResult(t, r["3"]); isErr {
+			t.Fatalf("%s stop: %s", key, firstText(content))
+		}
+		r = runLocalBridge(t, rt, nil, call(4, "local_cobrowse_status", nil))
+		content, _ := toolResult(t, r["4"])
+		txt := firstText(content)
+		if !strings.Contains(txt, "cb-1") || strings.Contains(txt, "cb-2") {
+			t.Errorf("%s: want only cb-1 left, got %s", key, txt)
+		}
+		rt.close()
+	}
+}
+
+func TestLocalToolRefusesNonASCIIKeys(t *testing.T) {
+	ownerDir := t.TempDir()
+	rt := newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: func() string { return ownerDir }, browser: newCmdFakeBrowser(), policy: allowAllURLs})
+	defer rt.close()
+	runLocalBridge(t, rt, nil, call(1, "local_cobrowse_start", nil), call(2, "local_cobrowse_start", nil))
+	for i, args := range []map[string]any{
+		{"cobrowse_session": "cb-1", "ſession_id": "cb-2"},
+		{"cobrowse_session": "cb-1", "Key": auditSentinel, "selector": "#a"},
+	} {
+		tool := "local_cobrowse_stop"
+		if i == 1 {
+			tool = "local_cobrowse_key"
+			args["key"] = "Tab"
+		}
+		r := runLocalBridge(t, rt, nil, call(10+i, tool, args))
+		content, isErr := toolResult(t, r[strconv.Itoa(10+i)])
+		if txt := firstText(content); !isErr || !strings.Contains(txt, "non-ASCII") || strings.Contains(txt, auditSentinel) {
+			t.Errorf("case %d: %v %q", i, isErr, txt)
+		}
+	}
+	r := runLocalBridge(t, rt, nil, call(20, "local_cobrowse_status", nil))
+	content, _ := toolResult(t, r["20"])
+	if txt := firstText(content); !strings.Contains(txt, "cb-1") || !strings.Contains(txt, "cb-2") {
+		t.Errorf("a refused call changed sessions: %s", txt)
 	}
 }
