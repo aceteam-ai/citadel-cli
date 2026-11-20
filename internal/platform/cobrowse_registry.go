@@ -336,13 +336,26 @@ func deleteRecord(regDir, id string) { _ = os.Remove(recordFile(regDir, id)) }
 
 // persistRecord writes (best-effort) the registry record for a live session.
 func (s *cobrowseSession) persistRecord() {
+	s.persistRecordWithWriter(saveRecord)
+}
+
+// Identity probes stay outside mu. The final incarnation/state check, current
+// metadata snapshot and publication share mu with teardown, so an old probe
+// cannot resurrect a stopped record or overwrite a newer lifecycle transition.
+// The injected writer is private and synchronous; production uses saveRecord.
+func (s *cobrowseSession) persistRecordWithWriter(write func(string, sessionRecord) error) {
+	if write == nil {
+		return
+	}
 	s.mu.Lock()
 	proc := s.proc
-	if proc == nil || !adoptionSupported || s.regDir == "" {
+	if proc == nil || !adoptionSupported || s.regDir == "" || (s.state != SessionRunning && s.state != SessionAttached) {
 		s.mu.Unlock()
 		return
 	}
+	generation := s.generation
 	browserID, port, profile := proc.browserID, proc.debugPort, s.profile
+	browserPID, xvfbPID := proc.browserPID, proc.xvfbPID
 	s.mu.Unlock()
 	if browserID == "" && port > 0 {
 		if id, err := resolveBrowserID(port, profile); err == nil {
@@ -351,9 +364,15 @@ func (s *cobrowseSession) persistRecord() {
 			log.Printf("[cobrowse] could not read browser id for session %s: %v", s.id, err)
 		}
 	}
+	ownerStart := currentOwnerIdentity()
+	browserStart, _, _ := procIdentity(browserPID)
+	var xvfbStart uint64
+	if xvfbPID > 0 {
+		xvfbStart, _, _ = procIdentity(xvfbPID)
+	}
 	s.mu.Lock()
-	if s.proc != proc {
-		s.mu.Unlock()
+	defer s.mu.Unlock()
+	if s.proc != proc || s.generation != generation || (s.state != SessionRunning && s.state != SessionAttached) {
 		return
 	}
 	proc.browserID = browserID
@@ -384,18 +403,14 @@ func (s *cobrowseSession) persistRecord() {
 	if !s.startedAt.IsZero() {
 		rec.StartedAt = s.startedAt.UTC().Format(time.RFC3339)
 	}
-	s.mu.Unlock()
 	uid := os.Getuid()
 	rec.OwnerUID = &uid
-	rec.OwnerStart = currentOwnerIdentity()
+	rec.OwnerStart = ownerStart
 	if proc.containerID != "" {
 		rec.Runner, rec.ContainerID, rec.ContainerStart, rec.ControlPort = "container", proc.containerID, proc.containerStart, proc.containerCtrl
 	}
-	rec.BrowserStart, _, _ = procIdentity(rec.BrowserPID)
-	if rec.XvfbPID > 0 {
-		rec.XvfbStart, _, _ = procIdentity(rec.XvfbPID)
-	}
-	if err := saveRecord(regDir, rec); err != nil {
+	rec.BrowserStart, rec.XvfbStart = browserStart, xvfbStart
+	if err := write(regDir, rec); err != nil {
 		log.Printf("[cobrowse] could not persist session record for %s: %v", rec.ID, err)
 	}
 }
