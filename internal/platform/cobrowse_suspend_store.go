@@ -71,14 +71,15 @@ func prepareSuspendCapture(m suspendManifest, persistent bool, profileName strin
 // transition and any old-worker handoff. Merely opening a store grants no owner
 // or browser authority.
 type suspendManifestStore struct {
-	mu        sync.Mutex
-	root      *os.Root
-	lockFile  *os.File
-	closeOnce sync.Once
-	closeErr  error
-	syncFile  func(*os.File) error
-	syncDir   func() error
-	publish   func(string, string) error
+	mu           sync.Mutex
+	root         *os.Root
+	lockFile     *os.File
+	closeOnce    sync.Once
+	closeErr     error
+	syncFile     func(*os.File) error
+	syncDir      func() error
+	publish      func(string, string) error
+	removeOrphan func(string) error
 }
 
 func openSuspendManifestStore(regDir string, create bool) (*suspendManifestStore, error) {
@@ -129,7 +130,7 @@ func openSuspendManifestStore(regDir string, create bool) (*suspendManifestStore
 		_ = root.Close()
 		return nil, errors.New("browser manifest storage is busy; retry later")
 	}
-	s := &suspendManifestStore{root: root, lockFile: lock, syncFile: func(f *os.File) error { return f.Sync() }, publish: root.Link}
+	s := &suspendManifestStore{root: root, lockFile: lock, syncFile: func(f *os.File) error { return f.Sync() }, publish: root.Link, removeOrphan: root.Remove}
 	s.syncDir = func() error {
 		if runtime.GOOS == "windows" {
 			return nil
