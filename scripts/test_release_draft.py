@@ -554,6 +554,44 @@ class ReleaseDraftTests(unittest.TestCase):
                 runner.pages('releases')
             self.assertEqual(api.call_count, 20)
 
+    def test_git_trust_is_scoped_to_exact_checkout_root(self):
+        runner = release.Runner(self.tmp.name)
+        with mock.patch.object(runner, 'run', return_value='') as run:
+            runner.git('status', '--porcelain')
+        argv = run.call_args.args[0]
+        root = str(pathlib.Path(self.tmp.name).resolve())
+        self.assertEqual(argv[:3], ['git', '-c', f'safe.directory={root}'])
+        self.assertNotIn('safe.directory=*', argv)
+        self.assertEqual(argv[3:], ['status', '--porcelain'])
+
+    def test_failure_names_step_and_exit_code_without_leaks(self):
+        error = release.subprocess.CalledProcessError(
+            128, ['x'], stderr=b'synthetic-stderr-sentinel'
+        )
+        runner = release.Runner(self.tmp.name)
+        with mock.patch.object(release.subprocess, 'run', side_effect=error):
+            with self.assertRaises(release.Refused) as result:
+                runner.git('fetch', 'synthetic-private-ref')
+        message = str(result.exception)
+        self.assertIn('git fetch', message)
+        self.assertIn('exit 128', message)
+        self.assertIn('no automatic retries', message)
+        for leaked in ('synthetic', self.tmp.name, 'safe.directory'):
+            self.assertNotIn(leaked, message)
+
+    def test_step_labels_are_a_closed_set(self):
+        cases = {
+            ('git', '-c', 'safe.directory=/p', 'rev-parse', 'HEAD'): 'git rev-parse',
+            ('gh', 'api', 'repos/x'): 'gh api',
+            ('gh', 'release', 'create'): 'gh release',
+            ('go', 'build', '-o', 'x'): 'go build',
+            ('go', 'run', './scripts/releasesign'): 'go run',
+            ('weird-tool', 'secret-arg'): 'release command',
+            ('git', 'secret-subcommand'): 'release command',
+        }
+        for argv, label in cases.items():
+            self.assertEqual(release.step_label(list(argv)), label)
+
     def test_command_errors_do_not_reveal_raw_output_or_arguments(self):
         error = release.subprocess.CalledProcessError(
             1, ['synthetic-private-argument'], stderr=b'synthetic-secret-value'

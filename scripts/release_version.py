@@ -39,7 +39,9 @@ def parse_version(data):
 
 def _git(repo, *args, check=True):
     result = subprocess.run(
-        ['git', '-C', str(repo), *args], capture_output=True, timeout=10
+        ['git', '-C', str(repo), '-c', f'safe.directory={pathlib.Path(repo).resolve()}', *args],
+        capture_output=True,
+        timeout=10,
     )
     if check and result.returncode:
         raise VersionError('Git snapshot operation failed')
