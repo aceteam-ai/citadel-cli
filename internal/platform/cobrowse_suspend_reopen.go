@@ -43,6 +43,9 @@ func (s *suspendIntentStore) stageResuming(ctx context.Context, expected, planne
 		return refuse()
 	}
 	want.UpdatedAt = now.UTC().Format(time.RFC3339Nano)
+	if _, err := suspendExpiry(want); err != nil {
+		return refuse()
+	}
 	current, err := s.read(expected.ID)
 	if err != nil {
 		return refuse()
@@ -51,6 +54,9 @@ func (s *suspendIntentStore) stageResuming(ctx context.Context, expected, planne
 		// A prior atomic rename can be visible despite a failed directory
 		// flush. Preserve its timestamp and reconcile durability only.
 		want.UpdatedAt = current.UpdatedAt
+		if _, err := suspendExpiry(current); err != nil {
+			return refuse()
+		}
 		if !reflect.DeepEqual(current, want) || s.payloads.checkPayload(current) != nil ||
 			s.syncDir() != nil || !check() {
 			return refuse()

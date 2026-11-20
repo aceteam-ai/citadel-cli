@@ -62,12 +62,49 @@ type suspendMetadata struct {
 	// CaptureGeneration stays fixed while a resuming record advances its live
 	// generation. Recovery must still find and decrypt the previous capture.
 	CaptureGeneration uint64 `json:"capture_generation"`
-	OwnerUserID       string `json:"owner_user_id"`
-	ProfileName       string `json:"profile_name,omitempty"`
-	SuspendedAt       string `json:"suspended_at"`
-	ExpiresAt         string `json:"expires_at"`
-	TabCount          int    `json:"tab_count"`
-	ManifestBytes     int64  `json:"manifest_bytes"`
+	// ReopenRollback records the last positively stopped reopen attempt.
+	// Only this receipt permits a suspended live generation above capture.
+	ReopenRollback *suspendReopenRollback `json:"reopen_rollback,omitempty"`
+	OwnerUserID    string                 `json:"owner_user_id"`
+	ProfileName    string                 `json:"profile_name,omitempty"`
+	SuspendedAt    string                 `json:"suspended_at"`
+	ExpiresAt      string                 `json:"expires_at"`
+	TabCount       int                    `json:"tab_count"`
+	ManifestBytes  int64                  `json:"manifest_bytes"`
+}
+
+type suspendReopenRollback struct {
+	Generation uint64 `json:"generation"`
+	At         string `json:"at"`
+}
+
+func validSuspendGeneration(rec sessionRecord) bool {
+	meta := rec.Suspension
+	if meta == nil || meta.CaptureGeneration == 0 {
+		return false
+	}
+	base := meta.CaptureGeneration
+	if rollback := meta.ReopenRollback; rollback != nil {
+		captured, e1 := time.Parse(time.RFC3339Nano, meta.SuspendedAt)
+		at, e2 := time.Parse(time.RFC3339Nano, rollback.At)
+		updated, e3 := time.Parse(time.RFC3339Nano, rec.UpdatedAt)
+		if rollback.Generation <= base || e1 != nil || e2 != nil || e3 != nil ||
+			at.IsZero() || at.Before(captured) || updated.Before(at) {
+			return false
+		}
+		switch rec.State {
+		case RecordSuspended:
+			return rec.Generation == rollback.Generation && rec.UpdatedAt == rollback.At
+		case "resuming":
+			return rollback.Generation != math.MaxUint64 && rec.Generation == rollback.Generation+1
+		default:
+			return false
+		}
+	}
+	if rec.State == "resuming" {
+		return base != math.MaxUint64 && rec.Generation == base+1
+	}
+	return rec.Generation == base
 }
 
 func validSuspendOwner(owner string) bool {
@@ -218,8 +255,7 @@ func suspendExpiry(rec sessionRecord) (time.Time, error) {
 	meta := rec.Suspension
 	if rec.Version != sessionRecordVersion || rec.Generation == 0 || !sessionIDPattern.MatchString(rec.ID) || len(rec.ID) > 64 ||
 		meta == nil || meta.OwnerUserID != rec.OwnerUserID || !validSuspendOwner(meta.OwnerUserID) ||
-		meta.CaptureGeneration == 0 || (rec.State == "resuming" && (meta.CaptureGeneration == math.MaxUint64 || rec.Generation != meta.CaptureGeneration+1)) ||
-		(rec.State != "resuming" && rec.Generation != meta.CaptureGeneration) ||
+		!validSuspendGeneration(rec) ||
 		meta.ProfileName != rec.ProfileName || rec.Persistent != (rec.ProfileName != "") ||
 		(rec.Persistent && !suspendProfileName.MatchString(rec.ProfileName)) ||
 		meta.TabCount < 1 || meta.TabCount > maxSuspendTabs || meta.ManifestBytes <= 0 ||
