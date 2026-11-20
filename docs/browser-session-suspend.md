@@ -108,6 +108,12 @@ world. Its connection requires a finite deadline and a 1 MiB CDP message bound;
 every await rechecks a caller-provided lifecycle/identity fence. The manager
 still must enumerate/verify all pages, authorize owner/driver and hold its
 action/lifecycle locks before invoking these currently unwired primitives.
+The scoped capture continuation retains action exclusion until intent staging
+returns, rather than leaving an unlock/relock gap after capture. Its trusted
+caller still owns registry exclusion and must revalidate around its own awaits;
+it must not re-enter ordinary actions or teardown. Cancellation after a durable
+effect is an unacknowledged result, not permission to delete referenced data.
+The manager transaction is not wired to this continuation yet.
 
 Reopen retains the session ID, increments generation without wraparound, keeps
 the driver, and consumes a live slot. A persistent session requires a successful

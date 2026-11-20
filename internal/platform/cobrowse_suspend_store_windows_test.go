@@ -8,6 +8,10 @@ import "testing"
 // storage/OS-lock contract there without changing or bypassing the workflow.
 func TestWindowsSuspendManifestStorage(t *testing.T) {
 	for name, test := range map[string]func(*testing.T){
+		"capture-use-lock":         TestSuspendCaptureContinuationRetainsActionExclusion,
+		"capture-use-input":        TestSuspendCaptureContinuationRejectsBeforeIO,
+		"capture-use-exit":         TestSuspendCaptureContinuationFailureAndCancellation,
+		"capture-use-stage":        TestSuspendCaptureContinuationStagesWithoutUnlockGap,
 		"maintenance-schedule":     TestSuspendMaintenanceScheduleBudgetAndBackoff,
 		"maintenance-unused":       TestSuspendMaintenanceMissingStoreAndLocalMode,
 		"maintenance-open-mode":    TestSuspendMaintenanceNonCreatingStoreOpen,

@@ -52,17 +52,53 @@ func (s *cobrowseSession) captureSuspendPages(ctx context.Context, owner string,
 }
 
 func (s *cobrowseSession) captureSuspendPagesWith(ctx context.Context, owner string, ownerInitiated bool, source suspendPageSource) (suspendManifest, error) {
+	var captured suspendManifest
+	err := s.withSuspendPageCapture(ctx, owner, ownerInitiated, source, func(manifest suspendManifest) error {
+		captured = manifest
+		return nil
+	})
+	if err != nil {
+		return suspendManifest{}, err
+	}
+	return captured, nil
+}
+
+// withSuspendPageCapture retains action exclusion through a trusted continuation,
+// so intent staging need not release and reacquire the action lock after capture.
+// The continuation must not re-enter an action or ordinary teardown. It owns
+// lifecycle/registry exclusion and revalidation around its own awaits; the action
+// lock alone neither stops external navigation nor grants authority. No manager
+// transaction uses this boundary yet. A continuation may have durable effects
+// even when cancellation or failure prevents acknowledgement; do not roll those
+// effects back by deleting a possibly referenced capture.
+func (s *cobrowseSession) withSuspendPageCapture(ctx context.Context, owner string, ownerInitiated bool,
+	source suspendPageSource, use func(suspendManifest) error) error {
+	if ctx == nil || use == nil || ctx.Err() != nil {
+		return errors.New("could not capture this owner-bound browser session")
+	}
+	if _, finite := ctx.Deadline(); !finite || !validSuspendOwner(owner) ||
+		source.verify == nil || source.list == nil || source.read == nil {
+		return errors.New("could not capture this owner-bound browser session")
+	}
+	if !s.actionMu.TryLock() {
+		return errors.New("browser session is busy; retry later")
+	}
+	defer s.actionMu.Unlock()
+	manifest, err := s.captureSuspendPagesLockedWith(ctx, owner, ownerInitiated, source)
+	if err != nil {
+		return err
+	}
+	if ctx.Err() != nil || use(manifest) != nil || ctx.Err() != nil {
+		return errors.New("browser capture continuation incomplete")
+	}
+	return nil
+}
+
+// Only withSuspendPageCapture calls this implementation, while holding actionMu.
+func (s *cobrowseSession) captureSuspendPagesLockedWith(ctx context.Context, owner string, ownerInitiated bool, source suspendPageSource) (suspendManifest, error) {
 	refuse := func() (suspendManifest, error) {
 		return suspendManifest{}, errors.New("could not capture this owner-bound browser session")
 	}
-	if _, finite := ctx.Deadline(); !finite || ctx.Err() != nil || !validSuspendOwner(owner) ||
-		source.verify == nil || source.list == nil || source.read == nil {
-		return refuse()
-	}
-	if !s.actionMu.TryLock() {
-		return suspendManifest{}, errors.New("browser session is busy; retry later")
-	}
-	defer s.actionMu.Unlock()
 	s.mu.Lock()
 	proc, generation, id := s.proc, s.generation, s.id
 	tracking, policy := s.tracking, s.policy
