@@ -89,7 +89,7 @@ func (s *suspendIntentStore) completeSuspending(ctx context.Context, intent sess
 		return refuse()
 	}
 	started, err := time.Parse(time.RFC3339Nano, intent.Suspension.SuspendedAt)
-	if err != nil {
+	if err != nil || now.Before(started) {
 		return refuse()
 	}
 	live := intent
@@ -108,6 +108,10 @@ func (s *suspendIntentStore) completeSuspending(ctx context.Context, intent sess
 		// A prior rename may be visible even though its directory flush
 		// failed. Reconcile the exact completed state without a second stop
 		// or refreshed timestamp. A newer/different record must not match.
+		committed, parseErr := time.Parse(time.RFC3339Nano, current.UpdatedAt)
+		if parseErr != nil || committed.IsZero() || committed.Before(started) {
+			return refuse()
+		}
 		final.UpdatedAt = current.UpdatedAt
 		if !reflect.DeepEqual(current, final) || s.payloads.checkPayload(current) != nil || s.syncDir() != nil || !check() {
 			return refuse()
@@ -135,6 +139,11 @@ func (s *suspendIntentStore) completeSuspending(ctx context.Context, intent sess
 		return refuse()
 	}
 	if err := stopAndVerify(ctx, identity); err != nil || !check() {
+		return refuse()
+	}
+	// Teardown is an awaited effect. Do not publish restorable suspension if
+	// its capture disappeared or became incomplete during that boundary.
+	if s.payloads.checkPayload(intent) != nil || !check() {
 		return refuse()
 	}
 	if err := s.replaceRecord(intent, final, check); err != nil {

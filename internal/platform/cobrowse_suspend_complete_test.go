@@ -2,6 +2,7 @@ package platform
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"reflect"
@@ -296,5 +297,100 @@ func TestSuspendCompletionConcurrentRetryStopsOnlyOnce(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Fatal("concurrent retries invoked teardown more than once")
+	}
+}
+
+func TestSuspendCompletionRejectsClockBeforeCapture(t *testing.T) {
+	s, _, intent, _ := suspendCompletionFixture(t)
+	calls := 0
+	out, err := s.completeSuspending(suspendPagesContext(t), intent, suspendTestNow.Add(-time.Nanosecond),
+		func(context.Context, suspendStopIdentity) error { calls++; return nil })
+	if err == nil || out.ID != "" || calls != 0 {
+		t.Fatal("backward clock crossed the teardown boundary or published an invalid receipt")
+	}
+	current, err := s.read(intent.ID)
+	if err != nil || !reflect.DeepEqual(current, intent) {
+		t.Fatal("backward clock changed the recoverable intent")
+	}
+}
+
+func TestSuspendCompletionRechecksCaptureAfterTeardown(t *testing.T) {
+	for _, kind := range []string{"missing", "truncated", "directory"} {
+		t.Run(kind, func(t *testing.T) {
+			s, _, intent, _ := suspendCompletionFixture(t)
+			name, _ := suspendManifestName(intent)
+			calls := 0
+			stop := func(context.Context, suspendStopIdentity) error {
+				calls++
+				switch kind {
+				case "missing", "directory":
+					if err := s.payloads.root.Remove(name); err != nil {
+						return err
+					}
+					if kind == "directory" {
+						return s.payloads.root.Mkdir(name, 0o700)
+					}
+				case "truncated":
+					f, err := s.payloads.root.OpenFile(name, os.O_WRONLY|os.O_TRUNC, 0o600)
+					if err != nil {
+						return err
+					}
+					return f.Close()
+				}
+				return nil
+			}
+			out, err := s.completeSuspending(suspendPagesContext(t), intent, suspendTestNow.Add(time.Minute), stop)
+			if err == nil || out.ID != "" || calls != 1 {
+				t.Fatal("lost capture was acknowledged as a completed suspension")
+			}
+			current, err := s.read(intent.ID)
+			if err != nil || !reflect.DeepEqual(current, intent) {
+				t.Fatal("capture uncertainty replaced the recoverable intent")
+			}
+			// Only confirmed absence admits the existing failed-suspend path;
+			// a malformed or unexpected object must remain retryable.
+			result, err := s.recoverSuspending(suspendPagesContext(t), suspendTestNow.Add(2*time.Minute), "", func(context.Context, suspendStopIdentity) error { return nil })
+			if kind == "missing" {
+				if err != nil || result.Terminated != 1 || result.Completed != 0 {
+					t.Fatal("confirmed loss could not recover as failed suspension")
+				}
+			} else if err == nil || result.Failed != 1 || result.Completed != 0 || result.Terminated != 0 {
+				t.Fatal("uncertain capture was guessed absent")
+			}
+		})
+	}
+}
+
+func TestSuspendCompletionRejectsInvalidVisibleReceiptTime(t *testing.T) {
+	for _, stamp := range []string{"", "invalid-time", suspendTestNow.Add(-time.Nanosecond).Format(time.RFC3339Nano)} {
+		t.Run(stamp, func(t *testing.T) {
+			s, _, intent, _ := suspendCompletionFixture(t)
+			out, err := s.completeSuspending(suspendPagesContext(t), intent, suspendTestNow.Add(time.Minute), func(context.Context, suspendStopIdentity) error { return nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			out.UpdatedAt = stamp
+			data, err := json.Marshal(out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f, err := s.root.OpenFile(out.ID+".json", os.O_WRONLY|os.O_TRUNC, 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, writeErr := f.Write(data)
+			closeErr := f.Close()
+			if writeErr != nil || closeErr != nil {
+				t.Fatal("could not prepare the exact malformed receipt")
+			}
+			calls := 0
+			if _, err := s.completeSuspending(suspendPagesContext(t), intent, suspendTestNow.Add(2*time.Minute), func(context.Context, suspendStopIdentity) error { calls++; return nil }); err == nil || calls != 0 {
+				t.Fatal("invalid visible receipt was acknowledged or retried teardown")
+			}
+			current, err := s.read(intent.ID)
+			if err != nil || !reflect.DeepEqual(current, out) {
+				t.Fatal("refusal rewrote the malformed receipt")
+			}
+		})
 	}
 }
