@@ -275,6 +275,32 @@ func runSuspendPagesRealBrowser(t *testing.T, m *CobrowseSessionManager) {
 		t.Fatal("complete page observation substituted a duplicate URL for a missing target")
 	}
 	t.Log("three real tabs, including duplicate URLs: capture, read-only refusal, both-axis restore, URL drift, complete-set and selection checks passed")
+	// Exercise only graceful root exit, not suspend or all-resource teardown.
+	// This local fixture fence permits the expected exit but still rejects a
+	// changed proc/generation. StopAll cleanup remains responsible for the rest.
+	closeFence := func() error {
+		s.mu.Lock()
+		current := s.proc == proc && s.generation == generation
+		s.mu.Unlock()
+		if !current || ctx.Err() != nil {
+			return errors.New("private closing fixture incarnation changed")
+		}
+		return nil
+	}
+	select {
+	case <-proc.exited:
+		t.Fatal("private fixture root exited before the graceful request")
+	default:
+	}
+	if err := closeSuspendBrowser(ctx, suspendBrowserClosePlan{port: proc.debugPort, browserID: proc.browserID, exited: proc.exited}, closeFence); err != nil {
+		t.Fatal("private fixture graceful root exit failed", err)
+	}
+	select {
+	case <-proc.exited:
+	default:
+		t.Fatal("graceful close acknowledged before the fixture root was reaped")
+	}
+	t.Log("bounded browser close observed the pinned root reaper; complete resource teardown is not claimed")
 }
 
 func awaitSuspendFixture(t *testing.T, parent context.Context, what string, ready func(context.Context) bool) {
