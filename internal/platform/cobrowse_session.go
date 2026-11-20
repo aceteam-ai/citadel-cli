@@ -82,7 +82,11 @@ const (
 	SessionAttached CobrowseSessionState = "attached"
 	// SessionExited: the browser process terminated (crashed or was killed) while
 	// the session was still tracked. Terminal; the session should be stopped/pruned.
-	SessionExited CobrowseSessionState = "exited"
+	SessionExited     CobrowseSessionState = "exited"
+	SessionSuspending CobrowseSessionState = "suspending"
+	SessionSuspended  CobrowseSessionState = "suspended"
+	SessionResuming   CobrowseSessionState = "resuming"
+	SessionExpired    CobrowseSessionState = "expired"
 )
 
 // CobrowseSessionStatus is the queryable state of one session.
@@ -110,6 +114,12 @@ type CobrowseSessionStatus struct {
 	Features     []string         `json:"features,omitempty"`
 	// Generation counts ownership changes (first launch is 1, each re-adopt adds 1).
 	Generation uint64 `json:"generation,omitempty"`
+	// Dormant lifecycle metadata never includes a manifest, profile path or
+	// debugger endpoint. Expired is an availability report, not a GC receipt.
+	ExpiresAt   string `json:"expires_at,omitempty"`
+	TabCount    int    `json:"tab_count,omitempty"`
+	ProfileKind string `json:"profile_kind,omitempty"`
+	EndedReason string `json:"ended_reason,omitempty"`
 	// Done and Effects are set only by scripted actions (click, type, key,
 	// scroll): Done is false when the action hit its deadline or failed after
 	// it may have acted, and Effects says what happened (citadel-cli#1663).
@@ -729,11 +739,17 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 
 // SessionStatus returns the queryable state of one session.
 func (m *CobrowseSessionManager) SessionStatus(id string) (CobrowseSessionStatus, bool) {
+	if id == "" {
+		return CobrowseSessionStatus{}, false
+	}
 	m.Recover()
 	m.mu.Lock()
 	s, ok := m.sessions[id]
 	m.mu.Unlock()
 	if !ok {
+		for _, status := range m.dormantSessionStatuses(id) {
+			return status, true
+		}
 		return CobrowseSessionStatus{}, false
 	}
 	return s.status(), true
@@ -749,8 +765,15 @@ func (m *CobrowseSessionManager) List() []CobrowseSessionStatus {
 	}
 	m.mu.Unlock()
 	out := make([]CobrowseSessionStatus, 0, len(all))
+	seen := make(map[string]bool, len(all))
 	for _, s := range all {
 		out = append(out, s.status())
+		seen[s.id] = true
+	}
+	for _, status := range m.dormantSessionStatuses("") {
+		if !seen[status.ID] {
+			out = append(out, status)
+		}
 	}
 	return out
 }

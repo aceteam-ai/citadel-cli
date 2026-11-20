@@ -10,6 +10,18 @@ browser close/relaunch, profile snapshot, sweep timer or advertised capability.
 Existing browser behavior is unchanged. This is not a completed suspend feature
 or native acceptance proof.
 
+The existing node-wide status and list methods now project validated dormant
+registry metadata when no in-memory session takes precedence. They report the
+state, live generation, expiry, retained tab count and profile kind, never tab
+content, profile paths or a viewer endpoint. Local mode does not read the node
+registry. The fallback creates no directory, opens no payload/profile, probes
+no process/browser and writes no lifecycle transition. Reads have directory,
+record and total-byte bounds. An elapsed suspended capture reports expired
+availability without claiming physical deletion; durable expiry and pruning
+still belong to the unfinished housekeeping integration. Old expiry metadata
+is hidden after its seven-day retention window. This is status wiring, not an
+enabled suspend/reopen action or real node-restart acceptance.
+
 ## Contract being built
 
 Suspend applies only to running or attached sessions. A pending unlock must be

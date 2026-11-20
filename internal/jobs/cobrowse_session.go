@@ -599,6 +599,11 @@ type sessionResult struct {
 // sessionStatusResult marshals one session's status (plus stream endpoint) to
 // JSON output bytes.
 func sessionStatusResult(st platform.CobrowseSessionStatus) ([]byte, error) {
+	switch st.State {
+	case platform.SessionSuspending, platform.SessionSuspended, platform.SessionResuming, platform.SessionExpired:
+		// A retained lifecycle record is not a usable viewer endpoint.
+		return json.Marshal(st)
+	}
 	out, err := json.Marshal(sessionResult{
 		CobrowseSessionStatus: st,
 		Stream: sessionStreamInfo{
