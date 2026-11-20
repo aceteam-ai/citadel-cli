@@ -28,9 +28,10 @@ Code), paste the text below into it. It installs Citadel, checks it, connects
 itself, and tells you when to restart the app. You still do two things: click
 through the Windows SmartScreen prompt, and restart the app at the end.
 
-If you use Codex and it says its approval policy rejected a command, type
-`/permissions` and choose "Ask for approval". On first run, a standard
-(non-admin) user picks "non-admin sandbox".
+Using Codex? Before you paste, type `/permissions` and choose "Ask for
+approval" (on first run, a standard non-admin user picks "non-admin sandbox").
+Codex will then ask you before each step that needs the internet or files
+outside its folder; approving those is expected.
 
 ```text
 Set up Citadel local browse on this Windows computer, so you can drive a web
