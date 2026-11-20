@@ -103,7 +103,7 @@ func TestSuspendWriterDoesNotOverwriteNewLifecycle(t *testing.T) {
 			writes := 0
 			s.persistRecordWithWriter(func(dir string, rec sessionRecord) error {
 				writes++
-				return saveRecord(dir, rec)
+				return saveRecordUnderRegistryGate(dir, rec)
 			})
 			got, err := loadRecord(s.regDir, s.id)
 			if !changed || writes != 0 || err != nil || !reflect.DeepEqual(got, expected) {
@@ -129,7 +129,7 @@ func TestSuspendWriterPublicationSharesLifecycleLock(t *testing.T) {
 					rec.OwnerStart != 42 || rec.BrowserStart != 42 || rec.XvfbStart != 42 {
 					t.Error("live publication lost its current session or observed process facts")
 				}
-				return saveRecord(dir, rec)
+				return saveRecordUnderRegistryGate(dir, rec)
 			})
 			if calls != 1 {
 				t.Fatal("stable running/attached session did not persist once")

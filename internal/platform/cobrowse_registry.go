@@ -22,6 +22,7 @@
 package platform
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -277,6 +278,24 @@ func saveRecord(regDir string, rec sessionRecord) error {
 	if err := ensureCobrowseBaseDir(regDir); err != nil {
 		return err
 	}
+	release, err := acquireBrowserRegistryGate(context.Background(), regDir)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return saveRecordUnderRegistryGate(regDir, rec)
+}
+
+// Only call while holding the directory's registry gate. Live persistence
+// acquires it before the session mutex; reacquiring it inside that mutex would
+// deadlock a transaction that needs to inspect or update the session.
+func saveRecordUnderRegistryGate(regDir string, rec sessionRecord) error {
+	if !sessionIDPattern.MatchString(rec.ID) {
+		return fmt.Errorf("bad session id")
+	}
+	if err := ensureCobrowseBaseDir(regDir); err != nil {
+		return err
+	}
 	rec.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	data, err := json.Marshal(rec)
 	if err != nil {
@@ -332,17 +351,25 @@ func listRecords(regDir string) []sessionRecord {
 	return out
 }
 
-func deleteRecord(regDir, id string) { _ = os.Remove(recordFile(regDir, id)) }
+func deleteRecord(regDir, id string) {
+	release, err := acquireBrowserRegistryGate(context.Background(), regDir)
+	if err != nil {
+		return
+	}
+	defer release()
+	_ = os.Remove(recordFile(regDir, id))
+}
 
 // persistRecord writes (best-effort) the registry record for a live session.
 func (s *cobrowseSession) persistRecord() {
-	s.persistRecordWithWriter(saveRecord)
+	s.persistRecordWithWriter(saveRecordUnderRegistryGate)
 }
 
 // Identity probes stay outside mu. The final incarnation/state check, current
 // metadata snapshot and publication share mu with teardown, so an old probe
 // cannot resurrect a stopped record or overwrite a newer lifecycle transition.
-// The injected writer is private and synchronous; production uses saveRecord.
+// The registry gate precedes mu; the injected synchronous writer must not
+// reacquire it. Production uses saveRecordUnderRegistryGate.
 func (s *cobrowseSession) persistRecordWithWriter(write func(string, sessionRecord) error) {
 	if write == nil {
 		return
@@ -354,6 +381,7 @@ func (s *cobrowseSession) persistRecordWithWriter(write func(string, sessionReco
 		return
 	}
 	generation := s.generation
+	regDir := s.regDir
 	browserID, port, profile := proc.browserID, proc.debugPort, s.profile
 	browserPID, xvfbPID := proc.browserPID, proc.xvfbPID
 	s.mu.Unlock()
@@ -370,9 +398,19 @@ func (s *cobrowseSession) persistRecordWithWriter(write func(string, sessionReco
 	if xvfbPID > 0 {
 		xvfbStart, _, _ = procIdentity(xvfbPID)
 	}
+	if err := ensureCobrowseBaseDir(regDir); err != nil {
+		log.Printf("[cobrowse] registry publication unavailable for session %s", s.id)
+		return
+	}
+	release, err := acquireBrowserRegistryGate(context.Background(), regDir)
+	if err != nil {
+		log.Printf("[cobrowse] registry publication unavailable for session %s", s.id)
+		return
+	}
+	defer release()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.proc != proc || s.generation != generation || (s.state != SessionRunning && s.state != SessionAttached) {
+	if s.proc != proc || s.generation != generation || s.regDir != regDir || (s.state != SessionRunning && s.state != SessionAttached) {
 		return
 	}
 	proc.browserID = browserID
@@ -399,7 +437,6 @@ func (s *cobrowseSession) persistRecordWithWriter(write func(string, sessionReco
 		OwnerUserID:  s.ownerUserID,
 		ProfileName:  s.profileName,
 	}
-	regDir := s.regDir
 	if !s.startedAt.IsZero() {
 		rec.StartedAt = s.startedAt.UTC().Format(time.RFC3339)
 	}
