@@ -66,8 +66,10 @@ No release key is stored in GitHub or given to the CI workflow.
    omit the linker flags required by the updater's non-executing version parser.
    CI verifies archive consistency and each CLI's recorded main package, exact
    version stamp and OS/architecture using that same parser, rechecks fresh main
-   and the gates, pushes only the exact commit's version tag, and creates an
-   unsigned **draft** release. It never signs, publishes or updates Homebrew.
+   and the gates, and creates an unsigned **draft** release whose tag name is
+   the version and whose `target_commitish` is the exact source commit. CI
+   pushes no tag (see "Where tags are created"). It never signs, publishes or
+   updates Homebrew.
 3. CI prints a `CITADEL_DRAFT_RECEIPT` in its Actions log binding the tag,
    source commit, merged PR, CI run and manifest SHA-256. The draft body holds
    a copy, but the signer requires equality with the successful workflow log.
@@ -80,13 +82,31 @@ No release key is stored in GitHub or given to the CI workflow.
    scripts/release.sh --sign-draft vX.Y.Z
    ```
 
-   The command checks workflow/source/PR provenance, exact remote tag binding
-   and all exact-source gates, downloads assets by immutable ID with byte/time
+   The command checks workflow/source/PR provenance, that the draft targets
+   exactly the receipt commit, that the tag does not exist yet, and all
+   exact-source gates, downloads assets by immutable ID with byte/time
    limits, compares the manifest to the CI log digest, and verifies every
    archive against the updater's tag-bound parser. Only then does it load the
    local key and sign. It self-verifies the signature, re-reads the draft to
    reject changes, uploads the signature, checks the upload, publishes by the
-   original release ID, and updates the Homebrew tap from verified checksums.
+   original release ID, re-reads the created tag and requires it to point at
+   exactly the receipt commit, and updates the Homebrew tap from verified
+   checksums.
+
+### Where tags are created
+
+The repository's `protect-release-tags` ruleset covers `refs/tags/v*`
+(creation, update, deletion, non-fast-forward) and lets only the admin
+repository role bypass it. The drafting workflow runs as github-actions[bot],
+so it cannot push a tag. The ruleset stays strict, so CI creates only the
+draft: GitHub allows a draft release for a tag that does not exist yet and
+creates the lightweight tag at `target_commitish` on publication. The admin's
+`--sign-draft` publication is therefore the single place a release tag is
+created. Before publishing, sign mode requires the draft target to equal the
+receipt commit, that commit to be an ancestor of fresh origin/main, and no
+remote tag of that name to exist, checked again immediately before the publish
+call. After publishing it requires the new tag to be a lightweight ref at
+exactly the receipt commit.
 
 Drafts are not installable. Publication happens only after the signature is
 present, before GitHub freezes the release assets. The compiled updater key set
@@ -124,10 +144,18 @@ owner-controlled backup.
 - A bump whose CI was cancelled, is red, or is no longer fresh main is not
   drafted. Do not bypass a gate. Before moving main again, rerun failed CI if
   appropriate; otherwise prepare a fresh reviewed bump at current main.
-- A remote tag at another commit, an existing release (including a partial
-  draft), unknown check provider, or incomplete forge pagination refuses the CI
-  draft. CI never overwrites assets or force-pushes a tag. Inspect and reconcile
-  an uncertain creation/upload manually; no write is automatically retried.
+- Any existing remote tag of the version name (at any commit), an existing
+  release (including a partial draft), unknown check provider, or incomplete
+  forge pagination refuses the CI draft. CI never pushes or overwrites a tag or
+  assets. Inspect and reconcile an uncertain creation/upload manually; no write
+  is automatically retried.
+- Sign mode refuses a draft whose target differs from the receipt commit, and
+  refuses if the tag already exists before publication (for example, created by
+  someone else in between). Inspect the tag and release; do not delete or move
+  a tag to make it pass. If the tag exists at another commit after publication,
+  the command stops before the Homebrew step with an inspect-state error. A
+  published retry is accepted only when the tag is at exactly the receipt
+  commit, and then finishes only the tap.
 - Local signing refuses a changed/foreign/published-unsigned draft, mismatched
   CI receipt, incomplete assets, changed bytes or an unverifiable signature.
   Do not replace a failed archive or manifest by hand: fix source and rebuild
