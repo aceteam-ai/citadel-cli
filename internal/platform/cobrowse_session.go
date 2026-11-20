@@ -218,6 +218,9 @@ type cobrowseProc struct {
 	exited <-chan struct{}
 	// stop kills the browser then the Xvfb (bounded waits) and is safe to call once.
 	stop func() error
+	// Optional positive owned-resource proof, distinct from legacy best-effort
+	// stop. Currently only fresh Windows jobs supply it; no manager calls it.
+	stopForSuspend func(context.Context) error
 }
 
 // launchCobrowseProc launches an isolated headless browser on a fresh dedicated

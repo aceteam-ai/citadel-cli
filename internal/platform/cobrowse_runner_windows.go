@@ -130,16 +130,16 @@ func startHeadless(info BrowserInfo, profileDir, startURL, userAgent string, lo 
 		close(exited)
 	}()
 
-	var once sync.Once
-	var stopErr error
+	stopper := newSuspendJobStop(exited, func() error { return stopJob(job, exited) },
+		func() error { return windows.TerminateJobObject(job, 1) },
+		func() (uint32, error) { return activeBrowserJobProcesses(job) },
+		func() error { return windows.CloseHandle(job) })
 	proc := &cobrowseProc{
-		browser:    info.Kind,
-		browserPID: pidOf(cmd),
-		exited:     exited,
-		stop: func() error {
-			once.Do(func() { stopErr = stopJob(job, exited) })
-			return stopErr
-		},
+		browser:        info.Kind,
+		browserPID:     pidOf(cmd),
+		exited:         exited,
+		stop:           stopper.ordinaryStop,
+		stopForSuspend: stopper.stopForSuspend,
 	}
 
 	fail := func(cause error) (*cobrowseProc, error) {
@@ -386,6 +386,29 @@ func stopJob(job windows.Handle, exited <-chan struct{}) error {
 		err = fmt.Errorf("close browser job: %w", cerr)
 	}
 	return err
+}
+
+// JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION has four LARGE_INTEGER times,
+// followed by four DWORD counters. Use the kernel's ActiveProcesses count,
+// not root-process exit, to prove that every job child is gone.
+// https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_accounting_information
+func activeBrowserJobProcesses(job windows.Handle) (uint32, error) {
+	if job == 0 || job == windows.InvalidHandle {
+		return 0, errors.New("browser job handle unavailable")
+	}
+	var info struct {
+		TotalUser, TotalKernel, PeriodUser, PeriodKernel int64
+		PageFaults, Total, Active, Terminated            uint32
+	}
+	var written uint32
+	if err := windows.QueryInformationJobObject(job, windows.JobObjectBasicAccountingInformation,
+		uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info)), &written); err != nil {
+		return 0, err
+	}
+	if written != uint32(unsafe.Sizeof(info)) {
+		return 0, errors.New("incomplete browser job accounting")
+	}
+	return info.Active, nil
 }
 
 // processStartToken returns a process's creation time as a single integer.
