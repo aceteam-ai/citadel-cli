@@ -28,6 +28,10 @@ Code), paste the text below into it. It installs Citadel, checks it, connects
 itself, and tells you when to restart the app. You still do two things: click
 through the Windows SmartScreen prompt, and restart the app at the end.
 
+If you use Codex and it says its approval policy rejected a command, type
+`/permissions` and choose "Ask for approval". On first run, a standard
+(non-admin) user picks "non-admin sandbox".
+
 ```text
 Set up Citadel local browse on this Windows computer, so you can drive a web
 browser with me. Use PowerShell. You do not need admin rights; do not use them.
@@ -54,9 +58,13 @@ browser with me. Use PowerShell. You do not need admin rights; do not use them.
    different "citadel" entry is already there), STOP and show me the message.
    Never add --replace yourself.
 5. Tell me to fully quit and reopen this app, then ask you to browse a site, for
-   example: "Using citadel, open example.com and tell me the page title." I will
-   approve the website in the Citadel viewer that opens. Do not ask me for
+   example: "Using citadel, open wikipedia.org and tell me the page title." I
+   will approve the website in the Citadel viewer that opens. Do not ask me for
    passwords: when a page needs a login, hand the browser to me and wait.
+6. For the browsing steps, use only Citadel's tools. If Citadel reports an
+   error, show me the error. Do not switch to another tool or work around it.
+   If Codex asks to approve a Citadel tool, that is expected: it asks once per
+   tool, and "Allow for this session" is fine.
 ```
 
 Claude Desktop chat cannot run commands, so it does not use this block (Desktop's
