@@ -27,7 +27,7 @@ type suspendTTLSweepResult struct {
 // the eventual manager scheduler supplies the clock, finite context, cursor
 // and lifecycle exclusion. Every transition re-reads its snapshot before use.
 func (s *suspendIntentStore) sweepTTL(ctx context.Context, now time.Time, cursor string) (suspendTTLSweepResult, error) {
-	var result suspendTTLSweepResult
+	result := suspendTTLSweepResult{Cursor: cursor}
 	if _, finite := ctx.Deadline(); !finite || ctx.Err() != nil || now.IsZero() {
 		return result, errors.New("browser TTL sweep requires a finite budget and clock")
 	}

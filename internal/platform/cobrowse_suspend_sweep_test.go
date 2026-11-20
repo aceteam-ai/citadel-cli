@@ -149,3 +149,73 @@ func TestSuspendTTLSweepFlushesUncertainMetadataOnNextPass(t *testing.T) {
 		t.Fatal("retry did not reconcile metadata in one bounded flush")
 	}
 }
+
+func TestSuspendTTLSweepKeepsEarnedCursor(t *testing.T) {
+	for _, kind := range []string{"deadline", "cancelled", "clock", "scan", "flush", "empty"} {
+		t.Run(kind, func(t *testing.T) {
+			n := 1
+			if kind == "empty" {
+				n = 0
+			}
+			s, records, now := suspendSweepFixture(t, n)
+			cursor := "cb-10f"
+			ctx := suspendPagesContext(t)
+			var before []byte
+			if n != 0 {
+				var err error
+				before, err = os.ReadFile(filepath.Join(s.root.Name(), records[0].ID+".json"))
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			flush := s.syncDir
+			flushes := 0
+			s.syncDir = func() error {
+				flushes++
+				if kind == "flush" {
+					return errors.New("synthetic interrupted scan flush")
+				}
+				return flush()
+			}
+			switch kind {
+			case "deadline":
+				ctx = context.Background()
+			case "cancelled":
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			case "clock":
+				now = time.Time{}
+			case "scan":
+				if err := saveRecord(s.root.Name(), sessionRecord{Version: sessionRecordVersion, ID: "cb-bad", State: "unknown"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			result, err := s.sweepTTL(ctx, now, cursor)
+			if (kind == "empty") != (err == nil) || result.Cursor != cursor || result.Scanned != 0 ||
+				result.Attempted != 0 || result.Expired != 0 || result.Pruned != 0 || result.Failed != 0 {
+				t.Fatal("initial TTL pass lost earned progress or acknowledged a transition")
+			}
+			wantFlushes := 0
+			if kind == "flush" || kind == "empty" {
+				wantFlushes = 1
+			}
+			if flushes != wantFlushes {
+				t.Fatal("TTL admission failure crossed the durability boundary")
+			}
+			if n != 0 {
+				after, err := os.ReadFile(filepath.Join(s.root.Name(), records[0].ID+".json"))
+				if err != nil || string(after) != string(before) {
+					t.Fatal("failed initial TTL pass rewrote a lifecycle record")
+				}
+				name, err := suspendManifestName(records[0])
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := s.payloads.root.Lstat(name); err != nil {
+					t.Fatal("failed initial TTL pass removed a retained capture")
+				}
+			}
+		})
+	}
+}

@@ -61,6 +61,7 @@ func TestWindowsSuspendManifestStorage(t *testing.T) {
 		"ttl-batch-progress":       TestSuspendTTLSweepFailedEntryDoesNotStarveSiblings,
 		"ttl-batch-empty":          TestSuspendTTLSweepBudgetAndEmptyRegistry,
 		"ttl-batch-flush-retry":    TestSuspendTTLSweepFlushesUncertainMetadataOnNextPass,
+		"ttl-batch-earned-cursor":  TestSuspendTTLSweepKeepsEarnedCursor,
 		"ttl-recovery-retention":   TestSuspendRecoveryLeavesTombstonesToDurableSweep,
 		"ttl-ended-lookup":         TestSuspendExpiredLookupKeepsSevenDayReason,
 		"recovery-pass-bounds":     TestSuspendRecoveryPassBoundedRestartAndRetry,
