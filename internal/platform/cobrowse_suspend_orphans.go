@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const maxSuspendOrphanRemovals = 16
@@ -42,16 +43,53 @@ func suspendPayloadName(name string) bool {
 func suspendPayloadReferences(records []sessionRecord) (map[string]bool, error) {
 	refs := make(map[string]bool)
 	for _, rec := range records {
-		if rec.Suspension == nil {
+		if rec.Suspension == nil && !(rec.State == RecordExpired && rec.EndedReason == "suspend_expired") {
 			continue
 		}
 		name, err := suspendManifestName(rec)
+		if rec.State == RecordExpired {
+			name, err = suspendTombstoneCaptureName(rec)
+		}
 		if err != nil {
 			return nil, errors.New("uncertain retained browser capture")
 		}
 		refs[name] = true
 	}
 	return refs, nil
+}
+
+// A durable expiry clears capture counters, but keeps metadata for seven days.
+// Validate that terminal receipt rather than treating it as a live manifest.
+// Conservatively protect its original filename until the tombstone is pruned:
+// this collector must not infer that an unexpectedly present capture is free.
+func suspendTombstoneCaptureName(rec sessionRecord) (string, error) {
+	fail := func() (string, error) { return "", errors.New("invalid expired browser capture receipt") }
+	meta := rec.Suspension
+	if rec.State != RecordExpired || rec.EndedReason != "suspend_expired" || meta == nil ||
+		meta.TabCount != 0 || meta.ManifestBytes != 0 {
+		return fail()
+	}
+	expiry, err := suspendCaptureExpiry(rec)
+	ended, e1 := time.Parse(time.RFC3339Nano, rec.EndedAt)
+	updated, e2 := time.Parse(time.RFC3339Nano, rec.UpdatedAt)
+	if err != nil || e1 != nil || e2 != nil || !ended.Equal(expiry) || updated.Before(expiry) {
+		return fail()
+	}
+	// The expiry commit has its own timestamp. Validate the preserved prior
+	// generation receipt at that receipt's time, without changing either record.
+	prior := rec
+	prior.State = RecordSuspended
+	if rollback := meta.ReopenRollback; rollback != nil {
+		at, err := time.Parse(time.RFC3339Nano, rollback.At)
+		if err != nil || updated.Before(at) {
+			return fail()
+		}
+		prior.UpdatedAt = rollback.At
+	}
+	if !validSuspendGeneration(prior) {
+		return fail()
+	}
+	return rec.ID + "." + strconv.FormatUint(meta.CaptureGeneration, 10) + ".tabs", nil
 }
 
 // A finite pass fully validates both bounded directories before any removal.

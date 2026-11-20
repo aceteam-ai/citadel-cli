@@ -2,6 +2,7 @@ package platform
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func suspendOrphanFixture(t *testing.T, n int) (*suspendIntentStore, []string) {
@@ -95,6 +97,153 @@ func TestSuspendOrphansPreserveAllReferencedStates(t *testing.T) {
 	result, err = s.sweepOrphanPayloads(suspendPagesContext(t), result.Cursor)
 	if err != nil || result.Removed != 1 {
 		t.Fatal("known crash temporary file was not reclaimed")
+	}
+}
+
+func suspendOrphanTombstoneFixture(t *testing.T, persistent, rollback bool) (*suspendIntentStore, sessionRecord, time.Time, string) {
+	t.Helper()
+	s, _, rec, expiry := suspendExpiryFixture(t, persistent)
+	if rollback {
+		now := suspendTestNow.Add(time.Minute)
+		planned, err := planReopenRecord(rec, rec.OwnerUserID, true, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		intent, err := s.stageResuming(suspendPagesContext(t), rec, planned, now, func() error { return nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec, err = s.rollbackResuming(suspendPagesContext(t), intent, now.Add(time.Minute), func(context.Context, reopenAttemptIdentity) error { return nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	name, err := suspendManifestName(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tombstone, changed, err := s.expire(suspendPagesContext(t), rec, expiry.Add(time.Minute))
+	if err != nil || !changed {
+		t.Fatal("could not create real TTL tombstone")
+	}
+	return s, tombstone, expiry, name
+}
+
+func TestSuspendOrphansAfterExpiry(t *testing.T) {
+	for _, kind := range []struct{ persistent, rollback bool }{{}, {true, false}, {false, true}, {true, true}} {
+		t.Run(fmt.Sprintf("persistent=%t/rollback=%t", kind.persistent, kind.rollback), func(t *testing.T) {
+			s, tombstone, expiry, captureName := suspendOrphanTombstoneFixture(t, kind.persistent, kind.rollback)
+			profile := filepath.Join(filepath.Dir(s.root.Name()), "retained-profile.fixture")
+			if err := os.WriteFile(profile, []byte("keep"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			// If an old capture unexpectedly reappears, conservatively protect
+			// it until the tombstone is pruned; only unrelated orphans are free.
+			if err := os.WriteFile(filepath.Join(s.payloads.root.Name(), captureName), []byte("uncertain old capture"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			name := "cb-abcd.1.tabs"
+			if err := os.WriteFile(filepath.Join(s.payloads.root.Name(), name), []byte("orphan"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			result, err := s.sweepOrphanPayloads(suspendPagesContext(t), "")
+			if err != nil || result.Attempted != 1 || result.Removed != 1 {
+				t.Fatalf("TTL tombstone blocked unrelated orphan cleanup: %+v, %v", result, err)
+			}
+			if _, err := s.payloads.root.Lstat(name); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("unrelated orphan was acknowledged without removal")
+			}
+			if _, err := s.payloads.root.Lstat(captureName); err != nil {
+				t.Fatal("tombstone capture was mistaken for unrelated free storage")
+			}
+			got, err := s.read(tombstone.ID)
+			if err != nil || !reflect.DeepEqual(got, tombstone) {
+				t.Fatal("orphan cleanup changed tombstone retention")
+			}
+			if data, err := os.ReadFile(profile); err != nil || string(data) != "keep" {
+				t.Fatal("orphan cleanup changed retained profile")
+			}
+			if removed, err := s.pruneTombstone(suspendPagesContext(t), tombstone, expiry.Add(suspendTombstoneTTL)); err != nil || !removed {
+				t.Fatal("could not prune due tombstone")
+			}
+			if result, err := s.sweepOrphanPayloads(suspendPagesContext(t), result.Cursor); err != nil || result.Removed != 1 {
+				t.Fatal("pruned tombstone permanently pinned crash storage")
+			}
+			if _, err := s.payloads.root.Lstat(captureName); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("pruned capture was acknowledged without removal")
+			}
+		})
+	}
+}
+
+func TestSuspendOrphansRefuseMalformedTombstones(t *testing.T) {
+	for _, kind := range []string{"reason", "state", "missing-metadata", "tabs", "bytes", "expiry", "refreshed-ttl", "ended", "updated", "before-expiry", "generation", "capture-generation", "rollback-generation", "rollback-time", "rollback-future", "rollback-unrecorded"} {
+		t.Run(kind, func(t *testing.T) {
+			s, rec, expiry, _ := suspendOrphanTombstoneFixture(t, false, true)
+			switch kind {
+			case "reason":
+				rec.EndedReason = "other"
+			case "state":
+				rec.State = RecordLive
+			case "missing-metadata":
+				rec.Suspension = nil
+			case "tabs":
+				rec.Suspension.TabCount = 1
+			case "bytes":
+				rec.Suspension.ManifestBytes = 1
+			case "expiry":
+				rec.Suspension.ExpiresAt = expiry.Add(time.Hour).Format(time.RFC3339Nano)
+			case "refreshed-ttl":
+				rec.Suspension.ExpiresAt = expiry.Add(time.Hour).Format(time.RFC3339Nano)
+				rec.EndedAt = rec.Suspension.ExpiresAt
+				rec.UpdatedAt = rec.EndedAt
+			case "ended":
+				rec.EndedAt = expiry.Add(-time.Minute).Format(time.RFC3339Nano)
+			case "updated":
+				rec.UpdatedAt = "invalid"
+			case "before-expiry":
+				rec.UpdatedAt = expiry.Add(-time.Second).Format(time.RFC3339Nano)
+			case "generation":
+				rec.Generation++
+			case "capture-generation":
+				rec.Suspension.CaptureGeneration = 0
+			case "rollback-generation":
+				rec.Suspension.ReopenRollback.Generation = rec.Suspension.CaptureGeneration
+			case "rollback-time":
+				rec.Suspension.ReopenRollback.At = "invalid"
+			case "rollback-future":
+				rec.Suspension.ReopenRollback.At = expiry.Add(2 * time.Minute).Format(time.RFC3339Nano)
+			case "rollback-unrecorded":
+				rec.Suspension.ReopenRollback = nil
+			}
+			if name, err := suspendTombstoneCaptureName(rec); err == nil || name != "" {
+				t.Fatal("malformed terminal metadata produced a capture reference")
+			}
+			// Legacy saveRecord replaces UpdatedAt with the wall clock. Write
+			// the exact synthetic receipt so another invalid timestamp cannot
+			// accidentally mask the particular bound under test.
+			data, err := json.Marshal(rec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(s.root.Name(), rec.ID+".json"), data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			stored, err := s.read(rec.ID)
+			if err != nil || !reflect.DeepEqual(stored, rec) {
+				t.Fatal("malformed receipt fixture changed before the scan")
+			}
+			name := "cb-abcd.1.tabs"
+			if err := os.WriteFile(filepath.Join(s.payloads.root.Name(), name), []byte("orphan"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			s.payloads.removeOrphan = func(string) error { calls++; return nil }
+			result, err := s.sweepOrphanPayloads(suspendPagesContext(t), "kept-cursor")
+			if err == nil || calls != 0 || result.Attempted != 0 || result.Removed != 0 || result.Cursor != "kept-cursor" {
+				t.Fatal("malformed terminal metadata crossed orphan removal boundary")
+			}
+		})
 	}
 }
 

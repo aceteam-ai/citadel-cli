@@ -253,13 +253,22 @@ func planSuspendedRecord(live sessionRecord, owner, profileName string, tabCount
 
 func suspendExpiry(rec sessionRecord) (time.Time, error) {
 	meta := rec.Suspension
+	if meta == nil || !validSuspendGeneration(rec) || meta.TabCount < 1 || meta.TabCount > maxSuspendTabs ||
+		meta.ManifestBytes <= 0 || meta.ManifestBytes > maxSuspendManifestBytes+4096 {
+		return time.Time{}, errors.New("invalid suspended browser metadata")
+	}
+	return suspendCaptureExpiry(rec)
+}
+
+// Shared immutable capture identity and TTL validation. Live-retained records
+// additionally require valid generation/counters; expired tombstones instead
+// require a validated terminal receipt and zero counters.
+func suspendCaptureExpiry(rec sessionRecord) (time.Time, error) {
+	meta := rec.Suspension
 	if rec.Version != sessionRecordVersion || rec.Generation == 0 || !sessionIDPattern.MatchString(rec.ID) || len(rec.ID) > 64 ||
 		meta == nil || meta.OwnerUserID != rec.OwnerUserID || !validSuspendOwner(meta.OwnerUserID) ||
-		!validSuspendGeneration(rec) ||
 		meta.ProfileName != rec.ProfileName || rec.Persistent != (rec.ProfileName != "") ||
-		(rec.Persistent && !suspendProfileName.MatchString(rec.ProfileName)) ||
-		meta.TabCount < 1 || meta.TabCount > maxSuspendTabs || meta.ManifestBytes <= 0 ||
-		meta.ManifestBytes > maxSuspendManifestBytes+4096 {
+		(rec.Persistent && !suspendProfileName.MatchString(rec.ProfileName)) {
 		return time.Time{}, errors.New("invalid suspended browser metadata")
 	}
 	start, e1 := time.Parse(time.RFC3339Nano, meta.SuspendedAt)

@@ -88,6 +88,8 @@ func TestWindowsSuspendManifestStorage(t *testing.T) {
 		"recovery-pass-scan-error": TestSuspendRecoveryPassKeepsCursorOnInitialFailure,
 		"orphan-pass-bounds":       TestSuspendOrphansBoundedProgressAndDurability,
 		"orphan-retained-states":   TestSuspendOrphansPreserveAllReferencedStates,
+		"orphan-expiry-cycle":      TestSuspendOrphansAfterExpiry,
+		"orphan-bad-tombstone":     TestSuspendOrphansRefuseMalformedTombstones,
 		"orphan-refused-scan":      TestSuspendOrphansRefuseUncertainScanBeforeDeletion,
 		"orphan-failure-retry":     TestSuspendOrphansFailuresDoNotStarveAndRetryFlushes,
 		"orphan-await-recheck":     TestSuspendOrphansRecheckReferencesAndFileIdentity,
