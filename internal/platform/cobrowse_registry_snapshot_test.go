@@ -17,7 +17,10 @@ import (
 func TestSuspendRegistrySnapshotPrunePreservesNewerRecord(t *testing.T) {
 	for _, kind := range []string{"age", "count"} {
 		t.Run(kind, func(t *testing.T) {
-			base := t.TempDir()
+			// Recovery validates its base before enumerating records. A bare
+			// Windows t.TempDir has an inherited ACL, not the private directory
+			// production creates; use the existing cross-platform fixture.
+			base := trustedBaseDir(t)
 			m := NewCobrowseSessionManager(base, 4)
 			m.useResolver = true
 			// Keep this manager isolated from the node-wide resolver.
@@ -176,7 +179,7 @@ func TestSuspendRegistrySnapshotRecoveryPreservesNewerRecord(t *testing.T) {
 			adoption, runner, resolver := adoptionSupported, activeBrowserRunner, registryDirResolver
 			adoptionSupported, activeBrowserRunner, registryDirResolver = true, nil, nil
 			t.Cleanup(func() { adoptionSupported, activeBrowserRunner, registryDirResolver = adoption, runner, resolver })
-			m := NewCobrowseSessionManager(t.TempDir(), 4)
+			m := NewCobrowseSessionManager(trustedBaseDir(t), 4)
 			m.useResolver = true
 			dir := m.registryDir()
 			original := sessionRecord{Version: sessionRecordVersion, ID: "cb-abcd", State: RecordLive, Generation: 4}
@@ -238,7 +241,7 @@ func TestSuspendRegistrySnapshotRecoveryAndRetentionStillProgress(t *testing.T) 
 	adoption, runner, resolver := adoptionSupported, activeBrowserRunner, registryDirResolver
 	adoptionSupported, activeBrowserRunner, registryDirResolver = true, nil, nil
 	t.Cleanup(func() { adoptionSupported, activeBrowserRunner, registryDirResolver = adoption, runner, resolver })
-	m := NewCobrowseSessionManager(t.TempDir(), 4)
+	m := NewCobrowseSessionManager(trustedBaseDir(t), 4)
 	m.useResolver = true
 	dir := m.registryDir()
 	for i := 0; i < expiredMaxRecords+2; i++ {
