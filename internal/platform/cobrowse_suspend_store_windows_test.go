@@ -63,6 +63,7 @@ func TestWindowsSuspendManifestStorage(t *testing.T) {
 		"intent-accounting":        TestSuspendIntentCapacityAndUnparseableRecords,
 		"intent-concurrency":       TestSuspendIntentSerializesCompetingCaptures,
 		"completion-order":         TestSuspendCompletionPersistsAfterVerifiedTeardown,
+		"repeated-throwaway-cycle": TestSuspendRepeatedThrowawayCyclesAcrossStoreRestarts,
 		"completion-replay":        TestSuspendCompletionFailureReplay,
 		"completion-refusals":      TestSuspendCompletionRequiresCaptureAndIntent,
 		"completion-visible":       TestSuspendCompletionVisibleRecordStillRequiresDurability,
