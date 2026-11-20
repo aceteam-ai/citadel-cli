@@ -6,7 +6,7 @@ This branch starts the node-side implementation with planning, authenticated
 start-owner metadata, bounded manifest encryption, private file storage and
 per-page CDP capture primitives. Suspend and
 reopen have no production caller yet: no new job action,
-browser close/relaunch, profile snapshot, sweep timer or advertised capability.
+browser close/relaunch, profile snapshot or advertised capability.
 Existing live-browser launch/action behavior is unchanged. This is not a completed suspend feature
 or native acceptance proof.
 
@@ -120,6 +120,17 @@ manager-incarnation fence during publication. Its continuation starts only after
 durable intent staging. Failures retain any referenced intent and capture; a
 successful fake stop continuation is a component test, not a runtime proof.
 Saved-profile handling and the production manager transaction remain unwired.
+
+`stopSuspendProc` owns the private graceful-close-to-positive-proof sequence.
+It requires a finite parent budget and a positive per-launch stop adapter before
+any close attempt. Graceful failure may fall back only while the same proc and
+caller fence still hold; even a reaped root must pass complete resource proof.
+Both stages share one capped wall deadline, and ordinary teardown is never the
+fallback. The caller retains registry/action exclusion and permits expected
+root exit in its fence. Only fresh Windows jobs currently provide the positive
+adapter; other runners remain unsupported at this boundary. No manager or job
+calls this sequence yet. Its fake-process composition test proves ordering with
+durable capture completion, not actual resource release or profile persistence.
 
 Reopen retains the session ID, increments generation without wraparound, keeps
 the driver, and consumes a live slot. A persistent session requires a successful

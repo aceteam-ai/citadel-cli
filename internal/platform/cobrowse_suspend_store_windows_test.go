@@ -8,6 +8,11 @@ import "testing"
 // storage/OS-lock contract there without changing or bypassing the workflow.
 func TestWindowsSuspendManifestStorage(t *testing.T) {
 	for name, test := range map[string]func(*testing.T){
+		"stop-complete-proof":      TestSuspendStopRequiresCompleteProofAfterGracefulClose,
+		"stop-admission":           TestSuspendStopRefusesBeforeAnyEffect,
+		"stop-fences":              TestSuspendStopFencesCloseAndProof,
+		"stop-budget":              TestSuspendStopSharesOriginalBoundedBudget,
+		"stop-capture-completion":  TestSuspendStopComposesWithDurableCaptureCompletion,
 		"stage-capture-order":      TestSuspendStagedCaptureOrdersIntentBeforeContinuation,
 		"stage-capture-input":      TestSuspendStagedCaptureRejectsInputsBeforePageIO,
 		"stage-capture-failure":    TestSuspendStagedCaptureFailureRetainsReferencedIntent,
