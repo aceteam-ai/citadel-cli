@@ -815,7 +815,7 @@ func (s *cobrowseSession) teardown() error {
 		deleteRecord(regDir, s.id)
 	}
 
-	var err error
+	var err, reapErr error
 	if enc != nil && proc != nil {
 		// A persistent profile is sealed from what the browser wrote to disk.
 		// Chromium keeps recent cookie and login writes in memory and commits
@@ -829,6 +829,10 @@ func (s *cobrowseSession) teardown() error {
 	}
 	if proc != nil {
 		dropTargetSet(proc.debugPort)
+		// The main process is dead; its helpers may not be yet, and they
+		// recreate files under the profile. Nothing is sealed until they are
+		// gone (citadel-cli#1836); a survivor fails closed below.
+		reapErr = reapProfileUsers(profile, proc.browserScope)
 	}
 	// Again after the browser is gone (it may have held a staged file open),
 	// and always before Persist seals anything. A dir that cannot be removed
@@ -839,7 +843,13 @@ func (s *cobrowseSession) teardown() error {
 		// produced new state, and sealing an empty/partial working dir would
 		// overwrite a good profile with nothing.
 		if proc != nil {
-			if stageErr != nil {
+			if reapErr != nil {
+				// A live helper may be writing a torn database: keep the
+				// previous ciphertext rather than seal over it.
+				if err == nil {
+					err = reapErr
+				}
+			} else if stageErr != nil {
 				if err == nil {
 					err = stageErr
 				}
@@ -855,11 +865,27 @@ func (s *cobrowseSession) teardown() error {
 	// cookies (and no throwaway state) behind. The pidfile lives under it and goes
 	// too. For a persistent profile the durable state now lives only as ciphertext.
 	if profile != "" {
-		if rerr := removeSessionDir(profile); rerr != nil && enc != nil && err == nil {
+		rerr := removeSessionDir(profile)
+		// A helper can recreate the tree after a removal that succeeded, so
+		// with a browser involved re-reap and re-check until the dir is gone.
+		for i := 0; proc != nil && i < 3; i++ {
+			if r := reapProfileUsers(profile, proc.browserScope); r != nil && reapErr == nil {
+				reapErr = r
+			}
+			if _, serr := os.Lstat(profile); os.IsNotExist(serr) {
+				rerr = nil
+				break
+			}
+			rerr = removeSessionDir(profile)
+		}
+		if rerr != nil && enc != nil && err == nil {
 			// A persistent session's working dir holds decrypted cookies; a
 			// failure to remove it must be visible, never silent.
 			err = fmt.Errorf("the decrypted working copy of a saved profile could not be removed from %s: %w", profile, rerr)
 		}
+	}
+	if reapErr != nil && err == nil {
+		err = reapErr
 	}
 	return err
 }
