@@ -132,6 +132,23 @@ adapter; other runners remain unsupported at this boundary. No manager or job
 calls this sequence yet. Its fake-process composition test proves ordering with
 durable capture completion, not actual resource release or profile persistence.
 
+A separate private scope-pair adapter accepts only copied, complete per-launch
+invocation and process-birth observations for the browser and its dedicated
+display. Both scopes must match the session and role, have distinct invocations
+and processes, share a non-root user and boot, and occupy disjoint canonical
+control groups. It requires exact-invocation stop proofs for both, followed by
+both original reapers, with a single finite budget including exclusion wait.
+Uncertain teardown stops the sequence and remains retryable; no success receipt
+is cached and unit-name or root-exit observations never substitute for proof.
+The trusted exact-stop operation must verify empty old scopes and disappeared
+process births, rather than a successful stop request alone. This is an unwired
+composition boundary: no Linux runner supplies verified launch-time observations
+yet, and system-manager, direct-process, container and re-adoption support remain
+unfinished. Fake scope callbacks are not native resource-release acceptance.
+Two scope observations do not prove complete launch containment: a future runner
+must also exclude helpers that escaped into another scope. This boundary must
+not become a complete proc adapter merely because the original scopes are empty.
+
 Reopen retains the session ID, increments generation without wraparound, keeps
 the driver, and consumes a live slot. A persistent session requires a successful
 human unlock and the same profile binding, with no throwaway fallback. A
