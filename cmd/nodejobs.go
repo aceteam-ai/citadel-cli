@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"runtime"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/cacheindex"
 	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
+	"github.com/aceteam-ai/citadel-cli/internal/laneinventory"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/pairingdisplay"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
@@ -29,6 +31,10 @@ type nodeJobHandlerOpts struct {
 	OrgID string
 	// NodeID is the exact Headscale node identifier used for control jobs.
 	NodeID string
+	// InventoryCollect is an optional in-process observation seam for tests.
+	// Production callers leave it nil and use the lazy native collector.
+	InventoryCollect func(context.Context) (laneinventory.Report, error)
+	InventoryEnabled func() bool
 	// WorkspaceDir is the sandbox root for file-operation handlers.
 	WorkspaceDir string
 	// ConfigDir is the citadel.yaml manifest directory (enables service handlers).
@@ -46,6 +52,10 @@ type nodeJobHandlerOpts struct {
 	// the worker handler set; nil leaves those handlers unsigned.
 	WorkReceiptSigner aep.Signer
 	WorkReceiptNodeID string
+	// ReceiptRoutingNodeID is the id this worker serves under (its per-node stream
+	// and heartbeat node id). Chat receipts sign it, the same value as
+	// WorkReceiptNodeID (citadel-cli#1638). Empty keeps the default.
+	ReceiptRoutingNodeID string
 	// AllowReadOutsideWorkspace lets read-only file handlers escape the sandbox.
 	AllowReadOutsideWorkspace bool
 	// AuthorizedRoots resolves the operator-bound authorized roots a dispatched
@@ -146,6 +156,21 @@ func buildNodeJobHandlers(opts nodeJobHandlerOpts) ([]worker.JobHandler, *worker
 	if opts.WorkflowExec != nil {
 		handlers = append(handlers, workflow.NewHandler(opts.WorkflowExec))
 	}
+	// Read-only inventory never inherits the shared shell pool or accepts
+	// arbitrary paths/commands from a payload. Backend key-bound session-read
+	// authorization belongs to the paired #14139 dispatch path.
+	inventory := laneinventory.NewNative(opts.PermissionsDir)
+	collectInventory := opts.InventoryCollect
+	if collectInventory == nil {
+		collectInventory = inventory.Collect
+	}
+	inventoryEnabled := opts.InventoryEnabled
+	if inventoryEnabled == nil {
+		inventoryEnabled = func() bool { return os.Getenv("CITADEL_LANE_INVENTORY") == "1" }
+	}
+	handlers = append(handlers, worker.NewLaneInventoryHandler(worker.LaneInventoryConfig{
+		OrgID: opts.OrgID, NodeID: opts.NodeID, Collect: collectInventory, Enabled: inventoryEnabled,
+	}))
 	// llm_inference (issue #590): the aceteam python-backend dispatches
 	// job_type="llm_inference" for ALL fabric inference (OpenAI gateway, /fabric
 	// model deploys, mesh chat). Registered unconditionally — like the workflow
@@ -154,6 +179,10 @@ func buildNodeJobHandlers(opts nodeJobHandlerOpts) ([]worker.JobHandler, *worker
 	// ollama/llamacpp/bonsai). Without it every inference job failed with
 	// "unsupported job type \"llm_inference\": node X has no handler for it".
 	llmHandler := worker.NewLLMInferenceHandler()
+	if opts.ReceiptRoutingNodeID != "" {
+		routing := servingReceiptNodeID(opts.ReceiptRoutingNodeID)
+		llmHandler = llmHandler.WithFabricNodeIDResolver(func() string { return routing })
+	}
 	// Model hotswap (citadel-cli#632, default ON): unless CITADEL_MODEL_HOTSWAP is
 	// explicitly disabled (0/false/no/off) and this node has a config dir, attach a
 	// swap manager so an installed-but-not-resident target engine is swapped in on

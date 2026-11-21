@@ -233,6 +233,14 @@ func atomicReplaceWindows(src, dst string) error {
 // Returns (false, nil) when dst was already present and nothing needed to be
 // done.
 func recoverInterruptedSwap(dst string) (bool, error) {
+	// An interrupted swap leaves dst missing. With dst present there is
+	// nothing to recover, so do not require (or validate) the persistent
+	// update lock: on a fresh install it was never provisioned, and the
+	// update path provisions it itself under its own fail-closed rules
+	// (#1682). Any other stat error falls through to the locked path.
+	if _, err := os.Stat(dst); err == nil {
+		return false, nil
+	}
 	lock, err := acquireRecoveryMutationLock(context.Background(), dst)
 	if err != nil {
 		return false, err

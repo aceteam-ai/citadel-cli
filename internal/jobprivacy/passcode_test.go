@@ -35,3 +35,30 @@ func TestPasscodeIsRemovedFromRetainedCopies(t *testing.T) {
 		t.Fatalf("a payload without a passcode must be unchanged: %#v", got)
 	}
 }
+
+// TestCobrowseProfilePINIsRemovedFromRetainedCopies: the COBROWSE_SESSION
+// start "pin" unlocks a persistent profile (an at-rest passphrase since #820)
+// and is dropped like the passcode.
+func TestCobrowseProfilePINIsRemovedFromRetainedCopies(t *testing.T) {
+	const secret = "synthetic profile passphrase words"
+	payload := map[string]any{PINKey: secret, "action": "start", "profile": "default"}
+	got := Payload("COBROWSE_SESSION", payload)
+	if _, ok := got[PINKey]; ok || got["profile"] != "default" || got["action"] != "start" {
+		t.Fatalf("retained payload = %#v", got)
+	}
+	if !HasPasscode(payload) {
+		t.Fatal("a pin field must count as a credential")
+	}
+	for _, text := range []string{
+		Text("COBROWSE_SESSION", payload, "unlock failed for "+secret),
+		Error("COBROWSE_SESSION", payload, errors.New("bad "+secret)).Error(),
+		FailureData("COBROWSE_SESSION", payload, errors.New("bad "+secret), nil)["error"].(string),
+	} {
+		if strings.Contains(text, secret) {
+			t.Fatalf("retained text kept the pin: %q", text)
+		}
+	}
+	if payload[PINKey] != secret {
+		t.Fatal("redaction must not mutate the in-flight payload")
+	}
+}

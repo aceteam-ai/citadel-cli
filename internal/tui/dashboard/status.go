@@ -14,13 +14,15 @@ import (
 
 // StatusData holds all the data for the status dashboard
 type StatusData struct {
-	NodeName   string    `json:"nodeName"`
-	NodeIP     string    `json:"nodeIP"`
-	OrgID      string    `json:"orgID,omitempty"`
-	Tags       []string  `json:"tags,omitempty"`
-	Connected  bool      `json:"connected"`
-	Version    string    `json:"version"`
-	LastUpdate time.Time `json:"lastUpdate"`
+	Role           string    `json:"role,omitempty"` // Active non-default role; omitted when unobserved or full.
+	ConfiguredRole string    `json:"configured_role,omitempty"`
+	NodeName       string    `json:"nodeName"`
+	NodeIP         string    `json:"nodeIP"`
+	OrgID          string    `json:"orgID,omitempty"`
+	Tags           []string  `json:"tags,omitempty"`
+	Connected      bool      `json:"connected"`
+	Version        string    `json:"version"`
+	LastUpdate     time.Time `json:"lastUpdate"`
 
 	// System vitals
 	CPUPercent    float64 `json:"cpuPercent"`

@@ -99,6 +99,41 @@ func TestAMTJobDiagnosticsOmitCapabilities(t *testing.T) {
 	}
 }
 
+func TestAMTAckAndStagedFileAckKeepSeparateRetentionRules(t *testing.T) {
+	raw, url := fileFetchDisposableRedis(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	queue := "jobs:v1:privacy:node:combined"
+	source := NewRedisSource(RedisSourceConfig{URL: url, QueueName: queue, ConsumerGroup: "workers", BlockMs: 1, LogFn: func(string, string) {}})
+	if err := source.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	for _, tc := range []struct {
+		kind    string
+		payload string
+		deleted bool
+	}{
+		{JobTypeAMTKVM, `{"credential_token":"synthetic-amt-capability"}`, true},
+		{JobTypeFileFetch, `{"capability":"synthetic-file-capability"}`, true},
+		{JobTypeCobrowseSession, `{"action":"stage_file","bytes_b64":"QUJD"}`, true},
+		{JobTypeCobrowseSession, `{"action":"status"}`, false},
+	} {
+		id := enqueueTestJob(t, raw, queue, map[string]any{"jobId": "combined-fixture", "type": tc.kind, "payload": tc.payload})
+		job, err := source.Next(ctx)
+		if err != nil || job == nil {
+			t.Fatalf("delivery fixture failed: %v", err)
+		}
+		if err := source.Ack(ctx, job); err != nil {
+			t.Fatal(err)
+		}
+		rows, err := raw.XRange(ctx, queue, id, id).Result()
+		if err != nil || (len(rows) == 0) != tc.deleted {
+			t.Fatalf("retention changed for %s: deleted=%t, rows=%d, err=%v", tc.kind, tc.deleted, len(rows), err)
+		}
+	}
+}
+
 func TestAMTTerminalRedisDeliveryDropsCapability(t *testing.T) {
 	raw, url := fileFetchDisposableRedis(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
