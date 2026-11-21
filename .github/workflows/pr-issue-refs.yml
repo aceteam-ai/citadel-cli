@@ -28,4 +28,5 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
           PR_BASE: ${{ github.event.pull_request.base.ref }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PR_REPO: ${{ github.repository }}
         run: sh scripts/check-pr-issue-refs.sh

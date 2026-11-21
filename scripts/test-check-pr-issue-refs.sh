@@ -4,7 +4,7 @@ dir=$(cd "$(dirname "$0")" && pwd)
 fails=0
 # t NAME EXPECTED_EXIT TITLE BRANCH BODY [BASE]
 t() {
-  PR_TITLE=$3 PR_BRANCH=$4 PR_BODY=$5 PR_BASE=${6:-main} DEFAULT_BRANCH=main \
+  PR_TITLE=$3 PR_BRANCH=$4 PR_BODY=$5 PR_BASE=${6:-main} DEFAULT_BRANCH=main PR_REPO=aceteam-ai/citadel-cli \
     sh "$dir/check-pr-issue-refs.sh" >/dev/null 2>&1
   got=$?
   if [ "$got" -ne "$2" ]; then echo "FAIL: $1 (want $2 got $got)"; fails=$((fails+1)); else echo "ok:   $1"; fi
@@ -35,5 +35,9 @@ t "branch no issue"            0 "t" "release-2" ""
 t "title+branch same num"      0 "t (#5)" "fix-5" "Closes #5"
 t "stacked base exempt"        0 "thing (#123)" "x" "nothing" "feat/parent"
 t "default base enforced"      1 "thing (#123)" "x" "nothing" "main"
+t "dated docs branch"         0 "docs: notes" "docs/2026-11-21-notes" ""
+t "dated branch with issue"    1 "t" "fix/1732-2026-11-21" ""
+t "full-form same repo"        0 "fix (#12)" "x" "Closes aceteam-ai/citadel-cli#12"
+t "full-form other repo"       1 "fix (#12)" "x" "Closes aceteam-ai/aceteam#12"
 t "empty everything"           0 "" "" ""
 [ "$fails" -eq 0 ] && echo "all passed" || { echo "$fails failed"; exit 1; }
