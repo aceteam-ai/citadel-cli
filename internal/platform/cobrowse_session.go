@@ -33,6 +33,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
@@ -532,43 +533,54 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 			return CobrowseSessionStatus{}, err
 		}
 	}
+	fencedReservation := func(reserve func(context.Context, string) error) error {
+		ctx, cancel := context.WithTimeout(context.Background(), suspendStartFenceLimit)
+		defer cancel()
+		return m.withNewSessionRegistryFence(ctx, id, reserve)
+	}
+	// Refuse a retained identity before startup recovery/sweep can touch it.
+	// Recheck under the same registry exclusion as slot reservation afterwards.
+	if err := fencedReservation(func(context.Context, string) error { return nil }); err != nil {
+		if profile != nil {
+			_ = profile.Close()
+		}
+		return CobrowseSessionStatus{}, err
+	}
 	// Reap orphans from a prior crashed process before the first launch of this one.
 	m.sweepOnce.Do(m.sweep)
-
-	m.mu.Lock()
-	if len(m.sessions) >= m.maxSessions {
-		max := m.maxSessions
-		m.mu.Unlock()
-		// The caller handed us the profile; Close it since we are not taking it.
+	var s *cobrowseSession
+	err = fencedReservation(func(ctx context.Context, regDir string) error {
+		wait := time.NewTicker(time.Millisecond)
+		defer wait.Stop()
+		for !m.mu.TryLock() {
+			select {
+			case <-ctx.Done():
+				return errors.New("browser session reservation unavailable; retry later")
+			case <-wait.C:
+			}
+		}
+		defer m.mu.Unlock()
+		if ctx.Err() != nil {
+			return errors.New("browser session reservation unavailable; retry later")
+		}
+		if len(m.sessions) >= m.maxSessions {
+			return fmt.Errorf("too many co-browse sessions (%d running); stop one first or raise %s", m.maxSessions, EnvCobrowseMaxSessions)
+		}
+		if _, taken := m.sessions[id]; taken {
+			return fmt.Errorf("co-browse session %s already exists", id)
+		}
+		s = &cobrowseSession{id: id, profile: filepath.Join(m.baseDir, id), startedAt: time.Now(),
+			state: SessionLaunching, encProfile: profile, ownerUserID: ownerUserID, profileName: profileName,
+			regDir: regDir, generation: 1, tracking: m.trackTargets, policy: m.targetPolicy}
+		m.sessions[id] = s
+		return nil
+	})
+	if err != nil {
 		if profile != nil {
 			_ = profile.Close()
 		}
-		return CobrowseSessionStatus{}, fmt.Errorf(
-			"too many co-browse sessions (%d running); stop one first or raise %s",
-			max, EnvCobrowseMaxSessions)
+		return CobrowseSessionStatus{}, err
 	}
-	if _, taken := m.sessions[id]; taken {
-		m.mu.Unlock()
-		if profile != nil {
-			_ = profile.Close()
-		}
-		return CobrowseSessionStatus{}, fmt.Errorf("co-browse session %s already exists", id)
-	}
-	s := &cobrowseSession{
-		id:          id,
-		profile:     filepath.Join(m.baseDir, id),
-		startedAt:   time.Now(),
-		state:       SessionLaunching,
-		encProfile:  profile,
-		ownerUserID: ownerUserID,
-		profileName: profileName,
-		regDir:      m.sessionRegDir(),
-		generation:  1,
-		tracking:    m.trackTargets,
-		policy:      m.targetPolicy,
-	}
-	m.sessions[id] = s
-	m.mu.Unlock()
 
 	proc, err := m.launch(s, startURL)
 	if err != nil {

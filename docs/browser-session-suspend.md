@@ -10,6 +10,21 @@ browser close/relaunch, profile snapshot or advertised capability.
 Existing live-browser launch/action behavior is unchanged. This is not a completed suspend feature
 or native acceptance proof.
 
+The legacy start path now refuses an ID with retained suspension metadata or a
+suspension tombstone before startup sweep, and rechecks under registry exclusion
+when reserving its in-memory slot. A bounded, anchored metadata read never opens
+a manifest or saved profile. A malformed/unreadable record refuses only that
+requested identity rather than letting start overwrite it; an unsafe or
+unverifiable registry root also refuses admission. In a valid private registry,
+fresh identities and legacy live/non-suspension ended records retain their existing behavior; local
+mode does not inspect the node registry. Each guard phase has a five-second
+cooperative budget including exclusion wait and bounded metadata reads, not a
+hard real-time guarantee for synchronous filesystem I/O or a budget for the
+entire legacy start operation. Slot
+reservation retains the checked registry binding. This is in-process exclusion,
+not a durable launch receipt or cross-process start lease, and it does not
+implement reopen or finish process-aware startup recovery.
+
 The existing node-wide status and list methods now project validated dormant
 registry metadata when no in-memory session takes precedence. They report the
 state, live generation, expiry, retained tab count and profile kind, never tab
