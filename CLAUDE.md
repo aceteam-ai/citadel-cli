@@ -545,20 +545,21 @@ go test -v ./cmd -run TestReadManifest
 
 ### Windows E2E Test
 ```bash
+# Set WIN_HOST, WIN_USER and WIN_PASSWORD for your Windows test machine first.
 # Full E2E test (clean → install → init → verify) on a Windows machine via WinRM
-./scripts/windows-e2e-test.sh --host <windows-ip> --user <user> --password '<password>' --authkey tskey-auth-xxx
+./scripts/windows-e2e-test.sh --host "$WIN_HOST" --user "$WIN_USER" --password "$WIN_PASSWORD" --authkey tskey-auth-xxx
 
 # Run a single phase
-./scripts/windows-e2e-test.sh verify --host <windows-ip> --user <user> --password '<password>'
+./scripts/windows-e2e-test.sh verify --host "$WIN_HOST" --user "$WIN_USER" --password "$WIN_PASSWORD"
 
 # Skip clean phase (test on already-dirty machine)
-./scripts/windows-e2e-test.sh --skip-clean --host <windows-ip> ...
+./scripts/windows-e2e-test.sh --skip-clean --host "$WIN_HOST" ...
 
 # Install a specific version
-./scripts/windows-e2e-test.sh --version v2.3.0 --host <windows-ip> ...
+./scripts/windows-e2e-test.sh --version v2.3.0 --host "$WIN_HOST" ...
 
 # Dry run (show commands without executing)
-./scripts/windows-e2e-test.sh --dry-run --host <windows-ip> ...
+./scripts/windows-e2e-test.sh --dry-run --host "$WIN_HOST" ...
 ```
 
 Requires `pywinrm` (`pip install pywinrm`) and WinRM enabled on the target machine. See `scripts/windows-e2e-test.sh` header for WinRM setup instructions.
@@ -5294,7 +5295,7 @@ New-NetFirewallRule -Name "WinRM-HTTP" -DisplayName "WinRM HTTP" -Protocol TCP -
 ```bash
 # Requires pywinrm in a venv
 PYTHON=~/.venvs/winrm/bin/python3 ./scripts/windows-e2e-test.sh \
-  --host <windows-ip> --user <user> --password '***' --authkey tskey-auth-xxx
+  --host "$WIN_HOST" --user "$WIN_USER" --password "$WIN_PASSWORD" --authkey tskey-auth-xxx
 ```
 
 **Current test status** (as of v2.3.0):
