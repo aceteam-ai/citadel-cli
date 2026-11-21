@@ -23,11 +23,17 @@ type fakeBrowser struct {
 	startLandsOn string
 	// clickNavigatesTo simulates a link click that loads another page.
 	clickNavigatesTo string
+	// clickErr, when set, makes a click fail AFTER it navigated (a timeout
+	// after the input was dispatched).
+	clickErr error
 	// navigateLandsOn simulates a navigate that redirects; pageTitle is the
 	// title every page reports; notReady keeps readyState at "loading".
 	navigateLandsOn string
 	pageTitle       string
-	notReady        bool
+	// docID is the document identity PageState reports; clickNewDoc bumps it.
+	docID       string
+	clickNewDoc bool
+	notReady    bool
 	// startErr fails StartSessionWithID; stopErr fails Stop.
 	startErr error
 	stopErr  error
@@ -174,11 +180,18 @@ func (f *fakeBrowser) Click(id, sel string, x, y *float64) (platform.CobrowseSes
 	if f.onClick != nil {
 		f.onClick()
 	}
-	return f.act(id, "click "+sel, func(s *fakeSession) {
+	st, err := f.act(id, "click "+sel, func(s *fakeSession) {
 		if f.clickNavigatesTo != "" {
 			s.url = f.clickNavigatesTo
 		}
+		if f.clickNewDoc {
+			f.docID += "x"
+		}
 	})
+	if err == nil && f.clickErr != nil {
+		return st, f.clickErr
+	}
+	return st, err
 }
 func (f *fakeBrowser) Type(id, text string) (platform.CobrowseSessionStatus, error) {
 	return f.act(id, "type", nil)
@@ -212,7 +225,7 @@ func (f *fakeBrowser) PageState(id string) (platform.PageState, error) {
 	if f.notReady {
 		rs = "loading"
 	}
-	return platform.PageState{URL: s.url, ReadyState: rs, Title: f.pageTitle}, nil
+	return platform.PageState{URL: s.url, ReadyState: rs, Title: f.pageTitle, DocID: f.docID}, nil
 }
 func (f *fakeBrowser) InspectTarget(id string, _ platform.TargetProbe) (platform.TargetInfo, error) {
 	if f.onInspect != nil {

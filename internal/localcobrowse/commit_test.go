@@ -1010,3 +1010,177 @@ func TestApprovalNeverRedeemedAgainstUnverifiedTarget(t *testing.T) {
 		}
 	})
 }
+
+func logoutTarget() *platform.TargetInfo {
+	t := el(func(t *platform.TargetInfo) {
+		t.Tag, t.Name, t.Href, t.Actionable = "a", "Logout", "http://a.test/logout", true
+	})
+	return &t
+}
+
+// A dispatched link click that leaves the page where it was is not "done": the
+// outcome is unconfirmed, so neither the human nor the agent is told the page
+// moved when it did not (#1777).
+func TestApproveLinkClickWithoutNavigationIsUnconfirmed(t *testing.T) {
+	svc, fb, events, id := startGranted(t, nil)
+	fb.target = logoutTarget()
+	_, _ = svc.Click(ctx, id, "a[href='/logout']", nil, nil, "g")
+	c := pendingView(t, svc, id)
+	if err := svc.ApproveCommit(ctx, id, c.ID); err != nil {
+		t.Fatal(err)
+	}
+	if clicks(fb) != 1 {
+		t.Fatalf("approval must dispatch the click: %d", clicks(fb))
+	}
+	if v := svc.Sessions(id)[0]; v.CommitResult == nil || v.CommitResult.State != "unconfirmed" {
+		t.Fatalf("a link click that did not navigate must be unconfirmed: %+v", v.CommitResult)
+	}
+	assertUnconfirmedAudit(t, events)
+}
+
+func assertUnconfirmedAudit(t *testing.T, events *[]Event) {
+	t.Helper()
+	var click, approve bool
+	for _, e := range *events {
+		if e.Action == "click" && e.Class == "W" && e.Outcome != "refused" {
+			click = true
+			if e.Outcome != "unconfirmed" {
+				t.Errorf("the W click record must be unconfirmed, got %q", e.Outcome)
+			}
+		}
+		if e.Action == "approve_commit" {
+			approve = true
+			if e.Outcome != "unconfirmed" {
+				t.Errorf("approve_commit must be unconfirmed, got %q", e.Outcome)
+			}
+		}
+	}
+	if !click || !approve {
+		t.Fatalf("both records are needed: click=%v approve=%v", click, approve)
+	}
+}
+
+// A tab that was already open is not evidence that the click landed.
+func TestApproveLinkClickWithPreexistingTabIsUnconfirmed(t *testing.T) {
+	svc, fb, events, id := startGranted(t, nil)
+	fb.mu.Lock()
+	fb.sessions[id].targets = []platform.CobrowseTarget{{ID: "t1", Active: true}, {ID: "t2"}}
+	fb.mu.Unlock()
+	fb.target = logoutTarget()
+	_, _ = svc.Click(ctx, id, "a[href='/logout']", nil, nil, "g")
+	c := pendingView(t, svc, id)
+	if err := svc.ApproveCommit(ctx, id, c.ID); err != nil {
+		t.Fatal(err)
+	}
+	if v := svc.Sessions(id)[0]; v.CommitResult == nil || v.CommitResult.State != "unconfirmed" {
+		t.Fatalf("a pre-existing tab must not count: %+v", v.CommitResult)
+	}
+	assertUnconfirmedAudit(t, events)
+}
+
+// An unknown before-list (failed target sync) is not "no pages": the same page
+// listed afterwards must not read as a new tab.
+func TestApproveLinkClickUnknownBeforeTargetsIsUnconfirmed(t *testing.T) {
+	svc, fb, events, id := startGranted(t, nil)
+	fb.target = logoutTarget()
+	fb.mu.Lock()
+	fb.sessions[id].targets = nil
+	fb.mu.Unlock()
+	fb.onClick = func() {
+		fb.mu.Lock()
+		fb.sessions[id].targets = []platform.CobrowseTarget{{ID: "t1", Active: true}}
+		fb.mu.Unlock()
+	}
+	_, _ = svc.Click(ctx, id, "a[href='/logout']", nil, nil, "g")
+	c := pendingView(t, svc, id)
+	if err := svc.ApproveCommit(ctx, id, c.ID); err != nil {
+		t.Fatal(err)
+	}
+	if v := svc.Sessions(id)[0]; v.CommitResult == nil || v.CommitResult.State != "unconfirmed" {
+		t.Fatalf("unknown before-targets must not count as a new tab: %+v", v.CommitResult)
+	}
+	assertUnconfirmedAudit(t, events)
+}
+
+// A link click that opens a new tab, with the URL unchanged, is executed.
+func TestApproveLinkClickOpeningNewTabIsExecuted(t *testing.T) {
+	svc, fb, _, id := startGranted(t, nil)
+	fb.target = logoutTarget()
+	fb.mu.Lock()
+	fb.sessions[id].targets = []platform.CobrowseTarget{{ID: "t1", Active: true}}
+	fb.mu.Unlock()
+	fb.onClick = func() {
+		fb.mu.Lock()
+		fb.sessions[id].targets = []platform.CobrowseTarget{{ID: "t1", Active: true}, {ID: "t2"}}
+		fb.mu.Unlock()
+	}
+	_, _ = svc.Click(ctx, id, "a[href='/logout']", nil, nil, "g")
+	c := pendingView(t, svc, id)
+	if err := svc.ApproveCommit(ctx, id, c.ID); err != nil {
+		t.Fatal(err)
+	}
+	if v := svc.Sessions(id)[0]; v.CommitResult == nil || v.CommitResult.State != "executed" {
+		t.Fatalf("a new tab is evidence the link landed: %+v", v.CommitResult)
+	}
+}
+
+// Enter on a focused link that shows no navigation is unconfirmed.
+func TestApproveEnterOnLinkWithoutNavigationIsUnconfirmed(t *testing.T) {
+	svc, fb, events, id := startGranted(t, nil)
+	fb.target = logoutTarget()
+	fb.mu.Lock()
+	fb.sessions[id].targets = []platform.CobrowseTarget{{ID: "t1", Active: true}}
+	fb.mu.Unlock()
+	if _, err := svc.Key(ctx, id, "Enter", "g"); !errors.Is(err, ErrCommitApprovalRequired) {
+		t.Fatalf("Enter on a link needs approval: %v", err)
+	}
+	c := pendingView(t, svc, id)
+	if err := svc.ApproveCommit(ctx, id, c.ID); err != nil {
+		t.Fatal(err)
+	}
+	if v := svc.Sessions(id)[0]; v.CommitResult == nil || v.CommitResult.State != "unconfirmed" {
+		t.Fatalf("Enter on a link that did not navigate is unconfirmed: %+v", v.CommitResult)
+	}
+	var key bool
+	for _, e := range *events {
+		if e.Action == "key" && e.Class == "W" && e.Outcome != "refused" {
+			key = true
+			if e.Outcome != "unconfirmed" {
+				t.Errorf("the W key record must be unconfirmed, got %q", e.Outcome)
+			}
+		}
+	}
+	if !key {
+		t.Fatal("no W key record")
+	}
+}
+
+// A same-URL reload (new document identity) counts as a navigation.
+func TestApproveLinkClickSameURLNewDocumentIsExecuted(t *testing.T) {
+	svc, fb, _, id := startGranted(t, nil)
+	fb.target = logoutTarget()
+	fb.docID, fb.clickNewDoc = "d1", true
+	_, _ = svc.Click(ctx, id, "a[href='/logout']", nil, nil, "g")
+	c := pendingView(t, svc, id)
+	if err := svc.ApproveCommit(ctx, id, c.ID); err != nil {
+		t.Fatal(err)
+	}
+	if v := svc.Sessions(id)[0]; v.CommitResult == nil || v.CommitResult.State != "executed" {
+		t.Fatalf("a new document at the same URL is a navigation: %+v", v.CommitResult)
+	}
+}
+
+// The same link, when the page does navigate, is executed.
+func TestApproveLinkClickThatNavigatesIsExecuted(t *testing.T) {
+	svc, fb, _, id := startGranted(t, nil)
+	fb.target = logoutTarget()
+	fb.clickNavigatesTo = "http://a.test/login"
+	_, _ = svc.Click(ctx, id, "a[href='/logout']", nil, nil, "g")
+	c := pendingView(t, svc, id)
+	if err := svc.ApproveCommit(ctx, id, c.ID); err != nil {
+		t.Fatal(err)
+	}
+	if v := svc.Sessions(id)[0]; v.CommitResult == nil || v.CommitResult.State != "executed" {
+		t.Fatalf("a navigating link click is executed: %+v", v.CommitResult)
+	}
+}

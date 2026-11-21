@@ -143,22 +143,21 @@ func startHeadless(info BrowserInfo, profileDir, startURL, userAgent string, lo 
 	}
 
 	fail := func(cause error) (*cobrowseProc, error) {
-		_ = proc.stop()
+		// Sample before stopping: stop waits for the process, so checking
+		// afterwards always reads "exited" and would blame a browser that was
+		// merely slow (and then killed by us) for dying on its own (#1795).
 		select {
 		case <-exited:
+			_ = proc.stop()
 			code := -1
 			if cmd.ProcessState != nil {
 				code = cmd.ProcessState.ExitCode()
 			}
-			return nil, fmt.Errorf("%s exited during headless launch (exit code %d); run `citadel local doctor`", info.Kind, code)
+			return nil, headlessLaunchError(info.Kind, true, code, cause)
 		default:
 		}
-		if errors.Is(cause, errCDPImpostor) {
-			return nil, fmt.Errorf("%s debug port answered as a different browser; refusing the session: %w", info.Kind, cause)
-		}
-		return nil, fmt.Errorf("%w: %s started but never opened its automation port within %s. "+
-			"On a managed (work or school) computer this is usually a policy that disables remote debugging; "+
-			"try a per-user Chrome install or a personal computer", ErrBrowserAutomationBlocked, info.Kind, windowsCDPReadyTimeout)
+		_ = proc.stop()
+		return nil, headlessLaunchError(info.Kind, false, 0, cause)
 	}
 
 	port, browserID, err := waitForDevToolsActivePort(profileDir, windowsCDPReadyTimeout, exited)
@@ -544,3 +543,17 @@ func sessionOwnerAlive(pid int, start int64) bool { return processAliveWithStart
 // killOrphanSessionProcs is a no-op on Windows: the owner's kill-on-close Job
 // Object already ended the session's browser tree when the owner exited.
 func killOrphanSessionProcs(int, int) {}
+
+// headlessLaunchError words a failed headless launch. exitedOnItsOwn is true
+// only when the browser process was already gone before we stopped it.
+func headlessLaunchError(kind string, exitedOnItsOwn bool, code int, cause error) error {
+	if exitedOnItsOwn {
+		return fmt.Errorf("%s exited during headless launch (exit code %d); run `citadel local doctor`", kind, code)
+	}
+	if errors.Is(cause, errCDPImpostor) {
+		return fmt.Errorf("%s debug port answered as a different browser; refusing the session: %w", kind, cause)
+	}
+	return fmt.Errorf("%w: %s started but never opened its automation port within %s. "+
+		"On a managed (work or school) computer this is usually a policy that disables remote debugging; "+
+		"try a per-user Chrome install or a personal computer (last error: %v)", ErrBrowserAutomationBlocked, kind, windowsCDPReadyTimeout, cause)
+}

@@ -42,6 +42,11 @@ type PageState struct {
 	// Title is document.title, already bounded and stripped of control
 	// characters (SanitizeCobrowseTitle).
 	Title string `json:"title,omitempty"`
+	// DocID identifies the current document (performance.timeOrigin), so a
+	// same-URL reload or redirect is told apart from no navigation. It is a
+	// page-world hint, not a trust signal (the page can influence it). Empty when
+	// unknown. Not part of any wire format.
+	DocID string `json:"-"`
 }
 
 // MaxCobrowseTitleRunes bounds the page title returned from a navigation.
@@ -81,17 +86,57 @@ var (
 // navigateSettleWindow. It returns the last state read; a slow page is not an
 // error.
 func settleNavigation(p pin, before string) PageState {
+	return settlePage(p, before, false)
+}
+
+// settleLaunch is the start-up settle: the initial about:blank must not
+// satisfy the minimum-wait shortcut, so it waits for the page to commit away
+// from it (or for the settle window to end) and reports the current state.
+//
+// parent carries the start-up's one deadline, shared with pinning, so the two
+// together never exceed it. The settle window still applies inside it.
+func settleLaunch(parent context.Context, p pin) PageState {
+	return settlePageCtx(parent, p, "about:blank", true)
+}
+
+func settlePage(p pin, before string, requireChange bool) PageState {
+	return settlePageCtx(context.Background(), p, before, requireChange)
+}
+
+func settlePageCtx(parent context.Context, p pin, before string, requireChange bool) PageState {
 	var last PageState
 	start := time.Now()
+	// One connection for the whole poll loop instead of a discovery and a
+	// dial per tick (citadel-cli#1663). A failed read drops it and the next
+	// tick reconnects.
+	var conn *cdpConn
+	var caller cdpCaller = p
+	ctx, cancel := context.WithTimeout(parent, navigateSettleWindow+cobrowseReportReserve)
+	defer cancel()
+	defer func() {
+		if conn != nil {
+			conn.Close()
+		}
+	}()
 	for {
-		if ps, err := readPageState(p); err == nil {
+		if conn == nil {
+			if c, err := openCDPConn(ctx, p); err == nil {
+				conn, caller = c, c
+			}
+		}
+		ps, err := readPageStateOn(caller)
+		if err != nil && conn != nil {
+			conn.Close()
+			conn, caller = nil, p
+		}
+		if err == nil {
 			last = ps
 			if ps.ReadyState == "" {
 				// The page did not answer with a document state at all;
 				// polling cannot improve on that.
 				return ps
 			}
-			if ps.ReadyState == "complete" && (ps.URL != before || time.Since(start) >= navigateSettleMinimum) {
+			if ps.ReadyState == "complete" && (ps.URL != before || (!requireChange && time.Since(start) >= navigateSettleMinimum)) {
 				return ps
 			}
 		}
@@ -102,8 +147,10 @@ func settleNavigation(p pin, before string) PageState {
 	}
 }
 
-func readPageState(p pin) (PageState, error) {
-	val, err := runtimeEvaluate(p, `({url: location.href, ready: document.readyState, title: document.title})`)
+func readPageState(p pin) (PageState, error) { return readPageStateOn(p) }
+
+func readPageStateOn(c cdpCaller) (PageState, error) {
+	val, err := evaluateOn(c, `({url: location.href, ready: document.readyState, title: document.title, doc: (function(){try{return String(performance.timeOrigin)}catch(e){return ""}})()})`, false)
 	if err != nil {
 		return PageState{}, err
 	}
@@ -111,7 +158,8 @@ func readPageState(p pin) (PageState, error) {
 	u, _ := obj["url"].(string)
 	r, _ := obj["ready"].(string)
 	t, _ := obj["title"].(string)
-	return PageState{URL: u, ReadyState: r, Title: SanitizeCobrowseTitle(t)}, nil
+	d, _ := obj["doc"].(string)
+	return PageState{URL: u, ReadyState: r, Title: SanitizeCobrowseTitle(t), DocID: d}, nil
 }
 
 type SelectResult struct {
@@ -178,10 +226,12 @@ func (s *cobrowseSession) requireDrivablePort() (int, error) {
 // page changed after it was chosen, so a popup that opens in between never
 // receives a click or keystrokes meant for the page that was checked.
 type pin struct {
-	port int
-	id   string
-	ws   string
-	set  *targetSet
+	session    *cobrowseSession
+	background bool
+	port       int
+	id         string
+	ws         string
+	set        *targetSet
 	// refused: the page is the refused last page, pinned only to navigate away.
 	refused bool
 }
@@ -193,17 +243,40 @@ func (p pin) cdp(method string, params map[string]any) (map[string]any, error) {
 	return cdpDialAndSend(p.ws, method, params)
 }
 
+// Call makes pin a cdpCaller that connects per call; budgeted actions use
+// openCDPConn(p) instead to share one connection.
+func (p pin) Call(method string, params map[string]any) (map[string]any, error) {
+	return p.cdp(method, params)
+}
+
 // verify re-reads the pages and refuses when the pinned page is no longer the
 // active one.
 func (p pin) verify() error {
+	return p.verifyCtx(context.Background())
+}
+
+// verifyCtx is verify under the caller's context, so an action's one budget
+// covers it.
+func (p pin) verifyCtx(parent context.Context) error {
 	if p.set == nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), targetSyncTimeout)
+	ctx, cancel := context.WithTimeout(parent, targetSyncTimeout)
 	defer cancel()
 	snap, err := p.set.sync(ctx, p.port)
 	if err != nil {
 		return err
+	}
+	if p.background {
+		for _, tg := range snap.Targets {
+			if tg.ID == p.id {
+				if tg.Refused {
+					return ErrPageRefused
+				}
+				return nil
+			}
+		}
+		return fmt.Errorf("no such page %q in this session", p.id)
 	}
 	if snap.Active != p.id {
 		return ErrTargetChanged
@@ -211,9 +284,11 @@ func (p pin) verify() error {
 	return nil
 }
 
-func pinFor(port int) (pin, error) {
+func pinFor(port int) (pin, error) { return pinForCtx(context.Background(), port) }
+
+func pinForCtx(parent context.Context, port int) (pin, error) {
 	set := targetSetFor(port)
-	ctx, cancel := context.WithTimeout(context.Background(), targetSyncTimeout)
+	ctx, cancel := context.WithTimeout(parent, targetSyncTimeout)
 	defer cancel()
 	tg, err := set.activeTarget(ctx, port)
 	if err != nil {
@@ -246,7 +321,7 @@ func (s *cobrowseSession) pinNavigation() (pin, error) {
 	if expect != "" && expect != tg.ID {
 		return pin{}, ErrTargetChanged
 	}
-	return pin{port: port, id: tg.ID, ws: tg.WebSocketDebuggerURL, set: set, refused: true}, nil
+	return pin{port: port, id: tg.ID, ws: tg.WebSocketDebuggerURL, set: set, refused: true, session: s}, nil
 }
 
 // refusedRecoveryWait bounds how long a navigation away from a refused page
@@ -279,6 +354,12 @@ func waitAllowedPage(p pin) (pin, error) {
 // When a caller recorded the page it checked (ExpectTarget), a different active
 // page refuses the action.
 func (s *cobrowseSession) pinAction() (pin, error) {
+	return s.pinActionCtx(context.Background())
+}
+
+// pinActionCtx is pinAction under the caller's context: a budgeted action
+// creates its context first so pinning spends the same budget.
+func (s *cobrowseSession) pinActionCtx(ctx context.Context) (pin, error) {
 	port, err := s.requireDrivablePort()
 	if err != nil {
 		return pin{}, err
@@ -287,15 +368,16 @@ func (s *cobrowseSession) pinAction() (pin, error) {
 	tracking, expect := s.tracking, s.expectTarget
 	s.mu.Unlock()
 	if !tracking {
-		return pin{port: port}, nil
+		return pin{port: port, session: s}, nil
 	}
-	p, err := pinFor(port)
+	p, err := pinForCtx(ctx, port)
 	if err != nil {
 		return pin{}, err
 	}
 	if expect != "" && p.id != expect {
 		return pin{}, ErrTargetChanged
 	}
+	p.session = s
 	return p, nil
 }
 
@@ -333,11 +415,22 @@ func (m *CobrowseSessionManager) Navigate(id, url string) (CobrowseSessionStatus
 		// refused write).
 		return CobrowseSessionStatus{}, err
 	}
+	if s.tracking && s.policy != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		err = s.policy(ctx, url)
+		cancel()
+		if err != nil {
+			return CobrowseSessionStatus{}, err
+		}
+	}
 	var before string
 	if !p.refused { // nothing runs in a refused page but the navigation away
 		if ps, err := readPageState(p); err == nil {
 			before = ps.URL
 		}
+	}
+	if err := p.check(); err != nil {
+		return CobrowseSessionStatus{}, err
 	}
 	if _, err := p.cdp("Page.navigate", map[string]any{"url": url}); err != nil {
 		return CobrowseSessionStatus{}, err
@@ -355,12 +448,12 @@ func (m *CobrowseSessionManager) Navigate(id, url string) (CobrowseSessionStatus
 	// Wait for the navigation (including redirects) to settle, then report
 	// where the page ended up. A slow page returns its current state.
 	ps := settleNavigation(p, before)
-	st := s.status()
+	st := s.statusWithURL(context.Background(), ps.URL)
 	if ps.URL != "" {
 		st.URL = ps.URL
 	}
 	st.Title = ps.Title
-	return st, nil
+	return withBrowserInterstitial(st), nil
 }
 
 // NavigateAsHuman navigates on behalf of the human who has taken control (the
@@ -417,26 +510,55 @@ func (m *CobrowseSessionManager) NavigateAsHuman(id, url string) (CobrowseSessio
 // while handed off to a human -- mirrors CobrowseManager.Screenshot exactly
 // (see the package doc comment above).
 func (m *CobrowseSessionManager) Screenshot(id string) (string, error) {
+	data, _, err := m.ScreenshotStatus(id)
+	return data, err
+}
+
+// ScreenshotStatus is Screenshot plus the session status, read over the same
+// connection to the pinned page: one dial instead of one per call, and no
+// second probe for the URL (citadel-cli#1663).
+func (m *CobrowseSessionManager) ScreenshotStatus(id string) (string, CobrowseSessionStatus, error) {
 	s, err := m.sessionForAction(id)
 	if err != nil {
-		return "", err
+		return "", CobrowseSessionStatus{}, err
 	}
-	p, err := s.pinAction()
+	b, cancel := newActionBudget()
+	defer cancel()
+	ctx := b.act
+	p, err := s.pinActionCtx(b.op)
 	if err != nil {
-		return "", err
+		return "", CobrowseSessionStatus{}, err
 	}
-	res, err := p.cdp("Page.captureScreenshot", map[string]any{"format": "png"})
+	conn, err := openCDPConn(ctx, p)
 	if err != nil {
-		return "", err
+		return "", CobrowseSessionStatus{}, err
+	}
+	defer conn.Close()
+	// Final fence: nothing awaited after this precedes the capture.
+	if err := s.fence(ctx, p); err != nil {
+		return "", CobrowseSessionStatus{}, err
+	}
+	// optimizeForSpeed trades PNG size for encode time, which dominates on a
+	// software-rendered display.
+	res, err := conn.Call("Page.captureScreenshot", map[string]any{"format": "png", "optimizeForSpeed": true})
+	if err != nil {
+		return "", CobrowseSessionStatus{}, err
+	}
+	// Preserve the read-result fence when integrating the remote read path:
+	// a handoff or refused/changed page during capture discards the image.
+	if err := s.fence(b.op, p); err != nil {
+		return "", CobrowseSessionStatus{}, err
 	}
 	data, _ := res["data"].(string)
 	if data == "" {
-		return "", fmt.Errorf("empty screenshot data from CDP")
+		return "", CobrowseSessionStatus{}, fmt.Errorf("empty screenshot data from CDP")
 	}
 	if _, derr := base64.StdEncoding.DecodeString(data); derr != nil {
-		return "", fmt.Errorf("screenshot not valid base64: %w", derr)
+		return "", CobrowseSessionStatus{}, fmt.Errorf("screenshot not valid base64: %w", derr)
 	}
-	return data, nil
+	// Tracked sessions take the URL from the target set (statusWithURL); an
+	// untracked one reads it from the discovery that found the page.
+	return data, s.statusWithURL(b.op, conn.target.URL), nil
 }
 
 // Click performs a scripted mouse click in one session's browser: either at the
@@ -450,56 +572,48 @@ func (m *CobrowseSessionManager) Click(id, selector string, x, y *float64) (Cobr
 	if err != nil {
 		return CobrowseSessionStatus{}, err
 	}
-	p, err := s.pinAction()
+	b, cancel := newActionBudget()
+	defer cancel()
+	p, err := s.pinActionCtx(b.op)
 	if err != nil {
 		return CobrowseSessionStatus{}, err
 	}
-
-	var cx, cy float64
-	switch {
-	case selector != "":
-		cx, cy, err = resolveSelectorCenter(p, selector)
-		if err != nil {
-			return CobrowseSessionStatus{}, err
-		}
-	case x != nil && y != nil:
-		cx, cy = *x, *y
-	default:
+	if selector == "" && (x == nil || y == nil) {
 		return CobrowseSessionStatus{}, fmt.Errorf("click requires a 'selector' or both 'x' and 'y'")
 	}
-
-	// Selector settling awaits page JavaScript, during which a human can take
-	// control or the active page can change. Check the live driver and the
-	// pinned page again before sending any mouse event.
-	currentPort, err := s.requireDrivablePort()
-	if err != nil {
-		return CobrowseSessionStatus{}, err
-	}
-	if currentPort != p.port {
-		return CobrowseSessionStatus{}, ErrNotStarted
-	}
-	if err := clickAtPoint(p, cx, cy); err != nil {
-		return CobrowseSessionStatus{}, err
-	}
-	return s.status(), nil
+	return s.runAction(b, p, "click", func(r *actionRun) error {
+		var cx, cy float64
+		if selector != "" {
+			var err error
+			cx, cy, err = resolveSelectorCenterOn(r.conn, selector)
+			if err != nil {
+				return err
+			}
+		} else {
+			cx, cy = *x, *y
+		}
+		// Selector settling awaits page JavaScript, during which a human can
+		// take control or the active page can change. The final fence checks
+		// the live driver and the pinned page after the last await and before
+		// any mouse event.
+		if err := r.fence(); err != nil {
+			return err
+		}
+		r.eff.Dispatched = true
+		if err := r.clickSequence(cx, cy); err != nil {
+			return err
+		}
+		r.eff.Clicked = true
+		return nil
+	})
 }
 
 // Type inserts text into whatever element currently holds focus in one
 // session's browser (via CDP Input.insertText) -- the caller is expected to
-// have focused a field first, typically with a preceding `click`.
+// have focused a field first, typically with a preceding `click`. See TypeWith
+// for the targeted and replacing forms.
 func (m *CobrowseSessionManager) Type(id, text string) (CobrowseSessionStatus, error) {
-	s, err := m.sessionForAction(id)
-	if err != nil {
-		return CobrowseSessionStatus{}, err
-	}
-	p, err := s.pinAction()
-	if err != nil {
-		return CobrowseSessionStatus{}, err
-	}
-	if _, err := p.cdp("Input.insertText", map[string]any{"text": text}); err != nil {
-		return CobrowseSessionStatus{}, err
-	}
-	return s.status(), nil
+	return m.TypeWith(id, text, TypeOptions{})
 }
 
 // Select changes a native select through the page DOM. Native popup windows do
@@ -526,6 +640,9 @@ func (m *CobrowseSessionManager) Select(id, selector, value, label string) (Sele
 		el.dispatchEvent(new Event("change", {bubbles: true}));
 		return {value: el.value, label: el.selectedOptions[0]?.label || ""};
 	})()`, jsStringLiteral(selector), jsStringLiteral(value), jsStringLiteral(value), jsStringLiteral(label))
+	if err := p.check(); err != nil {
+		return SelectResult{}, err
+	}
 	result, err := runtimeEvaluate(p, expr)
 	if err != nil {
 		return SelectResult{}, err
@@ -548,33 +665,7 @@ func (m *CobrowseSessionManager) Select(id, selector, value, label string) (Sele
 // Key sends a real key press and release. Text is never logged by the job
 // handler; the MCP audit records only the action name.
 func (m *CobrowseSessionManager) Key(id, key string) (CobrowseSessionStatus, error) {
-	s, err := m.sessionForAction(id)
-	if err != nil {
-		return CobrowseSessionStatus{}, err
-	}
-	p, err := s.pinAction()
-	if err != nil {
-		return CobrowseSessionStatus{}, err
-	}
-	code, vk, produced, ok := browserKey(key)
-	if !ok {
-		return CobrowseSessionStatus{}, fmt.Errorf("unsupported key")
-	}
-	kind := "rawKeyDown"
-	if produced != "" {
-		kind = "keyDown"
-	}
-	params := map[string]any{"type": kind, "key": key, "code": code, "windowsVirtualKeyCode": vk}
-	if produced != "" {
-		params["text"] = produced
-	}
-	if _, err := p.cdp("Input.dispatchKeyEvent", params); err != nil {
-		return CobrowseSessionStatus{}, err
-	}
-	if _, err := p.cdp("Input.dispatchKeyEvent", map[string]any{"type": "keyUp", "key": key, "code": code, "windowsVirtualKeyCode": vk}); err != nil {
-		return CobrowseSessionStatus{}, err
-	}
-	return s.status(), nil
+	return m.KeyWith(id, key, 0)
 }
 
 func browserKey(key string) (string, int, string, bool) {
@@ -617,39 +708,40 @@ func (m *CobrowseSessionManager) Scroll(id, selector string, x, y *float64, dx, 
 	if err != nil {
 		return CobrowseSessionStatus{}, err
 	}
-	p, err := s.pinAction()
+	b, cancel := newActionBudget()
+	defer cancel()
+	p, err := s.pinActionCtx(b.op)
 	if err != nil {
 		return CobrowseSessionStatus{}, err
 	}
-	var cx, cy float64
-	if selector != "" {
-		cx, cy, err = resolveSelectorCenter(p, selector)
-	} else if x != nil && y != nil {
-		cx, cy = *x, *y
-	} else {
+	if selector == "" && (x == nil || y == nil) {
 		return CobrowseSessionStatus{}, fmt.Errorf("scroll requires selector or x and y")
 	}
-	if err != nil {
-		return CobrowseSessionStatus{}, err
-	}
-	if _, err := p.cdp("Input.dispatchMouseEvent", map[string]any{"type": "mouseWheel", "x": cx, "y": cy, "deltaX": dx, "deltaY": dy}); err != nil {
-		return CobrowseSessionStatus{}, err
-	}
-	return s.status(), nil
+	return s.runAction(b, p, "scroll", func(r *actionRun) error {
+		var cx, cy float64
+		if selector != "" {
+			var err error
+			cx, cy, err = resolveSelectorCenterOn(r.conn, selector)
+			if err != nil {
+				return err
+			}
+		} else {
+			cx, cy = *x, *y
+		}
+		if err := r.fence(); err != nil {
+			return err
+		}
+		r.eff.Dispatched = true
+		_, err := r.conn.Call("Input.dispatchMouseEvent", map[string]any{"type": "mouseWheel", "x": cx, "y": cy, "deltaX": dx, "deltaY": dy})
+		return err
+	})
 }
 
 // Extract reads the text content (and, optionally, named attribute values) of
 // the first element matching selector in one session's browser.
 func (m *CobrowseSessionManager) Extract(id, selector string, attrs []string) (ExtractResult, error) {
-	s, err := m.sessionForAction(id)
-	if err != nil {
-		return ExtractResult{}, err
-	}
-	p, err := s.pinAction()
-	if err != nil {
-		return ExtractResult{}, err
-	}
-	return extractElement(p, selector, attrs)
+	result, _, err := m.ExtractTarget(id, "", selector, attrs)
+	return result, err
 }
 
 // ExtractBounded is Extract with the text cut to maxChars inside the page (so an
@@ -790,27 +882,16 @@ func runtimeEvaluate(p pin, expr string) (any, error) {
 }
 
 func runtimeEvaluateWithPromise(p pin, expr string, awaitPromise bool) (any, error) {
-	res, err := p.cdp("Runtime.evaluate", map[string]any{
-		"expression":    expr,
-		"returnByValue": true,
-		"awaitPromise":  awaitPromise,
-	})
-	if err != nil {
-		return nil, err
-	}
-	if exc, ok := res["exceptionDetails"]; ok && exc != nil {
-		return nil, fmt.Errorf("script error: %v", exc)
-	}
-	remote, ok := res["result"].(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("evaluate returned no result")
-	}
-	return remote["value"], nil
+	return evaluateOn(p, expr, awaitPromise)
 }
 
 // resolveSelectorCenter waits for the first matching element to stop moving
 // after scrolling and verifies that the click point still hits that element.
 func resolveSelectorCenter(p pin, selector string) (float64, float64, error) {
+	return resolveSelectorCenterOn(p, selector)
+}
+
+func resolveSelectorCenterOn(c cdpCaller, selector string) (float64, float64, error) {
 	expr := fmt.Sprintf(`(async function(){
 		var el = document.querySelector(%s);
 		if (!el) return null;
@@ -839,7 +920,7 @@ func resolveSelectorCenter(p pin, selector string) (float64, float64, error) {
 		}
 		return {error: "element did not settle in the viewport"};
 	})()`, jsStringLiteral(selector))
-	val, err := runtimeEvaluateWithPromise(p, expr, true)
+	val, err := evaluateOn(c, expr, true)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -864,17 +945,21 @@ func clickAtPoint(p pin, x, y float64) error {
 	if err := p.verify(); err != nil {
 		return err
 	}
-	if _, err := p.cdp("Input.dispatchMouseEvent", map[string]any{
+	return clickAtPointOn(p, x, y)
+}
+
+func clickAtPointOn(c cdpCaller, x, y float64) error {
+	if _, err := c.Call("Input.dispatchMouseEvent", map[string]any{
 		"type": "mouseMoved", "x": x, "y": y, "button": "none",
 	}); err != nil {
 		return err
 	}
-	if _, err := p.cdp("Input.dispatchMouseEvent", map[string]any{
+	if _, err := c.Call("Input.dispatchMouseEvent", map[string]any{
 		"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1,
 	}); err != nil {
 		return err
 	}
-	_, err := p.cdp("Input.dispatchMouseEvent", map[string]any{
+	_, err := c.Call("Input.dispatchMouseEvent", map[string]any{
 		"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1,
 	})
 	return err

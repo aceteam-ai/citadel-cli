@@ -12,6 +12,15 @@
   let frameURL = null;
   let human = false;
 
+  // waitingText builds the banner for a handoff. The agent's reason may already
+  // tell the user to press Hand back, so the instruction is added only when
+  // missing, and trailing periods never double.
+  function waitingText(reason) {
+    const r = String(reason || "").replace(/[.\s]+$/, "");
+    const base = "Waiting for you: " + r + ".";
+    return /\bhand(?:\s+(?!(?:and|then|or|but)\b)\w+){0,2}\s+back\b/i.test(r) ? base : base + " Then press Hand back to agent.";
+  }
+
   // post sends one viewer action. It reports a failure in msgEl (default: the
   // hint line) and resolves to true on success.
   async function post(id, action, body, msgEl) {
@@ -49,6 +58,8 @@
   }
 
   function render() {
+    const uploads = state.uploads;
+    $("uploads-state").textContent = uploads ? uploads.reason + (uploads.warning ? ". " + uploads.warning : "") : "";
     $("agent-line").textContent = state.agent ? "Connected agent: " + state.agent : "No agent connected";
     const sessions = state.sessions || [];
     const tabs = $("tabs");
@@ -87,10 +98,12 @@
       $("commit").hidden = true;
       $("commit-result").hidden = true;
       $("hint").textContent = "";
+      human = false; // an unlock into a human-driven session then counts as a transition
       closeStream();
       return;
     }
 
+    const wasHuman = human;
     human = s.driver === "human";
     $("session-goal").textContent = s.goal || "Browser session";
     $("session-driver").textContent = human ? "You are driving" : "Agent driving";
@@ -103,7 +116,7 @@
     const w = $("waiting");
     if (human && s.handoff_reason && s.handoff_reason !== "taken by the user") {
       w.hidden = false;
-      w.textContent = "Waiting for you: " + s.handoff_reason + ". Then press Hand back to agent.";
+      w.textContent = waitingText(s.handoff_reason);
     } else if (human) {
       w.hidden = false;
       w.textContent = "You are driving. The agent cannot see or act until you hand back.";
@@ -125,6 +138,14 @@
     addr.disabled = !human;
     if (document.activeElement !== addr) addr.value = s.url || "";
     $("screen-wrap").className = human ? "driving" : "";
+    // Take control (or a handoff) leaves focus on the button, so the first key
+    // would scroll the viewer instead of reaching the stream.
+    // Only take focus from nothing in particular: a keyboard user on an
+    // approval or commit button keeps it.
+    const ae = document.activeElement;
+    if (human && !wasHuman && (!ae || ae === document.body || ae === $("drive"))) {
+      $("screen-wrap").focus({ preventScroll: true });
+    }
     $("hint").textContent = human ? "Click the picture and type; your keystrokes go only to this browser." : "";
     openStream(s.session_id);
     if (lastTargets && wsFor === s.session_id) renderPages(lastTargets); // buttons follow who is driving
@@ -188,13 +209,17 @@
     if (!c && r) {
       $("commit-result").textContent = r.state === "executed"
         ? "Approved and done: " + r.action + " on " + r.domain + "."
-        : (r.state === "changed" ? "The page changed, so " + r.action + " on " + r.domain + " was not done. The agent will ask again."
+        : (r.state === "unconfirmed" ? "May have been done: " + r.action + " on " + r.domain + ". Check the page before asking the agent to try again."
+          : r.state === "changed" ? "The page changed, so " + r.action + " on " + r.domain + " was not done. The agent will ask again."
           : "Not done (" + r.state + "): " + r.action + " on " + r.domain + ". " + (r.detail || ""));
     }
     if (!c) { commitShown = null; clearShot(); return; }
     $("commit-action").textContent = c.action;
     $("commit-domain").textContent = c.domain;
     $("commit-reason").textContent = "Why you are asked: " + c.reason + ".";
+    if (c.files && c.files.length) {
+      $("commit-reason").textContent += " Attached files: " + c.files.map(f => f.name + " (" + f.size + " bytes)").join(", ") + ".";
+    }
     $("commit-approve").hidden = !!c.unverifiable;
     if (c.unverifiable) $("commit-reason").textContent += " Citadel cannot verify this one, so it cannot be done for you: do it yourself in the browser, or deny it.";
     if (commitShown === c.id || !c.has_shot) return;
@@ -286,8 +311,11 @@
   screen.addEventListener("mousedown", (ev) => {
     if (!human) return;
     ev.preventDefault();
-    $("screen-wrap").focus();
+    // Read the position before focusing: focusing can scroll the viewer page,
+    // which would move the picture under the pointer and send the click to the
+    // wrong place. preventScroll keeps the document where the user left it.
     const p = pos(ev);
+    $("screen-wrap").focus({ preventScroll: true });
     send({ type: "mouse", event: "mousePressed", x: p.x, y: p.y, button: buttonName(ev.button), buttons: ev.buttons, clickCount: ev.detail || 1 });
   });
   screen.addEventListener("mouseup", (ev) => {
@@ -316,8 +344,11 @@
     if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "v") return; // paste event below
     ev.preventDefault();
     const printable = ev.key.length === 1 && !ev.ctrlKey && !ev.metaKey;
-    send({ type: "key", keyEvent: printable ? "keyDown" : "rawKeyDown", key: ev.key, code: ev.code,
-      text: printable ? ev.key : "", keyCode: ev.keyCode, modifiers: modifiers(ev) });
+    // Enter is a keyDown carrying "\r" (a real press), not a rawKeyDown: only
+    // that produces the keypress that submits a form.
+    const enter = ev.key === "Enter" && !ev.ctrlKey && !ev.metaKey && !ev.altKey;
+    send({ type: "key", keyEvent: printable || enter ? "keyDown" : "rawKeyDown", key: ev.key, code: ev.code,
+      text: enter ? "\r" : (printable ? ev.key : ""), keyCode: ev.keyCode, modifiers: modifiers(ev) });
   });
   wrap.addEventListener("keyup", (ev) => {
     if (!human) return;

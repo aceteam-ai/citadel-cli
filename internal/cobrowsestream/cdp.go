@@ -398,6 +398,15 @@ func (c *cdpClient) dispatchMouse(m InputMessage) error {
 
 // dispatchKey forwards a viewer key event straight to CDP.
 func (c *cdpClient) dispatchKey(m InputMessage) error {
+	return c.send("Input.dispatchKeyEvent", keyParams(m))
+}
+
+// keyParams builds the CDP key event for a viewer key message. A non-printing
+// key goes out as rawKeyDown, which never produces a keypress, and Chrome
+// submits a form on the keypress that Enter generates. A real Enter press is a
+// keyDown carrying text "\r", windowsVirtualKeyCode 13 and code "Enter", so
+// that is what Enter always becomes, whatever the viewer sent.
+func keyParams(m InputMessage) map[string]any {
 	params := map[string]any{
 		"type":      m.KeyEvent,
 		"modifiers": m.Modifiers,
@@ -414,7 +423,13 @@ func (c *cdpClient) dispatchKey(m InputMessage) error {
 	if m.KeyCode != 0 {
 		params["windowsVirtualKeyCode"] = m.KeyCode
 	}
-	return c.send("Input.dispatchKeyEvent", params)
+	if m.Key == "Enter" && (m.KeyEvent == "rawKeyDown" || m.KeyEvent == "keyDown") && m.Modifiers&(1|2|4) == 0 {
+		params["type"] = "keyDown"
+		params["code"] = "Enter"
+		params["text"] = "\r"
+		params["windowsVirtualKeyCode"] = 13
+	}
+	return params
 }
 
 // selectAt probes or updates a native select at the viewport point. Browser

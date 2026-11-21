@@ -27,6 +27,54 @@ func TestCobrowse_MissingAction(t *testing.T) {
 	}
 }
 
+func TestCobrowse_BrowserSigninStatusWire(t *testing.T) {
+	out, err := statusResult(platform.CobrowseStatus{URL: "chrome://managed-user-profile-notice/", Interstitial: platform.ChromeSigninInterstitial}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st map[string]any
+	if err := json.Unmarshal(out, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st["interstitial"] != string(platform.ChromeSigninInterstitial) {
+		t.Fatalf("legacy status dropped browser interstitial: %s", out)
+	}
+}
+
+func TestCobrowse_NoEmptyInterstitialWire(t *testing.T) {
+	out, err := statusResult(platform.CobrowseStatus{URL: "https://site.example/"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st map[string]any
+	if err := json.Unmarshal(out, &st); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st["interstitial"]; ok {
+		t.Fatalf("changed ordinary wire shape: %s", out)
+	}
+}
+
+func TestCobrowse_BrowserSigninScreenshotWire(t *testing.T) {
+	for _, tracked := range []bool{false, true} {
+		st := platform.CobrowseSessionStatus{URL: "chrome://managed-user-profile-notice/", Interstitial: platform.ChromeSigninInterstitial}
+		if tracked {
+			st.Features = []string{"tabs"}
+		}
+		out, err := sessionScreenshotResult("synthetic-image", st, platform.CobrowseTarget{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fields map[string]any
+		if err := json.Unmarshal(out, &fields); err != nil {
+			t.Fatal(err)
+		}
+		if fields["interstitial"] != "chrome_signin" || fields["image"] != "synthetic-image" {
+			t.Fatalf("tracked=%v: screenshot lost marker: %s", tracked, out)
+		}
+	}
+}
+
 func TestCobrowse_UnknownAction(t *testing.T) {
 	_, err := runCobrowse(t, "frobnicate", nil)
 	if err == nil {

@@ -1,26 +1,74 @@
 #!/bin/bash
 # release.sh — Release automation for Citadel CLI
 #
-# Builds cross-platform binaries, tags the release, and creates a GitHub
-# Release with binaries attached. Idempotent — re-running after a failure
-# resumes from the last completed step.
+# CI builds the unsigned draft after a reviewed VERSION bump. This operator
+# entrypoint verifies it, signs locally, publishes and updates Homebrew.
+# The previous all-local engine is explicit emergency recovery only.
 #
 # Usage:
-#   ./scripts/release.sh              # Minor bump release
-#   ./scripts/release.sh patch        # Patch release
-#   ./scripts/release.sh --dry-run    # Preview without changes
-#   ./scripts/release.sh --status     # Check last release state
-#   ./scripts/release.sh --resume     # Resume after failure
-#   ./scripts/release.sh --clean      # Clear state and start fresh
+#   ./scripts/release.sh --sign-draft vX.Y.Z  # Sign and publish a verified CI draft
+#   ./scripts/release.sh --legacy ...        # Operator-only old-engine recovery
 #
-# Version is derived from git tags (vX.Y.Z). The binary version is set
-# at build time via ldflags.
+# Normal releases use VERSION from the merged PR and ldflags at build time.
+# The legacy engine retains its tag-derived version and resume journal.
 
 set -euo pipefail
+
+# ── Be gentle with the build host ─────────────────────────────────────────
+#
+# The release gate runs `go test ./...` and six cross-compiles. On a shared
+# build host that can starve other work, so by default the whole run is
+# re-executed once under a CPU limit:
+#   - CITADEL_RELEASE_CPUS (default 4): Go parallelism (GOMAXPROCS and
+#     `go test`/`go build -p`).
+#   - CITADEL_RELEASE_CPU_QUOTA (default 400%): a hard cgroup cap via a
+#     transient `systemd-run --user --scope`, when a user manager is available.
+#     Set it to "off" to skip the cap.
+#   - nice 19 and idle-class I/O priority, when available.
+# Set CITADEL_RELEASE_GENTLE=off to run at full speed.
+if [[ "${CITADEL_RELEASE_GENTLE:-on}" != "off" && -z "${CITADEL_RELEASE_GENTLE_ACTIVE:-}" ]]; then
+  export CITADEL_RELEASE_GENTLE_ACTIVE=1
+  _cpus="${CITADEL_RELEASE_CPUS:-4}"
+  if ! [[ "$_cpus" =~ ^[1-9][0-9]*$ ]]; then
+    echo "CITADEL_RELEASE_CPUS must be a positive integer, got: $_cpus" >&2
+    exit 1
+  fi
+  export GOMAXPROCS="$_cpus"
+  export GOFLAGS="${GOFLAGS:+$GOFLAGS }-p=$_cpus"
+  _prefix=()
+  _quota="${CITADEL_RELEASE_CPU_QUOTA:-400%}"
+  # Probe with a no-op scope first, so a host without a usable user manager
+  # falls back to nice/ionice instead of failing the release.
+  if [[ "$_quota" != "off" ]] && command -v systemd-run >/dev/null 2>&1 \
+     && systemd-run --user --scope --quiet -p "CPUQuota=$_quota" -- true >/dev/null 2>&1; then
+    _prefix+=(systemd-run --user --scope --quiet -p "CPUQuota=$_quota" --)
+  fi
+  command -v ionice >/dev/null 2>&1 && _prefix+=(ionice -c 3)
+  command -v nice >/dev/null 2>&1 && _prefix+=(nice -n 19)
+  if ((${#_prefix[@]} > 0)); then
+    exec "${_prefix[@]}" "$0" "$@"
+  fi
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
+
+# Primary release path: CI builds the unsigned draft; the operator performs
+# only verification, local signing, publication and the Homebrew update here.
+if [[ "${1:-}" == "--sign-draft" ]]; then
+  if [[ "$#" -ne 2 ]]; then
+    echo "Usage: scripts/release.sh --sign-draft vX.Y.Z" >&2
+    exit 1
+  fi
+  exec python3 -I -B "$SCRIPT_DIR/release_draft.py" sign "$2"
+fi
+if [[ "${1:-}" != "--legacy" ]]; then
+  echo "Use a reviewed VERSION bump PR, then scripts/release.sh --sign-draft vX.Y.Z." >&2
+  echo "The old all-local engine requires the explicit --legacy recovery option." >&2
+  exit 2
+fi
+shift
 
 # ── Project config ─────────────────────────────────────────────────────────
 
@@ -90,11 +138,62 @@ hook_pre_publish() {
     --in "$release_dir/checksums.txt" --sig "$release_dir/checksums.txt.sig"
 }
 
+# The test gate trusts main's CI instead of re-running it here: CI already
+# runs the full suite, vet and lint on every main commit, and re-running them
+# on the release host duplicates that work on a shared machine. The release
+# must be cut from a clean tree at origin/main where every CI check succeeded.
+# Set CITADEL_RELEASE_LOCAL_TESTS=1 to run go test and go vet locally instead.
 hook_test() {
-  info "Running Go tests..."
-  go test ./...
-  info "Running Go vet..."
-  go vet ./...
+  if [[ "${CITADEL_RELEASE_LOCAL_TESTS:-0}" == "1" ]]; then
+    info "Running Go tests locally (CITADEL_RELEASE_LOCAL_TESTS=1)..."
+    go test ./...
+    info "Running Go vet..."
+    go vet ./...
+    return
+  fi
+
+  # git status --porcelain also lists untracked files: go build compiles any
+  # stray .go file in the tree, and CI never saw those.
+  local dirty
+  dirty=$(git status --porcelain --untracked-files=all)
+  if [[ -n "$dirty" ]]; then
+    err "The working tree has uncommitted or untracked files; CI did not test them:"
+    printf '%s\n' "$dirty" | head -20 >&2
+    return 1
+  fi
+  local sha main_sha
+  sha=$(git rev-parse HEAD)
+  git fetch -q origin main
+  main_sha=$(git rev-parse origin/main)
+  if [[ "$sha" != "$main_sha" ]]; then
+    err "HEAD ($sha) is not origin/main ($main_sha); release only from a CI-tested main commit."
+    return 1
+  fi
+
+  info "Checking main CI at ${sha:0:12} (set CITADEL_RELEASE_LOCAL_TESTS=1 to test locally instead)..."
+  # Every check run at the commit must have finished as success, skipped or
+  # neutral: the "Build + Test" aggregate is required, and a red lint, vet or
+  # Windows job under another name blocks the release too. A re-run check
+  # counts by its latest attempt.
+  local report
+  if ! report=$(gh api --paginate "repos/${RELEASE_GITHUB_REPO}/commits/${sha}/check-runs?per_page=100" \
+      --jq '.check_runs[] | [.name, (.completed_at // ""), .status, (.conclusion // "")] | @tsv'); then
+    err "Could not read CI check runs for ${sha}."
+    return 1
+  fi
+  local latest bad
+  latest=$(printf '%s\n' "$report" | sort -t$'\t' -k1,1 -k2,2 | awk -F'\t' 'NF{last[$1]=$0} END{for (n in last) print last[n]}')
+  if ! printf '%s\n' "$latest" | awk -F'\t' '$1=="Build + Test"{f=1} END{exit !f}'; then
+    err "Required check \"Build + Test\" has not run at ${sha:0:12}. Wait for CI."
+    return 1
+  fi
+  bad=$(printf '%s\n' "$latest" | awk -F'\t' 'NF && !($3=="completed" && ($4=="success" || $4=="skipped" || $4=="neutral")){print "  " $1 ": " $3 " " $4}')
+  if [[ -n "$bad" ]]; then
+    err "CI at ${sha:0:12} is not all green. Wait for CI, re-run flakes, or fix main:"
+    printf '%s\n' "$bad" >&2
+    return 1
+  fi
+  info "Main CI passed at ${sha:0:12} ($(printf '%s\n' "$latest" | grep -c .) checks)."
 }
 
 hook_build() {

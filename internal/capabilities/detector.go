@@ -605,6 +605,30 @@ func detectMeetingCapability() bool {
 	))
 }
 
+// DetectMeetingCapability re-evaluates only the `meeting` capability: the install
+// marker stat, the module /health probe (only when installed) and the legacy
+// host-stack LookPaths. It runs no docker sweep and no GPU probe, so it is cheap
+// enough for a heartbeat-tick reconciler (citadel-cli#1758).
+func DetectMeetingCapability() bool { return detectMeetingCapability() }
+
+// NodeDirHook resolves the node directory the manifest is read from
+// (--node-dir/CITADEL_NODE_DIR, else the node_config_dir indirection). It is set
+// by package cmd, which owns that resolution; this package is a leaf and cannot
+// import cmd. A nil hook, an error, or an empty result falls back to
+// platform.ConfigDir().
+var NodeDirHook func() string
+
+// meetingNodeDir is the directory whose services/ subdirectory holds installed
+// module compose files -- the same node dir `citadel module install` writes to.
+func meetingNodeDir() string {
+	if NodeDirHook != nil {
+		if dir := NodeDirHook(); dir != "" {
+			return dir
+		}
+	}
+	return platform.ConfigDir()
+}
+
 // meetingCapabilitySignal is the pure "can this node run a meeting" predicate: the
 // containerized module is healthy OR the legacy host stack is present. Extracted
 // so the OR-of-sources logic is testable in isolation from the probes.
@@ -631,9 +655,15 @@ func legacyHostStack() bool {
 // treating a coincidental listener on the port as the module, and short-circuits
 // the probe when the module isn't installed.
 func meetingModuleHealthy() bool {
-	if !meetingModuleInstalled(platform.ConfigDir()) {
+	if !meetingModuleInstalled(meetingNodeDir()) {
 		return false
 	}
+	return meetingHealthProbe()
+}
+
+// meetingHealthProbe is a seam so tests can assert the install-marker gate
+// without a listener on the published port.
+var meetingHealthProbe = func() bool {
 	hc := catalog.HealthCheck{
 		Endpoint: "/health",
 		Port:     services.MeetingdHostPort,
@@ -644,7 +674,7 @@ func meetingModuleHealthy() bool {
 
 // meetingModuleInstalled reports whether the meeting module's compose has been
 // installed on this node. `citadel module install` copies the resolved compose to
-// <configDir>/services/<name>.yml (cmd/module_ops.go), so its presence is the
+// <nodeDir>/services/<name>.yml (cmd/module_ops.go), so its presence is the
 // on-disk install marker — checkable without the cmd-package manifest reader
 // (which capabilities cannot import).
 func meetingModuleInstalled(configDir string) bool {

@@ -377,6 +377,64 @@ func TestWindowsRealBrowserSession(t *testing.T) {
 	}
 }
 
+// TestWindowsRealBrowserActionLatency asserts status, a warm screenshot, click
+// and type finish within 5s, and the first screenshot after start within
+// CobrowseActionDeadline, all under the platform's 15s job wait, with their
+// effects reported (citadel-cli#1663). The name matches the existing
+// ^TestWindowsRealBrowser run list.
+func TestWindowsRealBrowserActionLatency(t *testing.T) {
+	requireBrowserIT(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><title>latency</title><div style="height:3000px">tall</div><textarea id="t" rows="3"></textarea>`)
+	}))
+	t.Cleanup(srv.Close)
+	m := newCobrowseSessionManager(filepath.Join(t.TempDir(), "cobrowse-sessions"), 2)
+	st, err := m.StartSession(srv.URL + "/")
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { _ = m.StopAll() })
+	const budget = 5 * time.Second
+	withinBudget := func(name string, limit time.Duration, f func() error) {
+		t.Helper()
+		start := time.Now()
+		if err := f(); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if el := time.Since(start); el > limit {
+			t.Errorf("%s took %s, budget %s", name, el, limit)
+		}
+	}
+	within := func(name string, f func() error) { t.Helper(); withinBudget(name, budget, f) }
+	within("status", func() error {
+		if got, ok := m.SessionStatus(st.ID); !ok || got.URL == "" {
+			return fmt.Errorf("no url in status: %+v", got)
+		}
+		return nil
+	})
+	// The first capture after a cold start can take most of the action budget
+	// on a slow hosted runner (citadel-cli#1694); it must still finish inside
+	// the action deadline the platform relies on. A warm capture then has the
+	// tighter budget.
+	withinBudget("cold screenshot", CobrowseActionDeadline, func() error { _, _, err := m.ScreenshotStatus(st.ID); return err })
+	within("screenshot", func() error { _, _, err := m.ScreenshotStatus(st.ID); return err })
+	within("click", func() error {
+		got, err := m.Click(st.ID, "#t", nil, nil)
+		if err == nil && (got.Effects == nil || !got.Effects.Clicked || !got.Effects.Scrolled) {
+			err = fmt.Errorf("click effects %+v", got.Effects)
+		}
+		return err
+	})
+	within("type", func() error {
+		got, err := m.Type(st.ID, "hello")
+		if err == nil && (got.Effects == nil || got.Effects.TypedLength != 5) {
+			err = fmt.Errorf("type effects %+v", got.Effects)
+		}
+		return err
+	})
+}
+
 // TestWindowsRealBrowserOwnerKilled covers two acceptance items: killing the
 // owner leaves no browser process, and the stale session dir it leaves is swept
 // on the next start.
@@ -568,5 +626,26 @@ func TestWindowsRealBrowserProbeRetryAndSingleLaunch(t *testing.T) {
 	}
 	if n := loads.Load(); n != 1 {
 		t.Fatalf("the start URL must be loaded exactly once, got %d", n)
+	}
+}
+
+// A browser we stopped ourselves after a timeout must not be reported as having
+// exited on its own (#1795).
+func TestWindowsHeadlessLaunchErrorWording(t *testing.T) {
+	cause := errors.New("timed out waiting for DevToolsActivePort")
+	self := headlessLaunchError("edge", true, 1, cause)
+	if !strings.Contains(self.Error(), "exited during headless launch (exit code 1)") {
+		t.Fatalf("self-exit not reported: %v", self)
+	}
+	slow := headlessLaunchError("edge", false, 0, cause)
+	if strings.Contains(slow.Error(), "exited during") {
+		t.Fatalf("timeout reported as exit: %v", slow)
+	}
+	if !errors.Is(slow, ErrBrowserAutomationBlocked) || !strings.Contains(slow.Error(), cause.Error()) {
+		t.Fatalf("timeout lost its sentinel or cause: %v", slow)
+	}
+	imp := headlessLaunchError("edge", false, 0, errCDPImpostor)
+	if !errors.Is(imp, errCDPImpostor) {
+		t.Fatalf("impostor not wrapped: %v", imp)
 	}
 }

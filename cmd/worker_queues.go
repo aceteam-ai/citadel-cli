@@ -3,9 +3,11 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/aceteam-ai/citadel-cli/internal/capabilities"
+	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 )
@@ -24,6 +26,8 @@ import (
 // the single place both entry points now build this set, so they cannot
 // drift apart again.
 type workerQueueParams struct {
+	Role   config.WorkerRole
+	NodeID string
 	// APIBaseURL and Token authenticate the FetchWorkerConfig lookup.
 	APIBaseURL string
 	Token      string
@@ -58,10 +62,31 @@ type workerQueueParams struct {
 // list, and the residual inference-queue gap for InferenceQueueReconciler
 // (see missingQueues' doc comment for why that gap can be nil).
 type workerQueueResult struct {
+	Err       error
 	WorkQueue string
 	OrgID     string
 	Queues    []string
 	Missing   []string
+}
+
+// controlWorkerQueues refuses missing identity instead of letting a source's
+// empty-list fallback subscribe to a shared pool.
+func controlWorkerQueues(p workerQueueParams) workerQueueResult {
+	if strings.TrimSpace(p.OrgID) == "" || strings.TrimSpace(p.NodeID) == "" {
+		return workerQueueResult{Err: fmt.Errorf("control worker requires an enrolled organization and node ID; no shared queue fallback")}
+	}
+	return workerQueueResult{OrgID: p.OrgID, Queues: []string{nodeQueueName(p.OrgID, p.NodeID)}}
+}
+
+func resolveDirectRedisQueuesForRole(p workerQueueParams, tags []string, manual []capabilities.Capability) workerQueueResult {
+	role, err := config.ResolveWorkerRole(p.Role)
+	if err != nil {
+		return workerQueueResult{Err: err}
+	}
+	if role == config.WorkerRoleControl {
+		return controlWorkerQueues(p)
+	}
+	return workerQueueResult{OrgID: p.OrgID, WorkQueue: p.WorkQueue, Queues: resolveDirectRedisQueues(p.WorkQueue, tags, manual, p.OrgID)}
 }
 
 // resolveWorkerQueues resolves the API-mode boot-time Redis Streams queue
@@ -82,6 +107,13 @@ type workerQueueResult struct {
 // downstream of queue resolution (per-node shell stream, telemetry), which
 // is a behavior change outside #839's stated scope (queue-set parity only).
 func resolveWorkerQueues(ctx context.Context, p workerQueueParams) workerQueueResult {
+	role, err := config.ResolveWorkerRole(p.Role)
+	if err != nil {
+		return workerQueueResult{Err: err}
+	}
+	if role == config.WorkerRoleControl {
+		return controlWorkerQueues(p)
+	}
 	debug := p.DebugFn
 	if debug == nil {
 		debug = func(string, ...any) {}

@@ -58,7 +58,50 @@ const (
 	// as any other input.
 	InputTypeTargetSwitch = "target_switch"
 	InputTypeTargetClose  = "target_close"
+	// InputTypeFileAttach answers the page's pending file chooser with a file
+	// already staged in this session (citadel-cli#1723). It needs live control
+	// like every other input, and is handled only when the session offers it
+	// (FileAttachSession); anything else ignores it.
+	InputTypeFileAttach = "file_attach"
 )
+
+// FileChooserType is the "type" of the TEXT frame that tells the viewer whether
+// a file chooser is pending and which staged files it may attach. It is sent
+// only by a session that supports file attach, once after init and again
+// whenever it changes. Pending is false when there is no chooser, the viewer
+// lacks control or the node does not permit it; the staged list is then empty.
+const FileChooserType = "file_chooser"
+
+// StagedFileInfo is one staged file as the viewer sees it: name and size only.
+type StagedFileInfo struct {
+	Name string `json:"name"`
+	Size int64  `json:"size"`
+}
+
+// FileChooserMessage is the file_chooser frame.
+type FileChooserMessage struct {
+	Type          string           `json:"type"` // always "file_chooser"
+	Pending       bool             `json:"pending"`
+	BackendNodeID int              `json:"backend_node_id,omitempty"`
+	Multiple      bool             `json:"multiple,omitempty"`
+	Staged        []StagedFileInfo `json:"staged"`
+}
+
+// FileAttachResultType is the "type" of the TEXT frame that answers a
+// file_attach input.
+const FileAttachResultType = "file_attach_result"
+
+// FileAttachResult answers one file_attach. Error is a fixed reason code
+// (no_control, viewer_gone, files_disabled, no_pending_chooser, chooser_mismatch,
+// invalid_staged_name, staged_file_unavailable, page_changed,
+// session_unavailable, busy, attach_failed), never a path, URL or content.
+// StagedName is echoed only on success.
+type FileAttachResult struct {
+	Type       string `json:"type"` // always "file_attach_result"
+	OK         bool   `json:"ok"`
+	StagedName string `json:"staged_name,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
 
 // TargetsType is the "type" of the TEXT frame that lists the session's open
 // pages. The server sends it after init and again whenever the list or the
@@ -74,7 +117,8 @@ type TargetInfo struct {
 	Active bool   `json:"active,omitempty"`
 	// Refused marks a page the session's policy refuses. It is never active and
 	// is not streamed; the viewer shows it as blocked.
-	Refused bool `json:"refused,omitempty"`
+	Refused  bool   `json:"refused,omitempty"`
+	OpenedBy string `json:"opened_by,omitempty"`
 }
 
 // TargetsMessage lists the open pages. Targets keep the browser's order.
@@ -117,6 +161,10 @@ type InputMessage struct {
 	Value     string `json:"value,omitempty"`     // native select option value (select only)
 	ProbeID   string `json:"probe_id,omitempty"`  // viewer correlation for select_probe replies
 	Target    string `json:"target,omitempty"`    // page id for target_switch and target_close
+
+	// File attach fields (Type == "file_attach").
+	StagedName    string `json:"staged_name,omitempty"`     // a name from the last file_chooser frame
+	BackendNodeID int    `json:"backend_node_id,omitempty"` // the pending chooser's node
 }
 
 // parseInputMessage decodes a viewer TEXT frame. It returns ok=false when the
@@ -135,6 +183,10 @@ func parseInputMessage(data []byte) (InputMessage, bool) {
 		}
 	case InputTypeTargetSwitch, InputTypeTargetClose:
 		if m.Target == "" || len(m.Target) > 128 {
+			return InputMessage{}, false
+		}
+	case InputTypeFileAttach:
+		if m.StagedName == "" || len(m.StagedName) > 128 || m.BackendNodeID <= 0 {
 			return InputMessage{}, false
 		}
 	default:

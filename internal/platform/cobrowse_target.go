@@ -3,6 +3,8 @@ package platform
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
+	"sync"
 )
 
 // TargetProbe names the action whose target InspectTarget describes.
@@ -24,6 +26,16 @@ type TargetRect struct {
 	VH float64 `json:"vh"`
 }
 
+// FormFile is submission metadata only. Bytes and local paths never leave the
+// browser. Empty, unselected file controls are bound but not shown as files.
+type FormFile struct {
+	Field        string `json:"field"`
+	Name         string `json:"name"`
+	Size         int64  `json:"size"`
+	Type         string `json:"type"`
+	LastModified int64  `json:"last_modified"`
+}
+
 // TargetInfo describes what an action is about to act on. It is read inside
 // the page and decoded without interpretation; the local-mode commit
 // classifier (localcobrowse.Classify) decides what it means. ContentHash binds
@@ -34,22 +46,25 @@ type TargetInfo struct {
 	// Resolved is false when the target could not be identified (nothing at
 	// the point, a canvas, a nested frame). Callers must treat that as a
 	// commit: an unknown target is never assumed harmless.
-	Resolved   bool   `json:"resolved"`
-	Reason     string `json:"reason,omitempty"`
-	PageURL    string `json:"page_url,omitempty"`
-	Tag        string `json:"tag,omitempty"`
-	Role       string `json:"role,omitempty"`
-	InputType  string `json:"input_type,omitempty"`
-	Name       string `json:"name,omitempty"`
-	Href       string `json:"href,omitempty"`
-	Actionable bool   `json:"actionable,omitempty"`
-	Entry      bool   `json:"entry,omitempty"`
-	Composer   bool   `json:"composer,omitempty"`
-	Search     bool   `json:"search,omitempty"`
-	AutoSubmit bool   `json:"auto_submit,omitempty"`
-	InForm     bool   `json:"in_form,omitempty"`
-	FormMethod string `json:"form_method,omitempty"`
-	FormAction string `json:"form_action,omitempty"`
+	Resolved  bool   `json:"resolved"`
+	Reason    string `json:"reason,omitempty"`
+	PageURL   string `json:"page_url,omitempty"`
+	Tag       string `json:"tag,omitempty"`
+	Role      string `json:"role,omitempty"`
+	InputType string `json:"input_type,omitempty"`
+	// FileChooser is derived only from a native file input or a label's native
+	// associated file control, never from attributes on the label itself.
+	FileChooser bool   `json:"file_chooser,omitempty"`
+	Name        string `json:"name,omitempty"`
+	Href        string `json:"href,omitempty"`
+	Actionable  bool   `json:"actionable,omitempty"`
+	Entry       bool   `json:"entry,omitempty"`
+	Composer    bool   `json:"composer,omitempty"`
+	Search      bool   `json:"search,omitempty"`
+	AutoSubmit  bool   `json:"auto_submit,omitempty"`
+	InForm      bool   `json:"in_form,omitempty"`
+	FormMethod  string `json:"form_method,omitempty"`
+	FormAction  string `json:"form_action,omitempty"`
 	// FormEnctype and FormTarget are the effective submission encoding and
 	// target, after any submitter override (formenctype, formtarget).
 	FormEnctype string `json:"form_enctype,omitempty"`
@@ -65,7 +80,8 @@ type TargetInfo struct {
 	ContentHash string `json:"content_hash,omitempty"`
 	// Oversized is set when the content is too large to hash in full. Such a
 	// target is a commit whose approval can never be redeemed.
-	Oversized bool `json:"oversized,omitempty"`
+	Oversized bool       `json:"oversized,omitempty"`
+	FormFiles []FormFile `json:"form_files,omitempty"`
 }
 
 // FormDigestScript is the in-page encoding and hash of a form's fields, shared
@@ -122,9 +138,10 @@ const FormDigestScript = `
 // new FormData(form, submitter): that covers select-multiple, disabled controls,
 // controls joined by form=, form-associated custom elements (whatever they pass
 // to setFormValue) and the submitter's name and value by definition. Entries are
-// encoded as [name, kind, value] tuples in order. A File entry, or a FormData
-// constructor that throws, makes the target unverifiable (bad), and no approval
-// of it is redeemable. Entries named like a password or one-time-code control are
+// encoded as [name, kind, value] tuples in order; files use
+// [name, "file", fileName, size, type, lastModified]. Unreadable metadata or a
+// FormData constructor that throws makes the target unverifiable (bad).
+// Entries named like a password or one-time-code control are
 // dropped, conservatively by name. Composers outside the form (the focused one,
 // or the target) are added from their own text; one whose value cannot be read
 // is bad too. env supplies the DOM reads at prototype level, so a control named
@@ -151,7 +168,20 @@ const FormSnapshotScript = `
 		return f === "current-password" || f === "new-password" || f === "one-time-code";
 	}
 	function buildSnapshot(env, form, sub, t, focus, tIsEntry){
-		var tuples = [], bad = "";
+		var tuples = [], files = [], bad = "";
+		function fileTuple(name, val){
+			var f;
+			try { f = env.fileMeta(val); } catch (x) { bad = "the file metadata could not be read"; return; }
+			if (!f || typeof f.name !== "string" || typeof f.type !== "string" || !Number.isSafeInteger(f.size) || f.size < 0 || !Number.isSafeInteger(f.lastModified)) {
+				bad = "the file metadata could not be read"; return;
+			}
+			// FormData synthesizes a fresh empty File for an unselected input.
+			// Its timestamp changes on each read; it is not an attached file.
+			var empty = f.name === "" && f.size === 0, modified = empty ? 0 : f.lastModified;
+			tuples.push([name, "file", f.name, f.size, f.type, modified]);
+			if (!empty) files.push({field:name, name:f.name, size:f.size, type:f.type, last_modified:modified});
+			if (files.length > 128) bad = "the form has too many attached files to display";
+		}
 		if (form) {
 			var fd = null;
 			try { fd = env.formData(form, sub); } catch (x) { bad = "the browser could not build this form's submission"; }
@@ -194,6 +224,7 @@ const FormSnapshotScript = `
 				// password or an unchecked one-time-code checkbox, is unverifiable.
 				for (var e2 = 0; e2 < entries.length; e2++) {
 					var k2 = "n:" + String(entries[e2][0]);
+					if (sens[k2] && env.isFile(entries[e2][1])) { bad = "a file entry shares its name with a password or one-time-code field"; break; }
 					if (sens[k2]) { got[k2] = got[k2] || []; got[k2].push(env.isFile(entries[e2][1]) ? "\u0000file" : String(entries[e2][1]).replace(/\r\n?/g, "\n")); }
 				}
 				for (var key2 in sens) {
@@ -204,9 +235,10 @@ const FormSnapshotScript = `
 				if (!bad) {
 					for (var m2 = 0; m2 < entries.length; m2++) {
 						var name = String(entries[m2][0]), val = entries[m2][1];
-						if (env.isFile(val)) { bad = "the form submits a file"; break; }
 						if (skip["n:" + name]) continue;
-						tuples.push([name, "string", String(val)]);
+						if (env.isFile(val)) fileTuple(name, val);
+						else tuples.push([name, "string", String(val)]);
+						if (bad) break;
 					}
 				}
 			}
@@ -215,7 +247,13 @@ const FormSnapshotScript = `
 			var tag = String(c.tagName || "").toLowerCase();
 			if (env.disabled(c)) return;
 			var ty = String(c.type || "").toLowerCase();
-			if (ty === "file") { bad = "the page has a file input"; return; }
+			if (ty === "file") {
+				try {
+					var picked = env.files(c);
+					for (var fi = 0; fi < picked.length; fi++) fileTuple(String(c.name || ""), picked[fi]);
+				} catch (x) { bad = "the file metadata could not be read"; }
+				return;
+			}
 			if (/^(password|submit|button|reset|image)$/.test(ty)) return;
 			var ac = String(env.attr(c, "autocomplete") || "");
 			if (sensitiveAC(ac)) return;
@@ -228,9 +266,9 @@ const FormSnapshotScript = `
 		}
 		if (!bad) {
 			if (focus && focus !== t && (focus.tagName === "TEXTAREA" || focus.isContentEditable || focus.tagName === "INPUT") && !(form && env.inForm(form, focus))) add(focus, false);
-			if (t && !(form && env.inForm(form, t)) && (tIsEntry || String(t.tagName || "").toLowerCase() === "select")) add(t, true);
+			if (t && !(form && env.inForm(form, t)) && (tIsEntry || String(t.tagName || "").toLowerCase() === "select" || String(t.type || "").toLowerCase() === "file")) add(t, true);
 		}
-		return {tuples: tuples, bad: bad};
+		return {tuples: tuples, files: files, bad: bad};
 	}
 	// normTarget keeps a browsing-context name exactly (names are case-sensitive)
 	// and lower-cases only the reserved keywords.
@@ -242,7 +280,7 @@ const FormSnapshotScript = `
 	// button. The submitter's own name, id, type and value are folded into the
 	// digest. bad or oversized means the target cannot be verified in full.
 	function inspectForm(env, form, t, focus, tIsEntry, maxc){
-		var r = {bad: "", oversized: false, digest: "", action: "", method: "", enctype: "", target: "", overrides: ""};
+		var r = {bad: "", oversized: false, digest: "", files: [], action: "", method: "", enctype: "", target: "", overrides: ""};
 		var sub = null;
 		if (form) {
 			var els = env.elements(form);
@@ -281,6 +319,7 @@ const FormSnapshotScript = `
 		var d = formDigest(snap.tuples);
 		if (sub) d = formDigest([d, [sub.name || "", sub.id || "", String(sub.type || "").toLowerCase(), sub.value === undefined ? "" : String(sub.value)]]);
 		r.digest = d;
+		r.files = snap.files;
 		return r;
 	}
 `
@@ -352,14 +391,52 @@ const targetProbeScript = `(function(kind, selector, px, py){
 	var actSel = "button,a[href],input[type=submit],input[type=image],input[type=button],input[type=reset],[role=button],[role=link],[role=menuitem],[role=tab],summary,[onclick]";
 	var act = (kind === "click" && el.closest) ? el.closest(actSel) : (el.matches && el.matches(actSel) ? el : null);
 	var t = act || el;
+	function fileInput(e) {
+		try { return e instanceof HTMLInputElement && Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "type").get.call(e) === "file"; }
+		catch (x) { return false; }
+	}
+	function labelControl(e) {
+		try { return e instanceof HTMLLabelElement ? Object.getOwnPropertyDescriptor(HTMLLabelElement.prototype, "control").get.call(e) : null; }
+		catch (x) { return null; }
+	}
+	function interactiveDescendant(e, label) {
+		for (var n = e; n && n !== label; n = n.parentElement) {
+			var css = null; try { css = getComputedStyle(n); } catch (x) {}
+			if (n.matches(actSel + ",input,select,textarea,[tabindex],[contenteditable],img[usemap],video[controls],audio[controls]") || (css && css.cursor === "pointer")) return true;
+		}
+		return false;
+	}
+	function nativeInteractiveDescendant(e, label) {
+		for (var n = e; n && n !== label; n = n.parentElement) {
+			if (n.matches("a[href],audio[controls],button,details,embed,iframe,img[usemap],input:not([type=hidden]),label,select,textarea,video[controls]")) return true;
+		}
+		return false;
+	}
+	// The browser forwards a label click to its native associated control.
+	// Judge that control, not potentially misleading text on the label. File
+	// labels keep their chooser path; interactive descendants stay themselves.
+	var lab = el.closest ? el.closest("label") : null, labelActionName = "";
+	if (lab) {
+		var control = labelControl(lab);
+		if (control && !fileInput(control) && !nativeInteractiveDescendant(el, lab)) {
+			if (control.tagName.toLowerCase().indexOf("-") > 0) { out.reason = "the label activates a custom control that cannot be classified"; return out; }
+			// CSS cursor, tabindex and ARIA roles do not suppress the browser's
+			// label forwarding. Keep any such target's own action words as well.
+			if (act) labelActionName = nameOf(act);
+			t = control;
+			if (control.matches(actSel)) act = control;
+		} else if (control && fileInput(control) && (!act || act === lab) && !interactiveDescendant(el, lab)) { t = lab; }
+	}
 	tag = t.tagName.toLowerCase();
 	var cs = null; try { cs = getComputedStyle(t); } catch (e) {}
 	var role = (t.getAttribute("role") || "").toLowerCase();
 	var type = (t.type || t.getAttribute("type") || "").toLowerCase();
+	var chooser = fileInput(t) || (tag === "label" && fileInput(labelControl(t)));
+	if (tag === "label") type = chooser ? "file" : "";
 	var isEntry = tag === "textarea" || t.isContentEditable || role === "textbox" || role === "searchbox" || role === "combobox" ||
 		(tag === "input" && !/^(checkbox|radio|button|submit|reset|image|file|hidden|range|color)$/.test(type));
-	out.tag = tag; out.role = role; out.input_type = type;
-	out.name = nameOf(t);
+	out.tag = tag; out.role = role; out.input_type = type; out.file_chooser = chooser;
+	out.name = nameOf(t) + (labelActionName ? " " + labelActionName : "");
 	out.actionable = !!act || (!isEntry && ((cs && cs.cursor === "pointer") || t.hasAttribute("tabindex")));
 	out.entry = isEntry;
 	out.composer = tag === "textarea" || !!t.isContentEditable || role === "textbox";
@@ -373,6 +450,13 @@ const targetProbeScript = `(function(kind, selector, px, py){
 		formData: function(f, sub){ return sub ? new FormData(f, sub) : new FormData(f); },
 		entries: function(fd){ var out = []; fd.forEach(function(v, k){ out.push([k, v]); }); return out; },
 		isFile: function(v){ return typeof v !== "string"; },
+		fileMeta: function(v){
+			return {name:Object.getOwnPropertyDescriptor(File.prototype,"name").get.call(v),
+				size:Object.getOwnPropertyDescriptor(Blob.prototype,"size").get.call(v),
+				type:Object.getOwnPropertyDescriptor(Blob.prototype,"type").get.call(v),
+				lastModified:Object.getOwnPropertyDescriptor(File.prototype,"lastModified").get.call(v)};
+		},
+		files: function(c){ return Array.prototype.slice.call(Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,"files").get.call(c) || []); },
 		inForm: function(f, c){ try { return Array.prototype.indexOf.call(Object.getOwnPropertyDescriptor(HF, "elements").get.call(f), c) >= 0; } catch (x) { return false; } },
 		has: function(e, n){ try { return EP.hasAttribute.call(e, n); } catch (x) { return false; } },
 		abs: abs,
@@ -400,6 +484,7 @@ const targetProbeScript = `(function(kind, selector, px, py){
 	out.rect = {x: r.x, y: r.y, w: r.width, h: r.height, vw: window.innerWidth, vh: window.innerHeight};
 	if (fi.bad) { out.reason = fi.bad; return out; }
 	if (fi.oversized) { out.oversized = true; } else { out.content_hash = fi.digest; }
+	out.form_files = fi.files;
 	out.resolved = true;
 	return out;
 })`
@@ -412,8 +497,108 @@ func (m *CobrowseSessionManager) InspectTarget(id string, p TargetProbe) (Target
 	if err != nil {
 		return TargetInfo{}, err
 	}
-	pn, err := s.pinAction()
+	b, cancel := newActionBudget()
+	defer cancel()
+	pn, err := s.pinActionCtx(b.op)
 	if err != nil {
+		return TargetInfo{}, err
+	}
+	c, err := openCDPConn(b.op, pn)
+	if err != nil {
+		return TargetInfo{}, err
+	}
+	defer c.Close()
+	return inspectTargetCachedOn(c, p, func() error {
+		if err := pn.verifyCtx(b.op); err != nil {
+			return err
+		}
+		return s.driverFence(pn)
+	}, &s.formWorld, fmt.Sprintf("%d/%s/%s", pn.port, pn.id, pn.ws))
+}
+
+type formWorldKey struct{ target, frame, loader string }
+
+// Only the latest document is cached, so page churn cannot grow session state.
+// The browser owns this named isolated world; a stale context is never used as
+// a reason to fall back to the page world.
+type formSnapshotWorld struct {
+	mu  sync.Mutex
+	key formWorldKey
+	id  int
+}
+
+func (w *formSnapshotWorld) get(k formWorldKey) int {
+	if w == nil || k.loader == "" {
+		return 0
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.key == k {
+		return w.id
+	}
+	return 0
+}
+
+func (w *formSnapshotWorld) set(k formWorldKey, id int) {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.key, w.id = k, id
+}
+
+func (w *formSnapshotWorld) forget(k formWorldKey) {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.key == k {
+		w.id = 0
+	}
+}
+
+// Read the snapshot in a browser-created isolated world. The entire probe uses
+// the same DOM observation, avoiding a main-world/isolated-world merge race.
+// Page code cannot replace File/Blob getters or the FormData constructor here.
+func inspectTargetOn(c cdpCaller, p TargetProbe, fence func() error) (TargetInfo, error) {
+	return inspectTargetCachedOn(c, p, fence, nil, "")
+}
+
+func inspectTargetCachedOn(c cdpCaller, p TargetProbe, fence func() error, cache *formSnapshotWorld, target string) (TargetInfo, error) {
+	if err := fence(); err != nil {
+		return TargetInfo{}, err
+	}
+	tree, err := c.Call("Page.getFrameTree", nil)
+	if err != nil {
+		return TargetInfo{}, err
+	}
+	if err := fence(); err != nil {
+		return TargetInfo{}, err
+	}
+	frame := rootFrameID(tree)
+	if frame == "" {
+		return TargetInfo{}, ErrTargetChanged
+	}
+	ft, _ := tree["frameTree"].(map[string]any)
+	root, _ := ft["frame"].(map[string]any)
+	loader, _ := root["loaderId"].(string)
+	key := formWorldKey{target: target, frame: frame, loader: loader}
+	contextID := cache.get(key)
+	if contextID == 0 {
+		world, err := c.Call("Page.createIsolatedWorld", map[string]any{"frameId": frame, "worldName": "citadel-form-snapshot"})
+		if err != nil {
+			return TargetInfo{}, err
+		}
+		value, ok := world["executionContextId"].(float64)
+		if !ok || value <= 0 || value != float64(int(value)) {
+			return TargetInfo{}, ErrTargetChanged
+		}
+		contextID = int(value)
+		cache.set(key, contextID)
+	}
+	if err := fence(); err != nil {
 		return TargetInfo{}, err
 	}
 	var px, py any = nil, nil
@@ -424,9 +609,26 @@ func (m *CobrowseSessionManager) InspectTarget(id string, p TargetProbe) (Target
 	pyj, _ := json.Marshal(py)
 	expr := fmt.Sprintf("%s(%s,%s,%s,%s)", targetProbeScript,
 		jsStringLiteral(p.Kind), jsStringLiteral(p.Selector), pxj, pyj)
-	val, err := runtimeEvaluate(pn, expr)
+	res, err := c.Call("Runtime.evaluate", map[string]any{"expression": expr, "contextId": contextID, "returnByValue": true, "awaitPromise": false})
 	if err != nil {
+		// A lost document is refused now. The next probe obtains a fresh frame
+		// tree and recreates its context; no stale read or action is retried.
+		message := strings.ToLower(err.Error())
+		if strings.Contains(message, "cannot find context") || strings.Contains(message, "cannot find execution context") || strings.Contains(message, "execution context was destroyed") {
+			cache.forget(key)
+		}
 		return TargetInfo{}, err
+	}
+	if err := fence(); err != nil {
+		return TargetInfo{}, err
+	}
+	if res["exceptionDetails"] != nil {
+		return TargetInfo{}, fmt.Errorf("the form snapshot could not be read")
+	}
+	remote, _ := res["result"].(map[string]any)
+	val, ok := remote["value"].(map[string]any)
+	if !ok {
+		return TargetInfo{}, fmt.Errorf("the form snapshot could not be read")
 	}
 	raw, err := json.Marshal(val)
 	if err != nil {

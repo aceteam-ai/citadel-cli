@@ -449,3 +449,20 @@ func TestRecoverInterruptedSwap_ExposedWrapperIsWindowsScoped(t *testing.T) {
 		t.Fatalf("expected no-op (recovered=false) on non-Windows")
 	}
 }
+
+// TestRecoverInterruptedSwap_NoLockNoArtifactsIsSilent pins #1682: a present
+// binary whose update lock was never provisioned has nothing to recover and
+// must not produce an error (the CLI printed a spurious warning).
+func TestRecoverInterruptedSwap_NoLockNoArtifactsIsSilent(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "citadel.exe")
+	buildCitadelFixture(t, dst, "v2.1.0")
+
+	recovered, err := recoverInterruptedSwap(dst)
+	if err != nil || recovered {
+		t.Fatalf("recoverInterruptedSwap with binary and no lock = %v, %v; want false, nil", recovered, err)
+	}
+	if _, statErr := os.Stat(dst + ".citadel-update.lock"); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("recovery must not create the lock: %v", statErr)
+	}
+}
