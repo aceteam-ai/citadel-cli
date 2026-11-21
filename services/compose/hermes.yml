@@ -28,7 +28,7 @@
 
 services:
   hermes:
-    image: ghcr.io/aceteam-ai/hermes-service:latest
+    image: ghcr.io/aceteam-ai/hermes-service:6fad6be3951e28d6a4ad34a6e39e8c90113328ae@sha256:f8ba9d904b9330a76dc86363f00f13d0261273faba74688a44d59eda95772617
     container_name: citadel-hermes
     ports:
       - "${CITADEL_HERMES_HOST_PORT:?citadel must supply CITADEL_HERMES_HOST_PORT}:8787"

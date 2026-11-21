@@ -76,7 +76,23 @@ func registryQualifiedImage(image string) bool {
 // only a missing image, so a floating tag already present on a node is never
 // refreshed, and the node keeps running an image older than the compose
 // defaults this binary ships. Add a file here when its image is pinned.
-var digestPinnedComposeFiles = []string{"compose/diffusers.yml"}
+var digestPinnedComposeFiles = []string{
+	"compose/claudecode.yml",
+	"compose/diffusers.yml",
+	"compose/hermes.yml",
+	"compose/kokoro.yml",
+	"compose/transcribe.yml",
+}
+
+// These exact OCI index digests were matched to successful main-build tags.
+// The Kokoro publisher uses a short sha- tag; its full source commit and build
+// run are recorded in docs/2026-10-sidecar-image-pins.md.
+var reviewedBreachImageRefs = map[string]string{
+	"compose/claudecode.yml": "ghcr.io/aceteam-ai/claudecode-service:6fad6be3951e28d6a4ad34a6e39e8c90113328ae@sha256:c2285d2bfe1db43086e240c4c95b3f605bbf83f87579fa29d1b97bade77feee2",
+	"compose/hermes.yml":     "ghcr.io/aceteam-ai/hermes-service:6fad6be3951e28d6a4ad34a6e39e8c90113328ae@sha256:f8ba9d904b9330a76dc86363f00f13d0261273faba74688a44d59eda95772617",
+	"compose/kokoro.yml":     "ghcr.io/aceteam-ai/kokoro-service:sha-ad043e8@sha256:0f99603bc21c89b5bfbc941eaec0329805ba52b923b05414c26a111636452241",
+	"compose/transcribe.yml": "ghcr.io/aceteam-ai/whisper-service:6fad6be3951e28d6a4ad34a6e39e8c90113328ae@sha256:becb1051fcbc1fbd0fc5cc34b2099a7915411311350e9e2a1c28fda283c07f66",
+}
 
 var digestPinnedImageRef = regexp.MustCompile(`^ghcr\.io/aceteam-ai/[a-z0-9-]+:[0-9a-f]{40}@sha256:[0-9a-f]{64}$`)
 
@@ -98,7 +114,11 @@ func TestOwnSidecarImagesArePinnedByDigest(t *testing.T) {
 			t.Fatalf("%s: no services", path)
 		}
 		for name, svc := range doc.Services {
-			if !digestPinnedImageRef.MatchString(svc.Image) {
+			if want, reviewed := reviewedBreachImageRefs[path]; reviewed {
+				if svc.Image != want {
+					t.Errorf("%s service %q image is not the reviewed commit and OCI index digest", path, name)
+				}
+			} else if !digestPinnedImageRef.MatchString(svc.Image) {
 				t.Errorf("%s service %q image %q must be ghcr.io/aceteam-ai/<name>:<commit-sha>@sha256:<digest>", path, name, svc.Image)
 			}
 		}

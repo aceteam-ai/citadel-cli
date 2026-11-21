@@ -30,7 +30,7 @@
 # handler's health probe always dials 127.0.0.1, so this does not affect probing.
 services:
   kokoro:
-    image: ghcr.io/aceteam-ai/kokoro-service:latest
+    image: ghcr.io/aceteam-ai/kokoro-service:sha-ad043e8@sha256:0f99603bc21c89b5bfbc941eaec0329805ba52b923b05414c26a111636452241
     container_name: citadel-kokoro
     ports:
       - "127.0.0.1:${CITADEL_TTS_HOST_PORT}:8080"
