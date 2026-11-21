@@ -222,10 +222,33 @@ func TestStreamSurvivesPopupClosingItself(t *testing.T) {
 	readTargets(t, conn, "b")
 	waitConns(t, b, 1)
 
+	// Registration only proves that the server accepted the WebSocket. The
+	// client's upgrade read and startScreencast can still be pending. Close an
+	// established popup, not its in-flight handshake, so this tests recovery
+	// from the active page rather than a failed initial attachment.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		b.mu.Lock()
+		started := b.started
+		b.mu.Unlock()
+		if started {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("popup screencast did not start before simulated close")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	b.killConns()
 	time.AfterFunc(400*time.Millisecond, func() { sess.set("a", "a") })
 	readTargets(t, conn, "a")
 	waitConns(t, a, 2)
+	b.mu.Lock()
+	popupConnections := len(b.conns)
+	b.mu.Unlock()
+	if popupConnections != 1 {
+		t.Fatalf("reconnected to the closing popup: %d connections", popupConnections)
+	}
 
 	// Still connected: a later page change still reaches the viewer.
 	sess.set("b", "a", "b")

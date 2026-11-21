@@ -541,6 +541,9 @@ func runWork(cmd *cobra.Command, args []string) {
 	// recovery decides on that mark whether to re-adopt a dead owner's sessions.
 	configureBrowserRuntime()
 	platform.StartManagedCobrowse()
+	// The worker context owns this bounded metadata-only housekeeping loop.
+	// It does not enable suspend/reopen actions or open any saved profile.
+	go platform.GetCobrowseSessionManager().RunSuspendHousekeeping(ctx)
 
 	// Setup signal handling. The first signal cancels the root context so every
 	// subsystem (worker runner, status/terminal/gateway servers, heartbeat,

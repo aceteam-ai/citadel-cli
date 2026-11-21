@@ -33,6 +33,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
@@ -82,7 +83,11 @@ const (
 	SessionAttached CobrowseSessionState = "attached"
 	// SessionExited: the browser process terminated (crashed or was killed) while
 	// the session was still tracked. Terminal; the session should be stopped/pruned.
-	SessionExited CobrowseSessionState = "exited"
+	SessionExited     CobrowseSessionState = "exited"
+	SessionSuspending CobrowseSessionState = "suspending"
+	SessionSuspended  CobrowseSessionState = "suspended"
+	SessionResuming   CobrowseSessionState = "resuming"
+	SessionExpired    CobrowseSessionState = "expired"
 )
 
 // CobrowseSessionStatus is the queryable state of one session.
@@ -110,6 +115,12 @@ type CobrowseSessionStatus struct {
 	Features     []string         `json:"features,omitempty"`
 	// Generation counts ownership changes (first launch is 1, each re-adopt adds 1).
 	Generation uint64 `json:"generation,omitempty"`
+	// Dormant lifecycle metadata never includes a manifest, profile path or
+	// debugger endpoint. Expired is an availability report, not a GC receipt.
+	ExpiresAt   string `json:"expires_at,omitempty"`
+	TabCount    int    `json:"tab_count,omitempty"`
+	ProfileKind string `json:"profile_kind,omitempty"`
+	EndedReason string `json:"ended_reason,omitempty"`
 	// Done and Effects are set only by scripted actions (click, type, key,
 	// scroll): Done is false when the action hit its deadline or failed after
 	// it may have acted, and Effects says what happened (citadel-cli#1663).
@@ -218,6 +229,9 @@ type cobrowseProc struct {
 	exited <-chan struct{}
 	// stop kills the browser then the Xvfb (bounded waits) and is safe to call once.
 	stop func() error
+	// Optional positive owned-resource proof, distinct from legacy best-effort
+	// stop. Currently only fresh Windows jobs supply it; no production action uses it.
+	stopForSuspend func(context.Context) error
 }
 
 // launchCobrowseProc launches an isolated headless browser on a fresh dedicated
@@ -256,7 +270,8 @@ type CobrowseSessionManager struct {
 	filesAllowed func() bool
 	// useResolver is set on the process-wide manager only, so its registry
 	// follows registryDirResolver; other managers keep a sibling of baseDir.
-	useResolver bool
+	useResolver        bool
+	suspendMaintenance suspendMaintenanceState
 }
 
 // SessionProfile is an encrypted, PIN-unlocked persistent profile bound to one
@@ -297,6 +312,11 @@ type cobrowseSession struct {
 	// throwaway session. When set, teardown persists (only if the browser ran) and
 	// always Closes it.
 	encProfile SessionProfile
+	// Account identity is set only before launch from the authenticated job
+	// producer. It is not the OS process owner, and is never inferred or claimed
+	// by a later suspend/reopen request. Empty means a legacy/unbound session.
+	ownerUserID string
+	profileName string
 
 	mu    sync.Mutex
 	state CobrowseSessionState
@@ -447,7 +467,23 @@ func (m *CobrowseSessionManager) StartSession(startURL string) (CobrowseSessionS
 // lock can leak — a missed Close is structurally impossible because every cleanup
 // path routes through teardown().
 func (m *CobrowseSessionManager) StartSessionWithProfile(startURL string, profile SessionProfile) (status CobrowseSessionStatus, err error) {
-	return m.startSession(newSessionID(), startURL, profile)
+	return m.startSession(newSessionID(), startURL, profile, "", "")
+}
+
+// StartSessionForOwner binds a new session before it becomes observable. The
+// enrolled-node job producer must supply ownerUserID from its authenticated
+// account, never an agent/client parameter. Local and legacy entry points leave
+// ownership unknown and cannot later acquire suspend authority from a request.
+// Ownership of profile transfers here, including all validation failures.
+func (m *CobrowseSessionManager) StartSessionForOwner(startURL, ownerUserID, profileName string, profile SessionProfile) (CobrowseSessionStatus, error) {
+	if !validSuspendOwner(ownerUserID) || (profile != nil) != (profileName != "") ||
+		(profileName != "" && !suspendProfileName.MatchString(profileName)) {
+		if profile != nil {
+			_ = profile.Close()
+		}
+		return CobrowseSessionStatus{}, fmt.Errorf("invalid authenticated browser session owner or profile binding")
+	}
+	return m.startSession(newSessionID(), startURL, profile, ownerUserID, profileName)
 }
 
 // NewCobrowseSessionID returns a fresh session id in the manager's format. A
@@ -469,10 +505,10 @@ func (m *CobrowseSessionManager) StartSessionWithID(id, startURL string, profile
 		}
 		return CobrowseSessionStatus{}, fmt.Errorf("invalid co-browse session id %q", id)
 	}
-	return m.startSession(id, startURL, profile)
+	return m.startSession(id, startURL, profile, "", "")
 }
 
-func (m *CobrowseSessionManager) startSession(id, startURL string, profile SessionProfile) (status CobrowseSessionStatus, err error) {
+func (m *CobrowseSessionManager) startSession(id, startURL string, profile SessionProfile, ownerUserID, profileName string) (status CobrowseSessionStatus, err error) {
 	if err := ValidateCobrowseURL(startURL); err != nil {
 		if profile != nil {
 			profile.Close()
@@ -497,41 +533,54 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 			return CobrowseSessionStatus{}, err
 		}
 	}
+	fencedReservation := func(reserve func(context.Context, string) error) error {
+		ctx, cancel := context.WithTimeout(context.Background(), suspendStartFenceLimit)
+		defer cancel()
+		return m.withNewSessionRegistryFence(ctx, id, reserve)
+	}
+	// Refuse a retained identity before startup recovery/sweep can touch it.
+	// Recheck under the same registry exclusion as slot reservation afterwards.
+	if err := fencedReservation(func(context.Context, string) error { return nil }); err != nil {
+		if profile != nil {
+			_ = profile.Close()
+		}
+		return CobrowseSessionStatus{}, err
+	}
 	// Reap orphans from a prior crashed process before the first launch of this one.
 	m.sweepOnce.Do(m.sweep)
-
-	m.mu.Lock()
-	if len(m.sessions) >= m.maxSessions {
-		max := m.maxSessions
-		m.mu.Unlock()
-		// The caller handed us the profile; Close it since we are not taking it.
+	var s *cobrowseSession
+	err = fencedReservation(func(ctx context.Context, regDir string) error {
+		wait := time.NewTicker(time.Millisecond)
+		defer wait.Stop()
+		for !m.mu.TryLock() {
+			select {
+			case <-ctx.Done():
+				return errors.New("browser session reservation unavailable; retry later")
+			case <-wait.C:
+			}
+		}
+		defer m.mu.Unlock()
+		if ctx.Err() != nil {
+			return errors.New("browser session reservation unavailable; retry later")
+		}
+		if len(m.sessions) >= m.maxSessions {
+			return fmt.Errorf("too many co-browse sessions (%d running); stop one first or raise %s", m.maxSessions, EnvCobrowseMaxSessions)
+		}
+		if _, taken := m.sessions[id]; taken {
+			return fmt.Errorf("co-browse session %s already exists", id)
+		}
+		s = &cobrowseSession{id: id, profile: filepath.Join(m.baseDir, id), startedAt: time.Now(),
+			state: SessionLaunching, encProfile: profile, ownerUserID: ownerUserID, profileName: profileName,
+			regDir: regDir, generation: 1, tracking: m.trackTargets, policy: m.targetPolicy}
+		m.sessions[id] = s
+		return nil
+	})
+	if err != nil {
 		if profile != nil {
 			_ = profile.Close()
 		}
-		return CobrowseSessionStatus{}, fmt.Errorf(
-			"too many co-browse sessions (%d running); stop one first or raise %s",
-			max, EnvCobrowseMaxSessions)
+		return CobrowseSessionStatus{}, err
 	}
-	if _, taken := m.sessions[id]; taken {
-		m.mu.Unlock()
-		if profile != nil {
-			_ = profile.Close()
-		}
-		return CobrowseSessionStatus{}, fmt.Errorf("co-browse session %s already exists", id)
-	}
-	s := &cobrowseSession{
-		id:         id,
-		profile:    filepath.Join(m.baseDir, id),
-		startedAt:  time.Now(),
-		state:      SessionLaunching,
-		encProfile: profile,
-		regDir:     m.sessionRegDir(),
-		generation: 1,
-		tracking:   m.trackTargets,
-		policy:     m.targetPolicy,
-	}
-	m.sessions[id] = s
-	m.mu.Unlock()
 
 	proc, err := m.launch(s, startURL)
 	if err != nil {
@@ -703,11 +752,17 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 
 // SessionStatus returns the queryable state of one session.
 func (m *CobrowseSessionManager) SessionStatus(id string) (CobrowseSessionStatus, bool) {
+	if id == "" {
+		return CobrowseSessionStatus{}, false
+	}
 	m.Recover()
 	m.mu.Lock()
 	s, ok := m.sessions[id]
 	m.mu.Unlock()
 	if !ok {
+		for _, status := range m.dormantSessionStatuses(id) {
+			return status, true
+		}
 		return CobrowseSessionStatus{}, false
 	}
 	return s.status(), true
@@ -723,8 +778,15 @@ func (m *CobrowseSessionManager) List() []CobrowseSessionStatus {
 	}
 	m.mu.Unlock()
 	out := make([]CobrowseSessionStatus, 0, len(all))
+	seen := make(map[string]bool, len(all))
 	for _, s := range all {
 		out = append(out, s.status())
+		seen[s.id] = true
+	}
+	for _, status := range m.dormantSessionStatuses("") {
+		if !seen[status.ID] {
+			out = append(out, status)
+		}
 	}
 	return out
 }
@@ -810,9 +872,12 @@ func (s *cobrowseSession) teardown() error {
 	// never contain them.
 	s.closeStaging()
 	_ = s.removeStagingDir()
-	// A stopped session leaves no registry record: it did not "end" unexpectedly.
+	// Ordinary live metadata may be removed. Retained/uncertain lifecycle data
+	// is not Stop's discard authority: keep it for strict recovery and report
+	// that refusal while still attempting the legacy resource cleanup below.
+	var recordErr error
 	if regDir != "" {
-		deleteRecord(regDir, s.id)
+		recordErr = deleteRecord(regDir, s.id)
 	}
 
 	var err, reapErr error
@@ -886,6 +951,9 @@ func (s *cobrowseSession) teardown() error {
 	}
 	if reapErr != nil && err == nil {
 		err = reapErr
+	}
+	if recordErr != nil {
+		return errors.Join(err, recordErr)
 	}
 	return err
 }
@@ -1210,7 +1278,8 @@ func (m *CobrowseSessionManager) sweep() {
 	activeBrowserRunner.SweepOrphans(m.baseDir)
 	// Containers are swept by label, never by pidfile: only the node-wide manager
 	// does it, and a session is live when the manager tracks it or a live or
-	// suspended registry record names it.
+	// suspended/in-flight registry record names it. Retained captures require
+	// exact lifecycle recovery, never ordinary orphan removal.
 	if cs, ok := activeBrowserRunner.(containerSweeper); ok && m.useResolver {
 		cs.sweepContainers(m.baseDir, m.sessionIsLive)
 	}
@@ -1224,7 +1293,15 @@ func (m *CobrowseSessionManager) sessionIsLive(id string) bool {
 		return true
 	}
 	rec, err := loadRecord(m.registryDir(), id)
-	return err == nil && (rec.State == RecordLive || rec.State == RecordSuspended)
+	return err == nil && (rec.State == RecordLive || retainedSuspendRecord(rec))
+}
+
+// A retention marker is enough to withhold destructive legacy cleanup, not
+// proof of a valid/restorable capture, live process or authority to reopen.
+// Incomplete and unexpected combinations remain for strict lifecycle recovery.
+func retainedSuspendRecord(rec sessionRecord) bool {
+	return rec.Suspension != nil || rec.State == RecordSuspended || rec.State == "suspending" ||
+		rec.State == "resuming" || rec.EndedReason == "suspend_expired"
 }
 
 // sweepXvfbSessions is the Linux runner's orphan sweep; see sweep above.

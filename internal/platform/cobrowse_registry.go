@@ -22,6 +22,7 @@
 package platform
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -138,6 +139,12 @@ type sessionRecord struct {
 	EndedReason string        `json:"ended_reason,omitempty"`
 	EndedDetail string        `json:"ended_detail,omitempty"`
 	EndedAt     string        `json:"ended_at,omitempty"`
+	// Reserved suspend metadata (#1821). The unwired planner refuses legacy
+	// records without a platform-authenticated user binding. OwnerUID above is
+	// the OS process owner and must never substitute for this account identity.
+	OwnerUserID string           `json:"owner_user_id,omitempty"`
+	ProfileName string           `json:"profile_name,omitempty"`
+	Suspension  *suspendMetadata `json:"suspension,omitempty"`
 }
 
 // adoptionSupported reports whether this OS can re-adopt sessions. A var so
@@ -271,6 +278,24 @@ func saveRecord(regDir string, rec sessionRecord) error {
 	if err := ensureCobrowseBaseDir(regDir); err != nil {
 		return err
 	}
+	release, err := acquireBrowserRegistryGate(context.Background(), regDir)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return saveRecordUnderRegistryGate(regDir, rec)
+}
+
+// Only call while holding the directory's registry gate. Live persistence
+// acquires it before the session mutex; reacquiring it inside that mutex would
+// deadlock a transaction that needs to inspect or update the session.
+func saveRecordUnderRegistryGate(regDir string, rec sessionRecord) error {
+	if !sessionIDPattern.MatchString(rec.ID) {
+		return fmt.Errorf("bad session id")
+	}
+	if err := ensureCobrowseBaseDir(regDir); err != nil {
+		return err
+	}
 	rec.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	data, err := json.Marshal(rec)
 	if err != nil {
@@ -326,17 +351,39 @@ func listRecords(regDir string) []sessionRecord {
 	return out
 }
 
-func deleteRecord(regDir, id string) { _ = os.Remove(recordFile(regDir, id)) }
+func deleteRecord(regDir, id string) error {
+	if regDir == "" {
+		return nil // Isolated/local sessions have no node registry.
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), suspendDeleteLimit)
+	defer cancel()
+	return deleteLegacyBrowserRecord(ctx, regDir, id)
+}
 
 // persistRecord writes (best-effort) the registry record for a live session.
 func (s *cobrowseSession) persistRecord() {
+	s.persistRecordWithWriter(saveRecordUnderRegistryGate)
+}
+
+// Identity probes stay outside mu. The final incarnation/state check, current
+// metadata snapshot and publication share mu with teardown, so an old probe
+// cannot resurrect a stopped record or overwrite a newer lifecycle transition.
+// The registry gate precedes mu; the injected synchronous writer must not
+// reacquire it. Production uses saveRecordUnderRegistryGate.
+func (s *cobrowseSession) persistRecordWithWriter(write func(string, sessionRecord) error) {
+	if write == nil {
+		return
+	}
 	s.mu.Lock()
 	proc := s.proc
-	if proc == nil || !adoptionSupported || s.regDir == "" {
+	if proc == nil || !adoptionSupported || s.regDir == "" || (s.state != SessionRunning && s.state != SessionAttached) {
 		s.mu.Unlock()
 		return
 	}
+	generation := s.generation
+	regDir := s.regDir
 	browserID, port, profile := proc.browserID, proc.debugPort, s.profile
+	browserPID, xvfbPID := proc.browserPID, proc.xvfbPID
 	s.mu.Unlock()
 	if browserID == "" && port > 0 {
 		if id, err := resolveBrowserID(port, profile); err == nil {
@@ -345,9 +392,25 @@ func (s *cobrowseSession) persistRecord() {
 			log.Printf("[cobrowse] could not read browser id for session %s: %v", s.id, err)
 		}
 	}
+	ownerStart := currentOwnerIdentity()
+	browserStart, _, _ := procIdentity(browserPID)
+	var xvfbStart uint64
+	if xvfbPID > 0 {
+		xvfbStart, _, _ = procIdentity(xvfbPID)
+	}
+	if err := ensureCobrowseBaseDir(regDir); err != nil {
+		log.Printf("[cobrowse] registry publication unavailable for session %s", s.id)
+		return
+	}
+	release, err := acquireBrowserRegistryGate(context.Background(), regDir)
+	if err != nil {
+		log.Printf("[cobrowse] registry publication unavailable for session %s", s.id)
+		return
+	}
+	defer release()
 	s.mu.Lock()
-	if s.proc != proc {
-		s.mu.Unlock()
+	defer s.mu.Unlock()
+	if s.proc != proc || s.generation != generation || s.regDir != regDir || (s.state != SessionRunning && s.state != SessionAttached) {
 		return
 	}
 	proc.browserID = browserID
@@ -371,23 +434,20 @@ func (s *cobrowseSession) persistRecord() {
 		State:        RecordLive,
 		Generation:   s.generation,
 		PendingEnd:   s.pendingEnd,
+		OwnerUserID:  s.ownerUserID,
+		ProfileName:  s.profileName,
 	}
-	regDir := s.regDir
 	if !s.startedAt.IsZero() {
 		rec.StartedAt = s.startedAt.UTC().Format(time.RFC3339)
 	}
-	s.mu.Unlock()
 	uid := os.Getuid()
 	rec.OwnerUID = &uid
-	rec.OwnerStart = currentOwnerIdentity()
+	rec.OwnerStart = ownerStart
 	if proc.containerID != "" {
 		rec.Runner, rec.ContainerID, rec.ContainerStart, rec.ControlPort = "container", proc.containerID, proc.containerStart, proc.containerCtrl
 	}
-	rec.BrowserStart, _, _ = procIdentity(rec.BrowserPID)
-	if rec.XvfbPID > 0 {
-		rec.XvfbStart, _, _ = procIdentity(rec.XvfbPID)
-	}
-	if err := saveRecord(regDir, rec); err != nil {
+	rec.BrowserStart, rec.XvfbStart = browserStart, xvfbStart
+	if err := write(regDir, rec); err != nil {
 		log.Printf("[cobrowse] could not persist session record for %s: %v", rec.ID, err)
 	}
 }
@@ -586,12 +646,26 @@ func (m *CobrowseSessionManager) recoverSessions() {
 	now := time.Now()
 	var expired []sessionRecord
 	for _, rec := range listRecords(regDir) {
+		if retainedSuspendRecord(rec) {
+			// Metadata preservation alone is insufficient: the following host
+			// sweep must also leave the session's working directory/processes
+			// alone. Only exact-resource lifecycle recovery may resolve these
+			// records; legacy adoption/expiry must not claim or rewrite them.
+			sweepProtected.Store(filepath.Join(m.baseDir, rec.ID), struct{}{})
+			continue
+		}
 		switch rec.State {
 		case RecordSuspended:
 			continue
 		case RecordExpired:
+			if rec.EndedReason == "suspend_expired" {
+				// The bounded TTL writer owns these seven-day tombstones and
+				// their durable prune. Legacy 24h retention and its count cap
+				// must not remove them early or bypass prune reconciliation.
+				continue
+			}
 			if t, err := time.Parse(time.RFC3339, rec.EndedAt); err != nil || now.Sub(t) >= expiredRetention {
-				deleteRecord(regDir, rec.ID)
+				_, _ = mutateRecordIfCurrent(regDir, rec, nil)
 			} else {
 				expired = append(expired, rec)
 			}
@@ -631,6 +705,7 @@ func (m *CobrowseSessionManager) recoverSessions() {
 		if err != nil {
 			log.Printf("[cobrowse] not adopting session %s: %v", rec.ID, err)
 			stopRecordScopes(rec) // identity-checked; the sweep reaps anything left
+			expected := rec
 			rec.State = RecordExpired
 			rec.EndedReason, rec.EndedDetail = endedReasonLost, ""
 			if rec.PendingEnd != nil {
@@ -638,8 +713,9 @@ func (m *CobrowseSessionManager) recoverSessions() {
 			}
 			rec.PendingEnd = nil
 			rec.EndedAt = now.UTC().Format(time.RFC3339)
-			_ = saveRecord(regDir, rec)
-			expired = append(expired, rec)
+			if saved, err := mutateRecordIfCurrent(regDir, expected, &rec); err == nil {
+				expired = append(expired, saved)
+			}
 			continue
 		}
 		s := &cobrowseSession{
@@ -650,6 +726,8 @@ func (m *CobrowseSessionManager) recoverSessions() {
 			proc:            adoptedProc(rec),
 			explicitHandoff: rec.Handoff,
 			generation:      rec.Generation + 1,
+			ownerUserID:     rec.OwnerUserID,
+			profileName:     rec.ProfileName,
 			tracking:        rec.Tracking,
 			policy:          m.targetPolicy,
 		}
@@ -676,13 +754,13 @@ func (m *CobrowseSessionManager) recoverSessions() {
 	if len(expired) > expiredMaxRecords {
 		sort.Slice(expired, func(i, j int) bool { return expired[i].EndedAt > expired[j].EndedAt })
 		for _, r := range expired[expiredMaxRecords:] {
-			deleteRecord(regDir, r.ID)
+			_, _ = mutateRecordIfCurrent(regDir, r, nil)
 		}
 	}
 }
 
-// sweepProtected holds the dirs of sessions this process just re-adopted, so
-// the orphan sweep (which treats a dir owned by our own PID as stale) skips them.
+// sweepProtected holds dirs re-adopted or retained for suspend recovery, so the
+// orphan sweep (which treats a dir owned by our own PID as stale) skips them.
 var sweepProtected sync.Map
 
 // Recover re-adopts surviving sessions and sweeps the rest. Idempotent; the
