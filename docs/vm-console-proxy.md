@@ -7,16 +7,16 @@ MCP tools and the `node:vm_console` grant). aceteam-ai/aceteam#14122 (flows
 that run desktop acceptance gates and capture docs screenshots) is the first
 consumer.
 
-This revises the #1601 design under Jason's decision of 2026-11-17. The
+This revises the earlier #1601 design. The
 hypervisor is not enrolled as a Citadel node, and no root worker runs on it.
 An existing non-root Citadel node proxies console access through the Proxmox
 VE API. The first proxy is the operator's GPU workstation node, which runs a
 user-service worker. The earlier transport (`qm` screendump and sendkey over a
 root worker) is withdrawn.
 
-## Decisions (Jason, 2026-11-17)
+## Decisions
 
-Jason settled all nine open questions on PR #1753. Each went as the design
+All nine open questions were settled on PR #1753. Each went as the design
 first recommended, and the rejected alternatives are kept here.
 
 1. **The token secret lives in an owner-only file** under the node config
@@ -74,7 +74,7 @@ first recommended, and the rejected alternatives are kept here.
 
 ## Build process
 
-The codex lane builds the slices in section 6 as stacked PRs. Under Jason's
+The slices in section 6 are built as stacked PRs. Under the repository's
 standing rule:
 
 - A same-repo child slice branches off its parent slice's branch, not off
@@ -88,7 +88,7 @@ standing rule:
 Each slice gets its own review at its own head, with the tier given in
 section 6. Approval of this design does not cover any slice.
 
-## Decision recap from the issue (Jason, 2026-11-17)
+## Decision recap from the issue
 
 These are fixed and not reopened here.
 
@@ -226,9 +226,9 @@ pveum user add citadel-console@pve --comment "Citadel console proxy, no login"
 pveum user token add citadel-console@pve <proxy-alias> --privsep 1 \
     --expire <epoch> --comment "console proxy"
 
-# Once per allowlisted VM (example: vmid 108).
-pveum acl modify /vms/108 --users citadel-console@pve --roles CitadelConsole --propagate 0
-pveum acl modify /vms/108 --tokens 'citadel-console@pve!<proxy-alias>' \
+# Once per allowlisted VM (example: vmid 100).
+pveum acl modify /vms/100 --users citadel-console@pve --roles CitadelConsole --propagate 0
+pveum acl modify /vms/100 --tokens 'citadel-console@pve!<proxy-alias>' \
     --roles CitadelConsole --propagate 0
 ```
 
@@ -267,15 +267,15 @@ shell must resolve the same files (see the `ConfigDir()` note in CLAUDE.md).
 
 ```yaml
 hosts:
-  - alias: lab-pve                 # [a-z0-9-]{1,32}, the only name the platform sees
+  - alias: example-pve                 # [a-z0-9-]{1,32}, the only name the platform sees
     url: https://<pve-address>:8006  # https only, no path, no userinfo
     tls:
       mode: ca                     # ca | fingerprint | system
-      ca_file: vm-console/lab-pve-ca.pem
+      ca_file: vm-console/example-pve-ca.pem
       server_name: ""              # optional SNI and verify name override
     default_pve_node: <pve-node>
     vms:
-      - vmid: 108
+      - vmid: 100
         label: windows-test        # optional, shown to the owner org
         pve_node: ""               # empty means default_pve_node
         input: true                # false = screenshot only
@@ -286,7 +286,7 @@ full token id, so the id and the secret are stored, swapped and read
 together, never in separate files:
 
 ```yaml
-token_id: citadel-console@pve!workstation-2
+token_id: citadel-console@pve!example-proxy
 secret: <token secret>
 expires: 2027-02-15    # informational; status warns 14 days ahead
 ```
@@ -465,7 +465,7 @@ omitempty `vm_console` object:
 
 ```json
 {"vm_console": {"hosts": [
-  {"alias": "lab-pve", "vms": [{"vmid": 108, "label": "windows-test", "input": true}]}
+  {"alias": "example-pve", "vms": [{"vmid": 100, "label": "windows-test", "input": true}]}
 ]}}
 ```
 
@@ -524,8 +524,8 @@ Result:
   "width": 1280, "height": 800,
   "fb_width": 1280, "fb_height": 800,
   "pointer": "absolute",
-  "host": "lab-pve", "vmid": 108,
-  "captured_at": "2026-11-17T20:00:00Z",
+  "host": "example-pve", "vmid": 100,
+  "captured_at": "2000-01-01T00:00:00Z",
   "sha256": "<hex of the PNG bytes>"
 }
 ```
@@ -836,7 +836,7 @@ that produced it.
 In dependency order. Each is sized for one agent. CI has no hypervisor:
 every test uses a fake PVE server (`httptest.NewTLSServer`, with its own
 minted CA or leaf for the pin tests) and a scripted fake RFB server. Native
-acceptance against the operator's Windows test VM (vmid 108) runs after
+acceptance against a Windows test VM runs after
 merge, per the standing rule.
 
 **S1. RFB client core (`internal/rfb`).** Opus review: yes (parser of
