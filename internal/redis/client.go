@@ -761,8 +761,17 @@ func (c *Client) getDLQName() string {
 
 // PublishStreamEvent publishes a streaming event to Redis Pub/Sub.
 func (c *Client) PublishStreamEvent(ctx context.Context, jobID, rayID, eventType string, data map[string]interface{}) error {
-	streamName := fmt.Sprintf("stream:v1:%s", jobID)
+	eventJSON, err := c.StreamEventJSON(jobID, rayID, eventType, data)
+	if err != nil {
+		return err
+	}
+	return c.PublishStreamEventJSON(ctx, jobID, eventJSON)
+}
 
+// StreamEventJSON builds the exact stream:v1 envelope PublishStreamEvent
+// publishes, including the node identity metadata. A caller that both
+// publishes and retains an event uses it so the two copies are byte-identical.
+func (c *Client) StreamEventJSON(jobID, rayID, eventType string, data map[string]interface{}) ([]byte, error) {
 	// Inject node identity metadata into every event for operator attribution
 	if c.nodeMeta != nil {
 		if data == nil {
@@ -782,10 +791,24 @@ func (c *Client) PublishStreamEvent(ctx context.Context, jobID, rayID, eventType
 
 	eventJSON, err := json.Marshal(event)
 	if err != nil {
-		return fmt.Errorf("failed to marshal stream event: %w", err)
+		return nil, fmt.Errorf("failed to marshal stream event: %w", err)
 	}
+	return eventJSON, nil
+}
 
-	return c.client.Publish(ctx, streamName, eventJSON).Err()
+// PublishStreamEventJSON publishes an envelope built by StreamEventJSON on the
+// job's stream:v1 channel.
+func (c *Client) PublishStreamEventJSON(ctx context.Context, jobID string, eventJSON []byte) error {
+	return c.client.Publish(ctx, fmt.Sprintf("stream:v1:%s", jobID), eventJSON).Err()
+}
+
+// RetainTerminalEvent stores eventJSON under key with the given TTL, first
+// writer wins (SET NX EX). It reports whether this call stored the value; a key
+// that already holds a terminal event is left untouched, so a later terminal
+// write for the same job (a retried publish, or a refused redelivery) can never
+// replace the first result (citadel-cli#1553).
+func (c *Client) RetainTerminalEvent(ctx context.Context, key string, eventJSON []byte, ttl time.Duration) (bool, error) {
+	return c.client.SetNX(ctx, key, eventJSON, ttl).Result()
 }
 
 // PublishClaimed publishes a "claimed" event for a job, emitted the moment the

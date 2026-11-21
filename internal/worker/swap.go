@@ -368,13 +368,13 @@ func (m *SwapManager) EnsureResident(ctx context.Context, backend, model string)
 		// op.model (not the caller's `model` param) is the honest answer even
 		// here — a join onto an in-flight same-backend swap can be for a
 		// different model than this call requested (citadel-cli#681).
-		return SwapOutcome{Ready: false, ETASeconds: m.etaSeconds(op), WarmingFor: op.model}, nil
+		return m.warmingOutcome(op), nil
 	case <-timer.C:
-		return SwapOutcome{Ready: false, ETASeconds: m.etaSeconds(op), WarmingFor: op.model}, nil
+		return m.warmingOutcome(op), nil
 	case <-ctx.Done():
 		// The job context was cancelled; the background swap keeps running so a
 		// retry can pick up the now-resident model. Report warming.
-		return SwapOutcome{Ready: false, ETASeconds: m.etaSeconds(op), WarmingFor: op.model}, nil
+		return m.warmingOutcome(op), nil
 	}
 }
 
@@ -921,15 +921,29 @@ func (m *SwapManager) EngineStartedAt(backend string) (time.Time, bool) {
 	return t, ok
 }
 
-// etaSeconds estimates remaining seconds until the in-flight swap is ready,
-// floored at the retry_after hint so the platform never busy-retries.
+// etaSeconds estimates remaining seconds until the in-flight swap is ready.
+// The total is the load time this node has measured for the engine when it has
+// one, else the op's coarse estimate. It is floored at the retry_after hint so
+// a load that has outlived its estimate never quotes "~0s" (citadel-cli#1640):
+// while the load is still in progress, "retry in the standard interval" is the
+// honest answer, not "done".
 func (m *SwapManager) etaSeconds(op *swapOp) int {
-	remaining := op.loadEst - m.now().Sub(op.startedAt)
-	secs := int(remaining.Seconds())
+	total := op.loadEst
+	if measured, ok := m.MeasuredLoad(op.backend); ok && measured > 0 {
+		total = measured
+	}
+	secs := int((total - m.now().Sub(op.startedAt)).Seconds())
 	if secs < warmingRetryAfter {
 		secs = warmingRetryAfter
 	}
 	return secs
+}
+
+// warmingOutcome is the not-ready answer for an in-progress swap, with the
+// retry hint paced to the (floored) ETA.
+func (m *SwapManager) warmingOutcome(op *swapOp) SwapOutcome {
+	eta := m.etaSeconds(op)
+	return SwapOutcome{Ready: false, ETASeconds: eta, RetryAfterSeconds: retryAfterFor(eta), WarmingFor: op.model}
 }
 
 // inflightSnapshot returns the single in-flight swap op, or nil, under lock.

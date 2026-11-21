@@ -37,6 +37,7 @@ type fakeChrome struct {
 	acks          int
 	mouse         []map[string]any
 	keys          []map[string]any
+	pastes        []string
 	conns         []*websocket.Conn
 	started       bool
 	evaluateValue func(string) any
@@ -155,6 +156,11 @@ func (f *fakeChrome) serve(conn *websocket.Conn) {
 		case "Input.dispatchKeyEvent":
 			f.mu.Lock()
 			f.keys = append(f.keys, msg.Params)
+			f.mu.Unlock()
+		case "Input.insertText":
+			f.mu.Lock()
+			text, _ := msg.Params["text"].(string)
+			f.pastes = append(f.pastes, text)
 			f.mu.Unlock()
 		case "Runtime.evaluate":
 			value := any(12.5)

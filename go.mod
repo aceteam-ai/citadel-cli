@@ -3,6 +3,7 @@ module github.com/aceteam-ai/citadel-cli
 go 1.26.6
 
 require (
+	github.com/BurntSushi/toml v1.5.0
 	github.com/Masterminds/semver/v3 v3.5.0
 	github.com/UserExistsError/conpty v0.1.4
 	github.com/aceteam-ai/fabric-protocol v0.0.0-20260902143942-795c2cf81e47
@@ -130,7 +131,7 @@ require (
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba // indirect
 	golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546 // indirect
 	golang.org/x/mod v0.37.0 // indirect
-	golang.org/x/net v0.56.0 // indirect
+	golang.org/x/net v0.56.0
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/tools v0.47.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect

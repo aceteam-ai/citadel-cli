@@ -174,6 +174,12 @@ func (h *FileFetchHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 	if err != nil {
 		return nil, fileFetchRefusal("workspace_unavailable")
 	}
+	// Identity-based refusal BEFORE anything is created: a destination that
+	// would land in a bot-profile store (even one that does not exist yet) is
+	// refused like any other bad destination, without naming the reason.
+	if denyBotProfiles(filepath.Join(workspace, filepath.FromSlash(dest))) != nil {
+		return nil, fileFetchRefusal("invalid_dest_path")
+	}
 	root, err := os.OpenRoot(workspace)
 	if err != nil {
 		return nil, fileFetchRefusal("workspace_unavailable")

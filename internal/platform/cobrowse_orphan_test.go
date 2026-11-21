@@ -14,6 +14,11 @@ import (
 	"testing"
 )
 
+// foreignPID returns a PID that is never this test process's own, so
+// reclaimStalePort's self-kill guard cannot turn a stubbed owner into a no-op.
+// A fixed literal collided when a sharded test binary happened to run as it.
+func foreignPID() int { return os.Getpid() + 1 }
+
 // withStubbedPortSeams swaps portOwnerLookup / pidKiller for the duration of a
 // test and restores them via t.Cleanup, so tests never touch real processes.
 func withStubbedPortSeams(t *testing.T, lookup func(int) (int, bool), kill func(int) error) {
@@ -48,7 +53,7 @@ func TestReclaimStalePort_NoOwner(t *testing.T) {
 func TestReclaimStalePort_KillsOwner(t *testing.T) {
 	var killedPID int
 	withStubbedPortSeams(t,
-		func(int) (int, bool) { return 4242, true },
+		func(int) (int, bool) { return foreignPID(), true },
 		func(pid int) error { killedPID = pid; return nil },
 	)
 	reclaimed, err := reclaimStalePort(9222)
@@ -58,14 +63,14 @@ func TestReclaimStalePort_KillsOwner(t *testing.T) {
 	if !reclaimed {
 		t.Fatal("expected reclaimed=true when a stale owner was killed")
 	}
-	if killedPID != 4242 {
-		t.Fatalf("expected to kill pid 4242, killed %d", killedPID)
+	if killedPID != foreignPID() {
+		t.Fatalf("expected to kill pid %d, killed %d", foreignPID(), killedPID)
 	}
 }
 
 func TestReclaimStalePort_KillError(t *testing.T) {
 	withStubbedPortSeams(t,
-		func(int) (int, bool) { return 4242, true },
+		func(int) (int, bool) { return foreignPID(), true },
 		func(int) error { return errors.New("boom") },
 	)
 	reclaimed, err := reclaimStalePort(9222)

@@ -10,6 +10,7 @@
 package jobs
 
 import (
+	"context"
 	"os"
 
 	"github.com/aceteam-ai/citadel-cli/services"
@@ -43,10 +44,56 @@ func ollamaMaxLoadedModelsFromFile(manifestPath, serviceName string) *int {
 	return nil
 }
 
+// ollamaKeepAlivePolicyFromFile reads the #1560 `ollama_keep_alive:` and
+// `ollama_preload:` values for serviceName (best-effort; zero values when absent
+// or unreadable).
+func ollamaKeepAlivePolicyFromFile(manifestPath, serviceName string) (*string, []string) {
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return nil, nil
+	}
+	var doc struct {
+		Services []struct {
+			Name            string   `yaml:"name"`
+			OllamaKeepAlive *string  `yaml:"ollama_keep_alive"`
+			OllamaPreload   []string `yaml:"ollama_preload"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return nil, nil
+	}
+	for _, s := range doc.Services {
+		if s.Name == serviceName {
+			return s.OllamaKeepAlive, s.OllamaPreload
+		}
+	}
+	return nil, nil
+}
+
 // composeEnvForAppliedService is the hermetic core of APPLY_DEVICE_CONFIG's
 // compose-process environment policy. It deliberately accepts the manifest
 // path so tests can use a private fixture rather than the live node config.
 func composeEnvForAppliedService(env []string, manifestPath, serviceName string) ([]string, error) {
-	return services.OllamaMaxLoadedModelsComposeEnv(
+	env, err := services.OllamaMaxLoadedModelsComposeEnv(
 		env, serviceName, ollamaMaxLoadedModelsFromFile(manifestPath, serviceName))
+	keepAlive, _ := ollamaKeepAlivePolicyFromFile(manifestPath, serviceName)
+	env, kaErr := services.OllamaKeepAliveComposeEnv(env, serviceName, keepAlive)
+	if err == nil {
+		err = kaErr
+	}
+	return env, err
+}
+
+// startOllamaPreload runs the #1560 best-effort async preload (never fails the
+// caller). keepAlive/models come from the manifest.
+func startOllamaPreload(serviceName string, keepAlive *string, models []string, logf func(string, ...any)) {
+	if serviceName != "ollama" || len(models) == 0 {
+		return
+	}
+	ka := ""
+	if keepAlive != nil && services.ValidateOllamaKeepAlive(*keepAlive) == nil {
+		ka = *keepAlive
+	}
+	models = append([]string(nil), models...)
+	go services.PreloadOllamaModels(context.Background(), nil, services.OllamaPreloadURL, models, ka, logf)
 }

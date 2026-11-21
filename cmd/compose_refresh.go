@@ -66,11 +66,18 @@ func refreshManagedComposeFilesWithSweep(configDir string, sweep func(composeref
 		if err := finetunesafety.RequireAbsent(configDir); err != nil {
 			return err
 		}
+		embedded, missingOnly := services.ComposeRefreshPlan(runtime.GOOS, gpuCount)
+		// Unknown GPU evidence withholds existing CPU/GPU files from refresh,
+		// but a missing file still needs the default embedded template. This
+		// runs before the version fast path so the same binary retries absence.
+		if _, err := composerefresh.MaterializeMissing(servicesDir, missingOnly); err != nil {
+			return err
+		}
 		var sweepErr error
 		res, sweepErr = sweep(composerefresh.Options{
 			ServicesDir:           servicesDir,
 			Version:               Version,
-			Embedded:              services.ComposeMapForRefresh(runtime.GOOS, gpuCount),
+			Embedded:              embedded,
 			PortManaged:           services.ServiceHostPorts,
 			KnownHistoricalHashes: services.KnownComposeHashes,
 			Recreator:             recreator,
