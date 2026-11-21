@@ -534,6 +534,7 @@ func (s *Server) handleAsset(w http.ResponseWriter, r *http.Request) {
 
 // State is GET /api/state.
 type State struct {
+	Uploads  localcobrowse.UploadStatus  `json:"uploads"`
 	Agent    string                      `json:"agent"`
 	Sessions []localcobrowse.SessionView `json:"sessions"`
 	Now      string                      `json:"now"`
@@ -549,6 +550,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	s.lastPoll = s.cfg.Now()
 	s.mu.Unlock()
 	st := State{
+		Uploads:  s.cfg.Service.UploadStatus(),
 		Agent:    s.cfg.Service.Agent(),
 		Sessions: s.cfg.Service.Sessions(""),
 		Now:      s.cfg.Now().UTC().Format(time.RFC3339),

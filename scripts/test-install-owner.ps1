@@ -17,8 +17,17 @@ function Get-OwnerSid($path) {
 function Check($name, $cond) {
     if ($cond) { Write-Host "ok   $name" } else { Write-Host "FAIL $name"; $script:failures += $name }
 }
+# CI sets GITHUB_TOKEN: look the latest tag up once, authenticated, and pass it
+# to the installers so they skip their own unauthenticated (rate-limited) lookup
+# (#1795). Without a token the installers resolve "latest" themselves.
+$pinVersion = @()
+if ($env:GITHUB_TOKEN) {
+    $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/aceteam-ai/citadel-cli/releases/latest" -Headers @{ Authorization = "Bearer $env:GITHUB_TOKEN"; "User-Agent" = "citadel-ci" }
+    $pinVersion = @("-Version", $rel.tag_name)
+    Write-Host "resolved latest release: $($rel.tag_name)"
+}
 function Install($script, $extra) {
-    $psArgs = @("-NoProfile", "-File", $script, "-Force", "-AddToPath:`$false") + $extra
+    $psArgs = @("-NoProfile", "-File", $script, "-Force", "-AddToPath:`$false") + $pinVersion + $extra
     & pwsh @psArgs
     if ($LASTEXITCODE -ne 0) { throw "$script exited $LASTEXITCODE" }
 }

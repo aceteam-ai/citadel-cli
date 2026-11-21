@@ -1,6 +1,8 @@
 # Local co-browse: file upload, and field editing parity
 
-Status: design only. No code ships with this document.
+Status: design of record. S1 implements file-aware commit snapshots; S2 adds
+the opt-out setting and shared gate. Local upload entry points remain in later
+slices; the setting alone does not enable staging or attachment.
 
 Refs #1729 (local-mode file upload) and #1730 (type with selector and clear,
 key modifiers). Builds on #1721 / PR #1722 (staging, `set_file_input`, chooser
@@ -282,7 +284,7 @@ human's press or an approval (Q3).
 **The human**, through either source in Q1.
 
 **The agent, with acceptance (decision 3).** The tool is
-`local_cobrowse_stage_file {session_id, name, size, sha256, offset,
+`local_cobrowse_stage_file {cobrowse_session, name, size, sha256, offset,
 data_base64, goal}`.
 
 - Bytes arrive in chunks of at most 4 MiB decoded (about 5.4 MiB as base64),
@@ -346,7 +348,7 @@ plainly: "The page on <site> receives this file and can send it anywhere."
 
 ### Agent attach
 
-`local_cobrowse_set_file_input {session_id, staged_name, selector?, goal}`
+`local_cobrowse_set_file_input {cobrowse_session, staged_name, selector?, goal}`
 (decisions 4 and 5).
 
 - It targets the pending chooser by default, or a file input matched by
@@ -436,14 +438,31 @@ commit, because on many sites it sends files already attached.
 so that a File entry no longer sets `bad`. It encodes as a tuple
 `[name, "file", fileName, size, type, lastModified]`.
 
-The probe runs in the main world today (see Findings), so a page can replace
-`File.prototype` getters before it runs. The file-entry reads therefore run in
-an isolated world of the form's frame (`Page.createIsolatedWorld`), on the form
-node resolved there, the way `fillFileInput` resolves its target. The results
-are folded into the main-world digest by the service. Moving the whole probe
-into an isolated world is the cleaner end state. It is a larger change,
-because the probe also reads page state such as the focused element, and it is
-not required here. Then:
+At the design pass the probe ran in the main world (see Findings), where a
+page could replace `File.prototype` getters before it ran. S1 uses the cleaner
+end state: `InspectTarget` runs the complete probe in a browser-created
+isolated world (`Page.createIsolatedWorld`). Target resolution, focused state,
+the native submission set and native File/Blob getters use that same world's
+DOM observation, rather than merging two observations across worlds. A missing
+world, failed read or changed driver refuses the probe without falling back to
+the main world. The session reuses the context only for the same target, frame
+and loader, retaining at most one context reference. A lost context is invalidated
+and the current probe refuses; the next probe reads the current frame tree and
+recreates the world, without retrying any action. Chooser classification comes
+from a pristine native file-input type or a label's native associated control,
+not attributes on the label. A label for a non-file control is classified from
+that control's tag, type, name and form; misleading label text cannot hide a
+submit or Delete button. An uninspectable associated custom control is refused.
+Interactive descendants stay their own targets, and an actionable chooser
+still passes through the commit-word checks. While the human drives, agent
+views omit picked-file metadata; the human viewer retains its approval evidence.
+The browser's synthetic empty File timestamp is normalized to
+zero, so an unselected file input has a stable digest. A snapshot with more
+than 128 attached entries is unverifiable rather than producing an unbounded
+commit card. Filename display strips Unicode format and control characters and
+truncates the middle to retain the final extension. An extension too long for
+the bounded display is explicitly unavailable and makes approval unverifiable.
+No file bytes or local paths are read. Then:
 
 - fills in that form are ordinary fills under the grant;
 - the form's Submit is an ordinary commit whose content hash changes if the
@@ -977,16 +996,28 @@ S10.
 - The environment variable `CITADEL_LOCAL_UPLOADS`. A falsey value (`0`,
   `false`, `no`, `off`) turns uploads off. It is read once, when the owner
   process starts, because a process's environment does not change. Any other
-  non-empty value is ignored with a warning in `local doctor`. It never turns
+  non-empty unrecognized value is ignored with a warning in `local doctor`;
+  `1`, `true`, `yes` and `on` are recognized no-op values. It never turns
   on what the file turned off.
-- The setting file `settings.json` in `localStateDir`, holding
+- The setting file `local-settings/settings.json` under `localStateDir`, holding
   `{"uploads": "on"|"off"}`. It is owner-only (written with
   `platform.EnsurePrivateDir` rules and an atomic replace) and read **live**:
-  every gate check stats it and re-reads it when the size or mtime changes.
+  every gate check opens it with current read permission and validates the
+  descriptor, then re-reads it when the identity, size or mtime changes.
   So `citadel local config uploads off` takes effect on the next check
   without restarting the agent app. A missing file means on. A file that
   exists but cannot be read or parsed means **off**, and `local doctor` and
   the viewer say why.
+  The dedicated subdirectory has its own protected owner-only permissions;
+  the legacy state container may retain its inherited Windows ACL, but may not
+  grant an unprivileged other user write access. An untrusted existing
+  directory fails closed even when the file is missing. The wired owner
+  defaults on when no file exists; an unwired service policy always denies.
+  Ancestors above the local state directory are not trust-checked, and a
+  symlink to a directory is allowed there when checking for absent settings.
+  On Windows, atomic replacement retries sharing, lock and access-denied
+  errors at most ten times, with at most 225 ms total backoff. Other errors
+  return immediately; exhausted retries report failure, never false success.
 
 **Command.** `citadel local config uploads on|off|status`. `uploads` is a
 reserved word in `local config` and can never be a harness name. It writes

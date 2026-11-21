@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -36,6 +37,7 @@ type localDoctorDeps struct {
 	vault      func() (bool, error)
 	owner      func() error
 	audit      func() (localaudit.VerifyResult, error)
+	uploads    func() localcobrowse.UploadStatus
 	// binaryOwner reports who owns the running executable and who is running
 	// it. Nil means not checked (non-Windows).
 	binaryOwner func() (update.OwnerInfo, string, error)
@@ -74,6 +76,7 @@ func realLocalDoctorDeps(skipLaunch bool) localDoctorDeps {
 		audit: func() (localaudit.VerifyResult, error) {
 			return localaudit.Verify(filepath.Join(stateDir, localaudit.DirName))
 		},
+		uploads:   localcobrowse.NewUploadSettings(stateDir, os.Getenv("CITADEL_LOCAL_UPLOADS")).Status,
 		harnesses: detectHarnessConfigs(systemHarnessEnv()),
 		exe:       "citadel",
 	}
@@ -153,6 +156,18 @@ func collectLocalDoctor(d localDoctorDeps) (checks []localDoctorCheck, failed bo
 	ok := func(what, detail string) { line("ok", what, detail) }
 	warn := func(what, detail string) { line("note", what, detail) }
 	fail := func(what, detail string) { failed = true; line("FAIL", what, detail) }
+	if d.uploads != nil {
+		st := d.uploads()
+		st.Reason += " (this shell's environment; a running owner keeps its startup environment)"
+		if st.Enabled {
+			ok("Uploads", st.Reason)
+		} else {
+			warn("Uploads", st.Reason)
+		}
+		if st.Warning != "" {
+			warn("Uploads env", st.Warning)
+		}
+	}
 
 	info, err := d.discover()
 	if err != nil {
@@ -241,7 +256,7 @@ func collectLocalDoctor(d localDoctorDeps) (checks []localDoctorCheck, failed bo
 		}
 	}
 	if pointed == 0 {
-		warn("Harness", fmt.Sprintf("no agent app is configured yet. Fix: %s local config copilot (or claude-desktop, codex, opencode)", d.exe))
+		warn("Harness", fmt.Sprintf("no agent app is configured yet. Fix: %s local config copilot (or claude-code, claude-desktop, codex, opencode)", d.exe))
 	}
 
 	ok("Network", "Citadel makes no calls of its own (no account, no update check, no telemetry). The co-browse browser connects only to public addresses, through Citadel's local guard, with background updates off")

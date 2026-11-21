@@ -76,6 +76,7 @@ const CobrowseStageBytesKey = jobprivacy.BytesKey
 // CobrowseSessionHandler handles COBROWSE_SESSION jobs by delegating to the node's
 // CobrowseSessionManager singleton.
 type CobrowseSessionHandler struct {
+	manager *platform.CobrowseSessionManager
 	// Enabled gates stage_file and set_file_input on the node's Files
 	// permission, read live per job (as FILE_WRITE_BYTES does). Unset denies:
 	// a handler built without a permission source never writes a user file.
@@ -90,7 +91,76 @@ func (h *CobrowseSessionHandler) filesAllowed() bool {
 // NewCobrowseSessionHandler constructs an interactive browser-session handler.
 func NewCobrowseSessionHandler() *CobrowseSessionHandler { return &CobrowseSessionHandler{} }
 
+// NewCobrowseSessionHandlerWithManager uses an isolated session manager. Production
+// uses NewCobrowseSessionHandler and the node-wide tracked manager.
+func NewCobrowseSessionHandlerWithManager(m *platform.CobrowseSessionManager) *CobrowseSessionHandler {
+	return &CobrowseSessionHandler{manager: m}
+}
+
 func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
+	mgr := h.manager
+	if mgr == nil {
+		mgr = platform.GetCobrowseSessionManager()
+	}
+	action, id, target := job.Payload["action"], job.Payload["session_id"], job.Payload["target_id"]
+	tracked := id != "" && mgr.SessionTargetsEnabled(id)
+	var out []byte
+	var err error
+	run := func() error { out, err = h.execute(ctx, job, mgr); return err }
+	switch action {
+	case CobrowseSessionActionNavigate, CobrowseSessionActionClick, CobrowseSessionActionType, CobrowseSessionActionSelect, CobrowseSessionActionKey, CobrowseSessionActionScroll, CobrowseSessionActionHandoff, CobrowseSessionActionResume:
+		if id != "" && (tracked || target != "") {
+			err = mgr.WithTargetAssertion(id, target, run)
+		} else {
+			err = run()
+		}
+	case CobrowseSessionActionScreenshot, CobrowseSessionActionExtract:
+		if id != "" && tracked {
+			err = mgr.WithTargetAssertion(id, "", run)
+		} else {
+			err = run()
+		}
+	default:
+		if target != "" {
+			return nil, fmt.Errorf("target_id is not supported for %s", action)
+		}
+		err = run()
+	}
+	if err != nil {
+		return nil, err
+	}
+	// Decorate every successful session action, including non-status read results.
+	// Reset and list/capabilities are not addressed to a browser page.
+	if id != "" && (action == CobrowseSessionActionExtract || action == CobrowseSessionActionSelect) {
+		st, ok := mgr.SessionStatus(id)
+		if !ok && tracked {
+			return nil, platform.ErrNotStarted
+		}
+		if ok {
+			return decorateTargetResult(out, st)
+		}
+	}
+	return out, nil
+}
+
+func decorateTargetResult(out []byte, st platform.CobrowseSessionStatus) ([]byte, error) {
+	if len(st.Features) == 0 {
+		return out, nil
+	}
+	var result map[string]any
+	if err := json.Unmarshal(out, &result); err != nil {
+		return nil, err
+	}
+	result["active_target"] = st.ActiveTarget
+	targets := st.Targets
+	if targets == nil {
+		targets = []platform.CobrowseTarget{}
+	}
+	result["targets"], result["open_targets"], result["features"] = targets, len(targets), st.Features
+	return json.Marshal(result)
+}
+
+func (h *CobrowseSessionHandler) execute(ctx JobContext, job *nexus.Job, mgr *platform.CobrowseSessionManager) ([]byte, error) {
 	action := job.Payload["action"]
 	if action == "" {
 		return nil, fmt.Errorf("job payload missing 'action' field")
@@ -99,9 +169,13 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 	// never logged here or passed anywhere but nodevault's Unlock.
 	ctx.Log("info", "     - [Job %s] browser-session action: %s", job.ID, action)
 
-	mgr := platform.GetCobrowseSessionManager()
-
 	switch action {
+	case "capabilities":
+		features := []string{}
+		if mgr.TargetsEnabled() {
+			features = append(features, "tabs")
+		}
+		return json.Marshal(map[string]any{"features": features})
 	case CobrowseSessionActionStart:
 		return startSession(mgr, job)
 
@@ -122,18 +196,22 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 			}
 			return nil, fmt.Errorf("no such browser session: %q", id)
 		}
-		return sessionStatusResult(st)
+		return sessionStatusResult(mgr.WithPageSignals(st))
 
 	case CobrowseSessionActionStop:
 		id := job.Payload["session_id"]
 		if id == "" {
 			return nil, fmt.Errorf("stop requires a 'session_id' field")
 		}
+		st, _ := mgr.SessionStatus(id)
 		if err := mgr.Stop(id); err != nil {
 			return nil, err
 		}
 		out, _ := json.Marshal(map[string]any{"stopped": id})
-		return out, nil
+		st.ActiveTarget = ""
+		st.Targets = nil
+		st.OpenTargets = 0
+		return decorateTargetResult(out, st)
 
 	case CobrowseSessionActionReset:
 		name := job.Payload["profile"]
@@ -166,7 +244,24 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		if id == "" {
 			return nil, fmt.Errorf("screenshot requires a 'session_id' field")
 		}
-		img, st, err := mgr.ScreenshotStatus(id)
+		var img string
+		var st platform.CobrowseSessionStatus
+		var page platform.CobrowseTarget
+		var err error
+		if !mgr.SessionTargetsEnabled(id) && job.Payload["target_id"] == "" {
+			// Preserve main's single-connection screenshot and status read for
+			// legacy sessions; tracked reads also carry the selected page.
+			img, st, err = mgr.ScreenshotStatus(id)
+		} else {
+			img, page, err = mgr.ScreenshotTarget(id, job.Payload["target_id"])
+			if err == nil {
+				var ok bool
+				st, ok = mgr.SessionStatus(id)
+				if !ok {
+					return nil, platform.ErrNotStarted
+				}
+			}
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -174,15 +269,21 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		// format, driver, url) so a consumer that already parses
 		// cobrowse_screenshot's result -- e.g. an aceteam #8131/#8133 rewire
 		// -- does not silently lose driver/url when it switches job types.
-		// The status was read over the screenshot's own connection, so this
-		// decoration costs no extra CDP probe.
-		out, _ := json.Marshal(map[string]any{
+		pageURL := st.URL
+		if page.ID != "" {
+			pageURL = page.URL
+		}
+		fields := map[string]any{
 			"image":  img,
 			"format": "png",
 			"driver": string(st.Driver),
-			"url":    st.URL,
-		})
-		return out, nil
+			"url":    pageURL,
+		}
+		if page.ID != "" {
+			fields["target_id"] = page.ID
+		}
+		out, _ := json.Marshal(fields)
+		return decorateTargetResult(out, st)
 
 	case CobrowseSessionActionClick:
 		id := job.Payload["session_id"]
@@ -272,11 +373,18 @@ func (h *CobrowseSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 		if selector == "" {
 			return nil, fmt.Errorf("extract requires a 'selector' field")
 		}
-		result, err := mgr.Extract(id, selector, parseAttrNames(job.Payload["attrs"]))
+		result, page, err := mgr.ExtractTarget(id, job.Payload["target_id"], selector, parseAttrNames(job.Payload["attrs"]))
 		if err != nil {
 			return nil, err
 		}
 		out, err := json.Marshal(result)
+		if err == nil && page.ID != "" {
+			var fields map[string]any
+			if err = json.Unmarshal(out, &fields); err == nil {
+				fields["target_id"] = page.ID
+				out, err = json.Marshal(fields)
+			}
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -425,7 +533,7 @@ func startSession(mgr *platform.CobrowseSessionManager, job *nexus.Job) ([]byte,
 		if err != nil {
 			return nil, err
 		}
-		return sessionStatusResult(st)
+		return sessionStatusResult(mgr.WithPageSignals(st))
 	}
 
 	pin := job.Payload["pin"]
@@ -452,7 +560,7 @@ func startSession(mgr *platform.CobrowseSessionManager, job *nexus.Job) ([]byte,
 	if err != nil {
 		return nil, err
 	}
-	return sessionStatusResult(st)
+	return sessionStatusResult(mgr.WithPageSignals(st))
 }
 
 // sessionStreamInfo is the additive stream-endpoint hint carried on start/status
@@ -485,7 +593,7 @@ func sessionStatusResult(st platform.CobrowseSessionStatus) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return out, nil
+	return decorateTargetResult(out, st)
 }
 
 // CobrowseReportPartialKey is the payload flag with which a caller says it
@@ -522,14 +630,19 @@ func actionFailureResult(err error, reportPartial bool) ([]byte, error) {
 // sessionListResult marshals a list of session statuses to JSON output bytes, always
 // as a JSON array (never null) so a caller can iterate an empty result unconditionally.
 func sessionListResult(list []platform.CobrowseSessionStatus) ([]byte, error) {
-	if list == nil {
-		list = []platform.CobrowseSessionStatus{}
+	sessions := make([]json.RawMessage, 0, len(list))
+	for _, st := range list {
+		raw, err := json.Marshal(st)
+		if err != nil {
+			return nil, err
+		}
+		out, err := decorateTargetResult(raw, st)
+		if err != nil {
+			return nil, err
+		}
+		sessions = append(sessions, out)
 	}
-	out, err := json.Marshal(map[string]any{"sessions": list})
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
+	return json.Marshal(map[string]any{"sessions": sessions})
 }
 
 // parseTypeAction validates a type payload: session_id, text, and the optional

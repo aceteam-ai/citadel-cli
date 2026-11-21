@@ -3950,3 +3950,120 @@ Auto-generated log of every release.
   - fix(hpc): show bounded approval refusal details (#1629)
 
 
+---
+
+## v2.236.0 — 2026-11-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 17 |
+| Lines added | +1965 |
+
+**Changes:**
+
+  - Revert "feat(local): bind file metadata in form approvals (#1751)" (#1754)
+  - fix(cobrowse): handoff banner dedupe and browser names for CITADEL_COBROWSE_BROWSER (#1752)
+  - feat(local): bind file metadata in form approvals (#1751)
+  - feat(cobrowse): type replace with selector and clear, key modifiers, input_edit marker (#1731)
+
+
+---
+
+## v2.237.0 — 2026-11-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 13 |
+| Lines added | +993 |
+
+**Changes:**
+
+  - fix(local): re-land file approval snapshots with chooser provenance (#1755)
+
+
+---
+
+## v2.238.0 — 2026-11-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 8 |
+| Lines added | +594 |
+
+**Changes:**
+
+  - feat(cobrowse): report page_text and password_field on start and status (#1773)
+
+
+---
+
+## v2.239.0 — 2026-11-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 12 |
+| Lines added | +606 |
+
+**Changes:**
+
+  - fix(module): catalog cold-cache fetch, meeting marker node dir, re-detect meeting when healthy (#1774)
+
+
+---
+
+## v2.240.0 — 2026-11-18
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 40 |
+| Lines added | +2905 |
+
+**Changes:**
+
+  - release: CPU-limited by default, and trust main CI's test gate (#1791)
+  - feat(browser-runtime): browser-runtime image with a per-session run contract (C1) (#1786)
+  - feat(local): add live upload opt-out setting (#1737 S2) (#1780)
+  - fix(local): approved link outcome, viewer Enter, installer text, banner wording (#1784)
+  - ci: run PR CI for stacked PRs on feat/fix/docs/chore bases (#1775)
+
+
+---
+
+## v2.241.0 — 2026-11-18
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 41 |
+| Lines added | +3469 |
+
+**Changes:**
+
+  - feat(cobrowse): track pages in remotely dispatched sessions (#1671)
+  - feat(botprofile): bot profile store with split unattended key (#1787)
+
+
+---
+
+## v2.242.0 — 2026-11-19
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 42 |
+| Lines added | +5412 |
+
+**Changes:**
+
+  - feat(local): agent-led setup prompt and claude-code config target (#1807) (#1826)
+  - feat: report optional heartbeat load and pressure capacity (#1718)
+  - feat(browser-runtime): renderer sandbox and browser choice (#1788) (#1805)
+  - feat(browser-runtime): container runner for node cobrowse (C2, #1760) (#1798)
+  - ci: stabilize Windows real-browser steps and installer release lookup (#1797)
+
+

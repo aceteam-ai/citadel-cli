@@ -35,7 +35,7 @@ Windows comes first. See the
 - **Limits.** At most 2 sessions at once, 120 actions a minute and 600 page
   loads an hour per session, and an 8-hour idle lifetime. Local and private
   network addresses are refused.
-- **`citadel local doctor` and `citadel local config <copilot|claude-desktop|codex>`.**
+- **`citadel local doctor` and `citadel local config <copilot|claude-code|claude-desktop|codex>`.**
   First-run checks, and the exact MCP entry for your agent app, written for
   you with `--write`.
 

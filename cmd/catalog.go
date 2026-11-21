@@ -290,7 +290,7 @@ func runCatalogSearch(cmd *cobra.Command, args []string) error {
 
 // runCatalogInfo prints the full manifest details for a service.
 func runCatalogInfo(cmd *cobra.Command, args []string) error {
-	manifest, err := catalog.LoadServiceManifest(args[0])
+	manifest, err := catalog.LoadServiceManifestSelfHealing(args[0])
 	if err != nil {
 		return err
 	}

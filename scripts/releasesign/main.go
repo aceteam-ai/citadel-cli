@@ -5,6 +5,7 @@
 //	go run ./scripts/releasesign check  --key KEY.pem
 //	go run ./scripts/releasesign sign   --key KEY.pem --tag vX.Y.Z --in checksums.txt --out checksums.txt.sig
 //	go run ./scripts/releasesign verify --tag vX.Y.Z --in checksums.txt --sig checksums.txt.sig
+//	go run ./scripts/releasesign verify-assets --tag vX.Y.Z --in checksums.txt --dir ARCHIVES
 //
 // KEY.pem is a PKCS#8 PEM Ed25519 private key. This command never prints key
 // material; it reports only the derived key id.
@@ -32,7 +33,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: releasesign check|sign|verify [flags]")
+		return errors.New("usage: releasesign check|sign|verify|verify-assets [flags]")
 	}
 	fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	keyPath := fs.String("key", "", "PKCS#8 PEM Ed25519 private key")
@@ -40,10 +41,20 @@ func run(args []string) error {
 	in := fs.String("in", "", "checksums.txt path")
 	out := fs.String("out", "", "signature output path")
 	sigPath := fs.String("sig", "", "signature path")
+	archiveDir := fs.String("dir", "", "directory containing downloaded draft archives")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
 	switch args[0] {
+	case "verify-assets":
+		if *in == "" || *archiveDir == "" {
+			return errors.New("verify-assets requires --in and --dir")
+		}
+		if err := verifyDraftAssets(*in, *archiveDir, *tag); err != nil {
+			return err
+		}
+		fmt.Printf("unsigned draft archive digests match for %s (not signature verification)\n", *tag)
+		return nil
 	case "check":
 		priv, err := loadTrustedKey(*keyPath)
 		if err != nil {
