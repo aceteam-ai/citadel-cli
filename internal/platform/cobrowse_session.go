@@ -230,7 +230,7 @@ type cobrowseProc struct {
 	// stop kills the browser then the Xvfb (bounded waits) and is safe to call once.
 	stop func() error
 	// Optional positive owned-resource proof, distinct from legacy best-effort
-	// stop. Currently only fresh Windows jobs supply it; no manager calls it.
+	// stop. Currently only fresh Windows jobs supply it; no production action uses it.
 	stopForSuspend func(context.Context) error
 }
 

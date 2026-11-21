@@ -7,7 +7,7 @@ import (
 
 // stopSuspendProc is only for a trusted, already-staged suspend transaction.
 // The caller retains registry/action exclusion and fences the exact manager,
-// session, generation and proc through every await. No manager/action invokes
+// session, generation and proc through every await. No production action invokes
 // this helper yet. In particular, it never calls ordinary teardown, removes a
 // profile or upgrades legacy best-effort stop into complete resource proof.
 // The fence permits the expected root exit. Both injected operations must

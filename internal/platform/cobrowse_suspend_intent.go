@@ -3,7 +3,7 @@ package platform
 // Unwired suspend-intent persistence, using the existing lifecycle registry.
 // The caller must hold the session lifecycle exclusion across capture, staging
 // and teardown. This store's lock excludes other suspend-store instances, NOT
-// legacy live-record writers. There is deliberately no manager/job caller yet.
+// legacy live-record writers. There is deliberately no production job caller yet.
 
 import (
 	"context"

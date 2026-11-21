@@ -7,8 +7,8 @@ start-owner metadata, bounded manifest encryption, private file storage and
 per-page CDP capture primitives. Suspend and
 reopen have no production caller yet: no new job action,
 browser close/relaunch, profile snapshot or advertised capability.
-Existing live-browser launch/action behavior is unchanged. This is not a completed suspend feature
-or native acceptance proof.
+The wired legacy start/retention/delete guards are listed below. This is not a
+completed suspend feature or native acceptance proof.
 
 The legacy start path now refuses an ID with retained suspension metadata or a
 suspension tombstone before startup sweep, and rechecks under registry exclusion
@@ -170,9 +170,31 @@ caller fence still hold; even a reaped root must pass complete resource proof.
 Both stages share one capped wall deadline, and ordinary teardown is never the
 fallback. The caller retains registry/action exclusion and permits expected
 root exit in its fence. Only fresh Windows jobs currently provide the positive
-adapter; other runners remain unsupported at this boundary. No manager or job
+adapter; other runners remain unsupported at this boundary. No production job
 calls this sequence yet. Its fake-process composition test proves ordering with
 durable capture completion, not actual resource release or profile persistence.
+
+The private post-intent manager completion now retains the in-memory slot across
+positive teardown proof, working-copy cleanup and durable dormant publication.
+Its trusted caller must already retain registry and action exclusion; the
+capture-to-intent continuation exercises that composition in tests. Manager and
+staging locks refuse immediately when busy, rather than waiting while holding
+the outer gates. Staging closes before effects, and runtime generation, state,
+proc/reaper, registry and working-directory identity stay pinned around awaits.
+Cleanup receives only the pinned throwaway working-directory path, after positive
+resource proof, and absence is verified before publication and slot retirement.
+An uncertain final publish retains the slot; retry reconciles the exact record
+without refreshing capture/TTL or repeating cleanup, and still requires resource
+proof and the original reaper before retirement. Ordinary Stop cannot remove the
+slot mid-transaction. The manager lock covers all sessions during this private
+completion. Callbacks must be cooperative and non-reentrant; the shared capped
+budget is not a hard synchronous-filesystem deadline.
+
+This is not a production suspend entry point. The working-copy cleanup adapter,
+all-runner resource proofs, saved-profile integration and the surrounding full
+manager lifecycle/recovery remain unfinished. No job or advertised capability
+invokes the private completion. Tests use synthetic captures, fake resources and
+only their own temporary working directories; they do not prove native teardown.
 
 A separate private scope-pair adapter accepts only copied, complete per-launch
 invocation and process-birth observations for the browser and its dedicated
