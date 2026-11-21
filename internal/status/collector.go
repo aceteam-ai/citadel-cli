@@ -2,8 +2,10 @@ package status
 
 import (
 	"context"
+	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/apps"
@@ -23,13 +25,15 @@ import (
 
 // Collector gathers status metrics from the system, GPU, and services.
 type Collector struct {
+	role             string
 	clockState       clockstate.Provider
 	nodeName         string
 	configDir        string
 	services         []ServiceConfig
 	startTime        time.Time
 	modelDiscovery   *ModelDiscovery
-	capabilities     *NodeCapabilities                 // cached capabilities (set once at startup)
+	capsMu           sync.RWMutex                      // guards capabilities (replaced when meeting turns healthy, citadel-cli#1758)
+	capabilities     *NodeCapabilities                 // cached capabilities (set at startup; may be replaced by SetCapabilities)
 	workerLiveness   func() *WorkerLiveness            // live worker consume-loop liveness (issue #548), optional
 	swapStats        func() *SwapActivity              // live model-hotswap activity (citadel #717), optional
 	reconcileHealth  func() *ReconcileHealth           // live full-wipe-guard refusal state (citadel #742), optional
@@ -45,6 +49,7 @@ type Collector struct {
 	cacheReport      func() *CacheReport               // live cache-index attribution (citadel #682 P3), optional
 	jobTypes         func() []string                   // live registered worker job types (aceteam #9962), optional
 	permissions      func() *config.Permissions        // authoritative node permission policy, optional
+	visibleGPUs      []string                          // nil = all devices
 	appPods          func() []AppInfo                  // live hosted-app pod entries (CRAM A1, aceteam#9672), optional
 	sandboxedModules func() *SandboxedModuleCapability // generic sandboxed-module runtime availability (citadel-cli#1288), optional
 	nvrHealth        func() *NVRHealth                 // nvr module per-camera self-heal state (citadel-cli#1295), optional
@@ -60,6 +65,7 @@ type ServiceConfig struct {
 
 // CollectorConfig holds configuration for the status collector.
 type CollectorConfig struct {
+	Role string
 	// Cheap cached provider shared with this process's runner. No inline probe.
 	ClockState   clockstate.Provider
 	NodeName     string
@@ -120,6 +126,11 @@ type CollectorConfig struct {
 	// capability-aware dispatch. nil or an empty result leaves job_types omitted
 	// until the live runner is fully registered.
 	JobTypes func() []string
+	// VisibleGPUs, when non-nil, limits GPU metrics to these device indexes
+	// (CUDA_VISIBLE_DEVICES entries). A batch allocation reports only the GPUs
+	// its scheduler gave it; an empty non-nil slice reports none. nil (every
+	// ordinary node) reports all devices.
+	VisibleGPUs []string
 	// PermissionsProvider returns the authoritative node permission policy for
 	// capability advertisement. It is deliberately a provider, rather than a
 	// ConfigDir resolved inside status: a worker may run as root while a status
@@ -150,6 +161,7 @@ type CollectorConfig struct {
 // NewCollector creates a new status collector.
 func NewCollector(cfg CollectorConfig) *Collector {
 	return &Collector{
+		role:             cfg.Role,
 		clockState:       cfg.ClockState,
 		nodeName:         cfg.NodeName,
 		configDir:        cfg.ConfigDir,
@@ -172,6 +184,7 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		cacheReport:      cfg.CacheReport,
 		jobTypes:         cfg.JobTypes,
 		permissions:      cfg.PermissionsProvider,
+		visibleGPUs:      cfg.VisibleGPUs,
 		appPods:          cfg.AppPods,
 		sandboxedModules: cfg.SandboxedModules,
 		nvrHealth:        cfg.NVRHealth,
@@ -345,8 +358,12 @@ func toStringSet(items []string) map[string]bool {
 }
 
 // SetCapabilities sets the cached capabilities for heartbeat publishing.
+// It is safe to call while Collect runs; callers must pass a fresh value rather
+// than mutating one already set.
 func (c *Collector) SetCapabilities(caps *NodeCapabilities) {
+	c.capsMu.Lock()
 	c.capabilities = caps
+	c.capsMu.Unlock()
 }
 
 func (c *Collector) clockSynchronization() *bool {
@@ -356,13 +373,19 @@ func (c *Collector) clockSynchronization() *bool {
 	return clockstate.Boolean(c.clockState.Snapshot())
 }
 
-// Collect gathers all status metrics and returns a NodeStatus.
-func (c *Collector) Collect() (*NodeStatus, error) {
-	status := &NodeStatus{
+// statusHeader projects only cached startup policy and clock observations.
+func (c *Collector) statusHeader() *NodeStatus {
+	return &NodeStatus{
+		Role:      c.role,
 		NTPSynced: c.clockSynchronization(),
 		Version:   StatusVersion,
 		Timestamp: time.Now().UTC(),
 	}
+}
+
+// Collect gathers all status metrics and returns a NodeStatus.
+func (c *Collector) Collect() (*NodeStatus, error) {
+	status := c.statusHeader()
 
 	// Collect node info
 	status.Node = c.collectNodeInfo()
@@ -484,10 +507,12 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	// than aliasing it, so populating the per-heartbeat capability flags below
 	// does not mutate the shared cached value (Collect may run concurrently for
 	// the status server and the heartbeat publisher).
+	c.capsMu.RLock()
 	if c.capabilities != nil {
 		capsCopy := *c.capabilities
 		status.Capabilities = &capsCopy
 	}
+	c.capsMu.RUnlock()
 
 	// Collect desktop capabilities
 	status.Desktop = desktop.DetectCapabilities()
@@ -654,7 +679,7 @@ func (c *Collector) getNetworkIP() string {
 
 // collectSystemMetrics gathers CPU, memory, and disk utilization.
 func (c *Collector) collectSystemMetrics() SystemMetrics {
-	var metrics SystemMetrics
+	metrics := collectCapacityMetrics(nativeCapacityProbes())
 
 	// Memory
 	if v, err := mem.VirtualMemory(); err == nil {
@@ -769,7 +794,7 @@ func (c *Collector) collectGPUMetrics() []GPUMetrics {
 		gpuMetrics = append(gpuMetrics, metrics)
 	}
 
-	return gpuMetrics
+	return filterVisibleGPUsWithUUIDs(gpuMetrics, c.visibleGPUs, nvidiaSMIUUIDIndex)
 }
 
 // collectServiceStatus gathers status for all configured services.
@@ -996,4 +1021,100 @@ func InferServicePort(serviceName string) int {
 	}
 
 	return 0
+}
+
+// filterVisibleGPUs keeps the metrics whose device index is listed. visible
+// nil keeps everything. Entries that are not indexes and cannot be mapped
+// match nothing, so an unmappable list under-reports rather than over-reports.
+func filterVisibleGPUs(metrics []GPUMetrics, visible []string) []GPUMetrics {
+	return filterVisibleGPUsWithUUIDs(metrics, visible, nil)
+}
+
+// filterVisibleGPUsWithUUIDs is filterVisibleGPUs that also understands the
+// UUID and MIG forms CUDA_VISIBLE_DEVICES may carry. lookup maps a device or
+// MIG UUID to its GPU index; it is called only when a non-index entry exists.
+func filterVisibleGPUsWithUUIDs(metrics []GPUMetrics, visible []string, lookup func() map[string]int) []GPUMetrics {
+	if visible == nil {
+		return metrics
+	}
+	keep := make(map[string]bool, len(visible))
+	var uuids map[string]int
+	for _, v := range visible {
+		v = strings.TrimSpace(v)
+		if _, err := strconv.Atoi(v); err == nil {
+			keep[v] = true
+			continue
+		}
+		if lookup == nil {
+			continue
+		}
+		if uuids == nil {
+			uuids = lookup()
+		}
+		// A MIG id may carry a "/gi/ci" suffix and a "MIG-" prefix that the
+		// listing spells differently; try the plausible spellings.
+		base := v
+		if i := strings.IndexByte(base, '/'); i >= 0 {
+			base = base[:i]
+		}
+		for _, cand := range []string{v, base, strings.TrimPrefix(base, "MIG-")} {
+			if idx, ok := uuids[cand]; ok {
+				keep[strconv.Itoa(idx)] = true
+				break
+			}
+		}
+	}
+	out := make([]GPUMetrics, 0, len(metrics))
+	for _, m := range metrics {
+		if keep[strconv.Itoa(m.Index)] {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// parseGPUUUIDIndex reads `nvidia-smi -L` output and maps every GPU and MIG
+// device UUID to the index of the GPU it belongs to:
+//
+//	GPU 0: <name> (UUID: GPU-...)
+//	  MIG 1g.5gb Device 0: (UUID: MIG-...)
+func parseGPUUUIDIndex(out string) map[string]int {
+	m := map[string]int{}
+	current := -1
+	for _, line := range strings.Split(out, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "GPU ") {
+			rest := strings.TrimPrefix(trimmed, "GPU ")
+			if i := strings.IndexByte(rest, ':'); i > 0 {
+				if n, err := strconv.Atoi(rest[:i]); err == nil {
+					current = n
+				}
+			}
+		}
+		if current < 0 {
+			continue
+		}
+		if i := strings.Index(trimmed, "UUID: "); i >= 0 {
+			id := trimmed[i+len("UUID: "):]
+			if j := strings.IndexByte(id, ')'); j >= 0 {
+				id = id[:j]
+			}
+			if id = strings.TrimSpace(id); id != "" {
+				m[id] = current
+			}
+		}
+	}
+	return m
+}
+
+// nvidiaSMIUUIDIndex lists the node's GPUs with `nvidia-smi -L`. Best effort:
+// on any failure it returns an empty map, so UUID entries match nothing.
+func nvidiaSMIUUIDIndex() map[string]int {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "nvidia-smi", "-L").Output()
+	if err != nil {
+		return map[string]int{}
+	}
+	return parseGPUUUIDIndex(string(out))
 }

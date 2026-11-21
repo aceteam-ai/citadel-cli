@@ -38,6 +38,44 @@ type Session interface {
 	MarkAttached(id string) bool
 	// MarkDetached returns the session to running when the viewer disconnects.
 	MarkDetached(id string) bool
+	// ViewerHasControl is true only after explicit handoff. It is checked on
+	// every input frame so resume can revoke control while the stream stays open.
+	ViewerHasControl(id string) bool
+}
+
+// TargetSession is a Session that also tracks the session's open pages (tabs
+// and popups). The stream follows the active page, tells the viewer the list,
+// and applies the viewer's choice. A Session without it streams the first page.
+type TargetSession interface {
+	Session
+	// Targets synchronizes with the browser and returns the open pages.
+	Targets(id string) (TargetSnapshot, error)
+	// SwitchTarget makes a page active; CloseTarget closes one. Both are for
+	// the user who has taken control.
+	SwitchTarget(id, target string) error
+	CloseTarget(id, target string) error
+}
+
+// FileAttachSession is a Session that lets the viewer answer the page's
+// pending file chooser with a staged file (citadel-cli#1723). A Session without
+// it gets no file_chooser frames and ignores file_attach input.
+type FileAttachSession interface {
+	Session
+	// FileChooser reports the pending chooser and the staged files the viewer
+	// may attach. ok is false when there is nothing to offer right now (no
+	// chooser, no control, or Files not permitted).
+	FileChooser(id string) (FileChooserMessage, bool)
+	// AttachStagedFile fills the chooser's input with one staged file. reason
+	// is empty on success, else a fixed code (see FileAttachResult).
+	AttachStagedFile(ctx context.Context, id string, backendNodeID int, stagedName string) (reason string)
+}
+
+// TargetSnapshot is the pages of a session at one moment.
+type TargetSnapshot struct {
+	Active string
+	// ActiveWebSocketURL is the active page's loopback debugger URL.
+	ActiveWebSocketURL string
+	Targets            []TargetInfo
 }
 
 // Logger matches the deskstream/VNC/terminal server logger interface.

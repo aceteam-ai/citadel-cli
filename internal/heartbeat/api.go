@@ -362,6 +362,26 @@ func (p *APIPublisher) publishMessage(ctx context.Context, msg StatusMessage, ti
 	// 1. Durable stream for reliable processing by the platform worker.
 	// Attempted first; its failure is the only fatal one.
 	streamErr := p.client.StreamAdd(ctx, p.streamName, streamFields, 10000)
+	rateLimited := false
+	if rle, ok := redisapi.AsRateLimitError(streamErr); ok {
+		rateLimited = true
+		// Heartbeat first under a platform 429 (#1677): one bounded retry after
+		// the server's Retry-After, only when it fits well inside the interval so
+		// a dropped publish cannot age out liveness and the next tick is never
+		// delayed. A longer hint is left to the next tick.
+		wait := rle.Wait(time.Now())
+		if wait < time.Second {
+			wait = time.Second
+		}
+		if wait <= p.interval/2 {
+			select {
+			case <-time.After(wait):
+				streamErr = p.client.StreamAdd(ctx, p.streamName, streamFields, 10000)
+				_, rateLimited = redisapi.AsRateLimitError(streamErr)
+			case <-ctx.Done():
+			}
+		}
+	}
 	if streamErr == nil {
 		p.debug("heartbeat: stream add successful")
 	}
@@ -382,9 +402,11 @@ func (p *APIPublisher) publishMessage(ctx context.Context, msg StatusMessage, ti
 	}
 
 	// 2. Best-effort pub/sub for real-time UI updates. Attempted even when the
-	// stream write failed, since the two paths fail independently in API mode.
-	p.debug("heartbeat: publishing to channel %s", p.pubSubChannel)
-	if pubErr := p.client.Publish(ctx, p.pubSubChannel, msg); pubErr != nil {
+	// stream write failed, since the two paths fail independently in API mode --
+	// except under a 429, where it would only add load to the limited bucket.
+	if rateLimited {
+		p.debug("heartbeat: skipping pub/sub publish while rate limited")
+	} else if pubErr := p.client.Publish(ctx, p.pubSubChannel, msg); pubErr != nil {
 		p.debug("heartbeat: pub/sub publish failed (non-fatal): %v", pubErr)
 		if report, escalate := p.pubSubHealth.recordFailure(time.Now()); escalate {
 			p.log("warning", "   - Warning: heartbeat pub/sub publish to %s failing (%s): %v (live UI updates only; durable status stream unaffected)",

@@ -3467,3 +3467,603 @@ Auto-generated log of every release.
   - fix(update): disclose the effective startup auto-update policy (#1534)
 
 
+---
+
+## v2.210.0 — 2026-11-05
+
+| Metric | Value |
+|--------|-------|
+| Commits | 10 |
+| Files changed | 45 |
+| Lines added | +5604 |
+
+**Changes:**
+
+  - fix(services): register the PAW compile host port (#1470)
+  - feat(cobrowse): insert pasted text under live human control (#1547)
+  - feat(metrics): prepare inactive bounded store app candidate (#1551)
+  - feat(metrics): prepare bounded inactive host and job collector (#1550)
+  - Add native select and keyboard cobrowse actions (#1544)
+  - Gate co-browse viewer input on explicit handoff (#1542)
+  - Ensure co-browse viewers get an idle page first frame (#1540)
+  - docs: propose sovereign agent connection and runtime boundaries (#1433)
+  - feat(depth): prepare bounded point-cloud sequence contract and codecs (#1405)
+  - feat(mediainput): prepare shared pinned HTTPS inbox acquisition (#1413)
+
+
+---
+
+## v2.211.0 — 2026-11-09
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 6 |
+| Lines added | +126 |
+
+**Changes:**
+
+  - fix(cobrowse): restrict session URLs to http(s) and terminate browser switches (#1575)
+
+
+---
+
+## v2.212.0 — 2026-11-09
+
+| Metric | Value |
+|--------|-------|
+| Commits | 28 |
+| Files changed | 59 |
+| Lines added | +11409 |
+
+**Changes:**
+
+  - Merge pull request #1574 from aceteam-ai/feat/local-mode-s6-first-run
+  - Merge pull request #1573 from aceteam-ai/feat/local-mode-s5-audit
+  - Merge pull request #1572 from aceteam-ai/feat/local-mode-s4-viewer
+  - Merge pull request #1570 from aceteam-ai/feat/local-mode-s3-local-mcp
+  - Merge pull request #1569 from aceteam-ai/feat/local-mode-s1-windows-runner
+  - chore(local): make BurntSushi/toml a direct dependency; correct the harness-location note in CLAUDE.md
+  - fix(local): parse harness configs properly and make the first-run docs honest
+  - fix(local): resolve the harness home through platform.UserHomeDir
+  - fix(local): doctor reports the browser version and refuses one older than 109; clarify DNS in the no-network wording
+  - feat(local): citadel local doctor, citadel local config, quickstart and release notes
+  - fix(local): roll back a failed audit write, accept a lagging anchor, link pending records
+  - fix(local): record writes before they run and make the audit chain tamper-evident at both ends
+  - feat(local): hash-chained local co-browse audit log, Activity panel, citadel local audit
+  - fix(local): drop the old viewer stream on re-open and recheck a newly created private dir
+  - fix(cobrowse): validate the address-bar URL in NavigateAsHuman
+  - fix(local): keep viewer codes off the command line and the token out of the cookie
+  - fix(local): guard where the browser connects, start-page landing, resume and budgets
+  - test(local): retry viewer clicks until they take effect in the real-browser page test
+  - test(local): use documentation-range addresses in the address-filter tests
+  - feat(local): loopback co-browse viewer with approval card and take control
+  - feat(local): citadel local mcp and the local_cobrowse_* tools
+  - fix(cobrowse): never relaunch a session for its user agent; fix a probe-cache race
+  - fix(cobrowse): never fall back to a headless user agent when the UA probe fails
+  - fix(cobrowse): gate every runner launch on ValidateCobrowseURL
+  - fix(cobrowse): harden the Windows runner's debug port, UA probe and headed paths
+  - fix(cobrowse): send the browser's real user agent from Windows headless sessions
+  - test(cobrowse): accept ownership refusal for a plain dir on elevated Windows runners
+  - feat(cobrowse): Windows headless browser runner behind a runner interface
+
+
+---
+
+## v2.213.0 — 2026-11-09
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 50 |
+| Lines added | +3550 |
+
+**Changes:**
+
+  - fix(update): verify ed25519-signed release checksums (aceteam#12089) (#1589)
+  - feat(worker): retain terminal MEETING_JOIN result in Redis with a TTL (#1588)
+  - feat(local): add opencode harness to local config (#1587)
+  - feat(ollama): ollama_keep_alive and ollama_preload manifest settings (#1586)
+  - fix(services): materialize fresh compose on unknown GPU evidence (#1562)
+
+
+---
+
+## v2.214.0 — 2026-11-09
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 11 |
+| Lines added | +123 |
+
+**Changes:**
+
+  - fix(local): keep local-mode state in the invoking user's config dir (#1593)
+
+
+---
+
+## v2.215.0 — 2026-11-10
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 17 |
+| Lines added | +1252 |
+
+**Changes:**
+
+  - feat(meetings): Teams in-call disclosure and /ace leave (N3) (#1610)
+  - fix(enrollment): register relogin grants before linking, fail unsent links (#1605)
+  - feat(worker): retain terminal MEETING_JOIN result in API mode (citadel-cli#1553) (#1609)
+  - fix(meetings): select Teams audio before muting devices (#1549)
+
+
+---
+
+## v2.216.0 — 2026-11-10
+
+| Metric | Value |
+|--------|-------|
+| Commits | 22 |
+| Files changed | 56 |
+| Lines added | +7119 |
+
+**Changes:**
+
+  - Merge pull request #1608 from aceteam-ai/feat/hpc-launch
+  - Merge pull request #1607 from aceteam-ai/feat/hpc-enroll
+  - Merge pull request #1606 from aceteam-ai/feat/hpc-profile
+  - merge feat/hpc-enroll
+  - merge feat/hpc-profile
+  - test(hpc): make privateTempDir available on every platform
+  - merge feat/hpc-enroll
+  - test(hpc): explicit private temp dir for enroll fixtures
+  - merge feat/hpc-profile
+  - test(hpc): drop the cmd-wide umask, use explicit private temp dirs for hpc fixtures
+  - style(hpc): gofmt
+  - fix(hpc): harden vLLM flags, readiness owner check, caches, GPU forms and exit codes
+  - merge origin/feat/hpc-enroll
+  - fix(hpc): deregister on SIGTERM during drain and on partial enroll failure, harden token and leaf handling
+  - merge origin/feat/hpc-profile
+  - fix(hpc): reject group-writable job bases, gate every command, route llm_inference to the job engine only
+  - fix(hpc): require an explicit --auth-service on launch; test the child worker argv
+  - feat(hpc): login-node launcher and in-job supervisor (aceteam#12718)
+  - fix(hpc): register drain and terminate handlers before the lock and enrollment
+  - feat(hpc): non-interactive HPC enrollment, drain and deregister (aceteam#12717)
+  - fix(hpc): keep exact-leaf exemptions first and accept inherited global flags
+  - feat(hpc): job-scoped --profile hpc with an API-only worker (aceteam#12715)
+
+
+---
+
+## v2.217.0 — 2026-11-10
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 2 |
+| Lines added | +119 |
+
+**Changes:**
+
+  - fix(local): accept a UTF-8 BOM in agent config files for local config --write (#1611)
+
+
+---
+
+## v2.218.0 — 2026-11-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 19 |
+| Lines added | +1618 |
+
+**Changes:**
+
+  - fix(cobrowse): survive self-update restart; defer while a human is involved (#1546) (#1614)
+
+
+---
+
+## v2.219.0 — 2026-11-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 16 |
+| Lines added | +1333 |
+
+**Changes:**
+
+  - feat(local): guided setup page and Windows double-click launch (#1615 slice 1) (#1618)
+
+
+---
+
+## v2.220.0 — 2026-11-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 8 |
+| Lines added | +532 |
+
+**Changes:**
+
+  - Merge remote-tracking branch 'origin/main'
+  - fix(cobrowse): navigate waits to settle and returns the final URL and title (#1613) (#1619)
+  - fix(cobrowse): wait for selector click target to settle (#1552)
+
+
+---
+
+## v2.221.0 — 2026-11-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 12 |
+| Lines added | +1245 |
+
+**Changes:**
+
+  - fix(worker): keep model reasoning separate from answers (#1503)
+  - fix(cobrowse): sessions survive a full service restart on Linux (#1546) (#1621)
+
+
+---
+
+## v2.222.0 — 2026-11-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 4 |
+| Lines added | +181 |
+
+**Changes:**
+
+  - fix(cobrowse): adopt a browser that moved itself into its own app scope (#1546, #1621) (#1623)
+  - test(worker): wait for observed deadline before releasing meeting handler (#1624)
+
+
+---
+
+## v2.223.0 — 2026-11-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 6 |
+| Lines added | +210 |
+
+**Changes:**
+
+  - fix(cobrowse): adopt by recorded CDP browser id (#1546) (#1625)
+
+
+---
+
+## v2.224.0 — 2026-11-11
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 6 |
+| Lines added | +386 |
+
+**Changes:**
+
+  - ci: Linux co-browse real-browser job (#1626)
+  - fix(cobrowse): start with a launch URL reports the settled URL and title (#1613) (#1627)
+
+
+---
+
+## v2.225.0 — 2026-11-13
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 13 |
+| Lines added | +1323 |
+
+**Changes:**
+
+  - feat(hpc): approve-on-arrival enrollment (--org) (#1616)
+
+
+---
+
+## v2.226.0 — 2026-11-13
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 6 |
+| Lines added | +631 |
+
+**Changes:**
+
+  - Log credential fingerprints instead of full values (#1603)
+
+
+---
+
+## v2.227.0 — 2026-11-13
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 10 |
+| Lines added | +439 |
+
+**Changes:**
+
+  - fix(hpc): pin transformers<5 beside vLLM 0.11 in hpc setup (#1637)
+  - fix(cobrowse): stop leaves session dir behind; real-browser CI flake (#1630)
+  - Merge remote-tracking branch 'origin/main'
+  - fix(jobs): honor per-job timeout_ms in the HTTP proxy (#1628)
+
+
+---
+
+## v2.228.0 — 2026-11-14
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 63 |
+| Lines added | +8409 |
+
+**Changes:**
+
+  - fix(local): bind commit approvals to the full target URL and complete content digest (#1654)
+  - fix(hpc): refuse companion repair in foreign Python prefixes (#1655)
+  - feat(local): persistent encrypted browser profile with passphrase unlock in the viewer (#820 enforced) (#1647)
+  - feat(local): commit actions always ask, per-domain grants, identity-bearing limits (#1636) (#1646)
+  - fix(whisper): bump opentelemetry-api for GHSA-mf5v-w3w3-f6cg (#1652)
+
+
+---
+
+## v2.229.0 — 2026-11-15
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 29 |
+| Lines added | +3508 |
+
+**Changes:**
+
+  - feat(cobrowse): follow popups and new tabs in runner and local viewer (#1633) (#1648)
+
+
+---
+
+## v2.230.0 — 2026-11-16
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 15 |
+| Lines added | +625 |
+
+**Changes:**
+
+  - fix(update): no recovery warning when the update lock was never provisioned (#1682) (#1684)
+  - fix(worker): heartbeat first and Retry-After backoff under platform 429 (#1677) (#1680)
+
+
+---
+
+## v2.231.0 — 2026-11-16
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 19 |
+| Lines added | +2572 |
+
+**Changes:**
+
+  - fix(localviewer): first input after handoff reaches the streamed page (#1681) (#1686)
+  - fix(cobrowse): bounded single-connection actions with partial-effect reporting (#1663) (#1664)
+
+
+---
+
+## v2.232.0 — 2026-11-16
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 36 |
+| Lines added | +2047 |
+
+**Changes:**
+
+  - fix(llm_inference): honor temperature 0 on Ollama and add seed end to end (#1643)
+  - fix(hotswap): floor the warming ETA at the retry interval (#1640) (#1642)
+  - fix(receipts): sign the serving node id, not the key fingerprint, on regular workers (#1641)
+  - feat(worker): add control-only per-node scheduling role (#1698) (#1705)
+  - test(local): CI end-to-end of the local-mode gate through citadel local mcp (#1683) (#1685)
+
+
+---
+
+## v2.233.0 — 2026-11-16
+
+| Metric | Value |
+|--------|-------|
+| Commits | 6 |
+| Files changed | 37 |
+| Lines added | +3234 |
+
+**Changes:**
+
+  - feat(lanes): bounded read-only lane inventory (#1699) (#1711)
+  - fix(localviewer): focus the stream when the human takes control (#1687) (#1692)
+  - fix(cobrowse): fast, retried first page load after session start (#1694) (#1710)
+  - test(cobrowse): hold the cold first screenshot to the action deadline on Windows (#1712)
+  - fix(windows): installer gives citadel.exe to the installing user; doctor flags an Administrators-owned binary (#1695) (#1696)
+  - ci: shard Build + Test into parallel jobs (#1707) (#1708)
+
+
+---
+
+## v2.234.0 — 2026-11-16
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 47 |
+| Lines added | +3399 |
+
+**Changes:**
+
+  - feat(cobrowse): session file staging, set_file_input and file-chooser interception (#1721) (#1722)
+  - fix(cobrowse): report a pending first load instead of returning a blank page as loaded (#1714) (#1719)
+  - fix(local): local doctor prints only its results when a check fails (#1726)
+  - test(cobrowse): stub a port owner PID that can never be the test process (#1725)
+  - test: deflake #1697, #1706, #1709 (test-only) (#1720)
+
+
+---
+
+## v2.235.0 — 2026-11-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 19 |
+| Lines added | +2946 |
+
+**Changes:**
+
+  - docs: design for local co-browse file upload and edit parity (#1733)
+  - feat(cobrowse): human file attach for a pending file chooser (#1723) (#1728)
+  - fix(hpc): show bounded approval refusal details (#1629)
+
+
+---
+
+## v2.236.0 — 2026-11-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 17 |
+| Lines added | +1965 |
+
+**Changes:**
+
+  - Revert "feat(local): bind file metadata in form approvals (#1751)" (#1754)
+  - fix(cobrowse): handoff banner dedupe and browser names for CITADEL_COBROWSE_BROWSER (#1752)
+  - feat(local): bind file metadata in form approvals (#1751)
+  - feat(cobrowse): type replace with selector and clear, key modifiers, input_edit marker (#1731)
+
+
+---
+
+## v2.237.0 — 2026-11-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 13 |
+| Lines added | +993 |
+
+**Changes:**
+
+  - fix(local): re-land file approval snapshots with chooser provenance (#1755)
+
+
+---
+
+## v2.238.0 — 2026-11-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 8 |
+| Lines added | +594 |
+
+**Changes:**
+
+  - feat(cobrowse): report page_text and password_field on start and status (#1773)
+
+
+---
+
+## v2.239.0 — 2026-11-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 12 |
+| Lines added | +606 |
+
+**Changes:**
+
+  - fix(module): catalog cold-cache fetch, meeting marker node dir, re-detect meeting when healthy (#1774)
+
+
+---
+
+## v2.240.0 — 2026-11-18
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 40 |
+| Lines added | +2905 |
+
+**Changes:**
+
+  - release: CPU-limited by default, and trust main CI's test gate (#1791)
+  - feat(browser-runtime): browser-runtime image with a per-session run contract (C1) (#1786)
+  - feat(local): add live upload opt-out setting (#1737 S2) (#1780)
+  - fix(local): approved link outcome, viewer Enter, installer text, banner wording (#1784)
+  - ci: run PR CI for stacked PRs on feat/fix/docs/chore bases (#1775)
+
+
+---
+
+## v2.241.0 — 2026-11-18
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 41 |
+| Lines added | +3469 |
+
+**Changes:**
+
+  - feat(cobrowse): track pages in remotely dispatched sessions (#1671)
+  - feat(botprofile): bot profile store with split unattended key (#1787)
+
+
+---
+
+## v2.242.0 — 2026-11-19
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 42 |
+| Lines added | +5412 |
+
+**Changes:**
+
+  - feat(local): agent-led setup prompt and claude-code config target (#1807) (#1826)
+  - feat: report optional heartbeat load and pressure capacity (#1718)
+  - feat(browser-runtime): renderer sandbox and browser choice (#1788) (#1805)
+  - feat(browser-runtime): container runner for node cobrowse (C2, #1760) (#1798)
+  - ci: stabilize Windows real-browser steps and installer release lookup (#1797)
+
+

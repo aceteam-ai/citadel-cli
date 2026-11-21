@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/botprofile"
 )
 
 func validAbsolutePath(path string) bool { return filepath.IsAbs(path) && filepath.Clean(path) == path }
@@ -22,6 +24,9 @@ func validAbsolutePath(path string) bool { return filepath.IsAbs(path) && filepa
 func openRepository(ctx context.Context, path string) (*os.File, error) {
 	canonical, err := filepath.EvalSymlinks(path)
 	if err != nil || canonical != path {
+		return nil, failure("repository_unavailable")
+	}
+	if botprofile.DenyPath(canonical) != nil {
 		return nil, failure("repository_unavailable")
 	}
 	root, err := os.OpenRoot(path)

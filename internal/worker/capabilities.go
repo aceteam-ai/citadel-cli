@@ -110,7 +110,7 @@ func (r *Runner) attachRunnerWorkReceipt(job *Job, result *JobResult) error {
 	}
 	cfg := r.newRunnerWorkReceiptConfig(job)
 	inputManifest := map[string]any{"job_id": job.ID, "payload": rawOrPayload(job)}
-	outputManifest := map[string]any{"content": result.Output["content"]}
+	outputManifest := runnerOutputManifest(result.Output)
 	units := map[string]int64{}
 	if usg, ok := result.Output["usage"].(map[string]any); ok {
 		units["prompt_tokens"] = intFromOutput(usg, "prompt_tokens")
@@ -118,6 +118,17 @@ func (r *Runner) attachRunnerWorkReceipt(job *Job, result *JobResult) error {
 		units["total_tokens"] = intFromOutput(usg, "total_tokens")
 	}
 	return cfg.AttachRunnerWorkReceipt(result.Output, job.ID, aep.WorkActionInference, inputManifest, outputManifest, units)
+}
+
+// runnerOutputManifest is the output side of the runner work receipt. The
+// effective sampling settings are included only when the job recorded them, so
+// an output without them keeps a byte-identical manifest (citadel-cli#1639).
+func runnerOutputManifest(output map[string]any) map[string]any {
+	m := map[string]any{"content": output["content"]}
+	if sampling, ok := output["sampling"]; ok {
+		m["sampling"] = sampling
+	}
+	return m
 }
 
 // rawOrPayload returns the job's original wire bytes (preferred — the exact

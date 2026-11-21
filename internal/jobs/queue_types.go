@@ -72,8 +72,12 @@ type LLMInferencePayload struct {
 	// MaxTokens is the maximum number of tokens to generate
 	MaxTokens int `json:"max_tokens"`
 
-	// Temperature controls randomness (0.0-2.0)
-	Temperature float64 `json:"temperature"`
+	// Temperature controls randomness (0.0-2.0). A pointer so an explicit 0
+	// (greedy decoding) is distinguishable from absent (citadel-cli#1639).
+	Temperature *float64 `json:"temperature,omitempty"`
+
+	// Seed pins the sampler's RNG for repeatable output. nil means not sent.
+	Seed *int64 `json:"seed,omitempty"`
 
 	// TopP is nucleus sampling parameter
 	TopP float64 `json:"top_p,omitempty"`
@@ -122,6 +126,11 @@ type LLMInferencePayload struct {
 	// forwarded (ollama only demands the thinking capability when `think` is
 	// truthy, so think:false is accepted by a non-thinking model).
 	Think *bool `json:"think,omitempty"`
+	// ReasoningEffort selects a supported named thinking level. For Ollama this
+	// is sent as the string-valued think parameter when Think is absent; for
+	// OpenAI-compatible engines it is sent as reasoning_effort. An explicit
+	// Think=false always takes precedence.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
 // ChatMessage represents a message in chat-style APIs.

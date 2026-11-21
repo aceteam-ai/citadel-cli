@@ -69,6 +69,14 @@ type Service struct {
 	// here (and in internal/jobs' two manifest structs) so a cmd-package manifest
 	// rewrite does not silently drop it -- the #528/#850 field-drop failure mode.
 	OllamaMaxLoadedModels *int `yaml:"ollama_max_loaded_models,omitempty"`
+	// OllamaKeepAlive (aceteam-ai/citadel-cli#1560) is the default model
+	// keep_alive for the embedded ollama engine: "-1" or a positive Go duration
+	// ("30m", "24h"). Injected as OLLAMA_KEEP_ALIVE via
+	// services.OllamaKeepAliveComposeEnv; nil => explicit empty (engine default).
+	// OllamaPreload lists models loaded once (with that keep_alive) after ollama
+	// starts. Both are modeled in internal/jobs' manifest structs too (#528/#850).
+	OllamaKeepAlive *string  `yaml:"ollama_keep_alive,omitempty"`
+	OllamaPreload   []string `yaml:"ollama_preload,omitempty"`
 	// Threads is the aceteam-ai/citadel-cli#1269 per-service CPU thread opt-in for
 	// the embedded tei embedding service: the MKL/OMP/RAYON thread count injected
 	// as CITADEL_TEI_NUM_THREADS at `docker compose up`. A *int so nil (unset,
@@ -779,17 +787,14 @@ func healStaleGPUReservationOnDisk(destPath, serviceName string) error {
 	return nil
 }
 
-// reconcileHostComposeForStart covers existing manifest/module start paths.
-// It never creates files or changes a custom compose path.
+// reconcileHostComposeForStart covers canonical manifest/module start paths.
+// Missing files get the initial template even when GPU evidence is unknown;
+// existing flavors retain the same preservation policy as explicit starts.
+// Custom compose paths never acquire embedded-file ownership.
 func reconcileHostComposeForStart(name, path string, gpuCount func() int) error {
 	if runtime.GOOS != "linux" || !services.HasCPUComposeVariant(name) ||
 		filepath.Base(path) != name+".yml" || filepath.Base(filepath.Dir(path)) != "services" {
 		return nil
 	}
-	selection := services.SelectComposeForHost(name, runtime.GOOS, gpuCount)
-	if selection.PreserveExisting {
-		return nil
-	}
-	_, err := compose.ReconcileCPUComposeOnDisk(path, name, selection.Content, resolveNodeDirOverride(), Log)
-	return err
+	return ensureComposeFileForHost(filepath.Dir(filepath.Dir(path)), name, runtime.GOOS, gpuCount)
 }

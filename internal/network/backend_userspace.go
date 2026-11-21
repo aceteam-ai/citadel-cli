@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"runtime"
 	"strings"
 
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/envknob"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
@@ -23,12 +25,14 @@ import (
 // That limitation is why `citadel proxy` exists and why the TUN backend
 // (issue #643) is being added alongside it.
 type userspaceBackend struct {
-	srv *tsnet.Server
+	forceLogin bool
+	srv        *tsnet.Server
 }
 
 // newUserspaceBackend builds the tsnet server. Nothing starts until Up.
 func newUserspaceBackend(cfg ServerConfig, stateDir, authKey string) *userspaceBackend {
 	return &userspaceBackend{
+		forceLogin: cfg.ForceLogin,
 		srv: &tsnet.Server{
 			Hostname:   cfg.Hostname,
 			ControlURL: cfg.ControlURL,
@@ -46,7 +50,7 @@ func (b *userspaceBackend) Up(ctx context.Context) error {
 	removeRestriction := restrictPolicyLocks()
 	defer removeRestriction()
 
-	if err := b.srv.Start(); err != nil {
+	if err := withForceLogin(b.forceLogin, b.srv.Start); err != nil {
 		// On Windows, wrap cryptic syspolicy errors with actionable guidance.
 		if runtime.GOOS == "windows" && strings.Contains(err.Error(), "syspolicy") {
 			return fmt.Errorf("Windows requires SYSTEM privileges for network access.\n"+
@@ -111,4 +115,26 @@ func (b *userspaceBackend) Reauth(ctx context.Context, authKey string) error {
 	// re-authorizing the node key in place. UpdatePrefs is left nil so existing
 	// prefs (and Persist, i.e. the machine key) are preserved.
 	return lc.Start(ctx, ipn.Options{AuthKey: authKey})
+}
+
+// withForceLogin runs start with tsnet's TSNET_FORCE_LOGIN set when force is
+// true, then restores the previous value. tsnet reads the knob with
+// envknob.Bool at the end of Server.start, which os.Getenv serves uncached, so
+// setting it only for the duration of Start scopes it to this one connect.
+func withForceLogin(force bool, start func() error) error {
+	if !force {
+		return start()
+	}
+	const knob = "TSNET_FORCE_LOGIN"
+	prev, had := os.LookupEnv(knob)
+	envknob.Setenv(knob, "1")
+	defer func() {
+		if had {
+			envknob.Setenv(knob, prev)
+		} else {
+			_ = os.Unsetenv(knob)
+			envknob.Setenv(knob, "")
+		}
+	}()
+	return start()
 }

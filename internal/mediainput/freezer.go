@@ -8,6 +8,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+
+	"github.com/aceteam-ai/citadel-cli/internal/botprofile"
 )
 
 // Metadata is safe to place in a receipt: no path, credential or image bytes.
@@ -131,6 +134,9 @@ func (f WorkspaceFreezer) read(ctx context.Context, root *os.Root, input Descrip
 	if ctx.Err() != nil {
 		return frozenInput{}, refuse("cancelled_or_timeout")
 	}
+	if botprofile.DenyPath(filepath.Join(root.Name(), filepath.FromSlash(input.Path))) != nil {
+		return frozenInput{}, refuse("invalid_input_path")
+	}
 	file, err := openWorkspaceInput(root, input.Path)
 	if err != nil {
 		return frozenInput{}, refuse("invalid_input_path")
@@ -175,6 +181,12 @@ func (f WorkspaceFreezer) read(ctx context.Context, root *os.Root, input Descrip
 	if ctx.Err() != nil {
 		return frozenInput{}, refuse("cancelled_or_timeout")
 	}
+	return freezeImageData(data, input)
+}
+
+// Both acquisition paths verify retained bytes using the same image guards and
+// private reader factory. Readers capture no descriptor, path or capability.
+func freezeImageData(data []byte, input Descriptor) (frozenInput, error) {
 	sum := sha256.Sum256(data)
 	if hex.EncodeToString(sum[:]) != input.SHA256 {
 		return frozenInput{}, refuse("sha256_mismatch")

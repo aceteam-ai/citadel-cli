@@ -36,6 +36,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"mime"
 	"net"
 	"net/http"
@@ -64,6 +65,12 @@ type LLMInferenceHandler struct {
 	// constructor from the citadel port registry (services/ports.go); injectable
 	// so tests can point a backend at an httptest server without a live engine.
 	baseURLs map[string]string
+
+	// onlyBackends, when true, makes baseURLs the complete routing table: a
+	// backend not in it is refused instead of falling back to a default port.
+	// The hpc profile sets it (a shared compute node lets any user bind a
+	// default engine port first).
+	onlyBackends bool
 
 	// httpClient issues the outbound engine requests. Defaults to
 	// http.DefaultClient; overridable in tests.
@@ -195,6 +202,18 @@ func defaultAEPSigner() aep.Signer {
 	return nodeidentity.Convergent(network.GetNodeConfigDir())
 }
 
+// WithOnlyBackends replaces the routing table with exactly the given backend
+// to base URL map and refuses every other backend. There is no fallback to
+// the default engine ports. An empty map refuses all inference.
+func (h *LLMInferenceHandler) WithOnlyBackends(urls map[string]string) *LLMInferenceHandler {
+	h.baseURLs = make(map[string]string, len(urls))
+	for k, v := range urls {
+		h.baseURLs[k] = v
+	}
+	h.onlyBackends = true
+	return h
+}
+
 // WithSwapper attaches a model-hotswap swapper (citadel-cli#632). Called from
 // cmd/nodejobs.go ONLY when CITADEL_MODEL_HOTSWAP is on; leaving it unset keeps
 // the handler's behavior identical to before hotswap.
@@ -261,9 +280,15 @@ func (h *LLMInferenceHandler) baseURL(backend string) string {
 // backend switch mirrors the original internal/jobs handler verbatim; only the
 // output sink changed (StreamWriter + JobResult instead of Redis Publish*).
 func (h *LLMInferenceHandler) Execute(ctx context.Context, job *Job, stream StreamWriter) (*JobResult, error) {
+	if err := validateRawSeed(job.RawPayload); err != nil {
+		return h.failure(fmt.Errorf("invalid payload: %w", err)), nil
+	}
 	payload, err := parseLLMInferencePayload(job.Payload)
 	if err != nil {
 		return h.failure(fmt.Errorf("invalid payload: %w", err)), nil
+	}
+	if h.onlyBackends && h.baseURLs[payload.Backend] == "" {
+		return h.failure(fmt.Errorf("backend %q is not available on this node", payload.Backend)), nil
 	}
 	configuredExternal := false
 	if payload.Backend == "vllm" {
@@ -372,14 +397,144 @@ func (h *LLMInferenceHandler) Execute(ctx context.Context, job *Job, stream Stre
 	default:
 		return h.failure(fmt.Errorf("unsupported backend: %s", payload.Backend)), nil
 	}
+	attachSampling(payload, result)
 	h.applyTrustEngine(payload, job.ID, result)
 	return result, err
+}
+
+// openAITemperature is the temperature sent on the OpenAI-shaped paths: the
+// provided value, or 0 when absent (the long-standing wire behaviour).
+func openAITemperature(payload *jobs.LLMInferencePayload) float64 {
+	if payload.Temperature == nil {
+		return 0
+	}
+	return *payload.Temperature
+}
+
+// samplingSent reports the sampling settings actually put on the wire to the
+// engine for this payload (citadel-cli#1639). Only settings that were sent are
+// included. It mirrors the request builders: Ollama sends temperature only when
+// provided; the OpenAI-shaped paths always send temperature (0 when absent);
+// top_p is sent on Ollama chat and chat completions only.
+func samplingSent(payload *jobs.LLMInferencePayload) map[string]any {
+	s := map[string]any{}
+	chat := len(payload.Messages) > 0
+	if payload.Backend == "ollama" {
+		if payload.Temperature != nil {
+			s["temperature"] = *payload.Temperature
+		}
+		if chat && payload.TopP > 0 {
+			s["top_p"] = payload.TopP
+		}
+	} else {
+		s["temperature"] = openAITemperature(payload)
+		// SGLang always takes the completions path, which never sends top_p.
+		if payload.TopP > 0 && payload.Backend != "sglang" && (chat || payload.Backend == "unlimited-ocr") {
+			s["top_p"] = payload.TopP
+		}
+	}
+	if payload.Seed != nil {
+		s["seed"] = *payload.Seed
+	}
+	return s
+}
+
+// attachSampling records samplingSent in a successful content-bearing result.
+func attachSampling(payload *jobs.LLMInferencePayload, result *JobResult) {
+	if result == nil || result.Status != JobStatusSuccess || result.Output == nil {
+		return
+	}
+	if _, ok := result.Output["content"].(string); !ok {
+		return
+	}
+	if s := samplingSent(payload); len(s) > 0 {
+		result.Output["sampling"] = s
+	}
 }
 
 // parseLLMInferencePayload decodes the job payload into the shared payload
 // struct (internal/jobs.LLMInferencePayload) and applies the same validation +
 // backend default as the original handler.
+// supportedReasoningEffort prevents untrusted job payloads from forwarding an
+// arbitrary engine-specific option. An explicit think:false overrides effort.
+func supportedReasoningEffort(payload *jobs.LLMInferencePayload) string {
+	if payload.Think != nil && !*payload.Think {
+		return ""
+	}
+	switch payload.ReasoningEffort {
+	case "low", "medium", "high":
+		return payload.ReasoningEffort
+	default:
+		return ""
+	}
+}
+
+// reasoningChunkWriter is optional so existing StreamWriter implementations
+// remain compatible. The final JobResult carries reasoning_content only when
+// the engine actually returned reasoning.
+type reasoningChunkWriter interface {
+	WriteReasoningChunk(content string, index int) error
+}
+
+func writeReasoningChunk(stream StreamWriter, content string, index int) {
+	if writer, ok := stream.(reasoningChunkWriter); ok && content != "" {
+		_ = writer.WriteReasoningChunk(content, index)
+	}
+}
+
+// maxSafeSeed is the largest integer a job payload can carry exactly: payloads
+// decode through float64, so a larger seed would be silently rounded.
+const maxSafeSeed = 1<<53 - 1
+
+// safeSeed reports whether a decoded seed is an integer the payload round trip
+// keeps exactly.
+func safeSeed(v any) bool {
+	switch n := v.(type) {
+	case float64:
+		return n == math.Trunc(n) && math.Abs(n) <= maxSafeSeed
+	case int:
+		return n >= -maxSafeSeed && n <= maxSafeSeed
+	case int64:
+		return n >= -maxSafeSeed && n <= maxSafeSeed
+	case json.Number:
+		i, err := n.Int64()
+		return err == nil && i >= -maxSafeSeed && i <= maxSafeSeed
+	}
+	return false
+}
+
+// validateRawSeed checks the seed's original JSON token. The decoded Payload
+// map went through float64, which silently rounds a fractional seed such as
+// 9007199254740990.9 to an integer that then looks valid. The token must be an
+// integer literal (no fraction or exponent) within +/-maxSafeSeed.
+func validateRawSeed(raw []byte) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var m map[string]any
+	if err := dec.Decode(&m); err != nil {
+		return nil // the decoded payload path owns malformed-payload errors
+	}
+	v, ok := m["seed"]
+	if !ok || v == nil {
+		return nil
+	}
+	n, isNum := v.(json.Number)
+	if !isNum || strings.ContainsAny(n.String(), ".eE") {
+		return fmt.Errorf("seed must be an integer between -%d and %d", int64(maxSafeSeed), int64(maxSafeSeed))
+	}
+	if i, err := n.Int64(); err != nil || i < -maxSafeSeed || i > maxSafeSeed {
+		return fmt.Errorf("seed must be an integer between -%d and %d", int64(maxSafeSeed), int64(maxSafeSeed))
+	}
+	return nil
+}
+
 func parseLLMInferencePayload(data map[string]any) (*jobs.LLMInferencePayload, error) {
+	if v, ok := data["seed"]; ok && v != nil && !safeSeed(v) {
+		return nil, fmt.Errorf("seed must be an integer between -%d and %d", int64(maxSafeSeed), int64(maxSafeSeed))
+	}
 	jsonBytes, err := json.Marshal(data)
 	if err != nil {
 		return nil, err
@@ -427,8 +582,11 @@ func (h *LLMInferenceHandler) executeCompletions(ctx context.Context, stream Str
 		"model":       payload.Model,
 		"prompt":      payload.Prompt,
 		"max_tokens":  payload.MaxTokens,
-		"temperature": payload.Temperature,
+		"temperature": openAITemperature(payload),
 		"stream":      payload.Stream,
+	}
+	if payload.Seed != nil {
+		reqPayload["seed"] = *payload.Seed
 	}
 	if payload.MaxTokens == 0 {
 		reqPayload["max_tokens"] = 512
@@ -555,8 +713,18 @@ func (h *LLMInferenceHandler) executeOllama(ctx context.Context, stream StreamWr
 		"prompt": payload.Prompt,
 		"stream": payload.Stream,
 	}
+	options := map[string]any{}
 	if payload.MaxTokens > 0 {
-		reqPayload["options"] = map[string]any{"num_predict": payload.MaxTokens}
+		options["num_predict"] = payload.MaxTokens
+	}
+	if payload.Temperature != nil {
+		options["temperature"] = *payload.Temperature
+	}
+	if payload.Seed != nil {
+		options["seed"] = *payload.Seed
+	}
+	if len(options) > 0 {
+		reqPayload["options"] = options
 	}
 
 	resp, err := h.postJSON(ctx, h.baseURL("ollama")+"/api/generate", reqPayload)
@@ -774,11 +942,14 @@ func (h *LLMInferenceHandler) executeOllamaChat(ctx context.Context, stream Stre
 	if payload.MaxTokens > 0 {
 		options["num_predict"] = payload.MaxTokens
 	}
-	if payload.Temperature > 0 {
-		options["temperature"] = payload.Temperature
+	if payload.Temperature != nil {
+		options["temperature"] = *payload.Temperature
 	}
 	if payload.TopP > 0 {
 		options["top_p"] = payload.TopP
+	}
+	if payload.Seed != nil {
+		options["seed"] = *payload.Seed
 	}
 	if len(payload.Stop) > 0 {
 		options["stop"] = payload.Stop
@@ -816,6 +987,8 @@ func (h *LLMInferenceHandler) executeOllamaChat(ctx context.Context, stream Stre
 	// what a structured/deterministic call sends to suppress reasoning.
 	if payload.Think != nil {
 		reqPayload["think"] = *payload.Think
+	} else if effort := supportedReasoningEffort(payload); effort != "" {
+		reqPayload["think"] = effort
 	}
 
 	resp, err := h.postJSON(ctx, h.baseURL("ollama")+"/api/chat", reqPayload)
@@ -878,11 +1051,11 @@ func (h *LLMInferenceHandler) streamOllamaChat(stream StreamWriter, body io.Read
 			stream.WriteChunk(chunk.Message.Content, chunkIndex)
 			chunkIndex++
 		}
-		// Accumulate the separate thinking channel (aceteam-ai/aceteam#9817 S2);
-		// it is NOT streamed as a chunk here -- it only backstops an otherwise
-		// blank reply below.
+		// Keep the model's separate thinking channel out of answer content.
 		if chunk.Message.Thinking != "" {
 			fullThinking.WriteString(chunk.Message.Thinking)
+			writeReasoningChunk(stream, chunk.Message.Thinking, chunkIndex)
+			chunkIndex++
 		}
 		if len(chunk.Message.ToolCalls) > 0 {
 			if converted := ollamaToolCallsToOpenAI(chunk.Message.ToolCalls); converted != nil {
@@ -903,21 +1076,13 @@ func (h *LLMInferenceHandler) streamOllamaChat(stream StreamWriter, body io.Read
 		return h.failure(err), nil
 	}
 	finalContent := fullContent.String()
-	// Fall back to the accumulated thinking when the model streamed no visible
-	// answer and made no tool call -- a thinking model that spent its
-	// num_predict budget mid-reasoning would otherwise be a blank reply
-	// (aceteam-ai/aceteam#9817 S2). Mirrors streamChatCompletions'
-	// reasoning_content fallback exactly, including emitting a terminal chunk so
-	// a chunk-accumulating consumer renders it (not just the end-event content).
-	if finalContent == "" && len(toolCalls) == 0 {
-		if finalContent = fullThinking.String(); finalContent != "" {
-			stream.WriteChunk(finalContent, chunkIndex)
-		}
-	}
 	output := map[string]any{
 		"content":       finalContent,
 		"finish_reason": "stop",
 		"usage":         ollamaUsage(promptTokens, completionTokens),
+	}
+	if fullThinking.Len() > 0 {
+		output["reasoning_content"] = fullThinking.String()
 	}
 	if len(toolCalls) > 0 {
 		output["finish_reason"] = "tool_calls"
@@ -946,18 +1111,7 @@ func (h *LLMInferenceHandler) bufferedOllamaChat(stream StreamWriter, body io.Re
 		return h.failure(fmt.Errorf("failed to parse Ollama response: %w", err)), nil
 	}
 	toolCalls := ollamaToolCallsToOpenAI(response.Message.ToolCalls)
-	// Surface message.thinking as the reply ONLY when there is no visible answer
-	// and no tool call -- a thinking model that spent its num_predict budget
-	// mid-reasoning returns empty content, and dropping the reasoning too (the
-	// pre-S2 behavior) is the blank reply this closes (aceteam-ai/aceteam#9817
-	// S2). Mirrors parseChatCompletionResponse's reasoning_content fallback:
-	// when content is present, or the model instead emitted a tool call,
-	// thinking is NOT surfaced (rendering chain-of-thought as the answer, or
-	// alongside a tool call, is exactly wrong).
 	content := response.Message.Content
-	if content == "" && len(toolCalls) == 0 {
-		content = response.Message.Thinking
-	}
 	// A tool_calls-only reply has nothing worth publishing as a chunk --
 	// mirrors bufferedChatCompletions' identical rule for the OpenAI-
 	// compatible engines.
@@ -968,6 +1122,9 @@ func (h *LLMInferenceHandler) bufferedOllamaChat(stream StreamWriter, body io.Re
 		"content":       content,
 		"finish_reason": "stop",
 		"usage":         ollamaUsage(response.PromptEvalCount, response.EvalCount),
+	}
+	if response.Message.Thinking != "" {
+		output["reasoning_content"] = response.Message.Thinking
 	}
 	if len(toolCalls) > 0 {
 		output["finish_reason"] = "tool_calls"
@@ -1137,8 +1294,11 @@ func (h *LLMInferenceHandler) executeLlamaCppAt(ctx context.Context, stream Stre
 	reqPayload := map[string]any{
 		"prompt":      payload.Prompt,
 		"n_predict":   payload.MaxTokens,
-		"temperature": payload.Temperature,
+		"temperature": openAITemperature(payload),
 		"stream":      payload.Stream,
+	}
+	if payload.Seed != nil {
+		reqPayload["seed"] = *payload.Seed
 	}
 	if payload.MaxTokens == 0 {
 		reqPayload["n_predict"] = 512
@@ -1257,8 +1417,11 @@ func (h *LLMInferenceHandler) executeChatCompletionsAt(ctx context.Context, stre
 		"model":       payload.Model,
 		"messages":    messages,
 		"max_tokens":  payload.MaxTokens,
-		"temperature": payload.Temperature,
+		"temperature": openAITemperature(payload),
 		"stream":      payload.Stream,
+	}
+	if payload.Seed != nil {
+		reqPayload["seed"] = *payload.Seed
 	}
 	if payload.MaxTokens == 0 {
 		reqPayload["max_tokens"] = 512
@@ -1319,6 +1482,9 @@ func (h *LLMInferenceHandler) executeChatCompletionsAt(ctx context.Context, stre
 	if payload.Think != nil {
 		reqPayload["chat_template_kwargs"] = map[string]any{"enable_thinking": *payload.Think}
 	}
+	if effort := supportedReasoningEffort(payload); effort != "" {
+		reqPayload["reasoning_effort"] = effort
+	}
 
 	resp, err := h.postJSON(ctx, baseURL+"/v1/chat/completions", reqPayload)
 	if err != nil {
@@ -1354,7 +1520,7 @@ func (h *LLMInferenceHandler) bufferedChatCompletions(stream StreamWriter, body 
 	if err != nil {
 		return h.failure(err), nil
 	}
-	content, finishReason, toolCalls, usage, err := parseChatCompletionResponse(bodyBytes)
+	content, reasoning, finishReason, toolCalls, usage, err := parseChatCompletionResponse(bodyBytes)
 	if err != nil {
 		return h.failure(err), nil
 	}
@@ -1370,6 +1536,9 @@ func (h *LLMInferenceHandler) bufferedChatCompletions(stream StreamWriter, body 
 		"content":       content,
 		"finish_reason": finishReason,
 		"usage":         usage,
+	}
+	if reasoning != "" {
+		output["reasoning_content"] = reasoning
 	}
 	if len(toolCalls) > 0 {
 		output["tool_calls"] = toolCalls
@@ -1558,15 +1727,9 @@ func sha256Hex(s string) string {
 // streamChatCompletions translates an OpenAI chat-completions SSE stream into
 // chunks. Each `data:` frame carries a choices[].delta. The answer is streamed
 // from delta.content (matching the buffered path and standard OpenAI clients).
-// Thinking models like Bonsai emit the chain-of-thought in delta.reasoning_content
-// and the answer in delta.content; the reasoning is accumulated but only surfaced
-// if the stream ends with NO answer AND no tool call (token budget spent
-// mid-reasoning), so a reply is never silently blank while staying consistent
-// with the non-stream content-only result. A thinking model that decided to
-// call a tool instead (citadel-cli#603) has real reasoning_content but nothing
-// there is the visible reply, so it must not be promoted to `content` there
-// either -- see parseChatCompletionResponse's doc comment for the identical
-// buffered-path reasoning.
+// Thinking models may emit a separate delta.reasoning_content. Keep it in
+// reasoning_content and never promote it to visible answer content, even if
+// the model exhausts its token budget before producing an answer.
 //
 // Tool-call deltas (choices[].delta.tool_calls) are accumulated across chunks
 // via toolCallAccumulator and surfaced ONLY in the returned JobResult.Output
@@ -1625,24 +1788,20 @@ func (h *LLMInferenceHandler) streamChatCompletions(stream StreamWriter, body io
 			answer.WriteString(text)
 			stream.WriteChunk(text, chunkIndex)
 			chunkIndex++
-		} else if rc := chunk.Choices[0].Delta.ReasoningContent; rc != "" {
+		}
+		if rc := chunk.Choices[0].Delta.ReasoningContent; rc != "" {
 			reasoning.WriteString(rc)
+			writeReasoningChunk(stream, rc, chunkIndex)
+			chunkIndex++
 		}
 		if len(chunk.Choices[0].Delta.ToolCalls) > 0 {
 			toolCalls.merge(chunk.Choices[0].Delta.ToolCalls)
 		}
 
 		if fr := chunk.Choices[0].FinishReason; fr != "" {
-			// Only "tool_calls" overrides the pre-#603 hardcoded "stop" --
-			// this streaming path never surfaced any other finish_reason
-			// (e.g. "length") before this change, so widening the override to
-			// every finish_reason would change output for a text-only stream
-			// that previously always reported "stop", violating the
-			// no-tools-⇒-unchanged-behavior contract. "tool_calls" cannot
-			// have occurred before #603 (tools were never forwarded), so this
-			// branch is unreachable pre-#603 and only activates in the new
-			// tool-calling path.
-			if fr == "tool_calls" {
+			// Preserve a length stop only when reasoning exhausted the budget
+			// before any answer. Ordinary text keeps its historical stop shape.
+			if fr == "tool_calls" || (fr == "length" && reasoning.Len() > 0 && answer.Len() == 0) {
 				finishReason = fr
 			}
 			break
@@ -1653,17 +1812,12 @@ func (h *LLMInferenceHandler) streamChatCompletions(stream StreamWriter, body io
 	}
 
 	final := answer.String()
-	if final == "" && toolCalls.empty() {
-		// No answer and no tool call produced (thinking model ran out of budget
-		// mid-reason); surface the reasoning so the reply is not blank, mirroring
-		// the buffered path's reasoning_content fallback.
-		if final = reasoning.String(); final != "" {
-			stream.WriteChunk(final, chunkIndex)
-		}
-	}
 	output := map[string]any{
 		"content":       final,
 		"finish_reason": finishReason,
+	}
+	if reasoning.Len() > 0 {
+		output["reasoning_content"] = reasoning.String()
 	}
 	if tc := toolCalls.json(); len(tc) > 0 {
 		output["tool_calls"] = tc
@@ -1678,12 +1832,8 @@ func (h *LLMInferenceHandler) streamChatCompletions(stream StreamWriter, body io
 // 2 bytes, both len(raw) > 0 despite meaning "no tool calls". A Pydantic- (or
 // any strictly-typed-response-model-) backed engine can plausibly serialize
 // `"tool_calls": null` on an ORDINARY non-tool reply, so `len(raw) > 0` alone
-// would wrongly treat that reply as tool-calls-present -- on the buffered
-// response path this wrongly suppresses the reasoning_content->content
-// fallback for a thinking model (e.g. bonsai) that ran out of budget
-// mid-reasoning and also happened to carry an explicit null/empty tool_calls
-// field, so the caller gets an empty reply instead of the reasoning. This
-// unmarshals into a slice and counts elements instead of trusting the byte
+// would wrongly treat that reply as tool-calls-present. This unmarshals into
+// a slice and counts elements instead of trusting the byte
 // length, so `null`/`""`/`[]`/malformed JSON all correctly read as "absent".
 func hasToolCalls(raw json.RawMessage) bool {
 	if len(raw) == 0 {
@@ -1813,18 +1963,13 @@ func (a *toolCallAccumulator) json() json.RawMessage {
 	return b
 }
 
-// parseChatCompletionResponse extracts the assistant content, finish reason,
-// tool_calls, and usage from a buffered OpenAI chat-completions body. Content
-// falls back to reasoning_content when the answer field is empty (thinking
-// models like Bonsai whose token budget was spent mid-reasoning), so a caller
-// never gets a blank reply while tokens were clearly generated -- EXCEPT when
-// the model instead emitted tool_calls (citadel-cli#603): a thinking model
-// that decided to call a tool has real chain-of-thought in reasoning_content
-// but nothing there is meant to be the assistant's visible reply, so surfacing
-// it as `content` would render as a bogus text answer ALONGSIDE the tool call.
+// parseChatCompletionResponse extracts assistant content, separate reasoning,
+// finish reason, tool_calls and usage from a buffered chat-completions body.
+// An empty answer stays empty even when reasoning exists. Reasoning is never
+// treated as visible content, including tool-call responses.
 // (Ported from internal/jobs; kept unexported here to keep the worker handler
 // self-contained.)
-func parseChatCompletionResponse(bodyBytes []byte) (content, finishReason string, toolCalls json.RawMessage, usage map[string]any, err error) {
+func parseChatCompletionResponse(bodyBytes []byte) (content, reasoning, finishReason string, toolCalls json.RawMessage, usage map[string]any, err error) {
 	var response struct {
 		Choices []struct {
 			Message struct {
@@ -1841,17 +1986,16 @@ func parseChatCompletionResponse(bodyBytes []byte) (content, finishReason string
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(bodyBytes, &response); err != nil {
-		return "", "", nil, nil, fmt.Errorf("failed to parse chat completions response: %w", err)
+		return "", "", "", nil, nil, fmt.Errorf("failed to parse chat completions response: %w", err)
 	}
 
 	finishReason = "stop"
 	if len(response.Choices) > 0 {
 		msg := response.Choices[0].Message
 		content = msg.Content
+		reasoning = msg.ReasoningContent
 		if hasToolCalls(msg.ToolCalls) {
 			toolCalls = msg.ToolCalls
-		} else if content == "" {
-			content = msg.ReasoningContent
 		}
 		if response.Choices[0].FinishReason != "" {
 			finishReason = response.Choices[0].FinishReason
@@ -1863,7 +2007,7 @@ func parseChatCompletionResponse(bodyBytes []byte) (content, finishReason string
 		"completion_tokens": response.Usage.CompletionTokens,
 		"total_tokens":      response.Usage.TotalTokens,
 	}
-	return content, finishReason, toolCalls, usage, nil
+	return content, reasoning, finishReason, toolCalls, usage, nil
 }
 
 // postJSON issues a ctx-bound POST with a JSON body so a per-job deadline
@@ -2036,6 +2180,11 @@ func (h *LLMInferenceHandler) warming(model string, etaSeconds, retryAfterSecond
 	}
 	if retryAfterSeconds <= 0 {
 		retryAfterSeconds = warmingRetryAfter
+	}
+	// Never quote an ETA shorter than the retry interval: "~0s" reads as done
+	// and a caller that does not retry fails the step (citadel-cli#1640).
+	if etaSeconds < retryAfterSeconds {
+		etaSeconds = retryAfterSeconds
 	}
 	output := map[string]any{
 		"status":      "model_warming",

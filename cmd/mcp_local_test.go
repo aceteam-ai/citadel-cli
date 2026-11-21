@@ -35,6 +35,38 @@ var knownBackendToolNames = []string{
 	"terminal_exec", "terminal_list_nodes",
 }
 
+// platformCobrowseToolNames is every remote co-browse tool the AceTeam backend
+// serves (they take a node_id). The local_cobrowse_* tools act on THIS machine
+// and must never share a name with one of these (aceteam#13503 S3).
+var platformCobrowseToolNames = []string{
+	"cobrowse_start", "cobrowse_status", "cobrowse_navigate", "cobrowse_click",
+	"cobrowse_type", "cobrowse_select", "cobrowse_key", "cobrowse_scroll",
+	"cobrowse_extract", "cobrowse_screenshot", "cobrowse_handoff",
+	"cobrowse_resume", "cobrowse_stop", "cobrowse_record", "cobrowse_wait",
+}
+
+func init() { knownBackendToolNames = append(knownBackendToolNames, platformCobrowseToolNames...) }
+
+func TestCollisionListCoversEveryPlatformCobrowseTool(t *testing.T) {
+	known := map[string]bool{}
+	for _, n := range knownBackendToolNames {
+		known[n] = true
+	}
+	for _, n := range platformCobrowseToolNames {
+		if !known[n] {
+			t.Errorf("collision list is missing platform tool %s", n)
+		}
+	}
+	for _, tool := range newLocalMCPTools(localMCPDeps{}) {
+		if strings.HasPrefix(tool.Name, "local_cobrowse_") {
+			remote := strings.TrimPrefix(tool.Name, "local_")
+			if !known[remote] {
+				t.Errorf("%s has no platform counterpart in the collision list (%s)", tool.Name, remote)
+			}
+		}
+	}
+}
+
 func TestLocalToolNamesDoNotCollideWithKnownBackendTools(t *testing.T) {
 	tools := newLocalMCPTools(localMCPDeps{})
 	for _, tool := range tools {
@@ -57,6 +89,11 @@ func TestNewLocalMCPToolsRegistersExpectedTools(t *testing.T) {
 		"local_read_file", "local_list_files",
 		"local_model_deploy", "local_run_exclusive", "local_model_stop",
 		"local_egress_relay_status", "local_egress_relay_set",
+		"local_cobrowse_start", "local_cobrowse_status", "local_cobrowse_navigate",
+		"local_cobrowse_click", "local_cobrowse_type", "local_cobrowse_select",
+		"local_cobrowse_key", "local_cobrowse_scroll", "local_cobrowse_extract",
+		"local_cobrowse_screenshot", "local_cobrowse_handoff", "local_cobrowse_resume",
+		"local_cobrowse_stop", "local_cobrowse_wait",
 	}
 	got := map[string]bool{}
 	for _, tool := range tools {
@@ -67,7 +104,7 @@ func TestNewLocalMCPToolsRegistersExpectedTools(t *testing.T) {
 		if tool.InputSchema == nil {
 			t.Errorf("tool %q has no input schema", tool.Name)
 		}
-		if tool.Call == nil {
+		if tool.Call == nil && tool.CallContent == nil {
 			t.Errorf("tool %q has no Call handler", tool.Name)
 		}
 	}

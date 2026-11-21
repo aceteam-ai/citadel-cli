@@ -1,7 +1,11 @@
-name: Build meeting-service image
+name: Build browser-runtime image
 
-# Builds and publishes the Citadel meeting media stack sidecar to GHCR as
-# ghcr.io/aceteam-ai/meeting-service. The module compose
+# Builds and publishes the Citadel browser runtime (the meeting media stack image,
+# renamed in aceteam-ai/citadel-cli#1759) to GHCR as
+# ghcr.io/aceteam-ai/browser-runtime, and ALSO under the legacy name
+# ghcr.io/aceteam-ai/meeting-service (same digest) so existing compose and catalog
+# references keep working for one release. Releases pin
+# ghcr.io/aceteam-ai/browser-runtime:<sha>@sha256:<digest> (follow-up PR per build). The module compose
 # (services/meeting-service/compose.yml, and the catalog copy in
 # aceteam-ai/citadel-services) pulls this image when a node runs
 # `citadel module install meeting` (aceteam-ai/citadel-cli#514), so the image MUST
@@ -27,7 +31,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE: ghcr.io/aceteam-ai/meeting-service
+  IMAGE: ghcr.io/aceteam-ai/browser-runtime
+  LEGACY_IMAGE: ghcr.io/aceteam-ai/meeting-service
 
 jobs:
   build:
@@ -50,6 +55,76 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Pass 1: build locally (not pushed) only to read the Chromium major the
+      # image resolved to; pass 2 bakes it into the image label.
+      - name: Probe build
+        uses: docker/build-push-action@v6
+        with:
+          context: services/meeting-service
+          file: services/meeting-service/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: browser-runtime:probe
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Read Chromium major
+        id: major
+        run: |
+          major="$(docker run --rm --entrypoint cat browser-runtime:probe /etc/browser-runtime/chromium-major)"
+          case "$major" in ''|*[!0-9]*) echo "bad chromium major: $major" >&2; exit 1;; esac
+          echo "major=$major" >> "$GITHUB_OUTPUT"
+
+      # Renderer-sandbox gate (aceteam-ai/citadel-cli#1788). Runs the in-image
+      # self-check with the run contract's hardening (the flags of
+      # browserruntime.RunSpec.Args) under the pinned seccomp profile. The image
+      # label aceteam.browser-runtime.sandbox is set (SANDBOX_VERIFIED=1) ONLY when
+      # it exits 0. A failing check never fails the workflow: the image is
+      # published exactly as before with the label empty (the catalog meeting
+      # module still pulls :latest), and a warning carries the reason. A negative
+      # control under the engine's DEFAULT seccomp must fail; if it passes, the
+      # check proves nothing and the job fails.
+      - name: Sandbox self-check
+        id: sandbox
+        run: |
+          set -u
+          profile="$GITHUB_WORKSPACE/internal/browserruntime/seccomp.json"
+          uid=10001
+          owner="uid=$uid,gid=$uid"
+          check() { # $@ = extra engine flags (seccomp choice)
+            docker run --rm \
+              --user "$uid:$uid" \
+              --cap-drop ALL \
+              --security-opt no-new-privileges \
+              "$@" \
+              --read-only \
+              --tmpfs "/run:rw,size=64m,mode=0700,$owner" \
+              --tmpfs "/tmp:rw,size=512m,mode=1777,$owner" \
+              --tmpfs "/home/bot:rw,size=256m,mode=0700,$owner" \
+              --tmpfs "/profile:rw,size=512m,mode=0700,$owner" \
+              --shm-size 1g --cpus 1.5 --memory 1536m --pids-limit 1024 \
+              -e MEETING_BROWSER=chromium \
+              -e MEETING_REQUIRE_SANDBOX=1 \
+              browser-runtime:probe \
+              python3 /app/meetingd.py --sandbox-selfcheck
+          }
+          echo "verified=" >> "$GITHUB_OUTPUT"
+          out="$(check --security-opt "seccomp=$profile" 2>&1)" && rc=0 || rc=$?
+          last="$(printf '%s\n' "$out" | tail -n 1 | tr -d '\r')"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning::Sandbox self-check failed (exit $rc); publishing with an empty sandbox label. Reason: ${last}"
+            exit 0
+          fi
+          echo "self-check under the pinned profile: ${last}"
+          # Negative control: the engine's default seccomp must NOT pass.
+          neg="$(check 2>&1)" && nrc=0 || nrc=$?
+          if [ "$nrc" -eq 0 ]; then
+            echo "::error::Negative control passed under the default seccomp profile, so the self-check proves nothing: $(printf '%s\n' "$neg" | tail -n 1)"
+            exit 1
+          fi
+          echo "negative control failed as expected (exit $nrc)"
+          echo "verified=1" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -59,8 +134,13 @@ jobs:
           # arm64 (multi-arch chromium + audio validation on arm) is a follow-up.
           platforms: linux/amd64
           push: true
+          build-args: |
+            CHROMIUM_MAJOR=${{ steps.major.outputs.major }}
+            SANDBOX_VERIFIED=${{ steps.sandbox.outputs.verified }}
           tags: |
             ${{ github.ref == 'refs/heads/main' && format('{0}:latest', env.IMAGE) || '' }}
             ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ github.ref == 'refs/heads/main' && format('{0}:latest', env.LEGACY_IMAGE) || '' }}
+            ${{ env.LEGACY_IMAGE }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
