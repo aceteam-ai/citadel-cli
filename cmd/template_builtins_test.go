@@ -362,15 +362,43 @@ func TestPapercraftChromiumCannotLoadBlockedURLSubresources(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(profileRoot) })
-	page, err := startChromiumRenderPage(context.Background(), html, 100, 100, filepath.Join(profileRoot, "profile"), []string{html})
-	if err != nil {
+	// A hosted runner can take longer than the product's 30s CDP readiness
+	// wait to bring up its first headless Chromium (citadel-cli#1709). That
+	// wait is not what this test pins, so retry a cold start that never became
+	// ready (each failed attempt has already shut its browser down); any other
+	// failure, and a browser that never starts, still fails the test.
+	var page papercraftPage
+	for attempt := 1; ; attempt++ {
+		page, err = startChromiumRenderPage(context.Background(), html, 100, 100, filepath.Join(profileRoot, "profile-"+strconv.Itoa(attempt)), []string{html})
+		if err == nil {
+			break
+		}
 		if errors.Is(err, syscall.EPERM) {
 			t.Skipf("loopback sockets are unavailable: %v", err)
 		}
-		t.Fatal(err)
+		if attempt >= 3 || !strings.Contains(err.Error(), "Chromium CDP did not become ready") {
+			t.Fatal(err)
+		}
+		t.Logf("attempt %d: cold Chromium start was not ready in time, retrying: %v", attempt, err)
 	}
 	defer page.Close()
-	time.Sleep(500 * time.Millisecond)
+	// Wait for every image to finish (loaded or failed) instead of sleeping, so
+	// the blocked-subresource assertions below cannot pass just because an
+	// image had not been attempted yet.
+	settleDeadline := time.Now().Add(30 * time.Second)
+	for {
+		done, err := page.Evaluate(context.Background(), `Array.from(document.images).every(function(i){return i.complete})`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if done == true {
+			break
+		}
+		if time.Now().After(settleDeadline) {
+			t.Fatal("page images did not finish loading or failing within 30s")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	// file:// and blob: stay blocked. data: is deliberately allowed
 	// (citadel-cli#1202) since every Paper Trail texture is a
 	// canvas-generated data: URI and data: never reaches an external origin.

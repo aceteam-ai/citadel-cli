@@ -88,17 +88,19 @@ func hpcQueueNames(orgID, nodeID string) []string {
 // Redis, queues, egress relay, workspace, ...) names a surface the profile
 // turns off, so it is refused instead of silently ignored.
 var hpcWorkFlagsAllowed = map[string]bool{
-	"poll-ms":           true,
-	"max-retries":       true,
-	"max-concurrency":   true,
-	"hpc-token-file":    true,
-	"hpc-wall-time-end": true,
-	"hpc-drain-timeout": true,
+	"poll-ms":              true,
+	"max-retries":          true,
+	"max-concurrency":      true,
+	"hpc-token-file":       true,
+	"hpc-org":              true,
+	"hpc-approval-timeout": true,
+	"hpc-wall-time-end":    true,
+	"hpc-drain-timeout":    true,
 }
 
 // hpcOnlyWorkFlags are the `citadel work` flags that mean nothing outside the
 // hpc profile; an ordinary worker refuses them rather than ignoring them.
-var hpcOnlyWorkFlags = []string{"hpc-token-file", "hpc-wall-time-end", "hpc-drain-timeout"}
+var hpcOnlyWorkFlags = []string{"hpc-token-file", "hpc-org", "hpc-approval-timeout", "hpc-wall-time-end", "hpc-drain-timeout"}
 
 // hpcFlagsOutsideProfile returns the hpc-only flags set on an ordinary run.
 func hpcFlagsOutsideProfile(fs *pflag.FlagSet) []string {
@@ -353,7 +355,7 @@ func runHPCWork(cmd *cobra.Command, _ []string) {
 	}
 	layout := currentHPCLayout()
 	opts := hpcWorkOptions{DrainTimeout: hpcDrainTimeoutFlag}
-	if hpcTokenFileFlag != "" {
+	if hpcTokenFileFlag != "" || hpcOrgFlag != "" {
 		enroll := productionHPCEnrollOptions(hpcTokenFileFlag, hpcWallTimeEndFlag)
 		opts.Enroll = &enroll
 	}
@@ -372,6 +374,24 @@ type hpcWorkOptions struct {
 	// Ready, when set, is called once the worker is serving. The launcher
 	// uses it; it is optional.
 	Ready func(creds hpcCredentials)
+}
+
+// enrollHPCWorkWithSignals keeps the clean-interruption decision adjacent to
+// the enrollment result so a stop cannot hide a post-issuance cleanup failure.
+func enrollHPCWorkWithSignals(ctx context.Context, term, drain chan os.Signal, enroll func(context.Context) (hpcCredentials, error)) (hpcCredentials, bool, error) {
+	var creds hpcCredentials
+	err := hpc.WithEnrollmentSignals(ctx, term, drain, func(enrollCtx context.Context) error {
+		var enrollErr error
+		creds, enrollErr = enroll(enrollCtx)
+		return enrollErr
+	})
+	if errors.Is(err, hpc.ErrApprovalInterrupted) {
+		return hpcCredentials{}, true, nil
+	}
+	if err != nil {
+		return hpcCredentials{}, false, err
+	}
+	return creds, false, nil
 }
 
 // runHPCWorkProcess wires the production edges and runs the worker. Every
@@ -402,7 +422,16 @@ func runHPCWorkProcess(parent context.Context, layout hpc.Layout, opts hpcWorkOp
 
 	creds, err := readHPCCredentials(layout.NodeDir)
 	if err != nil && opts.Enroll != nil {
-		creds, err = enrollHPCNode(ctx, layout, *opts.Enroll)
+		// Preserve any post-issuance or token-path error, even when a signal
+		// races it. Only the explicit pre-issuance interruption is a clean exit.
+		var interrupted bool
+		creds, interrupted, err = enrollHPCWorkWithSignals(ctx, termSigs, drainSigs, func(enrollCtx context.Context) (hpcCredentials, error) {
+			return enrollHPCNode(enrollCtx, layout, *opts.Enroll)
+		})
+		if interrupted {
+			fmt.Println("   - Stopped while waiting for enrollment approval; nothing to deregister")
+			return nil
+		}
 		if err == nil {
 			fmt.Printf("   - Enrolled node %s\n", creds.NodeID)
 		}

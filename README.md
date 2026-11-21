@@ -31,7 +31,7 @@ the device. Windows first; see the
 
 ```powershell
 citadel local doctor
-citadel local config copilot   # or claude-desktop, codex
+citadel local config copilot   # or claude-code, claude-desktop, codex
 ```
 
 ## AI Tool Integration (MCP)

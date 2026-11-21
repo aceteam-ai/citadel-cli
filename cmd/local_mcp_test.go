@@ -18,14 +18,21 @@ import (
 
 // cmdFakeBrowser is a minimal localcobrowse.Browser for bridge tests.
 type cmdFakeBrowser struct {
-	mu     sync.Mutex
-	clicks int
-	n      int
-	human  map[string]bool
-	live   map[string]bool
+	mu sync.Mutex
+	// stopAllEntered and stopAllGate, when set, hold StopAll (the seal of
+	// every session) until the test releases it; stopAllDone records it ran.
+	stopAllEntered chan struct{}
+	stopAllGate    chan struct{}
+	stopAllDone    bool
+	clicks         int
+	n              int
+	human          map[string]bool
+	live           map[string]bool
 	// landing and title, when set, are what PageState reports (a redirect
 	// and a page title).
 	landing, title string
+	// target, when set, is what InspectTarget reports.
+	target *platform.TargetInfo
 }
 
 func newCmdFakeBrowser() *cmdFakeBrowser {
@@ -58,6 +65,17 @@ func (f *cmdFakeBrowser) StartSession(string) (platform.CobrowseSessionStatus, e
 	f.live[id] = true
 	return f.st(id), nil
 }
+func (f *cmdFakeBrowser) StartSessionWithID(id, _ string, p platform.SessionProfile) (platform.CobrowseSessionStatus, error) {
+	// The fake keeps no profile data: Close it now, as the real manager does
+	// on teardown, so its lock (an open file on Windows) is released.
+	if p != nil {
+		_ = p.Close()
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.live[id] = true
+	return f.st(id), nil
+}
 func (f *cmdFakeBrowser) SessionStatus(id string) (platform.CobrowseSessionStatus, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -70,8 +88,13 @@ func (f *cmdFakeBrowser) Stop(id string) error {
 	return nil
 }
 func (f *cmdFakeBrowser) StopAll() error {
+	if f.stopAllEntered != nil {
+		close(f.stopAllEntered)
+		<-f.stopAllGate
+	}
 	f.mu.Lock()
 	f.live = map[string]bool{}
+	f.stopAllDone = true
 	f.mu.Unlock()
 	return nil
 }
@@ -116,6 +139,14 @@ func (f *cmdFakeBrowser) PageState(id string) (platform.PageState, error) {
 		u = f.landing
 	}
 	return platform.PageState{URL: u, ReadyState: "complete", Title: f.title}, f.gate(id)
+}
+func (f *cmdFakeBrowser) InspectTarget(id string, _ platform.TargetProbe) (platform.TargetInfo, error) {
+	if f.target != nil {
+		t := *f.target
+		t.PageURL = "http://fixture.test/"
+		return t, f.gate(id)
+	}
+	return platform.TargetInfo{Resolved: true, Tag: "div", PageURL: "http://fixture.test/"}, f.gate(id)
 }
 func (f *cmdFakeBrowser) Handoff(id string) (platform.CobrowseSessionStatus, error) {
 	f.mu.Lock()

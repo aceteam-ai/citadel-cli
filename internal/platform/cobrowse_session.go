@@ -35,13 +35,18 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/browserurl"
 )
 
 // cobrowseSessionsDirName is the parent directory (under os.TempDir()) that holds
@@ -85,6 +90,8 @@ type CobrowseSessionStatus struct {
 	ID    string               `json:"id"`
 	State CobrowseSessionState `json:"state"`
 	URL   string               `json:"url,omitempty"`
+	// Interstitial describes browser-owned sign-in UI, never website auth.
+	Interstitial BrowserInterstitial `json:"interstitial,omitempty"`
 	// Title is the page title after a navigate (bounded, control characters
 	// stripped); empty for every other status.
 	Title     string `json:"title,omitempty"`
@@ -97,8 +104,90 @@ type CobrowseSessionStatus struct {
 	Driver CobrowseDriver `json:"driver,omitempty"`
 	// Browser is the launched browser's kind ("chrome", "edge", "chromium").
 	Browser string `json:"browser,omitempty"`
+	// ActiveTarget and Targets list the open pages (tabs and popups); the URL
+	// above is the active page's.
+	ActiveTarget string           `json:"active_target,omitempty"`
+	Targets      []CobrowseTarget `json:"targets,omitempty"`
+	OpenTargets  int              `json:"open_targets,omitempty"`
+	Features     []string         `json:"features,omitempty"`
 	// Generation counts ownership changes (first launch is 1, each re-adopt adds 1).
 	Generation uint64 `json:"generation,omitempty"`
+	// Done and Effects are set only by scripted actions (click, type, key,
+	// scroll): Done is false when the action hit its deadline or failed after
+	// it may have acted, and Effects says what happened (citadel-cli#1663).
+	Done    *bool          `json:"done,omitempty"`
+	Effects *ActionEffects `json:"effects,omitempty"`
+	// FileChooser is set while a page's file chooser is open and waiting: the
+	// session intercepts the dialog (headless, it never renders) and reports
+	// it so the file can be offered and set through set_file_input
+	// (citadel-cli#1721). Cleared when that input is filled or the page
+	// navigates.
+	FileChooser *FileChooserPending `json:"file_chooser,omitempty"`
+	// FileUploadPageFence names the page fence set_file_input enforces, so a
+	// caller can detect it before calling; absent when the session has no
+	// set_file_input (page-tracking sessions).
+	FileUploadPageFence string `json:"file_upload_page_fence,omitempty"`
+	// InputEdit names the type/key edit contract this node implements (type
+	// with selector and clear, key with modifiers). A caller must not send
+	// those fields to a node whose status lacks it: an older node ignores them
+	// and would append instead of replace. Reported only by non-tracking
+	// sessions, like FileUploadPageFence.
+	InputEdit string `json:"input_edit,omitempty"`
+	// PageText and PasswordField are page content signals for the platform's
+	// login-wall detection (aceteam#13773). Set only by WithPageSignals on a
+	// node-wide session's start and single-session status result; omitted on
+	// any failure, handoff, refused page or tracking session. PageText is
+	// never logged or stored.
+	PageText      string `json:"page_text,omitempty"`
+	PasswordField *bool  `json:"password_field,omitempty"`
+	// FirstLoad is "pending" while the start URL has not yet replaced the
+	// initial about:blank (StartSession returned before the browser's own
+	// navigation committed). The first status read that sees another page
+	// clears it. Nothing ever re-issues the navigation.
+	FirstLoad string `json:"first_load,omitempty"`
+	// PendingOrigin is the scheme and host of the start URL while FirstLoad is
+	// pending. Never the path or query, which can hold a token.
+	PendingOrigin string `json:"pending_origin,omitempty"`
+}
+
+// FirstLoadPending is the FirstLoad value while the start page has not landed.
+const FirstLoadPending = "pending"
+
+// urlOrigin returns scheme://host[:port] of raw, or "" when unparseable.
+func urlOrigin(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+func (s *cobrowseSession) setFirstLoadPending(startURL string) {
+	s.mu.Lock()
+	s.pendingOrigin = urlOrigin(startURL)
+	s.firstLoadPending = true
+	s.mu.Unlock()
+}
+
+func (s *cobrowseSession) clearFirstLoadPending() {
+	s.mu.Lock()
+	s.firstLoadPending, s.pendingOrigin = false, ""
+	s.mu.Unlock()
+}
+
+// applyFirstLoad sets or clears the pending marker from the URL a status read
+// found. An unknown (empty) URL leaves it pending.
+func (s *cobrowseSession) applyFirstLoad(st *CobrowseSessionStatus) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.firstLoadPending {
+		return
+	}
+	if st.URL != "" && st.URL != "about:blank" {
+		s.firstLoadPending, s.pendingOrigin = false, ""
+		return
+	}
+	st.FirstLoad, st.PendingOrigin = FirstLoadPending, s.pendingOrigin
 }
 
 // cobrowseProc is the running-process bundle for one session: the browser and its
@@ -119,6 +208,13 @@ type cobrowseProc struct {
 	// run in (empty when launched directly); scopeUser says which manager owns them.
 	browserScope, xvfbScope string
 	scopeUser               bool
+	// Container sessions (cobrowse_container.go): the full container id, its
+	// per-session network, its StartedAt, the published control port, and the
+	// host dir mounted at /profile (for mapping staged-file paths).
+	containerID, containerNet, containerStart string
+	containerCtrl                             int
+	// containerStage is the host staging dir bound read-only into the container.
+	containerStage string
 	// exited is closed by the reaper when the browser process terminates, so status
 	// can report SessionExited for a crashed session rather than a bare running=false.
 	exited <-chan struct{}
@@ -151,6 +247,15 @@ type CobrowseSessionManager struct {
 	baseDir     string
 	sweepOnce   sync.Once
 	launchOpts  LaunchOptions
+	// trackTargets, targetPolicy and targetEvent are set by
+	// EnableTargetTracking for newly created sessions.
+	trackTargets bool
+	targetPolicy TargetPolicy
+	targetEvent  TargetEventFunc
+	// filesAllowed is the live Files permission for the viewer's human file
+	// attach (SetFilesAllowed). Nil denies, so a manager nobody wired never lets
+	// a viewer attach (local mode is one).
+	filesAllowed func() bool
 	// useResolver is set on the process-wide manager only, so its registry
 	// follows registryDirResolver; other managers keep a sibling of baseDir.
 	useResolver bool
@@ -180,9 +285,15 @@ type SessionProfile interface {
 // cobrowseSession is one isolated browser session. Its own mutex guards proc/state so
 // a status/stop of a sibling never blocks on this session's launch or CDP wait.
 type cobrowseSession struct {
+	// actionMu serializes dispatched assertions without changing viewer control.
+	actionMu  sync.Mutex
 	id        string
 	profile   string
 	startedAt time.Time
+	// workDir is where the browser profile working copy lives: profile itself
+	// for host runners, <profile>/profile for a container session. Guarded by mu;
+	// empty means profile.
+	workDir string
 
 	// encProfile is the encrypted persistent profile for this session, or nil for a
 	// throwaway session. When set, teardown persists (only if the browser ran) and
@@ -192,6 +303,13 @@ type cobrowseSession struct {
 	mu    sync.Mutex
 	state CobrowseSessionState
 	proc  *cobrowseProc
+	// lastURL is the last page URL a probe read; status falls back to it when
+	// the DevTools endpoint is slow (citadel-cli#1663).
+	lastURL string
+	// firstLoadPending marks a start URL whose navigation had not committed
+	// when StartSession returned; pendingOrigin is its origin only.
+	firstLoadPending bool
+	pendingOrigin    string
 	// explicitHandoff blocks agent actions and enables viewer input until
 	// resume, even if the viewer temporarily disconnects.
 	explicitHandoff bool
@@ -210,6 +328,26 @@ type cobrowseSession struct {
 	regDir     string
 	generation uint64
 	pendingEnd *EndedSession
+	// tracking is set at creation or restored from the registry: pages are
+	// followed and status lists them. expectTarget is the page a call was
+	// checked against (see ExpectTarget).
+	tracking     bool
+	policy       TargetPolicy
+	expectTarget string
+	formWorld    formSnapshotWorld
+
+	// stageMu serializes writes into the staging dir (count check and create).
+	stageMu     sync.Mutex
+	stageClosed bool
+	// attachMu serializes the human's viewer attaches (check, dispatch, clear).
+	attachMu sync.Mutex
+	// chooser is the pending file chooser, guarded by mu; watchStop ends the
+	// chooser watcher (closed once through watchOnce).
+	chooser   *FileChooserPending
+	watchStop chan struct{}
+	watchOnce sync.Once
+	// watchStopped makes a start after any stop a no-op.
+	watchStopped bool
 }
 
 var (
@@ -226,6 +364,7 @@ func GetCobrowseSessionManager() *CobrowseSessionManager {
 			resolveMaxCobrowseSessions(),
 		)
 		cobrowseSessionManager.useResolver = true
+		cobrowseSessionManager.EnableTargetTracking(browserurl.NewURLPolicy(browserurl.DefaultResolver, nil), nil)
 	})
 	return cobrowseSessionManager
 }
@@ -258,12 +397,35 @@ func newCobrowseSessionManager(baseDir string, maxSessions int) *CobrowseSession
 // resolveMaxCobrowseSessions reads EnvCobrowseMaxSessions, falling back to the default
 // when unset or not a positive integer.
 func resolveMaxCobrowseSessions() int {
+	if n := configuredBrowserSlots.Load(); n > 0 && os.Getenv(EnvCobrowseMaxSessions) == "" {
+		return int(n)
+	}
 	if v := strings.TrimSpace(os.Getenv(EnvCobrowseMaxSessions)); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			return n
 		}
 	}
 	return defaultMaxCobrowseSessions
+}
+
+// configuredBrowserSlots is the shared concurrent-session count from device
+// config (0 = unset). EnvCobrowseMaxSessions still wins when set.
+var configuredBrowserSlots atomic.Int32
+
+// SetBrowserSlots applies the node's shared slot count to the node-wide
+// co-browse manager, whether or not it has been created yet.
+func SetBrowserSlots(n int) {
+	if n <= 0 || n > 64 {
+		return
+	}
+	configuredBrowserSlots.Store(int32(n))
+	if os.Getenv(EnvCobrowseMaxSessions) != "" || cobrowseSessionManager == nil {
+		return
+	}
+	m := cobrowseSessionManager
+	m.mu.Lock()
+	m.maxSessions = n
+	m.mu.Unlock()
 }
 
 // newSessionID returns a short random hex session handle.
@@ -295,11 +457,55 @@ func (m *CobrowseSessionManager) StartSession(startURL string) (CobrowseSessionS
 // lock can leak — a missed Close is structurally impossible because every cleanup
 // path routes through teardown().
 func (m *CobrowseSessionManager) StartSessionWithProfile(startURL string, profile SessionProfile) (status CobrowseSessionStatus, err error) {
+	return m.startSession(newSessionID(), startURL, profile)
+}
+
+// NewCobrowseSessionID returns a fresh session id in the manager's format. A
+// caller that must hand out an id before the browser exists (local mode's
+// locked persistent-profile session) reserves one here and passes it to
+// StartSessionWithID once the profile is unlocked.
+func NewCobrowseSessionID() string { return newSessionID() }
+
+// reservedSessionIDPattern is the shape newSessionID produces.
+var reservedSessionIDPattern = regexp.MustCompile(`^cb-[0-9a-f]{16}$`)
+
+// StartSessionWithID is StartSessionWithProfile under a caller-reserved id from
+// NewCobrowseSessionID. An id of any other shape, or one already in use, is
+// refused (and the profile Closed), so a caller cannot name a directory.
+func (m *CobrowseSessionManager) StartSessionWithID(id, startURL string, profile SessionProfile) (CobrowseSessionStatus, error) {
+	if !reservedSessionIDPattern.MatchString(id) {
+		if profile != nil {
+			_ = profile.Close()
+		}
+		return CobrowseSessionStatus{}, fmt.Errorf("invalid co-browse session id %q", id)
+	}
+	return m.startSession(id, startURL, profile)
+}
+
+func (m *CobrowseSessionManager) startSession(id, startURL string, profile SessionProfile) (status CobrowseSessionStatus, err error) {
 	if err := ValidateCobrowseURL(startURL); err != nil {
 		if profile != nil {
 			profile.Close()
 		}
 		return CobrowseSessionStatus{}, err
+	}
+	m.mu.Lock()
+	tracking, policy := m.trackTargets, m.targetPolicy
+	m.mu.Unlock()
+	if tracking && policy != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		checkedURL := startURL
+		if strings.TrimSpace(checkedURL) == "" {
+			checkedURL = "about:blank"
+		}
+		err := policy(ctx, checkedURL)
+		cancel()
+		if err != nil {
+			if profile != nil {
+				_ = profile.Close()
+			}
+			return CobrowseSessionStatus{}, err
+		}
 	}
 	// Reap orphans from a prior crashed process before the first launch of this one.
 	m.sweepOnce.Do(m.sweep)
@@ -316,7 +522,13 @@ func (m *CobrowseSessionManager) StartSessionWithProfile(startURL string, profil
 			"too many co-browse sessions (%d running); stop one first or raise %s",
 			max, EnvCobrowseMaxSessions)
 	}
-	id := newSessionID()
+	if _, taken := m.sessions[id]; taken {
+		m.mu.Unlock()
+		if profile != nil {
+			_ = profile.Close()
+		}
+		return CobrowseSessionStatus{}, fmt.Errorf("co-browse session %s already exists", id)
+	}
 	s := &cobrowseSession{
 		id:         id,
 		profile:    filepath.Join(m.baseDir, id),
@@ -325,6 +537,8 @@ func (m *CobrowseSessionManager) StartSessionWithProfile(startURL string, profil
 		encProfile: profile,
 		regDir:     m.sessionRegDir(),
 		generation: 1,
+		tracking:   m.trackTargets,
+		policy:     m.targetPolicy,
 	}
 	m.sessions[id] = s
 	m.mu.Unlock()
@@ -352,6 +566,7 @@ func (m *CobrowseSessionManager) StartSessionWithProfile(startURL string, profil
 	m.mu.Lock()
 	if m.sessions[id] != s {
 		m.mu.Unlock()
+		s.stopChooserWatch()
 		_ = proc.stop()
 		// Do NOT persist here: the session was torn down mid-launch, the concurrent
 		// teardown may already have removed the working dir, and sealing an empty or
@@ -371,15 +586,39 @@ func (m *CobrowseSessionManager) StartSessionWithProfile(startURL string, profil
 		// Wait for the launch URL (including redirects) to settle, then report
 		// where the page ended up, as Navigate does. Best effort: a page that
 		// cannot be read leaves the plain status.
-		if port, perr := s.requireDrivablePort(); perr == nil {
-			ps := settleNavigation(port, "")
+		// Bounded: pinning and the settle share this one context (settleLaunch
+		// derives from it), so start-up never waits longer than the settle
+		// window plus the report reserve, in total.
+		pctx, pcancel := context.WithTimeout(context.Background(), navigateSettleWindow+cobrowseReportReserve)
+		defer pcancel()
+		// Pending is marked up front, independent of whether the page can be
+		// pinned: a cold tracked browser may have no page target yet, and
+		// that must not read as a loaded start page. A status read clears it
+		// once it observes a committed, non-blank URL.
+		s.setFirstLoadPending(startURL)
+		st.FirstLoad, st.PendingOrigin = FirstLoadPending, urlOrigin(startURL)
+		if p, perr := s.pinActionCtx(pctx); perr == nil {
+			// The browser opens on about:blank, which already reads
+			// "complete", before the launch URL commits. Wait for the page to
+			// leave it (bounded by the settle window) and report whatever is
+			// current. Never re-navigate: the launch URL may be single-use
+			// (magic link, OAuth code) and must be requested exactly once
+			// (citadel-cli#1694). If the page is still about:blank, the
+			// browser's own navigation has not committed (a cold Edge start
+			// can outlast the window, citadel-cli#1714): report the first
+			// load as pending instead of a blank page as loaded.
+			ps := settleLaunch(pctx, p)
 			if ps.URL != "" {
 				st.URL = ps.URL
 			}
 			st.Title = ps.Title
+			if ps.URL != "" && ps.URL != "about:blank" {
+				s.clearFirstLoadPending()
+				st.FirstLoad, st.PendingOrigin = "", ""
+			}
 		}
 	}
-	return st, nil
+	return withBrowserInterstitial(st), nil
 }
 
 // launch creates the session's profile dir, spawns the browser via the (injectable)
@@ -395,6 +634,26 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	if err := os.MkdirAll(s.profile, 0o700); err != nil {
 		return nil, fmt.Errorf("create session profile dir: %w", err)
 	}
+	// A container session mounts only <session>/profile, so the profile working
+	// copy lives there; everything else stays out of the container's reach.
+	useContainer := false
+	workDir := s.profile
+	if ch, ok := activeBrowserRunner.(containerChooser); ok && ch.useContainer(m.useResolver) {
+		useContainer = true
+		workDir = filepath.Join(s.profile, containerProfileSubdir)
+		if err := os.MkdirAll(workDir, 0o700); err != nil {
+			return nil, fmt.Errorf("create container profile dir: %w", err)
+		}
+	}
+	s.mu.Lock()
+	s.workDir = workDir
+	s.mu.Unlock()
+	// Local mode (page tracking) has no upload path and is left alone.
+	if !s.tracking {
+		if _, err := s.ensureStagingDir(); err != nil {
+			return nil, err
+		}
+	}
 	// For a persistent session, decrypt the stored profile into the (private, 0700)
 	// working dir BEFORE launching the browser, so the browser opens with the saved
 	// logins. Fails closed: a materialize error (e.g. tampered/corrupt store) aborts
@@ -404,14 +663,21 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	enc := s.encProfile
 	s.mu.Unlock()
 	if enc != nil {
-		if err := enc.Materialize(s.profile); err != nil {
+		// Mark the dir before any plaintext lands in it, so an interrupted
+		// session can be traced to its profile and cleaned up.
+		if err := writeProfileMarker(s.profile, enc); err != nil {
+			return nil, fmt.Errorf("mark encrypted profile working dir: %w", err)
+		}
+		if err := enc.Materialize(workDir); err != nil {
 			return nil, fmt.Errorf("materialize encrypted profile: %w", err)
 		}
 	}
 	m.mu.Lock()
 	lo := m.launchOpts
+	tpolicy, tevent := m.targetPolicy, m.targetEvent
 	m.mu.Unlock()
 	lo.Detach = m.useResolver && detachedWorker.Load()
+	lo.UseContainer = useContainer
 	proc, err := launchCobrowseProc(s.profile, startURL, lo)
 	if err != nil {
 		return nil, err
@@ -421,11 +687,25 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	// the session still runs and graceful stop still reaps it in-process.
 	writeSessionPidfile(s.profile, os.Getpid(), proc.browserPID, proc.xvfbPID, currentProcessStartToken())
 
+	// Configure the page policy before the session is visible to status or
+	// actions, so no page is ever accepted without it.
+	if s.tracking {
+		dropTargetSet(proc.debugPort)
+		targetSetFor(proc.debugPort).configure(s.id, tpolicy, tevent)
+	}
+	// Learn the browser's CDP id before the session is visible and before the
+	// chooser watcher exists, on every OS, so the watcher can always verify it.
+	if proc.browserID == "" && proc.debugPort > 0 {
+		if id, err := resolveBrowserID(proc.debugPort, s.profile); err == nil {
+			proc.browserID = id
+		}
+	}
 	s.mu.Lock()
 	s.proc = proc
 	s.state = SessionRunning
 	s.persistent = enc != nil
 	s.mu.Unlock()
+	s.startChooserWatch(proc.debugPort)
 	// Durable registry record so a restart by exec can re-adopt this session.
 	s.persistRecord()
 	return proc, nil
@@ -566,25 +846,64 @@ func (s *cobrowseSession) teardown() error {
 	proc := s.proc
 	s.proc = nil
 	profile := s.profile
+	workDir := s.workDir
+	if workDir == "" {
+		workDir = profile
+	}
 	enc := s.encProfile
 	s.encProfile = nil
 	regDir := s.regDir
 	s.mu.Unlock()
+	s.stopChooserWatch()
+	// No stage may start from here on; one already running has finished.
+	// Staged user files go first, so a persistent profile's sealed copy can
+	// never contain them.
+	s.closeStaging()
+	_ = s.removeStagingDir()
 	// A stopped session leaves no registry record: it did not "end" unexpectedly.
 	if regDir != "" {
 		deleteRecord(regDir, s.id)
 	}
 
-	var err error
+	var err, reapErr error
+	if enc != nil && proc != nil {
+		// A persistent profile is sealed from what the browser wrote to disk.
+		// Chromium keeps recent cookie and login writes in memory and commits
+		// them in batches, so a hard kill right after a login would seal a
+		// profile without it. Ask the browser to close first (bounded), then
+		// kill whatever is left as before. Throwaway sessions skip this.
+		closeBrowserGracefully(proc)
+	}
 	if proc != nil && proc.stop != nil {
 		err = proc.stop()
 	}
+	if proc != nil {
+		dropTargetSet(proc.debugPort)
+		// The main process is dead; its helpers may not be yet, and they
+		// recreate files under the profile. Nothing is sealed until they are
+		// gone (citadel-cli#1836); a survivor fails closed below.
+		reapErr = reapProfileUsers(profile, proc.browserScope)
+	}
+	// Again after the browser is gone (it may have held a staged file open),
+	// and always before Persist seals anything. A dir that cannot be removed
+	// is never sealed.
+	stageErr := s.removeStagingDir()
 	if enc != nil {
 		// Persist ONLY if the browser ran (proc != nil): a failed launch never
 		// produced new state, and sealing an empty/partial working dir would
 		// overwrite a good profile with nothing.
 		if proc != nil {
-			if perr := enc.Persist(profile); perr != nil && err == nil {
+			if reapErr != nil {
+				// A live helper may be writing a torn database: keep the
+				// previous ciphertext rather than seal over it.
+				if err == nil {
+					err = reapErr
+				}
+			} else if stageErr != nil {
+				if err == nil {
+					err = stageErr
+				}
+			} else if perr := enc.Persist(workDir); perr != nil && err == nil {
 				err = perr
 			}
 		}
@@ -596,7 +915,27 @@ func (s *cobrowseSession) teardown() error {
 	// cookies (and no throwaway state) behind. The pidfile lives under it and goes
 	// too. For a persistent profile the durable state now lives only as ciphertext.
 	if profile != "" {
-		removeSessionDir(profile)
+		rerr := removeSessionDir(profile)
+		// A helper can recreate the tree after a removal that succeeded, so
+		// with a browser involved re-reap and re-check until the dir is gone.
+		for i := 0; proc != nil && i < 3; i++ {
+			if r := reapProfileUsers(profile, proc.browserScope); r != nil && reapErr == nil {
+				reapErr = r
+			}
+			if _, serr := os.Lstat(profile); os.IsNotExist(serr) {
+				rerr = nil
+				break
+			}
+			rerr = removeSessionDir(profile)
+		}
+		if rerr != nil && enc != nil && err == nil {
+			// A persistent session's working dir holds decrypted cookies; a
+			// failure to remove it must be visible, never silent.
+			err = fmt.Errorf("the decrypted working copy of a saved profile could not be removed from %s: %w", profile, rerr)
+		}
+	}
+	if reapErr != nil && err == nil {
+		err = reapErr
 	}
 	return err
 }
@@ -611,6 +950,80 @@ func (s *cobrowseSession) teardown() error {
 // to every session status in the list). st is a local, unshared struct, so filling in
 // its URL after unlocking is race-free.
 func (s *cobrowseSession) status() CobrowseSessionStatus {
+	return s.statusCtx(context.Background())
+}
+
+// statusCtx is status under the caller's context, so an action's one budget
+// covers its read-back.
+func (s *cobrowseSession) statusCtx(parent context.Context) CobrowseSessionStatus {
+	st := s.statusProbed(parent)
+	s.applyFirstLoad(&st)
+	return withBrowserInterstitial(st)
+}
+
+func (s *cobrowseSession) statusProbed(parent context.Context) CobrowseSessionStatus {
+	st, probePort := s.statusBase()
+	if probePort == 0 {
+		return st
+	}
+	s.mu.Lock()
+	tracking := s.tracking
+	s.mu.Unlock()
+	if tracking {
+		ctx, cancel := context.WithTimeout(parent, targetSyncTimeout)
+		snap, err := targetSetFor(probePort).sync(ctx, probePort)
+		cancel()
+		if err == nil {
+			st.Targets = snap.Targets
+			st.OpenTargets = len(snap.Targets)
+			st.ActiveTarget = snap.Active
+			for _, tg := range snap.Targets {
+				if tg.Active {
+					st.URL = tg.URL
+				}
+			}
+			s.noteURL(st.URL)
+		} else {
+			st.URL = s.cachedURL()
+		}
+		return st
+	}
+	ctx, cancel := context.WithTimeout(parent, cobrowseStatusProbeTimeout)
+	t, err := pickTargetContext(ctx, probePort)
+	cancel()
+	if err != nil {
+		// A slow or wedged endpoint reports the last URL seen rather than
+		// stalling the status call.
+		st.URL = s.cachedURL()
+		return st
+	}
+	st.URL = t.URL
+	s.noteURL(t.URL)
+	return st
+}
+
+func (s *cobrowseSession) noteURL(u string) {
+	if u == "" {
+		return
+	}
+	s.mu.Lock()
+	s.lastURL = u
+	s.mu.Unlock()
+}
+
+func (s *cobrowseSession) cachedURL() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastURL
+}
+
+// statusNoProbe is status() without any CDP probe; the caller fills URL.
+func (s *cobrowseSession) statusNoProbe() CobrowseSessionStatus {
+	st, _ := s.statusBase()
+	return st
+}
+
+func (s *cobrowseSession) statusBase() (CobrowseSessionStatus, int) {
 	s.mu.Lock()
 	st := CobrowseSessionStatus{
 		ID:         s.id,
@@ -618,6 +1031,16 @@ func (s *cobrowseSession) status() CobrowseSessionStatus {
 		Profile:    s.profile,
 		Driver:     driverFor(s.humanDrivingLocked()),
 		Generation: s.generation,
+	}
+	if !s.tracking {
+		st.FileUploadPageFence = FileUploadPageFenceV1
+		st.InputEdit = InputEditV1
+	} else {
+		st.Features = []string{"tabs"}
+	}
+	if s.chooser != nil {
+		c := *s.chooser
+		st.FileChooser = &c
 	}
 	if !s.startedAt.IsZero() {
 		st.StartedAt = s.startedAt.UTC().Format(time.RFC3339)
@@ -638,13 +1061,7 @@ func (s *cobrowseSession) status() CobrowseSessionStatus {
 		}
 	}
 	s.mu.Unlock()
-
-	if probePort != 0 {
-		if t, err := pickTarget(probePort); err == nil {
-			st.URL = t.URL
-		}
-	}
-	return st
+	return st, probePort
 }
 
 // defaultLaunchCobrowseProc launches through this OS's browser runner (see
@@ -715,7 +1132,23 @@ func writeSessionPidfile(profileDir string, ownerPID, browserPID, xvfbPID int, o
 	if ownerStart != 0 {
 		content += fmt.Sprintf("%d\n", ownerStart)
 	}
-	_ = os.WriteFile(path, []byte(content), 0o600)
+	// Never write through a symlink: replace the entry with a fresh file by
+	// rename, so a planted link is dropped and its target is not touched.
+	if fi, err := os.Lstat(path); err == nil && !fi.Mode().IsRegular() {
+		if os.Remove(path) != nil {
+			return
+		}
+	}
+	tmp, err := os.CreateTemp(profileDir, ".pid-")
+	if err != nil {
+		return
+	}
+	name := tmp.Name()
+	_, werr := tmp.WriteString(content)
+	cerr := tmp.Close()
+	if werr != nil || cerr != nil || os.Chmod(name, 0o600) != nil || os.Rename(name, path) != nil {
+		os.Remove(name)
+	}
 }
 
 // readSessionPidfile parses the owner, browser, and Xvfb PIDs from a session dir's
@@ -825,6 +1258,23 @@ func (m *CobrowseSessionManager) sweep() {
 	// otherwise reap them as orphans (citadel-cli#1546).
 	m.recoverSessions()
 	activeBrowserRunner.SweepOrphans(m.baseDir)
+	// Containers are swept by label, never by pidfile: only the node-wide manager
+	// does it, and a session is live when the manager tracks it or a live or
+	// suspended registry record names it.
+	if cs, ok := activeBrowserRunner.(containerSweeper); ok && m.useResolver {
+		cs.sweepContainers(m.baseDir, m.sessionIsLive)
+	}
+}
+
+func (m *CobrowseSessionManager) sessionIsLive(id string) bool {
+	m.mu.Lock()
+	_, ok := m.sessions[id]
+	m.mu.Unlock()
+	if ok {
+		return true
+	}
+	rec, err := loadRecord(m.registryDir(), id)
+	return err == nil && (rec.State == RecordLive || rec.State == RecordSuspended)
 }
 
 // sweepXvfbSessions is the Linux runner's orphan sweep; see sweep above.
@@ -877,3 +1327,42 @@ func sweepKillIfVerified(pid int, role cobrowseProcRole, label string) {
 // protected owner-only DACL on Windows. An existing dir that fails is refused,
 // never repaired. Local mode keeps its viewer token and audit log in such dirs.
 func EnsurePrivateDir(dir string) error { return ensureCobrowseBaseDir(dir) }
+
+// gracefulCloseWait is the whole budget for closing a persistent session's
+// browser gracefully: the endpoint probe, the Browser.close call and the wait
+// for the process to exit all share it, after which teardown kills as usual.
+// A var for tests.
+var gracefulCloseWait = 10 * time.Second
+
+// closeBrowserGracefully sends CDP Browser.close to proc's browser target and
+// waits, within gracefulCloseWait in total, for the process to exit, so
+// Chromium flushes its cookie and login stores to disk. Best effort: no debug
+// port, an unreadable or mismatched endpoint, or a browser that does not exit
+// in time all fall through to the caller's kill.
+func closeBrowserGracefully(proc *cobrowseProc) {
+	if proc == nil || proc.debugPort <= 0 || proc.exited == nil {
+		return
+	}
+	select {
+	case <-proc.exited:
+		return
+	default:
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), gracefulCloseWait)
+	defer cancel()
+	ws, err := fetchCDPBrowserWSContext(ctx, proc.debugPort)
+	if err != nil {
+		return
+	}
+	// Only close the browser this session launched, on the port it owns.
+	prefix := fmt.Sprintf("ws://127.0.0.1:%d/devtools/browser/", proc.debugPort)
+	if !strings.HasPrefix(ws, prefix) || (proc.browserID != "" && ws != prefix+proc.browserID) {
+		return
+	}
+	// The browser may close the socket before replying; that is success.
+	_, _ = cdpDialAndSendContext(ctx, ws, "Browser.close", nil)
+	select {
+	case <-proc.exited:
+	case <-ctx.Done():
+	}
+}

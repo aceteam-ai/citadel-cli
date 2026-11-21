@@ -394,3 +394,47 @@ func waitFor(t *testing.T, cond func() bool, msg string) {
 	}
 	t.Fatal(msg)
 }
+
+func TestEtaSeconds_FlooredWhenLoadOutlivesEstimate(t *testing.T) {
+	m := newTestManager(newMockController())
+	base := time.Now()
+	m.now = func() time.Time { return base.Add(10 * time.Minute) }
+	op := &swapOp{backend: "ollama", startedAt: base, loadEst: 30 * time.Second}
+
+	if got := m.etaSeconds(op); got != warmingRetryAfter {
+		t.Fatalf("eta past estimate = %d, want retry-after floor %d", got, warmingRetryAfter)
+	}
+	out := m.warmingOutcome(op)
+	if out.ETASeconds != warmingRetryAfter || out.RetryAfterSeconds != warmingRetryAfter {
+		t.Fatalf("outcome eta/retry = %d/%d, want %d/%d", out.ETASeconds, out.RetryAfterSeconds, warmingRetryAfter, warmingRetryAfter)
+	}
+}
+
+func TestEtaSeconds_PrefersMeasuredLoad(t *testing.T) {
+	m := newTestManager(newMockController())
+	base := time.Now()
+	m.now = func() time.Time { return base.Add(20 * time.Second) }
+	op := &swapOp{backend: "ollama", startedAt: base, loadEst: 30 * time.Second}
+
+	if got := m.etaSeconds(op); got != warmingRetryAfter {
+		t.Fatalf("eta from estimate = %d, want floor %d", got, warmingRetryAfter)
+	}
+	m.mu.Lock()
+	m.loadMeasured["ollama"] = 90 * time.Second
+	m.mu.Unlock()
+	if got := m.etaSeconds(op); got != 70 {
+		t.Fatalf("eta from measured load = %d, want 70", got)
+	}
+}
+
+func TestWarming_ETAFlooredAtRetryAfter(t *testing.T) {
+	h := NewLLMInferenceHandler()
+	res := h.warming("m", 0, 0, "m")
+	if got, _ := res.Output["eta_seconds"].(int); got != warmingRetryAfter {
+		t.Fatalf("eta_seconds = %v, want %d", res.Output["eta_seconds"], warmingRetryAfter)
+	}
+	res = h.warming("m", 3, 30, "m")
+	if got, _ := res.Output["eta_seconds"].(int); got != 30 {
+		t.Fatalf("eta_seconds = %v, want 30", res.Output["eta_seconds"])
+	}
+}

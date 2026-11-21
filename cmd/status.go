@@ -118,6 +118,8 @@ func runStandardStatus(commandCtx context.Context) {
 	headerColor.Fprintf(w, "--- 📊 Citadel Node Status (%s) ---\n", Version)
 
 	headerColor.Fprintln(w, "\n🛠️ WORKER")
+	printConfiguredWorkerRole(w, getDeviceConfigFromFile())
+	printActiveWorkerRole(w)
 	printWorkerInfo(w)
 
 	headerColor.Fprintln(w, "\n💻 SYSTEM VITALS")
@@ -458,6 +460,12 @@ func gatherInitialStatusData(commandCtx context.Context) (dashboard.StatusData, 
 func gatherStatusData() (dashboard.StatusData, error) {
 	data := dashboard.StatusData{
 		Version: Version,
+	}
+	if role, err := resolveWorkerRole(getDeviceConfigFromFile(), ""); err == nil {
+		data.ConfiguredRole = role.Report()
+	}
+	if role, known := probeActiveWorkerRole(); known {
+		data.Role = role.Report()
 	}
 	if detail := deviceLinkDiagnostic(getDeviceConfigFromFile()); detail != "" {
 		data.DeviceLinkState = "unverified"

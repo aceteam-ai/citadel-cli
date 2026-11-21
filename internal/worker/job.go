@@ -250,6 +250,7 @@ const (
 	JobTypeFineTuneStart      = "FINETUNE_START"       // Train a node-local adapter on the pinned GPU node
 	JobTypeExposeSet          = "EXPOSE_SET"           // Expose a local service on the gateway with private/org/link visibility (issue #598)
 	JobTypeExposeList         = "EXPOSE_LIST"          // Read back this node's durable exposure inventory (issue #944)
+	JobTypeLaneInventory      = "LANE_INVENTORY"       // Bounded read-only lane inventory, exact own-node stream only (#1699)
 	JobTypeUnexpose           = "UNEXPOSE"             // Remotely revoke a gateway exposure (issue #944)
 	JobTypeMeetingJoin        = "MEETING_JOIN"         // Auto-join a video call, record + transcribe it node-locally (aceteam#5098)
 	JobTypeHuddleJoin         = "HUDDLE_JOIN"          // Join a native AceTeam huddle AS the agent (headless bot page) + confirm presence (aceteam#7081)
@@ -346,6 +347,7 @@ var allKnownJobTypes = []string{
 	JobTypeFineTuneStart,
 	JobTypeExposeSet,
 	JobTypeExposeList,
+	JobTypeLaneInventory,
 	JobTypeUnexpose,
 	JobTypeMeetingJoin,
 	JobTypeHuddleJoin,

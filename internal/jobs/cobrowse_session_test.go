@@ -134,7 +134,7 @@ func TestSaveCobrowseRecordingRejectsSymlinkAndExistingPublication(t *testing.T)
 
 func runSession(t *testing.T, payload map[string]string) ([]byte, error) {
 	t.Helper()
-	h := NewCobrowseSessionHandler("")
+	h := NewCobrowseSessionHandler()
 	return h.Execute(JobContext{}, &nexus.Job{ID: "test", Type: "COBROWSE_SESSION", Payload: payload})
 }
 
@@ -220,7 +220,7 @@ func TestCobrowseSession_RecordRequiresBoundedDurationAndSession(t *testing.T) {
 		{"action": CobrowseSessionActionRecord, "session_id": "cb-nope", "seconds": "31"},
 		{"action": CobrowseSessionActionRecord, "session_id": "cb-nope", "seconds": "NaN"},
 	} {
-		if _, err := runSession(t, payload); err == nil {
+		if _, err := runSessionFilesOn(t, payload); err == nil {
 			t.Fatalf("accepted invalid record payload: %v", payload)
 		}
 	}
@@ -513,7 +513,7 @@ func TestCobrowseSession_PinNeverLoggedForNewActions(t *testing.T) {
 			}
 
 			var logged []string
-			h := NewCobrowseSessionHandler("")
+			h := NewCobrowseSessionHandler()
 			ctx := JobContext{LogFn: func(level, msg string) {
 				logged = append(logged, msg)
 			}}

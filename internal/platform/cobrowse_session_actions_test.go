@@ -115,6 +115,24 @@ func TestCobrowseSessionActions_HandoffRefusesWrites(t *testing.T) {
 	}
 }
 
+func TestCobrowseSessionActions_RecordRequiresUntrackedPage(t *testing.T) {
+	for _, tracked := range []bool{false, true} {
+		s := &cobrowseSession{tracking: tracked, proc: &cobrowseProc{exited: make(chan struct{})}}
+		called := false
+		_, err := s.withRecordingPort(context.Background(), func(_ context.Context, _ int, commit func(func() error) error) ([]byte, error) {
+			called = true
+			return nil, commit(func() error { return nil })
+		})
+		if tracked {
+			if err == nil || !strings.Contains(err.Error(), "target-tracked") || called {
+				t.Fatalf("tracked page: err=%v called=%v", err, called)
+			}
+		} else if err != nil || !called {
+			t.Fatalf("legacy page: err=%v called=%v", err, called)
+		}
+	}
+}
+
 func TestCobrowseSessionActions_RecordRefusesHumanDriver(t *testing.T) {
 	f := &fakeLauncher{}
 	f.install(t)
@@ -618,6 +636,11 @@ type fakeCDPServer struct {
 	calls          []recordedCDPCall
 	evaluateValue  func(expr string) any
 	screenshotData string
+	// listedURL, when set, is the page URL the /json target list reports
+	// (default about:blank).
+	listedURL func() string
+	// custom, when set, answers a method before the built-in responses.
+	custom func(method string, params map[string]any) (map[string]any, bool)
 }
 
 func startFakeCDPServer(t *testing.T) *fakeCDPServer {
@@ -633,7 +656,13 @@ func startFakeCDPServer(t *testing.T) *fakeCDPServer {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/json", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `[{"type":"page","url":"about:blank","webSocketDebuggerUrl":"ws://127.0.0.1:%d/devtools/page/1"}]`, port)
+		pageURL := "about:blank"
+		f.mu.Lock()
+		if f.listedURL != nil {
+			pageURL = f.listedURL()
+		}
+		f.mu.Unlock()
+		fmt.Fprintf(w, `[{"type":"page","url":%q,"webSocketDebuggerUrl":"ws://127.0.0.1:%d/devtools/page/1"}]`, pageURL, port)
 	})
 	mux.HandleFunc("/devtools/page/1", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := up.Upgrade(w, r, nil)
@@ -681,6 +710,14 @@ func (f *fakeCDPServer) callsFor(method string) []recordedCDPCall {
 }
 
 func (f *fakeCDPServer) respond(method string, params map[string]any) map[string]any {
+	f.mu.Lock()
+	custom := f.custom
+	f.mu.Unlock()
+	if custom != nil {
+		if res, ok := custom(method, params); ok {
+			return res
+		}
+	}
 	switch method {
 	case "Runtime.evaluate":
 		expr, _ := params["expression"].(string)
@@ -763,9 +800,15 @@ func TestCobrowseSessionActions_ClickBySelectorResolvesCenterThenClicks(t *testi
 		t.Fatalf("click: %v", err)
 	}
 
-	evalCalls := f.callsFor("Runtime.evaluate")
+	var evalCalls []recordedCDPCall
+	for _, c := range f.callsFor("Runtime.evaluate") {
+		// The before/after effect probe (citadel-cli#1663) is not a resolution.
+		if expr, _ := c.Params["expression"].(string); !strings.Contains(expr, "window.scrollX") {
+			evalCalls = append(evalCalls, c)
+		}
+	}
 	if len(evalCalls) != 1 {
-		t.Fatalf("expected exactly 1 Runtime.evaluate call, got %d", len(evalCalls))
+		t.Fatalf("expected exactly 1 selector Runtime.evaluate call, got %d", len(evalCalls))
 	}
 	if evalCalls[0].Params["awaitPromise"] != true {
 		t.Fatal("selector resolution must wait for scrolling to settle")
@@ -791,7 +834,10 @@ func TestCobrowseSessionActions_ClickSelectorRefusesHandoffDuringSettle(t *testi
 	settling := make(chan struct{})
 	release := make(chan struct{})
 	f.mu.Lock()
-	f.evaluateValue = func(string) any {
+	f.evaluateValue = func(expr string) any {
+		if strings.Contains(expr, "window.scrollX") {
+			return nil // the effect probe, not the selector evaluation
+		}
 		close(settling)
 		<-release
 		return map[string]any{"x": 111.0, "y": 222.0}
@@ -943,11 +989,11 @@ func TestCobrowseSessionActions_ClickOffscreenSmoothPage(t *testing.T) {
 	if initial["below"] != true || initial["smooth"] != true {
 		t.Fatalf("test page must start offscreen with smooth scrolling: %v", initial)
 	}
-	x, y, err := resolveSelectorCenter(port, "#submit")
+	x, y, err := resolveSelectorCenter(pin{port: port}, "#submit")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := clickAtPoint(port, x, y); err != nil {
+	if err := clickAtPoint(pin{port: port}, x, y); err != nil {
 		t.Fatal(err)
 	}
 	value, err := evaluatePinnedCDPTarget(context.Background(), wsURL, `window.clicked || 0`)
@@ -958,7 +1004,7 @@ func TestCobrowseSessionActions_ClickOffscreenSmoothPage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := resolveSelectorCenter(port, "#submit"); err == nil {
+	if _, _, err := resolveSelectorCenter(pin{port: port}, "#submit"); err == nil {
 		t.Fatal("covered button must fail the hit test")
 	}
 }
@@ -969,8 +1015,11 @@ func TestCobrowseSessionActions_ClickByCoordsSkipsSelectorResolution(t *testing.
 	if _, err := m.Click(st.ID, "", &x, &y); err != nil {
 		t.Fatalf("click: %v", err)
 	}
-	if calls := f.callsFor("Runtime.evaluate"); len(calls) != 0 {
-		t.Errorf("click by coords should not evaluate a selector, got %d calls", len(calls))
+	for _, c := range f.callsFor("Runtime.evaluate") {
+		// Only the before/after effect probe may evaluate (citadel-cli#1663).
+		if expr, _ := c.Params["expression"].(string); !strings.Contains(expr, "window.scrollX") {
+			t.Errorf("click by coords should not evaluate a selector, got %q", expr)
+		}
 	}
 	mouseCalls := f.callsFor("Input.dispatchMouseEvent")
 	if len(mouseCalls) != 3 {
@@ -1346,5 +1395,48 @@ func TestCobrowseSessionStart_NoURLUnchanged(t *testing.T) {
 	}
 	if len(f.callsFor("Runtime.evaluate")) != 0 {
 		t.Fatal("start without a URL must not probe the page")
+	}
+}
+
+// The launch URL commits after the first read. The start-up settle must wait
+// for it (about:blank already reads "complete", so the minimum shortcut must
+// not apply), report the committed page, and never re-navigate: a launch URL
+// can be single-use (citadel-cli#1694).
+func TestCobrowseSessionStart_WaitsForCommitWithoutRenavigating(t *testing.T) {
+	w, m, p := navigateSettleWindow, navigateSettleMinimum, navigateSettlePoll
+	navigateSettleWindow, navigateSettleMinimum, navigateSettlePoll = 300*time.Millisecond, 20*time.Millisecond, 10*time.Millisecond
+	t.Cleanup(func() { navigateSettleWindow, navigateSettleMinimum, navigateSettlePoll = w, m, p })
+	f := startFakeCDPServer(t)
+	var once sync.Once
+	var firstRead time.Time
+	f.mu.Lock()
+	f.evaluateValue = func(string) any {
+		once.Do(func() { firstRead = time.Now() })
+		if time.Since(firstRead) < 150*time.Millisecond {
+			return map[string]any{"url": "about:blank", "ready": "complete", "title": ""}
+		}
+		return map[string]any{"url": "https://example.com/committed", "ready": "complete", "title": "Committed"}
+	}
+	f.mu.Unlock()
+	installFixedPortLauncher(t, f.port)
+	mgr := newCobrowseSessionManager(trustedBaseDir(t), 8)
+	st, err := mgr.StartSession("https://example.com/launch")
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if n := len(f.callsFor("Page.navigate")); n != 0 {
+		t.Fatalf("start re-navigated %d time(s); the launch URL must be requested once", n)
+	}
+	if st.URL != "https://example.com/committed" || st.Title != "Committed" {
+		t.Fatalf("url/title = %q / %q, want the committed page, not about:blank", st.URL, st.Title)
+	}
+}
+
+func TestCobrowseSessionStart_LoadedFirstPageIsNotNavigatedAgain(t *testing.T) {
+	_, f := startOnFakeCDPWithURL(t, map[string]any{
+		"url": "https://example.com/", "ready": "complete", "title": "ok",
+	}, "https://example.com/")
+	if n := len(f.callsFor("Page.navigate")); n != 0 {
+		t.Fatalf("a loaded first page was navigated %d time(s)", n)
 	}
 }

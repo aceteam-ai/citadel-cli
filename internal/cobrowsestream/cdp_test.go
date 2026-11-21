@@ -7,6 +7,7 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -19,6 +20,22 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+func TestCDPResolvedTargetDialPreservesParentCancellation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	client, err := dialCDPURLContext(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil, maxCDPMessageBytes)
+	if client != nil {
+		client.Close()
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("resolved target lost parent cancellation: %v", err)
+	}
+}
 
 // fakeChrome is a minimal CDP endpoint over a WebSocket: it emits screencast
 // frames gated on acks (so a test can prove acking is what keeps frames flowing)

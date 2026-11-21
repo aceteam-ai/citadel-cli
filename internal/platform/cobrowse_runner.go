@@ -20,6 +20,7 @@
 package platform
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,7 +36,9 @@ import (
 
 // EnvCobrowseBrowser pins the browser executable a co-browse session launches.
 // When set, discovery uses exactly this path and fails if it does not exist; it
-// never silently falls back to another browser.
+// never silently falls back to another browser. On Windows the value may also be
+// a browser name (chrome or edge, case-insensitive), resolved through the normal
+// discovery restricted to that browser.
 const EnvCobrowseBrowser = "CITADEL_COBROWSE_BROWSER"
 
 // BrowserInfo identifies the browser a runner found.
@@ -89,6 +92,10 @@ type LaunchOptions struct {
 	// they outlive a service restart. Only the node-wide manager of the managed
 	// worker sets it; everything else launches directly.
 	Detach bool
+	// UseContainer is the manager's per-launch decision (made before it lays out
+	// the session dir) to run this session in a container. Only the node-wide
+	// manager sets it; local mode keeps the user's own host browser.
+	UseContainer bool
 }
 
 // devToolsActivePortFile is where a browser launched with
@@ -157,10 +164,35 @@ func verifyCDPBrowserID(port int, browserID string) error {
 // fetchCDPBrowserID reads the browser id the loopback endpoint on port reports
 // (bounded client, no redirects).
 func fetchCDPBrowserID(port int) (string, error) {
+	ws, err := fetchCDPBrowserWS(port)
+	if err != nil {
+		return "", err
+	}
+	const marker = "/devtools/browser/"
+	i := strings.LastIndex(ws, marker)
+	if i < 0 || i+len(marker) == len(ws) {
+		return "", errors.New("endpoint reports no browser id")
+	}
+	return ws[i+len(marker):], nil
+}
+
+// fetchCDPBrowserWS reads the browser-level WebSocket URL the loopback endpoint
+// on port reports (bounded client, no redirects).
+func fetchCDPBrowserWS(port int) (string, error) {
+	return fetchCDPBrowserWSContext(context.Background(), port)
+}
+
+// fetchCDPBrowserWSContext is fetchCDPBrowserWS bounded by ctx as well as the
+// client timeout.
+func fetchCDPBrowserWSContext(ctx context.Context, port int) (string, error) {
 	// The id is identity evidence: never follow a redirect to another origin.
 	client := *cdpHTTPClient
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/json/version", port))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/json/version", port), nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -175,17 +207,22 @@ func fetchCDPBrowserID(port int) (string, error) {
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&v); err != nil {
 		return "", err
 	}
-	const marker = "/devtools/browser/"
-	i := strings.LastIndex(v.WS, marker)
-	if i < 0 || i+len(marker) == len(v.WS) {
-		return "", errors.New("endpoint reports no browser id")
+	// A containerized browser advertises its container-internal port; the
+	// loopback endpoint we probed is the one that is reachable. Host browsers
+	// already advertise exactly this authority, so the rewrite is a no-op there.
+	if rewritten, rerr := rewriteLoopbackWSPort(v.WS, port); rerr == nil {
+		return rewritten, nil
 	}
-	return v.WS[i+len(marker):], nil
+	return v.WS, nil
 }
 
 // activeBrowserRunner is the runner for this OS. A package var so tests can
 // substitute one; production sets it in cobrowse_runner_{windows,other}.go.
-var activeBrowserRunner = newDefaultBrowserRunner()
+var activeBrowserRunner browserRunner = browserSelector
+
+// browserSelector fronts the host runner and, once ConfigureBrowserRuntime has
+// run, the container runner.
+var browserSelector = &selectingRunner{host: newDefaultBrowserRunner()}
 
 // DiscoverCobrowseBrowser reports the browser co-browse sessions would launch on
 // this machine, without launching it.
@@ -308,16 +345,7 @@ func launchXvfbAttempt(profileDir, startURL string, lo LaunchOptions, plan *scop
 
 	// A managed Xvfb has no GPU, so force software rendering (matches the sibling
 	// launchers). stealthEnabled() keeps parity with the other browser launches.
-	args := buildChromeArgs(cobrowseLaunchOptions{
-		debugPort:   debugPort,
-		profileDir:  profileDir,
-		startURL:    startURL,
-		stealth:     stealthEnabled(),
-		userAgent:   os.Getenv(EnvCobrowseUserAgent),
-		softwareGL:  true,
-		proxyServer: lo.ProxyServer,
-		quiet:       lo.Quiet,
-	})
+	args := buildXvfbChromeArgs(debugPort, profileDir, startURL, lo)
 
 	argv := append([]string{chrome}, args...)
 	if plan != nil {
@@ -379,7 +407,7 @@ func launchXvfbAttempt(profileDir, startURL string, lo LaunchOptions, plan *scop
 		return serr
 	}
 
-	if err := waitForCDPReady(debugPort, 20*time.Second); err != nil {
+	if err := waitForCDPReady(debugPort, cobrowseCDPReadyTimeout()); err != nil {
 		// Best-effort teardown so a browser that launched but never exposed CDP does
 		// not leak a process or display.
 		_ = proc.stop()
@@ -429,4 +457,41 @@ func removeAllRetry(dir string, attempts int, delay time.Duration) error {
 		time.Sleep(delay)
 	}
 	return err
+}
+
+// cobrowseCDPReadyTimeout is the CDP-ready wait. The default is 20s; the
+// real-browser CI tests raise it through CITADEL_COBROWSE_CDP_WAIT_SECONDS
+// because shared runners start Chrome slowly.
+func cobrowseCDPReadyTimeout() time.Duration {
+	if v, err := strconv.Atoi(os.Getenv("CITADEL_COBROWSE_CDP_WAIT_SECONDS")); err == nil && v > 0 && v <= 300 {
+		return time.Duration(v) * time.Second
+	}
+	return 20 * time.Second
+}
+
+// buildXvfbChromeArgs is the Chrome command line for the managed-Xvfb co-browse
+// runner, shared by local mode and the remote `citadel work` path. A managed
+// Xvfb has no GPU, so software rendering is forced; stealthEnabled() keeps
+// parity with the other browser launches.
+//
+// passwordStoreBasic is load-bearing for first-load latency: without it Chrome
+// waits on the desktop keyring over D-Bus at its first cookie-store use and
+// stalls the first request for ~25s on a host with no unlocked keyring
+// (citadel-cli#1694). Consequence: cookies in a profile are encrypted with
+// Chromium's fixed basic key, so a local-mode saved login (#1647) created
+// earlier on desktop Linux with a working keyring is not readable once and the
+// user signs in again. The working dir is 0700 and the sealed blob is
+// vault-encrypted either way.
+func buildXvfbChromeArgs(debugPort int, profileDir, startURL string, lo LaunchOptions) []string {
+	return buildChromeArgs(cobrowseLaunchOptions{
+		debugPort:          debugPort,
+		profileDir:         profileDir,
+		startURL:           startURL,
+		stealth:            stealthEnabled(),
+		userAgent:          os.Getenv(EnvCobrowseUserAgent),
+		softwareGL:         true,
+		proxyServer:        lo.ProxyServer,
+		quiet:              lo.Quiet,
+		passwordStoreBasic: true,
+	})
 }
