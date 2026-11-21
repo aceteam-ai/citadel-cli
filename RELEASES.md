@@ -4048,3 +4048,22 @@ Auto-generated log of every release.
   - feat(botprofile): bot profile store with split unattended key (#1787)
 
 
+---
+
+## v2.242.0 — 2026-11-19
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 42 |
+| Lines added | +5412 |
+
+**Changes:**
+
+  - feat(local): agent-led setup prompt and claude-code config target (#1807) (#1826)
+  - feat: report optional heartbeat load and pressure capacity (#1718)
+  - feat(browser-runtime): renderer sandbox and browser choice (#1788) (#1805)
+  - feat(browser-runtime): container runner for node cobrowse (C2, #1760) (#1798)
+  - ci: stabilize Windows real-browser steps and installer release lookup (#1797)
+
+

@@ -186,7 +186,7 @@ func TestSetupConnectMergesAndBacksUpLikeConfigWrite(t *testing.T) {
 	cliPath := filepath.Join(cliHome, ".copilot", "mcp-config.json")
 	_ = os.WriteFile(cliPath, []byte(orig), 0o600)
 	var out bytes.Buffer
-	if err := runLocalConfig("copilot", f.exe, harnessEnv{goos: "linux", home: cliHome}, true, true, strings.NewReader(""), &out, time.Now()); err != nil {
+	if err := runLocalConfig("copilot", f.exe, harnessEnv{goos: "linux", home: cliHome}, true, true, false, strings.NewReader(""), &out, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 

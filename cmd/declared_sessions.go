@@ -87,6 +87,7 @@ func newDeclaredSessionsCommand(open declaredManagerFactory) *cobra.Command {
 	}
 	parent.PersistentFlags().StringVar(&nodeDir, "node-config-dir", "", "Existing node configuration directory (defaults to this node's configuration)")
 	parent.AddCommand(newLaneInventoryCommand(&nodeDir, collectNativeLaneInventory))
+	parent.AddCommand(newContainerSessionCommands(&nodeDir)...)
 	for _, action := range []string{"list", "status", "start", "stop", "restart"} {
 		action := action
 		use := action + " <name>"
@@ -176,12 +177,16 @@ func newDeclaredSessionsCommand(open declaredManagerFactory) *cobra.Command {
 	return parent
 }
 
+// runContainerHolderFn is the in-container holder entry; a seam for tests.
+var runContainerHolderFn = declaredsession.RunContainerHolder
+
 func newDeclaredHostCommand() *cobra.Command {
 	return newDeclaredHostCommandWith(declaredsession.RunHolder)
 }
 
 func newDeclaredHostCommandWith(run func(context.Context, declaredsession.RunHolderOptions) error) *cobra.Command {
 	var opts declaredsession.RunHolderOptions
+	var containerHolder bool
 	command := &cobra.Command{
 		Use:              "session-host <name>",
 		Hidden:           true,
@@ -203,6 +208,9 @@ func newDeclaredHostCommandWith(run func(context.Context, declaredsession.RunHol
 			// holder owns cleanup and durable publication before returning.
 			ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt, declaredTerminateSignal())
 			defer cancel()
+			if containerHolder {
+				return runContainerHolderFn(ctx, declaredsession.ContainerHolderOptions{NodeDir: selected, Name: names[0], Incarnation: opts.ExpectedIncarnation, BinaryVersion: Version})
+			}
 			return run(ctx, opts)
 		},
 	}
@@ -210,6 +218,7 @@ func newDeclaredHostCommandWith(run func(context.Context, declaredsession.RunHol
 	command.Flags().StringVar(&opts.ExpectedUnit, "expected-unit", "", "Exact independently verified user scope")
 	command.Flags().StringVar(&opts.ExpectedIncarnation, "launch-id", "", "Reserved launch incarnation")
 	command.Flags().StringVar(&opts.OriginControlGroup, "origin-cgroup", "", "Originating caller cgroup to exclude from ownership")
+	command.Flags().BoolVar(&containerHolder, "container", false, "Run as the PID 1 holder of a container session")
 	command.Flags().BoolVar(&opts.RestartCommand, "restart-command", false, "Use the declaration's explicit restart argv for this reserved incarnation")
 	return command
 }
