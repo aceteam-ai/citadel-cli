@@ -1,0 +1,31 @@
+name: PR issue refs
+
+# A PR that names an issue (#N in the title, or a branch like fix-N, fix/N-...,
+# issue-N) must say `Closes #N` (or Fixes/Resolves) in its body, or `Refs #N`
+# when it must not close the issue. PRs into a non-default base (stacked PRs)
+# are exempt: GitHub only auto-closes issues on merges to the default branch.
+# Logic lives in scripts/check-pr-issue-refs.sh; untrusted PR text is passed
+# via env vars only, never interpolated into the script.
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Issue refs
+    runs-on: ubuntu-latest
+    steps:
+      # actions/checkout v7 (sha-pinned)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Check issue references
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_BASE: ${{ github.event.pull_request.base.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: sh scripts/check-pr-issue-refs.sh
