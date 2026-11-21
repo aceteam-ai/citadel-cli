@@ -52,6 +52,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/heartbeat"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/nodeidentity"
 	"github.com/spf13/cobra"
 )
 
@@ -72,6 +73,8 @@ const identityCacheFile = "identity.json"
 // returns a valid NodeIdentity with the unavailable fields left empty and a
 // note in Warnings, never an error.
 type NodeIdentity struct {
+	Certificate *nodeidentity.CertificateStatus `json:"certificate,omitempty"`
+
 	// NodeName is citadel.yaml's node.name (cmd/manifest.go's CitadelManifest),
 	// the name set at `citadel init`/onboarding. Falls back to the
 	// Headscale-reported hostname, then empty.
@@ -148,6 +151,8 @@ func gatherIdentity(ctx context.Context) NodeIdentity {
 	id := NodeIdentity{
 		CitadelVersion: Version,
 	}
+	certificate := readNodeCertificateStatus()
+	id.Certificate = &certificate
 	if h, err := os.Hostname(); err == nil {
 		id.Hostname = h
 	}
@@ -319,6 +324,7 @@ func renderIdentity(w io.Writer, id NodeIdentity) {
 	headerColor.Fprintln(w, "\nHEARTBEAT")
 	fmt.Fprintf(w, "  %s %s\n", labelColor.Sprint("Freshness:"), id.HeartbeatFreshness)
 
+	renderNodeCertificateStatus(w, id.Certificate)
 	if len(id.Warnings) > 0 {
 		headerColor.Fprintln(w, "\nWARNINGS")
 		for _, msg := range id.Warnings {
