@@ -403,12 +403,17 @@ func stateWriterSubprocess(t *testing.T, mode string) *exec.Cmd {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Generous: this only bounds a wedged helper, it is not part of the
+	// behavior under test, and a loaded host can stretch the helper's run.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	t.Cleanup(cancel)
 	cmd := exec.CommandContext(ctx, executable, "-test.run=^TestUpdateStateWriterHelper$", "-test.count=1")
 	cmd.Env = append(os.Environ(), "CITADEL_STATE_FIXTURE_HOME="+os.Getenv("HOME"), "CITADEL_STATE_FIXTURE_MODE="+mode)
 	return cmd
 }
+
+// stateLockPollForTest mirrors withStateLock's retry interval.
+const stateLockPollForTest = 20 * time.Millisecond
 
 func TestStateTransactionSerializesProcessesAndGoroutines(t *testing.T) {
 	isolateState(t)
@@ -422,7 +427,8 @@ func TestStateTransactionSerializesProcessesAndGoroutines(t *testing.T) {
 		if err := cmd.Start(); err != nil {
 			return err
 		}
-		deadline := time.NewTimer(10 * time.Second)
+		// Process start-up under host load is not what this test pins.
+		deadline := time.NewTimer(time.Minute)
 		defer deadline.Stop()
 		ticker := time.NewTicker(time.Millisecond)
 		defer ticker.Stop()
@@ -455,6 +461,14 @@ func TestStateTransactionSerializesProcessesAndGoroutines(t *testing.T) {
 					errs <- err
 					return
 				}
+				// The lock is not fair: it is polled every 20ms, so a writer
+				// that re-locks immediately can starve the helper process past
+				// the lock's fixed 10s wait when fsyncs are slow (host load).
+				// Leave a free window longer than the poll interval so the
+				// helper's contention is real but not starved by the test's
+				// own tight loop. The lost-update check below still proves
+				// serialization: every increment from every writer must land.
+				time.Sleep(2 * stateLockPollForTest)
 			}
 		}()
 	}

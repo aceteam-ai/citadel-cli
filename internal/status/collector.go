@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/apps"
@@ -25,13 +26,15 @@ import (
 
 // Collector gathers status metrics from the system, GPU, and services.
 type Collector struct {
+	role             string
 	clockState       clockstate.Provider
 	nodeName         string
 	configDir        string
 	services         []ServiceConfig
 	startTime        time.Time
 	modelDiscovery   *ModelDiscovery
-	capabilities     *NodeCapabilities                 // cached capabilities (set once at startup)
+	capsMu           sync.RWMutex                      // guards capabilities (replaced when meeting turns healthy, citadel-cli#1758)
+	capabilities     *NodeCapabilities                 // cached capabilities (set at startup; may be replaced by SetCapabilities)
 	workerLiveness   func() *WorkerLiveness            // live worker consume-loop liveness (issue #548), optional
 	swapStats        func() *SwapActivity              // live model-hotswap activity (citadel #717), optional
 	reconcileHealth  func() *ReconcileHealth           // live full-wipe-guard refusal state (citadel #742), optional
@@ -63,6 +66,7 @@ type ServiceConfig struct {
 
 // CollectorConfig holds configuration for the status collector.
 type CollectorConfig struct {
+	Role string
 	// Cheap cached provider shared with this process's runner. No inline probe.
 	ClockState   clockstate.Provider
 	NodeName     string
@@ -158,6 +162,7 @@ type CollectorConfig struct {
 // NewCollector creates a new status collector.
 func NewCollector(cfg CollectorConfig) *Collector {
 	return &Collector{
+		role:             cfg.Role,
 		clockState:       cfg.ClockState,
 		nodeName:         cfg.NodeName,
 		configDir:        cfg.ConfigDir,
@@ -354,8 +359,12 @@ func toStringSet(items []string) map[string]bool {
 }
 
 // SetCapabilities sets the cached capabilities for heartbeat publishing.
+// It is safe to call while Collect runs; callers must pass a fresh value rather
+// than mutating one already set.
 func (c *Collector) SetCapabilities(caps *NodeCapabilities) {
+	c.capsMu.Lock()
 	c.capabilities = caps
+	c.capsMu.Unlock()
 }
 
 func (c *Collector) clockSynchronization() *bool {
@@ -365,13 +374,19 @@ func (c *Collector) clockSynchronization() *bool {
 	return clockstate.Boolean(c.clockState.Snapshot())
 }
 
-// Collect gathers all status metrics and returns a NodeStatus.
-func (c *Collector) Collect() (*NodeStatus, error) {
-	status := &NodeStatus{
+// statusHeader projects only cached startup policy and clock observations.
+func (c *Collector) statusHeader() *NodeStatus {
+	return &NodeStatus{
+		Role:      c.role,
 		NTPSynced: c.clockSynchronization(),
 		Version:   StatusVersion,
 		Timestamp: time.Now().UTC(),
 	}
+}
+
+// Collect gathers all status metrics and returns a NodeStatus.
+func (c *Collector) Collect() (*NodeStatus, error) {
+	status := c.statusHeader()
 
 	// Collect node info
 	status.Node = c.collectNodeInfo()
@@ -493,10 +508,12 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	// than aliasing it, so populating the per-heartbeat capability flags below
 	// does not mutate the shared cached value (Collect may run concurrently for
 	// the status server and the heartbeat publisher).
+	c.capsMu.RLock()
 	if c.capabilities != nil {
 		capsCopy := *c.capabilities
 		status.Capabilities = &capsCopy
 	}
+	c.capsMu.RUnlock()
 
 	// Collect desktop capabilities
 	status.Desktop = desktop.DetectCapabilities()
@@ -669,7 +686,7 @@ func (c *Collector) getNetworkIP() string {
 
 // collectSystemMetrics gathers CPU, memory, and disk utilization.
 func (c *Collector) collectSystemMetrics() SystemMetrics {
-	var metrics SystemMetrics
+	metrics := collectCapacityMetrics(nativeCapacityProbes())
 
 	// Memory
 	if v, err := mem.VirtualMemory(); err == nil {

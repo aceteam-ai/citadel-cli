@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/hpc"
@@ -19,7 +22,15 @@ import (
 // hpcEnrollOptions are the inputs of one non-interactive enrollment
 // (aceteam#12717). Every edge is a field so tests drive it offline.
 type hpcEnrollOptions struct {
-	TokenFile   string
+	TokenFile string
+	// OrgID selects approve-on-arrival enrollment; it is used only when
+	// TokenFile is empty (the token path wins when both are given).
+	OrgID           string
+	ApprovalTimeout time.Duration
+	Out             io.Writer
+	// Sleep and Jitter replace the poll wait in tests.
+	Sleep       func(context.Context, time.Duration) error
+	Jitter      func(time.Duration) time.Duration
 	WallTimeEnd string
 	BaseURL     string
 	Client      hpc.Client
@@ -49,8 +60,14 @@ func enrollHPCNode(ctx context.Context, layout hpc.Layout, o hpcEnrollOptions) (
 	if _, err := readHPCCredentials(layout.NodeDir); err == nil {
 		return hpcCredentials{}, errors.New("this job root is already enrolled; a second enrollment would create a second node")
 	}
-	if strings.TrimSpace(o.TokenFile) == "" {
-		return hpcCredentials{}, errors.New("--token-file is required")
+	byToken := strings.TrimSpace(o.TokenFile) != ""
+	if !byToken {
+		if strings.TrimSpace(o.OrgID) == "" {
+			return hpcCredentials{}, errors.New("--token-file or --org is required")
+		}
+		if err := hpc.ValidateOrgID(o.OrgID); err != nil {
+			return hpcCredentials{}, err
+		}
 	}
 	labels, err := hpc.ResolveLabels(hpc.LabelInputs{
 		Getenv:      o.Getenv,
@@ -73,13 +90,27 @@ func enrollHPCNode(ctx context.Context, layout hpc.Layout, o hpcEnrollOptions) (
 	if err != nil {
 		return hpcCredentials{}, err
 	}
-	token, err := hpc.ReadTokenFile(o.TokenFile, o.UID)
-	if err != nil {
-		return hpcCredentials{}, err
-	}
-	resp, err := o.Client.Enroll(ctx, o.BaseURL, token, string(csr), labels)
-	if err != nil {
-		return hpcCredentials{}, err
+	var resp hpc.EnrollResponse
+	if byToken {
+		token, err := hpc.ReadTokenFile(o.TokenFile, o.UID)
+		if err != nil {
+			return hpcCredentials{}, err
+		}
+		resp, err = o.Client.Enroll(ctx, o.BaseURL, token, string(csr), labels)
+		if err != nil {
+			return hpcCredentials{}, err
+		}
+	} else {
+		out := o.Out
+		if out == nil {
+			out = os.Stdout
+		}
+		resp, err = o.Client.EnrollByApproval(ctx, o.BaseURL, string(csr), labels, hpc.ApprovalOptions{
+			OrgID: o.OrgID, Timeout: o.ApprovalTimeout, Out: out, Sleep: o.Sleep, Jitter: o.Jitter,
+		})
+		if err != nil {
+			return hpcCredentials{}, err
+		}
 	}
 	// From here the server holds a live node and credential. Any local
 	// failure must remove them rather than strand a node nobody runs.
@@ -160,26 +191,30 @@ func nvidiaSMIGPUNames(visible []string) []string {
 	return hpc.ParseGPUNames(string(out), visible)
 }
 
-// productionHPCEnrollOptions fills the live edges for a token file.
+// productionHPCEnrollOptions fills the live edges for a token file or an org.
 func productionHPCEnrollOptions(tokenFile, wallTimeEnd string) hpcEnrollOptions {
 	host, _ := os.Hostname()
 	return hpcEnrollOptions{
-		TokenFile:   tokenFile,
-		WallTimeEnd: wallTimeEnd,
-		BaseURL:     authServiceURL,
-		Client:      hpc.Client{HTTP: hpc.NewHTTPClient()},
-		Getenv:      os.Getenv,
-		Hostname:    host,
-		GPUNames:    nvidiaSMIGPUNames,
-		Now:         time.Now(),
-		UID:         os.Geteuid(),
+		TokenFile:       tokenFile,
+		OrgID:           hpcOrgFlag,
+		ApprovalTimeout: hpcApprovalTimeoutFlag,
+		WallTimeEnd:     wallTimeEnd,
+		BaseURL:         authServiceURL,
+		Client:          hpc.Client{HTTP: hpc.NewHTTPClient()},
+		Getenv:          os.Getenv,
+		Hostname:        host,
+		GPUNames:        nvidiaSMIGPUNames,
+		Now:             time.Now(),
+		UID:             os.Geteuid(),
 	}
 }
 
 var (
-	hpcTokenFileFlag    string
-	hpcWallTimeEndFlag  string
-	hpcDrainTimeoutFlag time.Duration
+	hpcTokenFileFlag       string
+	hpcWallTimeEndFlag     string
+	hpcOrgFlag             string
+	hpcApprovalTimeoutFlag time.Duration
+	hpcDrainTimeoutFlag    time.Duration
 )
 
 var hpcCmd = &cobra.Command{
@@ -192,13 +227,21 @@ and the node has no network listeners, mesh, shell, files or updates.`,
 
 var hpcEnrollCmd = &cobra.Command{
 	Use:   "enroll",
-	Short: "Enroll this allocation with a single-use token",
+	Short: "Enroll this allocation with a single-use token, or wait for admin approval (--org)",
 	Args:  cobra.NoArgs,
 	Run: func(cmd *cobra.Command, _ []string) {
 		layout := currentHPCLayout()
-		creds, err := enrollHPCNode(cmd.Context(), layout, productionHPCEnrollOptions(hpcTokenFileFlag, hpcWallTimeEndFlag))
+		// SIGINT/SIGTERM/SIGUSR1 end an approval wait cleanly: nothing has
+		// been issued yet, so there is nothing to deregister.
+		ctx, stop := signal.NotifyContext(contextOrBackground(cmd.Context()),
+			append([]os.Signal{syscall.SIGINT, syscall.SIGTERM}, hpcDrainSignals...)...)
+		defer stop()
+		creds, err := enrollHPCNode(ctx, layout, productionHPCEnrollOptions(hpcTokenFileFlag, hpcWallTimeEndFlag))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			if errors.Is(err, hpc.ErrApprovalInterrupted) {
+				os.Exit(0)
+			}
 			os.Exit(1)
 		}
 		fmt.Printf("Enrolled node %s (job root %s)\n", creds.NodeID, layout.Root)
@@ -234,11 +277,15 @@ func contextOrBackground(ctx context.Context) context.Context {
 
 func init() {
 	hpcEnrollCmd.Flags().StringVar(&hpcTokenFileFlag, "token-file", "", "Owner-only file holding the single-use enrollment token (removed after reading)")
+	hpcEnrollCmd.Flags().StringVar(&hpcOrgFlag, "org", "", "Organization id: with no --token-file, wait for an admin to approve this enrollment (--token-file wins when both are given)")
+	hpcEnrollCmd.Flags().DurationVar(&hpcApprovalTimeoutFlag, "hpc-approval-timeout", hpc.DefaultApprovalTimeout, "How long to wait for an approval before exiting non-zero")
 	hpcEnrollCmd.Flags().StringVar(&hpcWallTimeEndFlag, "wall-time-end", "", "Allocation end (RFC 3339) when SLURM_JOB_END_TIME is not set")
 	hpcCmd.AddCommand(hpcEnrollCmd, hpcDeregisterCmd)
 	rootCmd.AddCommand(hpcCmd)
 
 	workCmd.Flags().StringVar(&hpcTokenFileFlag, "hpc-token-file", "", "hpc profile: enroll with this token file at startup if the job is not enrolled")
+	workCmd.Flags().StringVar(&hpcOrgFlag, "hpc-org", "", "hpc profile: organization id; with no token file, wait for an admin to approve the enrollment")
+	workCmd.Flags().DurationVar(&hpcApprovalTimeoutFlag, "hpc-approval-timeout", hpc.DefaultApprovalTimeout, "hpc profile: how long to wait for an enrollment approval")
 	workCmd.Flags().StringVar(&hpcWallTimeEndFlag, "hpc-wall-time-end", "", "hpc profile: allocation end (RFC 3339) when SLURM_JOB_END_TIME is not set")
 	workCmd.Flags().DurationVar(&hpcDrainTimeoutFlag, "hpc-drain-timeout", defaultHPCDrainTimeout, "hpc profile: how long to let in-flight jobs finish after the drain signal (SIGUSR1)")
 }

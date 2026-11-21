@@ -2210,6 +2210,15 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	// until a new worker confirms them after startup.
 	ccAppliedPermissions := loadNodePermissions()
 	deviceConfig := getDeviceConfigFromFile()
+	role, err := resolveWorkerRole(deviceConfig, "")
+	if err != nil {
+		return err
+	}
+	controlNodeID, err := controlWorkerIdentity(ctx, role, deviceConfig)
+	if err != nil {
+		return err
+	}
+	activity("info", fmt.Sprintf("Worker role: %s (startup policy; changes require restart)", role))
 
 	// Heartbeat auto_update telemetry (citadel-cli#1134), the control-center's
 	// worker-owned startup path. Mirrors runWork: a cache created before the
@@ -2264,7 +2273,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		// node's consumption and the Control Center must not compete for it).
 		var ccNodeCaps *capabilities.NodeCapabilities
 		ccServing := false
-		if !workerHeld {
+		if !workerHeld && role != config.WorkerRoleControl {
 			if manifest, _, mErr := findAndReadManifest(); mErr == nil && manifest != nil && manifest.Capabilities != nil {
 				ccNodeCaps = manifestToNodeCapabilities(manifest.Capabilities)
 			} else {
@@ -2281,6 +2290,8 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		// existing fallback -- a behavior change outside #839's scope
 		// (queue-set parity only). See resolveWorkerQueues' doc comment.
 		ccQueueResult := resolveWorkerQueues(ctx, workerQueueParams{
+			Role:       role,
+			NodeID:     controlNodeID,
 			APIBaseURL: apiBaseURL,
 			Token:      deviceConfig.DeviceAPIToken,
 			OrgID:      deviceConfig.OrgID,
@@ -2289,9 +2300,13 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 			WorkerHeld: workerHeld,
 			DebugFn:    func(format string, args ...any) { activity("info", fmt.Sprintf(format, args...)) },
 		})
+		if ccQueueResult.Err != nil {
+			return ccQueueResult.Err
+		}
 		ccQueueNames, ccMissingQueues := ccQueueResult.Queues, ccQueueResult.Missing
 
 		apiSource := worker.NewAPISource(worker.APISourceConfig{
+			PinnedQueue:   controlPinnedQueue(role, ccQueueNames),
 			BaseURL:       apiBaseURL,
 			Token:         deviceConfig.DeviceAPIToken,
 			QueueNames:    ccQueueNames,
@@ -2341,7 +2356,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 
 	// Get node name and Headscale node ID
 	nodeName := ""
-	headscaleNodeID := ""
+	headscaleNodeID := controlNodeID
 	if netStatus, err := network.GetGlobalStatus(ctx); err == nil && netStatus.Connected && netStatus.Hostname != "" {
 		nodeName = netStatus.Hostname
 		headscaleNodeID = netStatus.NodeID
@@ -2362,6 +2377,10 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		}
 	}
 	// Only subscribe to the per-node stream when NO dedicated worker holds the lock.
+	if role == config.WorkerRoleControl && headscaleNodeID != controlNodeID {
+		_ = source.Close()
+		return fmt.Errorf("control worker identity changed during startup; restart to select the current per-node stream")
+	}
 	// If a worker is present it owns the per-node stream; a second subscriber here
 	// would re-introduce the competing-consumer split.
 	if workerHeld {
@@ -2397,6 +2416,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 
 	// Create status collector for heartbeat
 	collector := status.NewCollector(status.CollectorConfig{
+		Role:                role.Report(),
 		ClockState:          clockMonitor,
 		NodeName:            nodeName,
 		ConfigDir:           "",
@@ -2586,7 +2606,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	// RUNNER-signed path (LLM_INFERENCE, citadel-cli#1287) share one convergent
 	// signer — the same as runWork.
 	ccWorkReceiptSigner := nodeidentity.Convergent(network.GetNodeConfigDir())
-	ccWorkReceiptNodeID := config.LoadDeviceCredsConverged().FabricNodeID
+	ccWorkReceiptNodeID := servingReceiptNodeID(nodeName)
 	nodeJobOpts := nodeJobHandlerOpts{
 		Source:         source,
 		OrgID:          nodeJobOrgID(),
@@ -2601,6 +2621,7 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		// same convergent node identity as runWork.
 		WorkReceiptSigner:         ccWorkReceiptSigner,
 		WorkReceiptNodeID:         ccWorkReceiptNodeID,
+		ReceiptRoutingNodeID:      nodeName,
 		AllowReadOutsideWorkspace: resolveAllowReadOutsideWorkspace(),
 		AuthorizedRoots:           authorizedRootsResolver(),
 		ShellDisabled:             !ccPerms.Shell,

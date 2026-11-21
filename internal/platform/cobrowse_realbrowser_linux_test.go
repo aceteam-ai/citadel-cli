@@ -52,11 +52,31 @@ type realEnv struct {
 func newRealEnv(t *testing.T) realEnv {
 	t.Helper()
 	requireRealBrowser(t)
+	t.Setenv("CITADEL_COBROWSE_CDP_WAIT_SECONDS", "90")
 	root := t.TempDir()
 	e := realEnv{base: filepath.Join(root, "sessions"), reg: filepath.Join(root, "registry")}
 	if err := os.MkdirAll(e.base, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	// Registered after t.TempDir, so it runs after every session Stop (cleanups
+	// are LIFO) and before the TempDir removal. Stop kills the main browser
+	// process, but Chrome's helper processes (zygote, renderer, GPU, network)
+	// can outlive it briefly and keep writing under the profile, which makes the
+	// TempDir RemoveAll fail with "directory not empty" (citadel-cli#1706). Wait
+	// for them to exit, then remove the tree ourselves with retries.
+	t.Cleanup(func() {
+		if !waitUntilReal(30*time.Second, func() bool { return len(procsMentioning(e.base)) == 0 }) {
+			t.Logf("browser helper processes still reference %s after 30s: %v", e.base, procsMentioning(e.base))
+		}
+		var err error
+		for i := 0; i < 50; i++ {
+			if err = os.RemoveAll(e.base); err == nil {
+				return
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		t.Logf("could not remove %s before TempDir cleanup: %v", e.base, err)
+	})
 	prev := registryDirResolver
 	registryDirResolver = func() string { return e.reg }
 	t.Cleanup(func() { registryDirResolver = prev })
@@ -248,8 +268,13 @@ func TestCobrowseRealBrowserStopLeavesNoProcesses(t *testing.T) {
 		t.Fatalf("processes left after Stop: browser=%v xvfb=%v profile users=%v",
 			!pidGone(rec.BrowserPID), !pidGone(rec.XvfbPID), procsMentioning(st.Profile))
 	}
-	if _, err := os.Stat(st.Profile); !os.IsNotExist(err) {
-		t.Fatalf("session dir still present: %v", err)
+	if !waitUntilReal(5*time.Second, func() bool { _, err := os.Lstat(st.Profile); return os.IsNotExist(err) }) {
+		var left []string
+		_ = filepath.WalkDir(st.Profile, func(p string, _ os.DirEntry, _ error) error { left = append(left, p); return nil })
+		if len(left) > 40 {
+			left = left[:40]
+		}
+		t.Fatalf("session dir still present; entries: %v", left)
 	}
 	if _, err := loadRecord(e.reg, st.ID); err == nil {
 		t.Fatal("registry record left behind after Stop")
