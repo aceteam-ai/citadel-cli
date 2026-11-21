@@ -37,6 +37,20 @@ import (
 // enabled but has no passcode set fails CLOSED (access denied) — enablement
 // without a passcode never silently opens the surface.
 type Permissions struct {
+	// ContainerHost is a separate owner-granted capability, never implied by Shell or Files.
+	ContainerHost bool `yaml:"container_host" json:"container_host"`
+	// Runtime is operator configuration, never a container job argument.
+	ContainerRuntime string `yaml:"container_runtime,omitempty" json:"container_runtime,omitempty"`
+	// Egress proxy is node-owned configuration, never a job or device grant value.
+	ContainerEgressProxyURL string `yaml:"container_egress_proxy_url,omitempty" json:"container_egress_proxy_url,omitempty"`
+	// Mandatory owner-local ceilings; absent values keep the native host inactive.
+	ContainerMaxQuotaBytes  int64   `yaml:"container_max_quota_bytes,omitempty" json:"container_max_quota_bytes,omitempty"`
+	ContainerMaxVolumes     int     `yaml:"container_max_volumes,omitempty" json:"container_max_volumes,omitempty"`
+	ContainerMaxMemoryBytes int64   `yaml:"container_max_memory_bytes,omitempty" json:"container_max_memory_bytes,omitempty"`
+	ContainerMaxPids        int64   `yaml:"container_max_pids,omitempty" json:"container_max_pids,omitempty"`
+	ContainerMaxCPUs        float64 `yaml:"container_max_cpus,omitempty" json:"container_max_cpus,omitempty"`
+	ContainerMinFreeBytes   int64   `yaml:"container_min_free_bytes,omitempty" json:"container_min_free_bytes,omitempty"`
+
 	Console   bool `yaml:"console" json:"console"`     // Terminal WebSocket access (default-deny, opt-in)
 	Desktop   bool `yaml:"desktop" json:"desktop"`     // VNC, screenshots, actions (default-deny, opt-in)
 	Files     bool `yaml:"files" json:"files"`         // File browser API (default-deny, opt-in)
