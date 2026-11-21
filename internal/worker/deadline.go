@@ -428,10 +428,10 @@ const jobTimeoutPayloadKey = "timeout_ms"
 // field, and job types that are legitimately unbounded (model download, build,
 // provision), are never capped -- there is deliberately no blanket ceiling.
 func jobExecTimeout(job *Job) (time.Duration, bool) {
-	if job == nil || job.Payload == nil {
+	if job == nil {
 		return 0, false
 	}
-	raw, ok := job.Payload[jobTimeoutPayloadKey]
+	raw, ok := job.executionField(jobTimeoutPayloadKey)
 	if !ok {
 		return 0, false
 	}
