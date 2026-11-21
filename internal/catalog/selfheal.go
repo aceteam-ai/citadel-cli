@@ -18,7 +18,59 @@ package catalog
 import (
 	"errors"
 	"fmt"
+	"regexp"
+	"strings"
 )
+
+// ErrCatalogUnavailable is returned when no catalog cache exists and the
+// automatic refresh failed, so the catalog cannot say whether a name exists.
+// It deliberately does not wrap ErrServiceNotFound: "not found" is only
+// reported when a present or freshly fetched catalog really lacks the name.
+var ErrCatalogUnavailable = errors.New("catalog not available; run `citadel service catalog update`")
+
+var urlUserinfoPattern = regexp.MustCompile(`(://)[^/\s]+@`)
+
+var secretQueryPattern = regexp.MustCompile(`(?i)\b((?:access_|refresh_|id_|auth_)?token|password|passwd|secret|api_?key|key|sig|signature)=[^&\s'"]+`)
+
+// sanitizeRefreshCause makes a catalog refresh error safe and short for an
+// operator-facing message: one line, URL credentials removed, bounded length.
+func sanitizeRefreshCause(err error) string {
+	s := strings.Join(strings.Fields(err.Error()), " ")
+	s = urlUserinfoPattern.ReplaceAllString(s, "$1")
+	s = secretQueryPattern.ReplaceAllString(s, "$1=REDACTED")
+	const max = 200
+	if r := []rune(s); len(r) > max {
+		s = string(r[:max]) + "..."
+	}
+	return s
+}
+
+// anyCatalogCached reports whether at least one configured source has a cache.
+func anyCatalogCached() bool {
+	sources, err := resolvedSources()
+	if err != nil {
+		return false
+	}
+	for _, src := range sources {
+		if dirIsAvailable(src.Path) {
+			return true
+		}
+	}
+	return false
+}
+
+// afterFailedLookup builds the error for a lookup that is still unresolved after
+// the one refresh.
+func afterFailedLookup(lookupErr, refreshErr error) error {
+	if refreshErr == nil {
+		return lookupErr
+	}
+	cause := sanitizeRefreshCause(refreshErr)
+	if !anyCatalogCached() {
+		return fmt.Errorf("%w: %s", ErrCatalogUnavailable, cause)
+	}
+	return fmt.Errorf("%w; catalog refresh also failed: %s", lookupErr, cause)
+}
 
 // ErrServiceNotFound is the sentinel wrapped by the catalog resolvers when a
 // service name is absent from every configured source's LOCAL cache. The
@@ -57,10 +109,7 @@ func ResolveCatalogServiceSelfHealing(name string) (*ResolvedCatalogService, err
 	if err == nil {
 		return resolved, nil
 	}
-	if refreshErr != nil {
-		return nil, fmt.Errorf("%w; catalog refresh also failed: %v", err, refreshErr)
-	}
-	return nil, err
+	return nil, afterFailedLookup(err, refreshErr)
 }
 
 // LoadServiceManifestSelfHealing is LoadServiceManifest with the same
@@ -80,8 +129,5 @@ func LoadServiceManifestSelfHealing(name string) (*ServiceManifest, error) {
 	if err == nil {
 		return manifest, nil
 	}
-	if refreshErr != nil {
-		return nil, fmt.Errorf("%w; catalog refresh also failed: %v", err, refreshErr)
-	}
-	return nil, err
+	return nil, afterFailedLookup(err, refreshErr)
 }

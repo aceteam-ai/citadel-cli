@@ -400,3 +400,13 @@ func TestWorkerLivenessCarriesIdentityUnresolved(t *testing.T) {
 		t.Error("heartbeat liveness must not report identity_unresolved once the Headscale ID resolved")
 	}
 }
+
+// TestWorkerLivenessFromCarriesRateLimitWindow pins the hand-copied projection
+// of the platform 429 window (citadel-cli#1677).
+func TestWorkerLivenessFromCarriesRateLimitWindow(t *testing.T) {
+	since := time.Now().Add(-time.Minute)
+	got := workerLivenessFrom(worker.WorkerSnapshot{RateLimitedSince: &since, LastRetryAfterSeconds: 9})
+	if got.RateLimitedSince == nil || !got.RateLimitedSince.Equal(since) || got.LastRetryAfterSeconds != 9 {
+		t.Fatalf("rate-limit window lost in projection: %+v", got)
+	}
+}

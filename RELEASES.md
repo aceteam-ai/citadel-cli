@@ -3809,3 +3809,261 @@ Auto-generated log of every release.
   - fix(jobs): honor per-job timeout_ms in the HTTP proxy (#1628)
 
 
+---
+
+## v2.228.0 — 2026-11-14
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 63 |
+| Lines added | +8409 |
+
+**Changes:**
+
+  - fix(local): bind commit approvals to the full target URL and complete content digest (#1654)
+  - fix(hpc): refuse companion repair in foreign Python prefixes (#1655)
+  - feat(local): persistent encrypted browser profile with passphrase unlock in the viewer (#820 enforced) (#1647)
+  - feat(local): commit actions always ask, per-domain grants, identity-bearing limits (#1636) (#1646)
+  - fix(whisper): bump opentelemetry-api for GHSA-mf5v-w3w3-f6cg (#1652)
+
+
+---
+
+## v2.229.0 — 2026-11-15
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 29 |
+| Lines added | +3508 |
+
+**Changes:**
+
+  - feat(cobrowse): follow popups and new tabs in runner and local viewer (#1633) (#1648)
+
+
+---
+
+## v2.230.0 — 2026-11-16
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 15 |
+| Lines added | +625 |
+
+**Changes:**
+
+  - fix(update): no recovery warning when the update lock was never provisioned (#1682) (#1684)
+  - fix(worker): heartbeat first and Retry-After backoff under platform 429 (#1677) (#1680)
+
+
+---
+
+## v2.231.0 — 2026-11-16
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 19 |
+| Lines added | +2572 |
+
+**Changes:**
+
+  - fix(localviewer): first input after handoff reaches the streamed page (#1681) (#1686)
+  - fix(cobrowse): bounded single-connection actions with partial-effect reporting (#1663) (#1664)
+
+
+---
+
+## v2.232.0 — 2026-11-16
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 36 |
+| Lines added | +2047 |
+
+**Changes:**
+
+  - fix(llm_inference): honor temperature 0 on Ollama and add seed end to end (#1643)
+  - fix(hotswap): floor the warming ETA at the retry interval (#1640) (#1642)
+  - fix(receipts): sign the serving node id, not the key fingerprint, on regular workers (#1641)
+  - feat(worker): add control-only per-node scheduling role (#1698) (#1705)
+  - test(local): CI end-to-end of the local-mode gate through citadel local mcp (#1683) (#1685)
+
+
+---
+
+## v2.233.0 — 2026-11-16
+
+| Metric | Value |
+|--------|-------|
+| Commits | 6 |
+| Files changed | 37 |
+| Lines added | +3234 |
+
+**Changes:**
+
+  - feat(lanes): bounded read-only lane inventory (#1699) (#1711)
+  - fix(localviewer): focus the stream when the human takes control (#1687) (#1692)
+  - fix(cobrowse): fast, retried first page load after session start (#1694) (#1710)
+  - test(cobrowse): hold the cold first screenshot to the action deadline on Windows (#1712)
+  - fix(windows): installer gives citadel.exe to the installing user; doctor flags an Administrators-owned binary (#1695) (#1696)
+  - ci: shard Build + Test into parallel jobs (#1707) (#1708)
+
+
+---
+
+## v2.234.0 — 2026-11-16
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 47 |
+| Lines added | +3399 |
+
+**Changes:**
+
+  - feat(cobrowse): session file staging, set_file_input and file-chooser interception (#1721) (#1722)
+  - fix(cobrowse): report a pending first load instead of returning a blank page as loaded (#1714) (#1719)
+  - fix(local): local doctor prints only its results when a check fails (#1726)
+  - test(cobrowse): stub a port owner PID that can never be the test process (#1725)
+  - test: deflake #1697, #1706, #1709 (test-only) (#1720)
+
+
+---
+
+## v2.235.0 — 2026-11-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 3 |
+| Files changed | 19 |
+| Lines added | +2946 |
+
+**Changes:**
+
+  - docs: design for local co-browse file upload and edit parity (#1733)
+  - feat(cobrowse): human file attach for a pending file chooser (#1723) (#1728)
+  - fix(hpc): show bounded approval refusal details (#1629)
+
+
+---
+
+## v2.236.0 — 2026-11-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 4 |
+| Files changed | 17 |
+| Lines added | +1965 |
+
+**Changes:**
+
+  - Revert "feat(local): bind file metadata in form approvals (#1751)" (#1754)
+  - fix(cobrowse): handoff banner dedupe and browser names for CITADEL_COBROWSE_BROWSER (#1752)
+  - feat(local): bind file metadata in form approvals (#1751)
+  - feat(cobrowse): type replace with selector and clear, key modifiers, input_edit marker (#1731)
+
+
+---
+
+## v2.237.0 — 2026-11-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 13 |
+| Lines added | +993 |
+
+**Changes:**
+
+  - fix(local): re-land file approval snapshots with chooser provenance (#1755)
+
+
+---
+
+## v2.238.0 — 2026-11-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 8 |
+| Lines added | +594 |
+
+**Changes:**
+
+  - feat(cobrowse): report page_text and password_field on start and status (#1773)
+
+
+---
+
+## v2.239.0 — 2026-11-17
+
+| Metric | Value |
+|--------|-------|
+| Commits | 1 |
+| Files changed | 12 |
+| Lines added | +606 |
+
+**Changes:**
+
+  - fix(module): catalog cold-cache fetch, meeting marker node dir, re-detect meeting when healthy (#1774)
+
+
+---
+
+## v2.240.0 — 2026-11-18
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 40 |
+| Lines added | +2905 |
+
+**Changes:**
+
+  - release: CPU-limited by default, and trust main CI's test gate (#1791)
+  - feat(browser-runtime): browser-runtime image with a per-session run contract (C1) (#1786)
+  - feat(local): add live upload opt-out setting (#1737 S2) (#1780)
+  - fix(local): approved link outcome, viewer Enter, installer text, banner wording (#1784)
+  - ci: run PR CI for stacked PRs on feat/fix/docs/chore bases (#1775)
+
+
+---
+
+## v2.241.0 — 2026-11-18
+
+| Metric | Value |
+|--------|-------|
+| Commits | 2 |
+| Files changed | 41 |
+| Lines added | +3469 |
+
+**Changes:**
+
+  - feat(cobrowse): track pages in remotely dispatched sessions (#1671)
+  - feat(botprofile): bot profile store with split unattended key (#1787)
+
+
+---
+
+## v2.242.0 — 2026-11-19
+
+| Metric | Value |
+|--------|-------|
+| Commits | 5 |
+| Files changed | 42 |
+| Lines added | +5412 |
+
+**Changes:**
+
+  - feat(local): agent-led setup prompt and claude-code config target (#1807) (#1826)
+  - feat: report optional heartbeat load and pressure capacity (#1718)
+  - feat(browser-runtime): renderer sandbox and browser choice (#1788) (#1805)
+  - feat(browser-runtime): container runner for node cobrowse (C2, #1760) (#1798)
+  - ci: stabilize Windows real-browser steps and installer release lookup (#1797)
+
+

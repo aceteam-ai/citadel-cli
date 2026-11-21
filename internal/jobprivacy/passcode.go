@@ -9,9 +9,15 @@ const PasscodeKey = "passcode"
 // so it is treated exactly like the passcode: never retained.
 const PINKey = "pin"
 
+// BytesKey is the COBROWSE_SESSION stage_file field carrying a user's file as
+// base64 (citadel-cli#1721). It is the user's data, up to tens of megabytes, so
+// it is dropped from every retained copy like a credential: it must never land
+// in a dead-letter entry, a log line or a rendered job.
+const BytesKey = "bytes_b64"
+
 // secretKeys are the payload fields dropped from every retained copy (DLQ
 // entries, logs, Job JSON and fmt renderings), for every job type.
-var secretKeys = [...]string{PasscodeKey, PINKey}
+var secretKeys = [...]string{PasscodeKey, PINKey, BytesKey}
 
 // HasPasscode reports whether payload carries a passcode or pin field.
 func HasPasscode(payload map[string]any) bool {

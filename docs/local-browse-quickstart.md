@@ -21,6 +21,58 @@ the same computer, with you in charge:
 Citadel is source-available under the Elastic License 2.0, and free to use and
 self-host. This page covers Windows 10 and 11 first. macOS and Linux are coming.
 
+## Let your agent set it up
+
+If you use an agent that can run commands on your computer (Codex or Claude
+Code), paste the text below into it. It installs Citadel, checks it, connects
+itself, and tells you when to restart the app. You still do two things: click
+through the Windows SmartScreen prompt, and restart the app at the end.
+
+Using Codex? Before you paste, type `/permissions` and choose "Ask for
+approval" (on first run, a standard non-admin user picks "non-admin sandbox").
+Codex will then ask you before each step that needs the internet or files
+outside its folder; approving those is expected.
+
+```text
+Set up Citadel local browse on this Windows computer, so you can drive a web
+browser with me. Use PowerShell. You do not need admin rights; do not use them.
+
+1. Install Citadel for the current user:
+   iwr -useb https://raw.githubusercontent.com/aceteam-ai/citadel-cli/main/install.ps1 | iex
+   The program is installed at "$env:LOCALAPPDATA\Citadel\citadel.exe". Use that full path
+   below, because this window may not see the updated PATH yet. Ignore the
+   installer's closing "next steps" text.
+2. Windows may show a "Windows protected your PC" (SmartScreen) prompt the first
+   time Citadel runs, even during step 1. You cannot see the dialog. If a command
+   hangs with no output, or fails as blocked, STOP and ask me to click "More
+   info", then "Run anyway". Do not try to get around it. Continue after I say
+   it is done.
+3. Run: & "$env:LOCALAPPDATA\Citadel\citadel.exe" local doctor
+   Each line is ok, note or FAIL. Fix any FAIL whose fix is a command you can run
+   without admin rights. If a FAIL needs something else (a missing browser,
+   admin rights, a blocked file), STOP, tell me exactly what it said, and let me
+   handle it.
+4. Connect yourself. Use "codex" if you are Codex, or "claude-code" if you are
+   Claude Code:
+   & "$env:LOCALAPPDATA\Citadel\citadel.exe" local config <codex or claude-code> --write --yes
+   It keeps a backup of the file it changes. If it refuses (for example, a
+   different "citadel" entry is already there), STOP and show me the message.
+   Never add --replace yourself.
+5. Tell me to fully quit and reopen this app, then ask you to browse a site, for
+   example: "Using citadel, open wikipedia.org and tell me the page title." I
+   will approve the website in the Citadel viewer that opens. Do not ask me for
+   passwords: when a page needs a login, hand the browser to me and wait.
+6. For the browsing steps, use only Citadel's tools. If Citadel reports an
+   error, show me the error. Do not switch to another tool or work around it.
+   If Codex asks to approve a Citadel tool, that is expected: it asks once per
+   tool, and "Allow for this session" is fine.
+```
+
+Claude Desktop chat cannot run commands, so it does not use this block (Desktop's
+Claude Code mode can: have it use `claude-code`). For the chat: double-click
+`citadel.exe` and press **Connect** beside Claude Desktop (see
+[Fastest path](#fastest-path-double-click)).
+
 ## What you need
 
 - Windows 10 or 11 (x64).
@@ -29,6 +81,7 @@ self-host. This page covers Windows 10 and 11 first. macOS and Linux are coming.
 - One MCP-capable agent app. These are covered below:
   - the GitHub Copilot CLI (VS Code keeps its MCP servers in its own
     `mcp.json` file, which this guide does not cover);
+  - Claude Code;
   - Claude Desktop;
   - Codex;
   - opencode.
@@ -105,6 +158,7 @@ because apps started from the Start menu may not see an updated `PATH`.
 
 ```powershell
 & $citadel local config copilot          # Copilot CLI: ~\.copilot\mcp-config.json
+& $citadel local config claude-code      # ~\.claude.json (user scope)
 & $citadel local config claude-desktop   # %APPDATA%\Claude\claude_desktop_config.json
 & $citadel local config codex            # ~\.codex\config.toml (or $env:CODEX_HOME)
 & $citadel local config opencode         # ~\.config\opencode\opencode.json
@@ -127,6 +181,14 @@ For GitHub Copilot and Claude Desktop, the entry is JSON like this:
 ```
 
 Copilot's entry also carries `"type": "local"` and `"tools": ["*"]`.
+
+Claude Code's entry goes in the same place `claude mcp add --scope user citadel
+-- <path to citadel.exe> local mcp` writes it: the top-level `mcpServers` of
+`~\.claude.json`. It also carries `"type": "stdio"` and `"env": {}`. That file
+holds all of Claude Code's other settings, which `--write` leaves untouched. If
+an entry named `citadel` already differs, `--write --yes` refuses; add
+`--replace` to overwrite it. If `CLAUDE_CONFIG_DIR` is set only in Claude Code's
+own settings (`env`), the double-click setup page does not see it.
 
 For Codex, the entry is TOML:
 
@@ -257,6 +319,7 @@ The command opens a fresh one-time link.
 | "exited during headless launch" | Run `& $citadel local doctor`. If it repeats, restart the computer. |
 | The viewer says "No agent connected" | The agent app has not started Citadel. Check its config with `& $citadel local doctor`, then restart the app. |
 | "another Citadel process already owns co-browse" | Another agent app is using co-browse. Close it, or use that one. |
+| `FAIL Self-update`: the binary is owned by Administrators | The installer ran from an elevated PowerShell and left `citadel.exe` owned by Administrators, so `citadel update install` is refused. From an elevated PowerShell run `icacls "$env:LOCALAPPDATA\Citadel\citadel.exe" /setowner "$env:USERDOMAIN\$env:USERNAME"` (use the account that runs Citadel), or re-run the installer. |
 | `approval_denied` / `approval_expired` / `approval_revoked` | The agent was told your answer. Approve again in the viewer if you want it to continue. |
 | `commit_approval_required` / `commit_denied` | A send, post, submit, payment or delete needs your answer each time. The viewer shows the button; the agent is told if you decline. |
 | "navigation refused" | The agent tried a local, private or non-web address. This is deliberate. |

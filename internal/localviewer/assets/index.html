@@ -12,6 +12,7 @@
   <span id="agent-line" class="muted right"></span>
 </header>
 <nav id="tabs"></nav>
+<p id="uploads-state" class="muted" role="status"></p>
 <main id="empty" class="empty">No browser sessions yet. Ask your agent to start one.</main>
 <main id="session" hidden>
   <section class="task">
@@ -77,6 +78,7 @@
     <button id="revoke" class="quiet" hidden>Revoke approval</button>
     <button id="stop" class="quiet danger">End session</button>
   </div>
+  <div id="pages" class="pages" hidden role="tablist" aria-label="Open pages"></div>
   <div id="screen-wrap" tabindex="0">
     <img id="screen" alt="Live view of the browser session" draggable="false">
   </div>

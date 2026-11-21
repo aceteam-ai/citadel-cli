@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -21,6 +22,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/localaudit"
 	"github.com/aceteam-ai/citadel-cli/internal/localcobrowse"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/spf13/cobra"
 )
 
@@ -35,7 +37,11 @@ type localDoctorDeps struct {
 	vault      func() (bool, error)
 	owner      func() error
 	audit      func() (localaudit.VerifyResult, error)
-	harnesses  []harnessConfigStatus
+	uploads    func() localcobrowse.UploadStatus
+	// binaryOwner reports who owns the running executable and who is running
+	// it. Nil means not checked (non-Windows).
+	binaryOwner func() (update.OwnerInfo, string, error)
+	harnesses   []harnessConfigStatus
 	// exe is how fix lines refer to citadel (the full path, quoted if needed).
 	exe string
 }
@@ -70,11 +76,18 @@ func realLocalDoctorDeps(skipLaunch bool) localDoctorDeps {
 		audit: func() (localaudit.VerifyResult, error) {
 			return localaudit.Verify(filepath.Join(stateDir, localaudit.DirName))
 		},
+		uploads:   localcobrowse.NewUploadSettings(stateDir, os.Getenv("CITADEL_LOCAL_UPLOADS")).Status,
 		harnesses: detectHarnessConfigs(systemHarnessEnv()),
 		exe:       "citadel",
 	}
 	if exe, err := citadelExecutable(); err == nil {
 		d.exe = quoteExe(exe)
+		if runtime.GOOS == "windows" {
+			d.binaryOwner = func() (update.OwnerInfo, string, error) {
+				info, err := update.ExecutableOwnership(exe)
+				return info, exe, err
+			}
+		}
 	}
 	if !skipLaunch {
 		d.launchTest = func() (string, string, error) {
@@ -101,6 +114,9 @@ the browser Citadel will use, a hidden (headless) test launch, the local viewer
 port, the passphrase vault, other agent apps, the audit log, and which agent
 app configs already point at citadel. It makes no network calls.`,
 	Args: cobra.NoArgs,
+	// A failed check is a result, not a usage mistake: print the results and
+	// the fix, never the flag help.
+	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runLocalDoctor(realLocalDoctorDeps(localDoctorSkipLaunch), cmd.OutOrStdout())
 	},
@@ -140,6 +156,18 @@ func collectLocalDoctor(d localDoctorDeps) (checks []localDoctorCheck, failed bo
 	ok := func(what, detail string) { line("ok", what, detail) }
 	warn := func(what, detail string) { line("note", what, detail) }
 	fail := func(what, detail string) { failed = true; line("FAIL", what, detail) }
+	if d.uploads != nil {
+		st := d.uploads()
+		st.Reason += " (this shell's environment; a running owner keeps its startup environment)"
+		if st.Enabled {
+			ok("Uploads", st.Reason)
+		} else {
+			warn("Uploads", st.Reason)
+		}
+		if st.Warning != "" {
+			warn("Uploads env", st.Warning)
+		}
+	}
 
 	info, err := d.discover()
 	if err != nil {
@@ -205,6 +233,18 @@ func collectLocalDoctor(d localDoctorDeps) (checks []localDoctorCheck, failed bo
 		ok("Audit log", fmt.Sprintf("%d records, chain intact", res.Records))
 	}
 
+	if d.binaryOwner != nil {
+		info, path, err := d.binaryOwner()
+		switch {
+		case err != nil:
+			warn("Self-update", fmt.Sprintf("could not read the owner of %s: %v", path, err))
+		case info.Matches():
+			ok("Self-update", fmt.Sprintf("%s is owned by %s, so self-update can run", path, info.UserName))
+		default:
+			fail("Self-update", fmt.Sprintf("%s is owned by %s, not by you (%s), so self-update will be refused (this happens when the installer ran from an elevated PowerShell). Fix: from an elevated PowerShell run: icacls \"%s\" /setowner \"%s\"   (or re-run the installer)", path, info.OwnerName, info.UserName, path, info.UserName))
+		}
+	}
+
 	pointed := 0
 	for _, h := range d.harnesses {
 		switch {
@@ -216,7 +256,7 @@ func collectLocalDoctor(d localDoctorDeps) (checks []localDoctorCheck, failed bo
 		}
 	}
 	if pointed == 0 {
-		warn("Harness", fmt.Sprintf("no agent app is configured yet. Fix: %s local config copilot (or claude-desktop, codex, opencode)", d.exe))
+		warn("Harness", fmt.Sprintf("no agent app is configured yet. Fix: %s local config copilot (or claude-code, claude-desktop, codex, opencode)", d.exe))
 	}
 
 	ok("Network", "Citadel makes no calls of its own (no account, no update check, no telemetry). The co-browse browser connects only to public addresses, through Citadel's local guard, with background updates off")
