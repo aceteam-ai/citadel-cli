@@ -60,3 +60,30 @@ func TestJobFormattingOmitsTheNodePasscode(t *testing.T) {
 		t.Fatalf("job rendering lost the other payload fields: %s", encoded)
 	}
 }
+
+// The COBROWSE_SESSION profile "pin" never reaches a dead-letter entry or a
+// rendering either.
+func TestCobrowseProfilePINNeverRetained(t *testing.T) {
+	const secret = "synthetic profile passphrase words"
+	_, client, raw := setupMiniredis(t)
+	ctx := context.Background()
+	job := &Job{JobID: "fixture", Type: "COBROWSE_SESSION", Payload: map[string]any{"pin": secret, "action": "start"}, RawPayload: []byte(secret), RawData: map[string]any{"payload": secret}}
+	if err := client.MoveToDLQ(ctx, job, "failed: "+secret); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := raw.XRange(ctx, "dlq:v1:integration-test", "-", "+").Result()
+	if err != nil || len(entries) != 1 {
+		t.Fatal("missing dead-letter entry")
+	}
+	for key, field := range entries[0].Values {
+		if text, ok := field.(string); ok && strings.Contains(text, secret) {
+			t.Fatalf("dead-letter field %q retained the pin", key)
+		}
+	}
+	encoded, _ := json.Marshal(*job)
+	for _, rendered := range []string{string(encoded), fmt.Sprintf("%v", *job), fmt.Sprintf("%+v", *job)} {
+		if strings.Contains(rendered, secret) {
+			t.Fatalf("job rendering retained the pin: %s", rendered)
+		}
+	}
+}

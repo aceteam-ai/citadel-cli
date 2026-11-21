@@ -52,7 +52,7 @@ func (h *ModuleSetHandler) executeExternal(ctx context.Context, job *Job) *JobRe
 		cfg.Probe = externalengine.Probe
 	}
 	if cfg.Restart == nil {
-		cfg.Restart = update.RestartProcess
+		cfg.Restart = func() error { return update.RestartProcessWithReason("external_engine_change") }
 	}
 	if cfg.Log == nil {
 		cfg.Log = func(string, ...any) {}

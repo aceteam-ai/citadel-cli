@@ -82,6 +82,27 @@ func TestHardenUnitContent_AddsMissingDirectives(t *testing.T) {
 	}
 }
 
+func TestRefreshPreservesPrivilegeSeparatedWorker(t *testing.T) {
+	before := oldWorkerUnit
+	before = strings.Replace(before, "[Service]\n", "[Service]\nUser=dedicated-fixture\nGroup=dedicated-fixture\nEnvironment=CITADEL_NO_AUTO_UPDATE=1\nEnvironment=KEEP=unchanged\nProtectSystem=strict\nReadWritePaths=/fixture/state\n", 1)
+	got, decision := decideUnitRefresh(before, false, 0)
+	if decision != refreshRewrite {
+		t.Fatalf("restart hardening not applied: %v", decision)
+	}
+	for _, line := range []string{"User=dedicated-fixture", "Group=dedicated-fixture", "Environment=CITADEL_NO_AUTO_UPDATE=1", "Environment=KEEP=unchanged", "ProtectSystem=strict", "ReadWritePaths=/fixture/state"} {
+		if strings.Count(got, line+"\n") != 1 {
+			t.Fatalf("refresh changed privilege-separation directive %q: %s", line, got)
+		}
+	}
+	if strings.Contains(got, "ReadWritePaths=-/etc/citadel") || strings.Contains(got, "ReadWritePaths=/usr/local/bin") {
+		t.Fatalf("refresh expanded worker write authority: %s", got)
+	}
+	again, decision := decideUnitRefresh(got, false, 0)
+	if decision != refreshNoChange || again != "" {
+		t.Fatal("privilege-separated refresh not byte-idempotent")
+	}
+}
+
 func TestHardenUnitContent_Idempotent(t *testing.T) {
 	once, changed := hardenUnitContent(oldWorkerUnit)
 	if !changed {

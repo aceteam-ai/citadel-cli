@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Citadel setup</title>
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<header class="top">
+  <strong>Citadel</strong> <span class="muted">setup for local mode on this computer</span>
+</header>
+<main class="setup">
+  <p class="muted">Everything here stays on this computer. Citadel makes no network calls of its own and needs no account.</p>
+
+  <section class="card">
+    <h2>1. Is this computer ready?</h2>
+    <ul id="checks"></ul>
+    <button id="full-check">Run the full check</button>
+    <span class="muted">Starts a hidden browser for a few seconds to prove it works.</span>
+  </section>
+
+  <section class="card">
+    <h2>2. Connect your agent app</h2>
+    <p class="muted">Clicking Connect adds Citadel to that app's settings file, shown beside the button. Your other settings are kept, and a backup of the old file is saved next to it. That click is your permission.</p>
+    <ul id="apps"></ul>
+    <p id="connect-result" role="status"></p>
+    <h3>Another app?</h3>
+    <p class="muted">Apps Citadel does not know yet (Muse, for example, has no settings file Citadel can write to) can use this entry in their MCP settings. It starts Citadel's local tools only.</p>
+    <textarea id="generic" readonly rows="8" spellcheck="false" aria-label="Generic MCP entry"></textarea>
+    <button id="copy">Copy</button>
+  </section>
+
+  <section class="card">
+    <h2>3. Browser sessions</h2>
+    <p id="limit" class="muted"></p>
+    <ul id="sessions"></ul>
+    <p id="sessions-note" class="muted"></p>
+    <button id="open-viewer">Open the viewer</button>
+    <p id="viewer-result" class="muted"></p>
+  </section>
+</main>
+<script src="/assets/setup.js"></script>
+</body>
+</html>

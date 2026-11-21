@@ -37,7 +37,7 @@ func TestRefuseReservedAppExposeName(t *testing.T) {
 // onto a host port a later deploy could reuse (the cross-visibility bypass).
 func TestAppTeardownRemovesDurableRecordWithNilGateway(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("HOME", dir) // isolates platform.ConfigDir() to the temp dir
+	useCmdFixtureHome(t, dir) // isolates platform.ConfigDir() to the temp dir
 	setProvisionedServiceGateway(nil, 0, false, "", 0)
 	t.Cleanup(func() { setProvisionedServiceGateway(nil, 0, false, "", 0) })
 

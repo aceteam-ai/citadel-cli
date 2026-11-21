@@ -121,7 +121,7 @@ func Start() error {
 		return nil
 	}
 
-	homeDir, err := os.UserHomeDir()
+	homeDir, err := platform.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("cannot resolve home directory: %w", err)
 	}

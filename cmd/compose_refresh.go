@@ -29,12 +29,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/composerefresh"
 	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/services"
 )
 
@@ -43,10 +45,10 @@ import (
 // binary version is unchanged it is a cheap no-op. Failures are logged and never
 // abort startup -- a refresh problem must not stop the node from serving jobs.
 func refreshManagedComposeFiles(configDir string) {
-	refreshManagedComposeFilesWithSweep(configDir, composerefresh.Sweep)
+	refreshManagedComposeFilesWithSweep(configDir, composerefresh.Sweep, platform.NvidiaGPUCountForCompose)
 }
 
-func refreshManagedComposeFilesWithSweep(configDir string, sweep func(composerefresh.Options) (composerefresh.Result, error)) {
+func refreshManagedComposeFilesWithSweep(configDir string, sweep func(composerefresh.Options) (composerefresh.Result, error), gpuCount func() int) {
 	if configDir == "" {
 		return
 	}
@@ -64,11 +66,18 @@ func refreshManagedComposeFilesWithSweep(configDir string, sweep func(composeref
 		if err := finetunesafety.RequireAbsent(configDir); err != nil {
 			return err
 		}
+		embedded, missingOnly := services.ComposeRefreshPlan(runtime.GOOS, gpuCount)
+		// Unknown GPU evidence withholds existing CPU/GPU files from refresh,
+		// but a missing file still needs the default embedded template. This
+		// runs before the version fast path so the same binary retries absence.
+		if _, err := composerefresh.MaterializeMissing(servicesDir, missingOnly); err != nil {
+			return err
+		}
 		var sweepErr error
 		res, sweepErr = sweep(composerefresh.Options{
 			ServicesDir:           servicesDir,
 			Version:               Version,
-			Embedded:              services.ServiceMap,
+			Embedded:              embedded,
 			PortManaged:           services.ServiceHostPorts,
 			KnownHistoricalHashes: services.KnownComposeHashes,
 			Recreator:             recreator,

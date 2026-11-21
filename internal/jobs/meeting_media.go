@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -44,6 +45,7 @@ import (
 // reasons unrelated to the code under test.
 var (
 	acquireMeetingProfileSetupLockFn = platform.AcquireMeetingProfileSetupLock
+	chromiumAvailableFn              = platform.ChromiumAvailable
 	markMeetingProfileOwnedFn        = platform.MarkMeetingProfileOwned
 	clearMeetingProfilePlaceholderFn = platform.ClearMeetingProfilePlaceholder
 	reapOrphanedMeetingSinksFn       = platform.ReapOrphanedMeetingSinks
@@ -148,8 +150,18 @@ func (m *hostMedia) Start() (meetingBrowser, error) {
 	// must clean up its own lock hold, not rely on Close() to do it). On
 	// success, ownership moves to m.releaseProfileLock, released by Close()
 	// only once the browser itself has been torn down.
+	// A missing browser is known before anything is created; refuse cleanly
+	// rather than discovering it after mark-owned and LoadSink.
+	if !chromiumAvailableFn() {
+		return nil, fmt.Errorf("%w: no Chromium/Chrome browser found on this node", ErrMeetingStartRefused)
+	}
 	profileDir, release, err := acquireMeetingProfileSetupLockFn(m.profileDir)
 	if err != nil {
+		if errors.Is(err, platform.ErrMeetingProfileBusy) {
+			// Nothing was created: the lock precedes mark-owned, the sink
+			// sweep, LoadSink and every launch.
+			return nil, fmt.Errorf("%w: %w", ErrMeetingStartRefused, err)
+		}
 		return nil, err
 	}
 	lockOwnedHere := true
@@ -402,20 +414,20 @@ func (m *containerMedia) StartContext(ctx context.Context) (*platform.CDPBrowser
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
-		if cleanupErr := m.deleteSessionContext(context.Background()); cleanupErr != nil {
+		if cleanupErr := m.cleanupDuringStart(ctx); cleanupErr != nil {
 			return nil, fmt.Errorf("%w (session cleanup also failed: %v)", err, cleanupErr)
 		}
 		return nil, err
 	}
 	br := platform.NewCDPBrowser(m.cdpPort)
 	if err := br.ReadyContext(ctx, meetingContainerCDPTimeout); err != nil {
-		if cleanupErr := m.deleteSessionContext(context.Background()); cleanupErr != nil {
+		if cleanupErr := m.cleanupDuringStart(ctx); cleanupErr != nil {
 			return nil, fmt.Errorf("%w (session cleanup also failed: %v)", err, cleanupErr)
 		}
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
-		if cleanupErr := m.deleteSessionContext(context.Background()); cleanupErr != nil {
+		if cleanupErr := m.cleanupDuringStart(ctx); cleanupErr != nil {
 			return nil, fmt.Errorf("%w (session cleanup also failed: %v)", err, cleanupErr)
 		}
 		return nil, err
@@ -437,7 +449,7 @@ func (m *containerMedia) createSessionContext(ctx context.Context) error {
 	if err != nil {
 		primary := fmt.Errorf("meetingd create session: %w", err)
 		if status == http.StatusCreated {
-			return m.cleanupAmbiguousCreatedSession(primary)
+			return m.cleanupAmbiguousCreatedSession(ctx, primary)
 		}
 		return primary
 	}
@@ -448,14 +460,14 @@ func (m *containerMedia) createSessionContext(ctx context.Context) error {
 		// deterministic id, so clear it and retry once; a DIFFERENT meeting's
 		// orphan we cannot address (meetingd has no list/clear endpoint) and it is
 		// a legitimate busy state, so we surface a clear error below.
-		if cleanupErr := m.deleteSessionContext(ctx); cleanupErr != nil {
+		if cleanupErr := m.cleanupDuringStart(ctx); cleanupErr != nil {
 			return fmt.Errorf("clear stale meetingd session: %w", cleanupErr)
 		}
 		respBody, status, err = m.postJSONContext(ctx, "/sessions", body)
 		if err != nil {
 			primary := fmt.Errorf("meetingd create session (after clearing stale): %w", err)
 			if status == http.StatusCreated {
-				return m.cleanupAmbiguousCreatedSession(primary)
+				return m.cleanupAmbiguousCreatedSession(ctx, primary)
 			}
 			return primary
 		}
@@ -464,29 +476,42 @@ func (m *containerMedia) createSessionContext(ctx context.Context) error {
 	case http.StatusCreated:
 		var sr meetingSessionResponse
 		if err := json.Unmarshal(respBody, &sr); err != nil {
-			return m.cleanupAmbiguousCreatedSession(fmt.Errorf("parse meetingd session response: %w", err))
+			return m.cleanupAmbiguousCreatedSession(ctx, fmt.Errorf("parse meetingd session response: %w", err))
 		}
 		if sr.SessionID != "" {
 			m.sessionID = sr.SessionID
 		}
 		return nil
 	case http.StatusConflict:
-		return fmt.Errorf("meeting module is busy with another active session on this node " +
-			"(one meeting per node); retry after it ends, or restart the meeting module to clear it")
+		// Reached only after our own same-id stale session was cleared
+		// successfully, so the busy session belongs to another meeting and
+		// this attempt holds nothing.
+		return fmt.Errorf("%w: meeting module is busy with another active session on this node "+
+			"(one meeting per node); retry after it ends, or restart the meeting module to clear it", ErrMeetingStartRefused)
 	case http.StatusServiceUnavailable:
-		return fmt.Errorf("meeting module not ready to start a session: %s", string(respBody))
+		return fmt.Errorf("%w: meeting module not ready to start a session: %s", ErrMeetingStartRefused, string(respBody))
 	default:
+		if status >= 400 && status < 500 {
+			return fmt.Errorf("%w: meetingd POST /sessions returned status %d: %s", ErrMeetingStartRefused, status, string(respBody))
+		}
 		return fmt.Errorf("meetingd POST /sessions returned status %d: %s", status, string(respBody))
 	}
 }
 
-func (m *containerMedia) cleanupAmbiguousCreatedSession(primary error) error {
-	cleanupCtx, cancel := context.WithTimeout(context.Background(), meetingContainerHTTPTimeout)
-	defer cancel()
-	if cleanupErr := m.deleteSessionContext(cleanupCtx); cleanupErr != nil {
+func (m *containerMedia) cleanupAmbiguousCreatedSession(ctx context.Context, primary error) error {
+	if cleanupErr := m.cleanupDuringStart(ctx); cleanupErr != nil {
 		return fmt.Errorf("%w (session cleanup also failed: %v)", primary, cleanupErr)
 	}
 	return primary
+}
+
+func (m *containerMedia) cleanupDuringStart(ctx context.Context) error {
+	if cleanup := MeetingCleanupFrom(ctx); cleanup != nil {
+		return cleanup.Run(ctx, m.deleteSessionContext)
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), meetingContainerHTTPTimeout)
+	defer cancel()
+	return m.deleteSessionContext(cleanupCtx)
 }
 
 func (m *containerMedia) StartRecording() error {
@@ -501,7 +526,11 @@ func (m *containerMedia) StartRecording() error {
 }
 
 func (m *containerMedia) StopRecording() (string, error) {
-	respBody, status, err := m.postJSON(m.sessionPath("/record/stop"), nil)
+	return m.StopRecordingContext(context.Background())
+}
+
+func (m *containerMedia) StopRecordingContext(ctx context.Context) (string, error) {
+	respBody, status, err := m.postJSONContext(ctx, m.sessionPath("/record/stop"), nil)
 	if err != nil {
 		return m.wavAbsPath, fmt.Errorf("meetingd stop recording: %w", err)
 	}

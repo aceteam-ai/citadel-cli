@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
+	"github.com/aceteam-ai/citadel-cli/internal/meetingpolicy"
 )
 
 // Fallback per-job execution budgets (issue #548). PR #552 added an OPT-IN
@@ -203,6 +204,13 @@ func needsSerializedLane(jobType string) bool {
 // applies. ok=false means "run unbounded" (no watchdog), preserving the exact
 // prior behavior for that path.
 func (r *Runner) resolveJobTimeout(job *Job) (time.Duration, bool) {
+	if job != nil && job.Type == JobTypeMeetingJoin {
+		_, d, ok, err := r.resolveExecutionBudget(context.Background(), r.findHandler(job.Type), job)
+		if err != nil {
+			return 0, true
+		} // refused, never an unbounded fallback
+		return d, ok
+	}
 	if d, ok := jobExecTimeout(job); ok {
 		return d, true // explicit backend budget always wins
 	}
@@ -310,12 +318,30 @@ const StalePendingReclaimFloorFallback = 4 * time.Hour
 // unbounded job that legitimately runs longer than that remains the
 // documented residual exposure (see CLAUDE.md's Direct-Redis redelivery
 // section), not something this function can close.
+//
+// MEETING_JOIN no longer uses the long tier: its finite #1505 budget can run
+// past it. The floor therefore never drops below meetingReclaimFloor, so a
+// healthy meeting's own budget and STUCK recovery both elapse before any
+// self-claim can redeliver it.
 func ResolveStalePendingReclaimFloor() time.Duration {
-	d, ok := envTimeoutSeconds(jobTimeoutLongEnvVar, defaultLongJobTimeoutSeconds)
-	if !ok {
-		return StalePendingReclaimFloorFallback
+	floor := StalePendingReclaimFloorFallback
+	if d, ok := envTimeoutSeconds(jobTimeoutLongEnvVar, defaultLongJobTimeoutSeconds); ok {
+		floor = d + ReclaimFloorMargin
 	}
-	return d + ReclaimFloorMargin
+	if meeting := meetingReclaimFloor(); meeting > floor {
+		floor = meeting
+	}
+	return floor
+}
+
+// meetingReclaimFloor is the largest meeting STUCK point any valid profile can
+// produce (Validate caps every phase at the ratified defaults), plus the margin.
+func meetingReclaimFloor() time.Duration {
+	maximum, err := meetingpolicy.Default().Maximum()
+	if err != nil {
+		return 0
+	}
+	return maximum.StuckAfter() + ReclaimFloorMargin
 }
 
 // ConsumerDeadAfterMargin is the safety margin added on top of the resolved
@@ -524,7 +550,8 @@ func (r *Runner) executeWithDeadline(
 	// (citadel-cli#1287 — was the heavyLaneJobTypes allowlist). Read from the
 	// handler in hand, not r.handlers, so a caller that passes the handler
 	// directly (tests) resolves the same as production.
-	heavy := capabilitiesOf(handler, job.Type).Lane == jobs.LaneHeavy
+	heavy := capabilitiesOf(handler, job.Type).Lane == jobs.LaneHeavy || job.delivery != nil
+	retainActualExit := heavy || job.Type == JobTypeMeetingJoin
 
 	type handlerResult struct {
 		result *JobResult
@@ -535,20 +562,43 @@ func (r *Runner) executeWithDeadline(
 	// blocked on the channel forever.
 	done := make(chan handlerResult, 1)
 	go func() {
-		result, err := handler.Execute(execCtx, job, stream)
+		result, err := r.executeObserved(execCtx, handler, job, stream)
 		done <- handlerResult{result: result, err: err}
 	}()
 
 	select {
 	case hr := <-done:
-		return completedHandlerResult(heavy, execCtx.Err(), timeout, hr.result, hr.err)
+		if job.Type == JobTypeMeetingJoin && errors.Is(hr.err, jobs.ErrMeetingTeardownUnconfirmed) {
+			return nil, hr.err
+		}
+		if durableSuccessDuringShutdown(job, ctx, execCtx, hr.result, hr.err) {
+			return hr.result, nil
+		}
+		if job.delivery != nil && durableShutdown(ctx, execCtx) {
+			return nil, ctx.Err()
+		}
+		return completedHandlerResult(retainActualExit, execCtx.Err(), timeout, hr.result, hr.err)
 	case <-execCtx.Done():
-		if heavy {
+		if retainActualExit {
 			// A heavy handler owns the single dispatched-writer slot until its
 			// goroutine really exits. An uncooperative handler intentionally holds
 			// this call (and runner shutdown) fail-closed rather than overlapping
 			// a second writer after an arbitrary escape timer.
-			<-done
+			hr := <-done
+			if job.Type == JobTypeMeetingJoin && errors.Is(hr.err, jobs.ErrMeetingTeardownUnconfirmed) {
+				return nil, hr.err
+			}
+			if durableSuccessDuringShutdown(job, ctx, execCtx, hr.result, hr.err) {
+				return hr.result, nil
+			}
+		} else if ticket, ok := execCtx.Value(executionTicketKey{}).(*executionTicket); ok {
+			// An ordinary abandoned handler keeps the pre-#1505 contract: the
+			// watchdog releases it, so a leaked goroutine never holds a ticket
+			// that suppresses STALL or forces a STUCK restart mid-meeting.
+			ticket.handlerFinished(false)
+		}
+		if job.delivery != nil && durableShutdown(ctx, execCtx) {
+			return nil, ctx.Err()
 		}
 		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
 			r.log("error", "Job %s abandoned: exceeded execution deadline of %s", job.ID, timeout)
@@ -576,4 +626,28 @@ func (r *Runner) executeWithDeadline(
 		// the loop unwinds without misreporting a deadline breach.
 		return nil, execCtx.Err()
 	}
+}
+
+// A root stop racing an already successful return must not erase its terminal.
+// Lease loss is checked separately by executeJob; an earlier job watchdog
+// deadline still wins and retains the same actual-exit custody.
+func durableSuccessDuringShutdown(job *Job, parent, execution context.Context, result *JobResult, err error) bool {
+	if job.delivery == nil || parent.Err() == nil || err != nil || result == nil || result.Status != JobStatusSuccess {
+		return false
+	}
+	return durableShutdown(parent, execution)
+}
+
+// An execution deadline inherited from the worker lifetime is shutdown. A
+// shorter, independently elapsed job watchdog remains a fatal job deadline.
+func durableShutdown(parent, execution context.Context) bool {
+	if parent.Err() == nil {
+		return false
+	}
+	if !errors.Is(execution.Err(), context.DeadlineExceeded) {
+		return true
+	}
+	parentDeadline, ok := parent.Deadline()
+	executionDeadline, _ := execution.Deadline()
+	return ok && parentDeadline.Equal(executionDeadline)
 }

@@ -28,8 +28,8 @@ validate_macho_arch() {
   local arch_output
   local -a arches
 
-  if [[ ! -f "$path" || ! -x "$path" ]]; then
-    echo "$label is missing or not executable: $path" >&2
+  if [[ -L "$path" || ! -f "$path" || ! -x "$path" ]]; then
+    echo "$label must be a non-symlink regular executable file: $path" >&2
     return 1
   fi
   if ! arch_output="$(lipo -archs "$path")"; then
@@ -47,12 +47,22 @@ validate_app_bundle() {
   local app_bundle="$1"
   local target="$2"
   local expected_arch
+  local relative_path
   expected_arch="$(target_arch "$target")" || return
 
-  if [[ ! -d "$app_bundle" ]]; then
-    echo "Tauri app bundle is missing: $app_bundle" >&2
+  if [[ -L "$app_bundle" || ! -d "$app_bundle" ]]; then
+    echo "Tauri app bundle must be a non-symlink directory: $app_bundle" >&2
     return 1
   fi
+  for relative_path in Contents Contents/MacOS; do
+    if [[ -L "$app_bundle/$relative_path" || ! -d "$app_bundle/$relative_path" ]]; then
+      echo "Required app directory is missing or symlinked: $app_bundle/$relative_path" >&2
+      return 1
+    fi
+  done
+  for relative_path in Contents/Info.plist Contents/MacOS/citadel-desktop Contents/MacOS/citadel; do
+    reject_symlink_components "$app_bundle" "$relative_path" || return
+  done
   if [[ ! -f "$app_bundle/Contents/Info.plist" ]]; then
     echo "Tauri app bundle has no Info.plist: $app_bundle" >&2
     return 1
@@ -70,6 +80,10 @@ validate_app_bundle() {
 single_dmg() {
   local dmg_dir="$1"
   local -a dmgs=()
+  if [[ -L "$dmg_dir" || ! -d "$dmg_dir" ]]; then
+    echo "Tauri DMG output directory is missing or symlinked: $dmg_dir" >&2
+    return 1
+  fi
   shopt -s nullglob
   dmgs=("$dmg_dir"/*.dmg)
   shopt -u nullglob
@@ -78,8 +92,8 @@ single_dmg() {
     echo "Expected exactly one Tauri DMG in $dmg_dir, found ${#dmgs[@]}" >&2
     return 1
   fi
-  if [[ ! -s "${dmgs[0]}" ]]; then
-    echo "Tauri DMG is empty: ${dmgs[0]}" >&2
+  if [[ -L "${dmgs[0]}" || ! -f "${dmgs[0]}" || ! -s "${dmgs[0]}" ]]; then
+    echo "Tauri DMG must be a nonempty non-symlink regular file: ${dmgs[0]}" >&2
     return 1
   fi
   printf '%s\n' "${dmgs[0]}"
@@ -185,6 +199,7 @@ build_macos_dmg() {
   validate_build_paths "$repo_root" "$target" || return
 
   stage_sidecar "$repo_root" "$target" || return
+  validate_build_paths "$repo_root" "$target" || return
   validate_macho_arch \
     "$repo_root/desktop/src-tauri/binaries/citadel-$target" \
     "$expected_arch" \
@@ -192,6 +207,7 @@ build_macos_dmg() {
 
   reset_bundle_output "$repo_root" "$target" || return
   run_tauri_build "$repo_root" "$target" || return
+  validate_build_paths "$repo_root" "$target" || return
 
   app_bundle="$target_root/macos/Citadel.app"
   validate_app_bundle "$app_bundle" "$target" || return

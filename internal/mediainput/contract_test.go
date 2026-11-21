@@ -13,7 +13,7 @@ import (
 	"testing"
 )
 
-const fixtureSHA256 = "e386064cb2c371cadc8bdc4eb6475adf78510a14fa9ae9aac450bcd830c185e0"
+const fixtureSHA256 = "808f87bb7e1315b2f4d910eb3340257c951fb51cd7ba0f3a4187adce6e77a41e"
 
 type validVector struct {
 	Name  string          `json:"name"`
@@ -27,6 +27,7 @@ type invalidVector struct {
 	Task    string          `json:"task"`
 	Replace []string        `json:"replace_first"`
 	Value   json.RawMessage `json:"value"`
+	Reason  string          `json:"reason"`
 }
 
 func loadVectors(t *testing.T) ([]validVector, []invalidVector) {
@@ -55,12 +56,16 @@ func TestSharedInputContractVectors(t *testing.T) {
 	valid, invalid := loadVectors(t)
 	byName := make(map[string]validVector)
 	for _, vector := range valid {
+		if _, duplicate := byName[vector.Name]; duplicate {
+			t.Fatal("duplicate valid fixture name")
+		}
 		byName[vector.Name] = vector
 		t.Run(vector.Name, func(t *testing.T) {
 			contract, err := Parse(vector.Task, vector.Value)
 			if err != nil || len(contract.Inputs()) == 0 {
 				t.Fatalf("valid vector refused: %v", err)
 			}
+			assertAcceptedContract(t, vector.Task, contract)
 		})
 	}
 	for _, vector := range invalid {
@@ -83,16 +88,30 @@ func TestSharedInputContractVectors(t *testing.T) {
 			if vector.Task != "" {
 				task = vector.Task
 			}
-			if _, err := Parse(task, []byte(raw)); err == nil {
-				t.Fatal("invalid vector accepted")
+			_, err := Parse(task, []byte(raw))
+			var refusal *Refusal
+			if vector.Reason == "" || !errors.As(err, &refusal) || refusal.Reason() != vector.Reason {
+				t.Fatalf("refusal=%v, want static reason %q", err, vector.Reason)
 			}
 		})
 	}
 }
 
-func TestContractCannotBeMutatedThroughAccessor(t *testing.T) {
+func namedVector(t *testing.T, name string) validVector {
+	t.Helper()
 	valid, _ := loadVectors(t)
-	contract, err := Parse(valid[0].Task, valid[0].Value)
+	for _, vector := range valid {
+		if vector.Name == name {
+			return vector
+		}
+	}
+	t.Fatalf("missing named fixture %q", name)
+	return validVector{}
+}
+
+func TestContractCannotBeMutatedThroughAccessor(t *testing.T) {
+	vector := namedVector(t, "workspace")
+	contract, err := Parse(vector.Task, vector.Value)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,13 +133,7 @@ func TestContractRefusalNeverReflectsInputs(t *testing.T) {
 }
 
 func TestCapabilityDiagnosticsAlwaysRedact(t *testing.T) {
-	valid, _ := loadVectors(t)
-	var inbox validVector
-	for _, vector := range valid {
-		if vector.Name == "inbox" {
-			inbox = vector
-		}
-	}
+	inbox := namedVector(t, "inbox")
 	contract, err := Parse(inbox.Task, inbox.Value)
 	if err != nil {
 		t.Fatal(err)
@@ -169,21 +182,23 @@ func TestCapabilityDiagnosticsAlwaysRedact(t *testing.T) {
 }
 
 func TestContractBoundsAndOrdering(t *testing.T) {
-	valid, _ := loadVectors(t)
+	workspace := namedVector(t, "workspace")
+	inbox := namedVector(t, "inbox")
+	inpaintVector := namedVector(t, "inpaint")
 	for _, raw := range [][]byte{
 		nil, []byte("null"), []byte("[]"), []byte(`{"schema":null,"inputs":[]}`),
-		append(append([]byte(nil), valid[0].Value...), []byte(` {}`)...),
+		append(append([]byte(nil), workspace.Value...), []byte(` {}`)...),
 		bytes.Repeat([]byte(" "), MaxEnvelopeBytes+1),
-		bytes.Replace(valid[0].Value, []byte("fixtures/source.png"), []byte{0xff}, 1),
-		bytes.Replace(valid[1].Value, []byte("synthetic.media-input.source"), bytes.Repeat([]byte("a"), MaxTokenBytes+1), 1),
-		bytes.Replace(valid[0].Value, []byte(`"size":1`), []byte(`"size":9223372036854775808`), 1),
+		bytes.Replace(workspace.Value, []byte("fixtures/source.png"), []byte{0xff}, 1),
+		bytes.Replace(inbox.Value, []byte("synthetic.media-input.source"), bytes.Repeat([]byte("a"), MaxTokenBytes+1), 1),
+		bytes.Replace(workspace.Value, []byte(`"size":1`), []byte(`"size":9223372036854775808`), 1),
 	} {
 		if _, err := Parse(TaskImageToImage, raw); err == nil {
 			t.Errorf("invalid raw contract accepted (%d bytes)", len(raw))
 		}
 	}
 	var inpaint map[string]json.RawMessage
-	if err := json.Unmarshal(valid[2].Value, &inpaint); err != nil {
+	if err := json.Unmarshal(inpaintVector.Value, &inpaint); err != nil {
 		t.Fatal(err)
 	}
 	var items []json.RawMessage
@@ -212,9 +227,80 @@ func FuzzParse(f *testing.F) {
 			}
 			return
 		}
-		inputs := contract.Inputs()
-		if len(inputs) < 1 || len(inputs) > 2 || inputs[0].Role != "source" {
-			t.Fatal("accepted contract has invalid cardinality or ordering")
-		}
+		assertAcceptedContract(t, task, contract)
 	})
+}
+
+func assertAcceptedContract(t *testing.T, task string, contract Contract) {
+	t.Helper()
+	want := 1
+	if task == TaskInpaint {
+		want = 2
+	} else if task != TaskImageToImage {
+		t.Fatal("accepted unsupported task")
+	}
+	inputs := contract.Inputs()
+	if len(inputs) != want {
+		t.Fatal("accepted invalid cardinality")
+	}
+	for i, input := range inputs {
+		role := "source"
+		if i == 1 {
+			role = "mask"
+		}
+		if input.Role != role || input.Size < 1 || input.Size > MaxFileBytes {
+			t.Fatal("accepted invalid role/size")
+		}
+		if len(input.SHA256) != 64 || input.SHA256 != strings.ToLower(input.SHA256) {
+			t.Fatal("accepted noncanonical hash")
+		}
+		if _, err := hex.DecodeString(input.SHA256); err != nil {
+			t.Fatal("accepted nonhex hash")
+		}
+		if input.Format != "png" && (role == "mask" || input.Format != "jpeg" && input.Format != "webp") {
+			t.Fatal("accepted invalid image format")
+		}
+		switch input.Origin {
+		case "workspace":
+			if !ValidPath(input.Path) || input.Capability.Reveal() != "" {
+				t.Fatal("accepted unsafe workspace location")
+			}
+		case "inbox":
+			if input.Path != "" || !validCapability(input.Capability.Reveal()) {
+				t.Fatal("accepted unsafe capability location")
+			}
+		default:
+			t.Fatal("accepted unknown origin")
+		}
+	}
+}
+
+func TestReadValueHasExactlyFourLevels(t *testing.T) {
+	for _, test := range []struct {
+		raw string
+		ok  bool
+	}{
+		{`[[["leaf"]]]`, true},
+		{`[[[["leaf"]]]]`, false},
+	} {
+		d := json.NewDecoder(strings.NewReader(test.raw))
+		budget := 128
+		_, err := readValue(d, 0, &budget)
+		if (err == nil) != test.ok {
+			t.Fatalf("four-level bound: %v, want accepted=%v", err, test.ok)
+		}
+	}
+}
+
+func TestExportedPathRuleIsSlashOnlyAndByteBounded(t *testing.T) {
+	for _, name := range []string{"NUL", "con.png", "dir/ordinary file.png", "dir/" + strings.Repeat("a", 255), "dir/" + strings.Repeat("é", 127) + "a"} {
+		if !ValidPath(name) {
+			t.Fatal("portable lexical path refused")
+		}
+	}
+	for _, name := range []string{"", ".", "..", "../a", "/a", "a//b", "a/./b", "a/../b", "a/", "a\\b", "C:/a", "a\x00b", "a\u00a0b", "a\uff0eb", "a\u200bb", "a\u202eb", "a\u2028b", "a\u2029b", "a\ufeffb", "cafe\u0301.png", string([]byte{0xff}), strings.Repeat("a", 256), strings.Repeat("é", 128)} {
+		if ValidPath(name) {
+			t.Fatal("unsafe lexical path accepted")
+		}
+	}
 }

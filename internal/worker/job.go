@@ -28,6 +28,9 @@ import (
 // Job represents a unit of work to be processed.
 // This is the common job format used internally, regardless of source.
 type Job struct {
+	// Opaque capture prevents reflective formatting from walking into the
+	// delivery control client, credential, terminal bytes or publisher.
+	delivery func() *durableDelivery `json:"-"`
 	// Passive delivery-scoped wall observations, never scheduling authority.
 	clock *deliveryClock `json:"-"`
 	// Passive original delivery snapshot, not handler execution authority.
@@ -259,6 +262,7 @@ const (
 	JobTypeFineTuneStart     = "FINETUNE_START"     // Train a node-local adapter on the pinned GPU node
 	JobTypeExposeSet         = "EXPOSE_SET"         // Expose a local service on the gateway with private/org/link visibility (issue #598)
 	JobTypeExposeList        = "EXPOSE_LIST"        // Read back this node's durable exposure inventory (issue #944)
+	JobTypeLaneInventory     = "LANE_INVENTORY"     // Bounded read-only lane inventory, exact own-node stream only (#1699)
 	JobTypeUnexpose          = "UNEXPOSE"           // Remotely revoke a gateway exposure (issue #944)
 	JobTypeMeetingJoin       = "MEETING_JOIN"       // Auto-join a video call, record + transcribe it node-locally (aceteam#5098)
 	JobTypeHuddleJoin        = "HUDDLE_JOIN"        // Join a native AceTeam huddle AS the agent (headless bot page) + confirm presence (aceteam#7081)
@@ -366,6 +370,7 @@ var allKnownJobTypes = []string{
 	JobTypeFineTuneStart,
 	JobTypeExposeSet,
 	JobTypeExposeList,
+	JobTypeLaneInventory,
 	JobTypeUnexpose,
 	JobTypeMeetingJoin,
 	JobTypeHuddleJoin,
@@ -413,8 +418,9 @@ var allKnownJobTypes = []string{
 //     `desktop` permission, also default-DENY.
 //   - config dir: SERVICE_START/SERVICE_STOP/SERVICE_STATUS register only when
 //     ConfigDir != "" (a resolved citadel.yaml manifest directory).
-//   - meeting: MEETING_JOIN registers only when WorkspaceDir != "" and the
-//     node's meeting capability is enabled (config.LoadMeeting(...).MeetingEnabled,
+//   - meeting: MEETING_JOIN is dispatchable only when WorkspaceDir != "" and the
+//     node's live meeting capability is enabled (MeetingEnabled, falling back to
+//     config.LoadMeeting(...).MeetingEnabled,
 //     default-on). HUDDLE_JOIN does not need a workspace, but it is gated by the
 //     same meeting-capability toggle.
 //

@@ -433,10 +433,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 // endpoint and a caller can fall back from /worker to /status without a second
 // decoder.
 type WorkerEnvelope struct {
+	Role   string          `json:"role,omitempty"`
 	Worker *WorkerLiveness `json:"worker,omitempty"`
 }
 
-// handleWorker returns ONLY the worker liveness block.
+// handleWorker returns cached startup role and worker liveness without probes.
 // GET /worker
 //
 // It exists because /status runs a full collection (docker stats across every
@@ -466,12 +467,14 @@ func (s *Server) handleWorker(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var live *WorkerLiveness
+	var role string
 	if s.collector != nil {
 		live = s.collector.WorkerLivenessSnapshot()
+		role = s.collector.role
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(WorkerEnvelope{Worker: live})
+	json.NewEncoder(w).Encode(WorkerEnvelope{Role: role, Worker: live})
 }
 
 // handleHealth returns a simple health check response.

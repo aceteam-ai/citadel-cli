@@ -20,6 +20,8 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 // InstanceRecord is the persisted spec of one payload-launched instance. It
@@ -62,7 +64,7 @@ type instanceStore struct {
 // NOT under the citadel.yaml config dir, to keep these records out of the
 // manifest/reconcile surface.
 func instanceStorePath() (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := platform.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("failed to get home directory: %w", err)
 	}

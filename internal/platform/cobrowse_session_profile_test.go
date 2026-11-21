@@ -64,7 +64,7 @@ type sentinelCheckingLauncher struct {
 func (l *sentinelCheckingLauncher) install(t *testing.T) {
 	t.Helper()
 	prev := launchCobrowseProc
-	launchCobrowseProc = func(profileDir, startURL string) (*cobrowseProc, error) {
+	launchCobrowseProc = func(profileDir, startURL string, _ LaunchOptions) (*cobrowseProc, error) {
 		if l.launchErr != nil {
 			return nil, l.launchErr
 		}

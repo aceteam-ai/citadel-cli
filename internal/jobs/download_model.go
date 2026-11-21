@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 type DownloadModelHandler struct{}
@@ -26,7 +27,7 @@ func (h *DownloadModelHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, 
 		return nil, fmt.Errorf("could not construct valid download URL: %w", err)
 	}
 
-	homeDir, _ := os.UserHomeDir()
+	homeDir, _ := platform.UserHomeDir()
 	destDir := filepath.Join(homeDir, "citadel-cache", modelType)
 	destPath := filepath.Join(destDir, fileName)
 

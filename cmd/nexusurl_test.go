@@ -19,7 +19,7 @@ import (
 // platform.ConfigDir() is hermetic.
 func withNexusWriteSeams(t *testing.T, dir string) {
 	t.Helper()
-	t.Setenv("HOME", t.TempDir())
+	useCmdFixtureHome(t, t.TempDir())
 	origDir := nodeConfigDirFn
 	origFix := fixStatePermissionsFn
 	nodeConfigDirFn = func() string { return dir }

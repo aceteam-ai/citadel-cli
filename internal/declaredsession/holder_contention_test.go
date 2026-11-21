@@ -23,7 +23,7 @@ func TestRunHolderKeepsStartupRecordBudgetUntilPublication(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := string(raw)
-	start := strings.Index(source, "func RunHolder(")
+	start := strings.Index(source, "func runHolderCore(")
 	if start < 0 {
 		t.Fatal("cannot locate production holder startup")
 	}

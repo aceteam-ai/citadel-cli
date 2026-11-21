@@ -4,13 +4,13 @@
 package reconstruct
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -87,6 +87,7 @@ type QualitySignal struct {
 type Artifact struct {
 	Path   string `json:"path"`
 	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size"`
 }
 
 // Result reports the quality gate and, only after success, the promoted PLY.
@@ -94,6 +95,26 @@ type Result struct {
 	Quality  QualitySignal `json:"quality"`
 	Artifact *Artifact     `json:"artifact,omitempty"`
 }
+
+// ProgressEvent carries only a fixed stage and transition. It never contains
+// filenames, raw tool logs, exception text or model output. A Run emits at most
+// six events: start and one terminal transition for each of its three stages.
+// Stage completion is not bundle publication, receipt signing or job success.
+type ProgressEvent struct {
+	Stage string `json:"stage"`
+	State string `json:"state"`
+}
+
+const (
+	StageExtractFrames = "extract_frames"
+	StageSFM           = "sfm"
+	StageTraining      = "training"
+
+	ProgressStarting = "starting"
+	ProgressComplete = "complete"
+	ProgressFailed   = "failed"
+	ProgressRejected = "rejected"
+)
 
 // ErrQualityGate means SfM completed but its signal did not justify spending
 // GPU time on training.
@@ -107,6 +128,10 @@ type Runner struct {
 	FFmpegPath  string
 	SpirulaPath string
 	Log         io.Writer
+	// Progress is a trusted, synchronous observer of bounded static events.
+	// It must not block. It grants no path/process authority and does not replace
+	// actual-exit custody or a job's authenticated progress transport.
+	Progress func(ProgressEvent)
 }
 
 // Run executes ffmpeg (for video), SfM, the quality gate, and headless 3DGS
@@ -162,9 +187,12 @@ func (r Runner) Run(ctx context.Context, request Request) (Result, error) {
 			"-vf", "fps=" + strconv.FormatFloat(req.FrameFPS, 'f', -1, 64),
 			"-q:v", "2", framePattern,
 		}
+		r.progress(StageExtractFrames, ProgressStarting)
 		if err := r.run(ctx, log, Invocation{Name: ffmpeg, Args: args, Dir: workDir}); err != nil {
+			r.progress(StageExtractFrames, ProgressFailed)
 			return result, fmt.Errorf("reconstruct: extract frames: %w", err)
 		}
+		r.progress(StageExtractFrames, ProgressComplete)
 	}
 
 	sfmDir := filepath.Join(workDir, "sfm")
@@ -178,6 +206,7 @@ func (r Runner) Run(ctx context.Context, request Request) (Result, error) {
 		"--quality", req.SFMQuality,
 		"--data-type", "video",
 	}
+	r.progress(StageSFM, ProgressStarting)
 	sfmErr := r.runWithWriters(ctx, Invocation{
 		Name: spirula, Args: sfmArgs, Dir: workDir,
 		Stdout: sfmLog, Stderr: sfmLog,
@@ -187,21 +216,25 @@ func (r Runner) Run(ctx context.Context, request Request) (Result, error) {
 	// carry the quality signal and a usable sparse model, so apply our explicit
 	// gate instead of confusing those verdicts with a crashed subprocess.
 	if sfmErr != nil && !completedSFMVerdict(sfmErr) {
+		r.progress(StageSFM, ProgressFailed)
 		return result, fmt.Errorf("reconstruct: SfM: %w", sfmErr)
 	}
 	quality, err := ParseQualitySignal(sfmOutput.String())
 	if err != nil {
+		r.progress(StageSFM, ProgressFailed)
 		return result, fmt.Errorf("reconstruct: SfM completed without a parseable quality signal: %w", err)
 	}
 	quality.AcceptedForTraining = quality.RegisteredPercent >= req.MinRegisteredPercent &&
 		quality.MeanReprojectionPX <= req.MaxMeanReprojectionPX
 	result.Quality = quality
 	if !quality.AcceptedForTraining {
+		r.progress(StageSFM, ProgressRejected)
 		return result, fmt.Errorf(
 			"%w: %.1f%% registered (minimum %.1f%%), mean reprojection %.3f px (maximum %.3f px)",
 			ErrQualityGate, quality.RegisteredPercent, req.MinRegisteredPercent,
 			quality.MeanReprojectionPX, req.MaxMeanReprojectionPX)
 	}
+	r.progress(StageSFM, ProgressComplete)
 	// SfM writes COLMAP features/matches/sparse data into its workspace but
 	// intentionally leaves the source images in place. Complete the standard
 	// COLMAP dataset layout for the trainer with a private symlink rather than
@@ -236,9 +269,12 @@ func (r Runner) Run(ctx context.Context, request Request) (Result, error) {
 		"--disable-viewer", "1",
 		"--keep-viewer-alive", "0",
 	}
+	r.progress(StageTraining, ProgressStarting)
 	if err := r.run(ctx, log, Invocation{Name: spirula, Args: trainArgs, Dir: workDir}); err != nil {
+		r.progress(StageTraining, ProgressFailed)
 		return result, fmt.Errorf("reconstruct: train 3DGS: %w", err)
 	}
+	r.progress(StageTraining, ProgressComplete)
 
 	checkpoint := fmt.Sprintf("step-%09d.ckpt", req.Iterations)
 	ply := filepath.Join(trainRoot, "run", checkpoint, "splat.ply")
@@ -249,9 +285,12 @@ func (r Runner) Run(ctx context.Context, request Request) (Result, error) {
 	if !info.Mode().IsRegular() {
 		return result, fmt.Errorf("reconstruct: final artifact is not a regular file")
 	}
-	digest, err := hashFile(ctx, ply)
+	digest, size, err := hashFile(ctx, ply)
 	if err != nil {
 		return result, fmt.Errorf("reconstruct: hash final artifact: %w", err)
+	}
+	if size == 0 {
+		return result, fmt.Errorf("reconstruct: final artifact is empty")
 	}
 
 	publishDir, err := os.MkdirTemp(parent, "."+base+".publish-")
@@ -271,15 +310,22 @@ func (r Runner) Run(ctx context.Context, request Request) (Result, error) {
 	if err := os.Rename(ply, stagedPLY); err != nil {
 		return result, fmt.Errorf("reconstruct: stage final artifact: %w", err)
 	}
-	if err := os.Rename(publishDir, output); err != nil {
+	if err := publishDirectory(ctx, publishDir, output); err != nil {
 		return result, fmt.Errorf("reconstruct: atomically publish final artifact: %w", err)
 	}
 	published = true
 	result.Artifact = &Artifact{
 		Path:   filepath.Join(output, "splat.ply"),
 		SHA256: "sha256:" + digest,
+		Size:   size,
 	}
 	return result, nil
+}
+
+func (r Runner) progress(stage, state string) {
+	if r.Progress != nil {
+		r.Progress(ProgressEvent{Stage: stage, State: state})
+	}
 }
 
 func (r Runner) run(ctx context.Context, log io.Writer, invocation Invocation) error {
@@ -333,7 +379,7 @@ func normalizeRequest(req Request) (Request, string, string, bool, error) {
 	if req.FrameFPS == 0 {
 		req.FrameFPS = defaultFrameFPS
 	}
-	if req.FrameFPS <= 0 || req.FrameFPS > 120 {
+	if !finite(req.FrameFPS) || req.FrameFPS <= 0 || req.FrameFPS > 120 {
 		return req, "", "", false, fmt.Errorf("reconstruct: frame FPS must be in (0, 120]")
 	}
 	if req.SFMQuality == "" {
@@ -369,16 +415,20 @@ func normalizeRequest(req Request) (Request, string, string, bool, error) {
 	if req.MinRegisteredPercent == 0 {
 		req.MinRegisteredPercent = defaultMinRegisteredPercent
 	}
-	if req.MinRegisteredPercent < 0 || req.MinRegisteredPercent > 100 {
+	if !finite(req.MinRegisteredPercent) || req.MinRegisteredPercent < 0 || req.MinRegisteredPercent > 100 {
 		return req, "", "", false, fmt.Errorf("reconstruct: minimum registered percent must be in [0, 100]")
 	}
 	if req.MaxMeanReprojectionPX == 0 {
 		req.MaxMeanReprojectionPX = defaultMaxMeanReprojection
 	}
-	if req.MaxMeanReprojectionPX < 0 {
+	if !finite(req.MaxMeanReprojectionPX) || req.MaxMeanReprojectionPX < 0 {
 		return req, "", "", false, fmt.Errorf("reconstruct: maximum mean reprojection must be nonnegative")
 	}
 	return req, input, output, info.IsDir(), nil
+}
+
+func finite(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0)
 }
 
 func pathWithin(path, directory string) bool {
@@ -424,24 +474,39 @@ func ParseQualitySignal(output string) (QualitySignal, error) {
 	registered := registeredRE.FindAllStringSubmatch(output, -1)
 	if len(registered) > 0 {
 		last := registered[len(registered)-1]
-		signal.RegisteredImages, _ = strconv.Atoi(last[1])
-		signal.TotalImages, _ = strconv.Atoi(last[2])
-		if signal.TotalImages > 0 {
-			signal.RegisteredPercent = 100 * float64(signal.RegisteredImages) / float64(signal.TotalImages)
+		var registeredErr, totalErr error
+		signal.RegisteredImages, registeredErr = strconv.Atoi(last[1])
+		signal.TotalImages, totalErr = strconv.Atoi(last[2])
+		if registeredErr != nil || totalErr != nil || signal.TotalImages <= 0 ||
+			signal.RegisteredImages > signal.TotalImages {
+			return QualitySignal{}, fmt.Errorf("invalid registered-image counts")
 		}
+		signal.RegisteredPercent = 100 * float64(signal.RegisteredImages) / float64(signal.TotalImages)
 	}
 	reprojection := reprojectionRE.FindAllStringSubmatch(output, -1)
 	if len(reprojection) > 0 {
-		signal.MeanReprojectionPX, _ = strconv.ParseFloat(reprojection[len(reprojection)-1][1], 64)
+		var err error
+		signal.MeanReprojectionPX, err = strconv.ParseFloat(reprojection[len(reprojection)-1][1], 64)
+		if err != nil {
+			return QualitySignal{}, fmt.Errorf("invalid mean-reprojection value")
+		}
 	}
 	result := resultRE.FindAllStringSubmatch(output, -1)
 	if len(result) > 0 {
 		last := result[len(result)-1]
 		if signal.TotalImages == 0 {
-			signal.RegisteredPercent, _ = strconv.ParseFloat(last[1], 64)
+			var err error
+			signal.RegisteredPercent, err = strconv.ParseFloat(last[1], 64)
+			if err != nil {
+				return QualitySignal{}, fmt.Errorf("invalid registered-image percentage")
+			}
 		}
 		if len(reprojection) == 0 {
-			signal.MeanReprojectionPX, _ = strconv.ParseFloat(last[2], 64)
+			var err error
+			signal.MeanReprojectionPX, err = strconv.ParseFloat(last[2], 64)
+			if err != nil {
+				return QualitySignal{}, fmt.Errorf("invalid mean-reprojection value")
+			}
 		}
 	}
 	if signal.TotalImages == 0 && len(result) == 0 {
@@ -450,52 +515,83 @@ func ParseQualitySignal(output string) (QualitySignal, error) {
 	if len(reprojection) == 0 && len(result) == 0 {
 		return QualitySignal{}, fmt.Errorf("mean-reprojection summary not found")
 	}
+	if !finite(signal.RegisteredPercent) || signal.RegisteredPercent < 0 || signal.RegisteredPercent > 100 ||
+		!finite(signal.MeanReprojectionPX) || signal.MeanReprojectionPX < 0 {
+		return QualitySignal{}, fmt.Errorf("quality summary is outside its finite range")
+	}
 	return signal, nil
 }
 
-func hashFile(ctx context.Context, path string) (string, error) {
+func hashFile(ctx context.Context, path string) (string, int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	defer f.Close()
 	h := sha256.New()
+	var size int64
 	buf := make([]byte, 256*1024)
 	for {
 		if err := ctx.Err(); err != nil {
-			return "", err
+			return "", 0, err
 		}
 		n, readErr := f.Read(buf)
 		if n > 0 {
-			if _, err := h.Write(buf[:n]); err != nil {
-				return "", err
+			if size > math.MaxInt64-int64(n) {
+				return "", 0, fmt.Errorf("artifact byte count overflow")
 			}
+			if _, err := h.Write(buf[:n]); err != nil {
+				return "", 0, err
+			}
+			size += int64(n)
 		}
 		if errors.Is(readErr, io.EOF) {
 			break
 		}
 		if readErr != nil {
-			return "", readErr
+			return "", 0, readErr
 		}
 	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	if err := ctx.Err(); err != nil {
+		return "", 0, err
+	}
+	return hex.EncodeToString(h.Sum(nil)), size, nil
 }
 
 // synchronizedBuffer tolerates stdout and stderr copy goroutines writing at
 // the same time in os/exec.
 type synchronizedBuffer struct {
-	mu sync.Mutex
-	b  bytes.Buffer
+	mu     sync.Mutex
+	data   [maxSFMLogBytes]byte
+	next   int
+	length int
 }
+
+// Only the bounded summary tail is retained. The caller's separate Log writer
+// still receives its original stream; a missing/truncated summary fails closed.
+const maxSFMLogBytes = 256 << 10
 
 func (b *synchronizedBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.b.Write(p)
+	n := len(p)
+	if n >= maxSFMLogBytes {
+		copy(b.data[:], p[n-maxSFMLogBytes:])
+		b.next, b.length = 0, maxSFMLogBytes
+		return n, nil
+	}
+	first := min(n, maxSFMLogBytes-b.next)
+	copy(b.data[b.next:], p[:first])
+	copy(b.data[:], p[first:])
+	b.next = (b.next + n) % maxSFMLogBytes
+	b.length = min(maxSFMLogBytes, b.length+n)
+	return n, nil
 }
 
 func (b *synchronizedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.b.String()
+	start := (b.next - b.length + maxSFMLogBytes) % maxSFMLogBytes
+	first := min(b.length, maxSFMLogBytes-start)
+	return string(b.data[start:start+first]) + string(b.data[:b.length-first])
 }

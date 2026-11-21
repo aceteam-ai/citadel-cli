@@ -32,6 +32,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 // probeTimeout bounds each vendor's --version exec. Mirrors the sibling
@@ -130,7 +132,7 @@ var vendorSpecs = []vendorSpec{
 // passes a zero Options so its behavior is byte-unchanged.
 type Options struct {
 	// HomeDir is the home directory whose per-vendor credential files are
-	// checked. Empty means the current process's own home (os.UserHomeDir) --
+	// checked. Empty means the current process's own home (platform.UserHomeDir) --
 	// UNLESS HomeUnknown is set (see below), which distinguishes "use the
 	// process home" from "the target could not be resolved".
 	HomeDir string
@@ -179,7 +181,7 @@ func Probe(ctx context.Context, opts Options) []VendorAgent {
 	// was unresolvable, and probing the worker's /root would produce the exact
 	// confident-false "no" the honesty principle exists to prevent (#1015).
 	if homeDir == "" && !opts.HomeUnknown {
-		homeDir, _ = os.UserHomeDir()
+		homeDir, _ = platform.UserHomeDir()
 	}
 	out := make([]VendorAgent, 0, len(vendorSpecs))
 	for _, spec := range vendorSpecs {
@@ -250,7 +252,7 @@ func lookPath(binary, pathEnv string) (string, error) {
 // AuthStateUnknown rather than a confident false "no" against /root -- the
 // #1015 fix, since a zero HomeDir alone does not do that.
 func ResolveTargetUser() (Options, error) {
-	return resolveTargetUser(os.Getenv("SUDO_USER"), lookupUserHome, os.UserHomeDir, os.Getenv("PATH"))
+	return resolveTargetUser(os.Getenv("SUDO_USER"), lookupUserHome, platform.UserHomeDir, os.Getenv("PATH"))
 }
 
 // lookupUserHome is the real user-home resolver behind ResolveTargetUser,

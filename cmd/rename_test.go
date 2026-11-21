@@ -18,7 +18,7 @@ func withTempConfigHome(t *testing.T) string {
 		t.Skip("skipping config-dir test when running as root (ConfigDir ignores HOME)")
 	}
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	useCmdFixtureHome(t, home)
 
 	configDir := platform.ConfigDir()
 	if configDir == "" {

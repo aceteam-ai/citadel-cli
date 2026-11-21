@@ -39,7 +39,7 @@ func TestResolveDefaultServe(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("HOME", t.TempDir()) // isolate platform.ConfigDir()
+			useCmdFixtureHome(t, t.TempDir()) // isolate platform.ConfigDir()
 			t.Setenv("CITADEL_DEFAULT_SERVE", tc.env)
 			if tc.persisted != nil {
 				writePersisted(t, *tc.persisted)
@@ -56,7 +56,7 @@ func TestResolveDefaultServe(t *testing.T) {
 // with no citadel.yaml yet) does not panic and falls through to the
 // persisted/env precedence.
 func TestResolveDefaultServe_NilManifest(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	useCmdFixtureHome(t, t.TempDir())
 	t.Setenv("CITADEL_DEFAULT_SERVE", "")
 	if got := resolveDefaultServe(nil); got != false {
 		t.Errorf("resolveDefaultServe(nil) = %v, want false", got)
@@ -144,7 +144,7 @@ func TestBlankNodeCheckForDefaultServe_TrulyBlank(t *testing.T) {
 // nothing -- no marker written, no side-effecting call made -- when
 // default-serve is not opted in.
 func TestRunDefaultServeReconcile_OptInOffIsNoOp(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	useCmdFixtureHome(t, t.TempDir())
 	t.Setenv("CITADEL_DEFAULT_SERVE", "")
 	configDir := t.TempDir()
 
@@ -168,7 +168,7 @@ func TestRunDefaultServeReconcile_OptInOffIsNoOp(t *testing.T) {
 // pre-existing marker short-circuits the reconcile before any GPU probe or
 // service-start call, even when opted in.
 func TestRunDefaultServeReconcile_OnceEverMarkerSkipsSecondRun(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	useCmdFixtureHome(t, t.TempDir())
 	t.Setenv("CITADEL_DEFAULT_SERVE", "1")
 	configDir := t.TempDir()
 	if err := saveDefaultServeMarker(configDir, "applied", "ollama", "llama3.1:8b", 8192); err != nil {
@@ -190,7 +190,7 @@ func TestRunDefaultServeReconcile_OnceEverMarkerSkipsSecondRun(t *testing.T) {
 // not-found GPU signal is a skip (not a failure), writes the once-ever
 // marker (no retry), and never calls executeServiceStart.
 func TestRunDefaultServeReconcile_NoGPUSkipsAndWritesMarker(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	useCmdFixtureHome(t, t.TempDir())
 	t.Setenv("CITADEL_DEFAULT_SERVE", "1")
 	configDir := t.TempDir()
 
@@ -214,7 +214,7 @@ func TestRunDefaultServeReconcile_NoGPUSkipsAndWritesMarker(t *testing.T) {
 // non-blank node is skipped (never calls executeServiceStart) and the
 // once-ever marker records why.
 func TestRunDefaultServeReconcile_NotBlankSkipsAndWritesMarker(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	useCmdFixtureHome(t, t.TempDir())
 	t.Setenv("CITADEL_DEFAULT_SERVE", "1")
 	configDir := t.TempDir()
 	manifest := &CitadelManifest{Services: []Service{{Name: "vllm", ComposeFile: "services/vllm.yml"}}}
@@ -239,7 +239,7 @@ func TestRunDefaultServeReconcile_NotBlankSkipsAndWritesMarker(t *testing.T) {
 // full happy path: opted in, GPU present, blank node -> executeServiceStart
 // is called with the tier's (engine, model) and the marker records "applied".
 func TestRunDefaultServeReconcile_AppliedCallsServiceStartAndWritesMarker(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	useCmdFixtureHome(t, t.TempDir())
 	t.Setenv("CITADEL_DEFAULT_SERVE", "1")
 	configDir := t.TempDir()
 
@@ -275,7 +275,7 @@ func TestRunDefaultServeReconcile_AppliedCallsServiceStartAndWritesMarker(t *tes
 // failed executeServiceStart still writes the once-ever marker (so the node
 // never crash-loops retrying a doomed pull) with a "failed:" status.
 func TestRunDefaultServeReconcile_FailureWritesMarkerAndNeverRetries(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	useCmdFixtureHome(t, t.TempDir())
 	t.Setenv("CITADEL_DEFAULT_SERVE", "1")
 	configDir := t.TempDir()
 
@@ -310,7 +310,7 @@ func (e staticError) Error() string { return string(e) }
 var errBoom = staticError("boom")
 
 func TestDefaultServeHeldBlank24GBDefersWithoutMutation(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	useCmdFixtureHome(t, t.TempDir())
 	t.Setenv("CITADEL_DEFAULT_SERVE", "1")
 	configDir := t.TempDir()
 	manifestPath := filepath.Join(configDir, "citadel.yaml")
@@ -356,7 +356,7 @@ func TestDefaultServeHeldBlank24GBDefersWithoutMutation(t *testing.T) {
 }
 
 func TestRealDefaultServeDepsRefusesHeldCalleeBeforeExecute(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	useCmdFixtureHome(t, t.TempDir())
 	t.Setenv("CITADEL_DEFAULT_SERVE", "1")
 	configDir := t.TempDir()
 	manifestPath := filepath.Join(configDir, "citadel.yaml")

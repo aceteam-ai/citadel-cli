@@ -11,8 +11,82 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/compose"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/aceteam-ai/citadel-cli/internal/service"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 )
+
+func TestManagedUpdateDiagnosticsPreservesEveryObservedUnit(t *testing.T) {
+	workers := []service.ManagedWorker{
+		{Unit: service.ManagedUnit{Name: "custom"}, Executable: "/fixture/citadel", User: "dedicated"},
+		{Unit: service.ManagedUnit{Name: "other", UserMode: true}, Executable: "/fixture/citadel", User: "operator"},
+	}
+	var seen []service.ManagedWorker
+	checks, note := managedUpdateDiagnostics(func() (string, error) { return "/fixture/citadel", nil }, func(path string) ([]service.ManagedWorker, error) {
+		if path != "/fixture/citadel" {
+			t.Fatalf("wrong executable %q", path)
+		}
+		return workers, nil
+	}, func(worker service.ManagedWorker) service.WorkerUpdateDiagnostic {
+		seen = append(seen, worker)
+		return service.WorkerUpdateDiagnostic{Unit: worker.Unit.Name, WorkerUser: worker.User, BinaryOwner: "uid 0", Directory: "/fixture", Warning: true, Detail: "privileged installer required"}
+	})
+	if note != "" || len(checks) != 2 || !reflect.DeepEqual(seen, workers) || checks[1].WorkerUser != "operator" {
+		t.Fatalf("managed unit identity not carried through: %+v %q %+v", checks, note, seen)
+	}
+	r := doctorReport{dockerHealth: platform.DockerHealth{OK: true}, doctor: healthyDoctorPayload(), updateDiagnostics: checks}
+	if !r.ok() {
+		t.Fatal("deliberate privilege separation must not make doctor unhealthy")
+	}
+	var out bytes.Buffer
+	renderDoctorReport(&out, r)
+	for _, want := range []string{"WORKER UPDATE INSTALL", "[WARN] custom", `worker "dedicated"`, `binary owner "uid 0"`, `install directory "/fixture"`, "privileged installer required", "Overall: OK"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("doctor missing %q: %s", want, out.String())
+		}
+	}
+	out.Reset()
+	reportManagedUpdateWarnings(&out, checks, "")
+	if strings.Count(out.String(), "Worker update capability:") != 2 || !strings.Contains(out.String(), `runs as "dedicated"`) {
+		t.Fatalf("manual install lost worker capability warning: %s", out.String())
+	}
+}
+
+func TestManagedUpdateDiagnosticsUnknownIsExplicit(t *testing.T) {
+	for _, phase := range []string{"executable", "discovery", "no workers"} {
+		t.Run(phase, func(t *testing.T) {
+			checks, note := managedUpdateDiagnostics(func() (string, error) {
+				if phase == "executable" {
+					return "", errors.New("private fixture path")
+				}
+				return "/fixture/citadel", nil
+			}, func(string) ([]service.ManagedWorker, error) {
+				if phase == "executable" {
+					t.Fatal("discovered units after executable failure")
+				}
+				if phase == "discovery" {
+					return nil, errors.New("private fixture unit contents")
+				}
+				return nil, nil
+			}, func(service.ManagedWorker) service.WorkerUpdateDiagnostic {
+				t.Fatal("diagnosed unverified worker")
+				return service.WorkerUpdateDiagnostic{}
+			})
+			if len(checks) != 0 || note == "" || strings.Contains(note, "private fixture") {
+				t.Fatalf("unknown observation not explicit or raw error leaked: %+v %q", checks, note)
+			}
+			var out bytes.Buffer
+			renderDoctorReport(&out, doctorReport{updateDiagnosisNote: note})
+			if !strings.Contains(out.String(), "[UNVERIFIED] "+note) {
+				t.Fatalf("unknown hidden: %s", out.String())
+			}
+		})
+	}
+	var out bytes.Buffer
+	reportManagedUpdateWarnings(&out, []service.WorkerUpdateDiagnostic{{Warning: false, Detail: "not a warning"}}, "fixture unknown")
+	if out.String() != "Worker update permissions unverified: fixture unknown\n" {
+		t.Fatalf("unexpected warning render: %s", out.String())
+	}
+}
 
 func TestRunPodmanGPUProbe(t *testing.T) {
 	var gotBinary string
@@ -467,5 +541,38 @@ func TestRenderDoctorReport_DarwinDockerOptional(t *testing.T) {
 		if strings.Contains(out, unwanted) {
 			t.Errorf("darwin (docker optional) report should not contain %q\nfull output:\n%s", unwanted, out)
 		}
+	}
+}
+
+func TestManualInstallSuppressesUnrequestedDiagnosticNotes(t *testing.T) {
+	for _, note := range []string{"managed worker install-layout inspection is only available on Linux", "no active managed worker using this executable was verified"} {
+		var out bytes.Buffer
+		reportManualManagedUpdateDiagnostics(&out, nil, note, false)
+		if out.Len() != 0 {
+			t.Fatalf("unrequested install diagnostic: %q", out.String())
+		}
+		reportManualManagedUpdateDiagnostics(&out, nil, note, true)
+		if !strings.Contains(out.String(), note) {
+			t.Fatal("explicit diagnostics lost the note")
+		}
+		out.Reset()
+		renderDoctorReport(&out, doctorReport{updateDiagnosisNote: note})
+		if !strings.Contains(out.String(), "[UNVERIFIED] "+note) {
+			t.Fatal("doctor lost explicit unknown evidence")
+		}
+	}
+}
+
+func TestIntentionalManualUpdatePolicyIsInformational(t *testing.T) {
+	check := service.WorkerUpdateDiagnostic{Unit: "fixture", WorkerUser: "9001", BinaryOwner: "uid 0", Directory: "/fixture", AutoUpdateDisabled: true, Detail: "automatic updates deliberately disabled"}
+	var out bytes.Buffer
+	reportManualManagedUpdateDiagnostics(&out, []service.WorkerUpdateDiagnostic{check}, "", false)
+	if !strings.Contains(out.String(), "[INFO]") || strings.Contains(out.String(), "[WARN]") || !strings.Contains(out.String(), check.Detail) {
+		t.Fatalf("manual policy not informational: %q", out.String())
+	}
+	out.Reset()
+	renderDoctorReport(&out, doctorReport{updateDiagnostics: []service.WorkerUpdateDiagnostic{check}})
+	if !strings.Contains(out.String(), "[INFO] fixture") || strings.Contains(out.String(), "[WARN] fixture") {
+		t.Fatalf("doctor policy not informational: %q", out.String())
 	}
 }

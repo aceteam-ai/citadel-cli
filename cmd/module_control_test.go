@@ -232,7 +232,7 @@ func TestRunModuleControlUnknownName(t *testing.T) {
 }
 
 func TestRunModuleControlNoManifest(t *testing.T) {
-	t.Setenv("HOME", t.TempDir()) // isolated HOME with no global config / manifest
+	useCmdFixtureHome(t, t.TempDir()) // isolated HOME with no global config / manifest
 
 	err := runModuleControl(context.Background(), "vllm", moduleActionStop)
 	if err == nil {

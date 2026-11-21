@@ -118,6 +118,8 @@ func runStandardStatus(commandCtx context.Context) {
 	headerColor.Fprintf(w, "--- 📊 Citadel Node Status (%s) ---\n", Version)
 
 	headerColor.Fprintln(w, "\n🛠️ WORKER")
+	printConfiguredWorkerRole(w, getDeviceConfigFromFile())
+	printActiveWorkerRole(w)
 	printWorkerInfo(w)
 
 	headerColor.Fprintln(w, "\n💻 SYSTEM VITALS")
@@ -459,6 +461,12 @@ func gatherStatusData() (dashboard.StatusData, error) {
 	data := dashboard.StatusData{
 		Version: Version,
 	}
+	if role, err := resolveWorkerRole(getDeviceConfigFromFile(), ""); err == nil {
+		data.ConfiguredRole = role.Report()
+	}
+	if role, known := probeActiveWorkerRole(); known {
+		data.Role = role.Report()
+	}
 	if detail := deviceLinkDiagnostic(getDeviceConfigFromFile()); detail != "" {
 		data.DeviceLinkState = "unverified"
 		data.DeviceLinkDetail = detail
@@ -608,7 +616,7 @@ func dashboardServiceStatus(check managedServiceHealth) dashboard.ServiceStatus 
 // `citadel work`) -- back-compat here is behavioral (human-facing tabwriter
 // text, no machine consumer to preserve), not schema-bound.
 func printCacheInfo(w *tabwriter.Writer) {
-	homeDir, err := os.UserHomeDir()
+	homeDir, err := platform.HomeDir("")
 	if err != nil {
 		fmt.Fprintf(w, "  %s\n", badColor.Sprintf("Could not determine home directory: %v", err))
 		return

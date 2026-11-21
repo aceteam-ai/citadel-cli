@@ -133,6 +133,60 @@ def test_health_video_loaded_state_is_independent_of_image_state(client, monkeyp
     assert body["device"] is None
 
 
+@pytest.mark.parametrize("pipeline", ["image", "video"])
+def test_health_keeps_independent_idle_cleanup_outcomes_without_release_claims(client, monkeypatch, pipeline):
+    class PrivateFailure(RuntimeError):
+        def __str__(self):
+            raise AssertionError("health must not format private cleanup exceptions")
+
+    callbacks = {"image": [], "video": []}
+    managers = {}
+    model_ids = {"image": app.DIFFUSERS_MODEL, "video": app.DIFFUSERS_VIDEO_MODEL}
+    for name in ("image", "video"):
+        def timer_factory(delay, callback, which=name):
+            callbacks[which].append(callback)
+            return SimpleNamespace(start=lambda: None, cancel=lambda: None)
+
+        specs = app.ALLOWED_IMAGE_MODELS if name == "image" else {model_ids[name]: app._video_spec}
+        managers[name] = app.ImageModelManager(
+            specs, model_ids[name], loader=lambda spec, variant: (object(), "cpu"),
+            warm_wait_seconds=5, idle_unload_seconds=0, timer_factory=timer_factory,
+            clock=lambda: 100.0,
+        )
+        monkeypatch.setattr(app, "_manager" if name == "image" else "_video_manager", managers[name])
+    monkeypatch.setattr(app, "_host_rss_bytes", lambda: 123456)
+    manager = managers[pipeline]
+    manager.lease(model_ids[pipeline]).release()
+
+    def fail_unload(pipe):
+        raise PrivateFailure("owned-private-token /owned/private/path")
+
+    manager._unloader = fail_unload
+    callbacks[pipeline][-1]()
+    response = client.get("/health")
+    assert response.status_code == 200
+    body = response.json()
+    other = "video" if pipeline == "image" else "image"
+    failed = {"outcome": "callback_error", "failed_stages": ["unload"], "interrupted_stage": None}
+    untouched = {"outcome": "not_attempted", "failed_stages": [], "interrupted_stage": None}
+    assert body["last_idle_cleanup"] == {pipeline: failed, other: untouched}
+    assert body["pipeline_cleanup"] == {"image": False, "video": False}
+    assert body["host_rss_bytes"] == 123456  # observed independently, not inferred from cleanup
+    for private in ("owned-private-token", "/owned/private/path", "PrivateFailure", "Traceback"):
+        assert private not in response.text
+
+    # A successful later load alone must not erase the failed idle observation.
+    manager._unloader = lambda pipe: None
+    manager.lease(model_ids[pipeline]).release()
+    assert client.get("/health").json()["last_idle_cleanup"][pipeline] == failed
+    callbacks[pipeline][-1]()
+    updated = client.get("/health").json()["last_idle_cleanup"]
+    assert updated[pipeline] == {
+        "outcome": "callbacks_returned", "failed_stages": [], "interrupted_stage": None,
+    }
+    assert updated[other] == untouched
+
+
 @pytest.mark.parametrize("failure", [None, "inference", "export"])
 def test_video_requests_release_real_lease_on_success_and_failure(client, monkeypatch, failure):
     callbacks = []

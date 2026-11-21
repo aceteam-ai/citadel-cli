@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/mem"
 )
@@ -292,7 +293,7 @@ func (realProbe) Host(ctx context.Context) HostResources {
 // never returns a path that doesn't exist, since a disk-usage syscall
 // requires one.
 func hostDiskPath() string {
-	return resolveDiskPath(os.UserHomeDir, dirExists)
+	return resolveDiskPath(platform.UserHomeDir, dirExists)
 }
 
 // HostDiskPath is the exported form of hostDiskPath, for a caller outside

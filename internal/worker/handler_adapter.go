@@ -71,7 +71,7 @@ func (a *LegacyHandlerAdapter) SetLogFn(logFn func(level, msg string)) {
 
 // CanHandle returns true if this adapter handles the given job type.
 func (a *LegacyHandlerAdapter) CanHandle(jobType string) bool {
-	return a.jobType == jobType && (a.enabled == nil || a.enabled())
+	return a.jobType == jobType && (a.enabled == nil || a.enabled()) && a.meetingReadiness() == nil
 }
 
 // DeclaredCapabilities forwards the wrapped legacy handler's capability
@@ -137,6 +137,13 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 			// large float64s. The handler rejects fractions, non-finite values
 			// and out-of-range integers. Other job payload semantics are unchanged.
 			if a.jobType == JobTypeFileFetch && k == "max_bytes" {
+				if number, ok := v.(float64); ok {
+					nexusJob.Payload[k] = strconv.FormatFloat(number, 'f', -1, 64)
+					continue
+				}
+			}
+			// A JSON number node id must stay decimal ("1000000", not "1e+06").
+			if a.jobType == JobTypeCobrowseSession && k == "backend_node_id" {
 				if number, ok := v.(float64); ok {
 					nexusJob.Payload[k] = strconv.FormatFloat(number, 'f', -1, 64)
 					continue
@@ -376,6 +383,12 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	if goos == "" {
 		goos = runtime.GOOS
 	}
+	meetingEnabled := opts.MeetingEnabled
+	if meetingEnabled == nil {
+		meetingEnabled = func() bool {
+			return config.LoadMeeting(platform.ConfigDir()).MeetingEnabled
+		}
+	}
 
 	// Embedding handler as fail-closed dispatched work when a signer is wired
 	// (aceteam#10876 C7). Without a signer (legacy/diagnostic paths) it stays
@@ -422,7 +435,7 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		// start/status/stop sessions. Registered unconditionally like COBROWSE — the
 		// manager needs no workspace or config dir, and each action is a short
 		// lifecycle call against the node-local session manager.
-		NewLegacyHandlerAdapter(JobTypeCobrowseSession, jobs.NewCobrowseSessionHandler()),
+		NewLegacyHandlerAdapter(JobTypeCobrowseSession, cobrowseSessionHandlerFor(opts)),
 		// Resource snapshot (issue #427): returns the node's full GPU/host
 		// resource-consumer picture over the fabric. Registered unconditionally
 		// like the inference handlers — it needs no workspace sandbox, and gating
@@ -605,15 +618,12 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		// per-meeting null sink, then transcribes it via the handler above. Needs
 		// the workspace both to write the recording and to validate the audio path
 		// for transcription, so it lives inside this workspace gate. Gated on the
-		// persisted meeting toggle (default-on, the house opt-out convention) so
-		// the handler registers unless the operator has explicitly opted out —
-		// matching the `meeting` capability advertisement gate in
-		// internal/capabilities.
-		if config.LoadMeeting(platform.ConfigDir()).MeetingEnabled {
-			handlers = append(handlers,
-				NewLegacyHandlerAdapter(JobTypeMeetingJoin, newMeetingJoinHandler(opts)),
-			)
-		}
+		// live meeting toggle shared with HUDDLE_JOIN and registration refusals.
+		// Retain the adapter while disabled so enabling new joins does not need
+		// a worker restart; CanHandle and Execute both recheck the same gate.
+		handlers = append(handlers,
+			newGatedLegacyHandlerAdapter(JobTypeMeetingJoin, newMeetingJoinHandler(opts), meetingEnabled),
+		)
 	}
 
 	// Native-huddle agent join (aceteam#7081). Part of the SAME default-on meeting
@@ -628,12 +638,6 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	huddleHandler := jobs.NewHuddleJoinHandler(opts.WorkspaceDir)
 	huddleTeardown := NewLegacyHandlerAdapter(JobTypeHuddleTeardown, huddleHandler)
 	huddleTeardown.backgroundOwner = false
-	meetingEnabled := opts.MeetingEnabled
-	if meetingEnabled == nil {
-		meetingEnabled = func() bool {
-			return config.LoadMeeting(platform.ConfigDir()).MeetingEnabled
-		}
-	}
 	handlers = append(handlers,
 		newGatedLegacyHandlerAdapter(JobTypeHuddleJoin, huddleHandler, meetingEnabled),
 		huddleTeardown,
@@ -685,6 +689,7 @@ func newMeetingJoinHandler(opts LegacyHandlerOpts) *jobs.MeetingJoinHandler {
 	// capability itself). The config accessors clamp non-positive cadence values
 	// to sane defaults.
 	m := config.LoadMeeting(platform.ConfigDir())
+	h.Timing, h.TimingError = m.TimingProfile()
 	h.StreamingEnabled = m.StreamingEnabled
 	h.StreamingInterval = m.StreamingInterval()
 	h.StreamingWindow = m.StreamingWindow()
@@ -700,5 +705,14 @@ func newMeetingJoinHandler(opts LegacyHandlerOpts) *jobs.MeetingJoinHandler {
 		creds := config.LoadDeviceCredsConverged()
 		return creds.APIBaseURL, creds.Token
 	})
+	return h
+}
+
+// cobrowseSessionHandlerFor wires the live Files permission into the session
+// handler, so file staging and set_file_input follow the same switch as
+// FILE_WRITE_BYTES (citadel-cli#1721).
+func cobrowseSessionHandlerFor(opts LegacyHandlerOpts) *jobs.CobrowseSessionHandler {
+	h := jobs.NewCobrowseSessionHandler()
+	h.Enabled = opts.FilesEnabled
 	return h
 }

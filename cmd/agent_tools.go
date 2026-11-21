@@ -306,7 +306,7 @@ func agentTailLogs(opts struct {
 	Grep  string
 	Since string
 }) (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := platform.HomeDir("")
 	if err != nil {
 		return "", fmt.Errorf("cannot resolve home dir: %w", err)
 	}
@@ -494,7 +494,7 @@ func formatTimePtr(t *time.Time) string {
 
 // agentConfig returns the effective config with secrets redacted (issue #236).
 func agentConfig(nodeName, baseURL, orgID string, queues []string) map[string]any {
-	home, _ := os.UserHomeDir()
+	home, _ := platform.HomeDir("")
 	return map[string]any{
 		"node_name":       nodeName,
 		"api_base_url":    baseURL,

@@ -53,6 +53,7 @@ type LivenessMonitor struct {
 	redialPlatform  func()
 	idleRestart     func(func()) bool
 	platformRestart bool
+	beforeRestart   func()
 	now             func() time.Time
 }
 
@@ -119,6 +120,14 @@ func NewLivenessMonitor(state *WorkerState, isDraining func() bool, log func(lev
 			// in-process goroutine restart could not.
 			os.Exit(1)
 		},
+	}
+}
+
+// SetRestartFence runs before non-idle recovery and must never wait for a
+// potentially stuck poll. The platform-idle recovery already owns its fence.
+func (m *LivenessMonitor) SetRestartFence(fence func()) {
+	if m != nil {
+		m.beforeRestart = fence
 	}
 }
 
@@ -192,6 +201,9 @@ func (m *LivenessMonitor) handleWedge(reason string, now time.Time) bool {
 		}
 		return true
 	}
+	if m.beforeRestart != nil {
+		m.beforeRestart()
+	}
 	exit()
 	return true
 }
@@ -206,6 +218,7 @@ func (m *LivenessMonitor) check(now time.Time) (reason string, wedged bool) {
 		return "", false // intentional pause (auto-update): not a wedge
 	}
 	snap := m.state.Snapshot()
+	tracked, executionStuck := m.state.trackedExecutionState(now, m.stuckTimeout)
 
 	// Respect a startup grace period, measured from when the MONITOR started (see
 	// startedAt), so the slow work before the consume loop begins is never
@@ -215,7 +228,7 @@ func (m *LivenessMonitor) check(now time.Time) (reason string, wedged bool) {
 		return "", false
 	}
 	if m.redialPlatform != nil && m.platformWindow > 0 {
-		if snap.InFlight > 0 || snap.Executing > 0 {
+		if tracked || snap.InFlight > 0 || snap.Executing > 0 {
 			m.state.platform.Suspend(now)
 		} else {
 			switch m.state.platform.NextAction(now, m.platformWindow, m.platformBackoff) {
@@ -230,7 +243,7 @@ func (m *LivenessMonitor) check(now time.Time) (reason string, wedged bool) {
 	}
 
 	// STALL: loop not polling while nothing is running.
-	if snap.InFlight == 0 && m.stallTimeout > 0 {
+	if !tracked && snap.InFlight == 0 && m.stallTimeout > 0 {
 		if snap.LastPollAt == nil {
 			// Up past grace, nothing in flight, and never a single poll: the
 			// loop never started consuming.
@@ -258,7 +271,10 @@ func (m *LivenessMonitor) check(now time.Time) (reason string, wedged bool) {
 	//      marks when the current EXECUTING streak began and is nil while every
 	//      in-flight job is still queued, so only a handler that has genuinely
 	//      run past the ceiling trips this.
-	if snap.Executing > 0 && m.stuckTimeout > 0 && snap.OldestExecutingAt != nil {
+	if executionStuck {
+		return "job stuck beyond its execution-specific self-heal ceiling", true
+	}
+	if !tracked && snap.Executing > 0 && m.stuckTimeout > 0 && snap.OldestExecutingAt != nil {
 		if held := now.Sub(*snap.OldestExecutingAt); held > m.stuckTimeout {
 			return "job stuck in handler for " + held.Truncate(time.Second).String() + " (exceeds self-heal ceiling)", true
 		}

@@ -122,8 +122,8 @@ func TestBuildChromeArgs_UserAgentAndLang(t *testing.T) {
 	}
 }
 
-// TestBuildChromeArgs_StartURL checks the start URL is the last arg when set and
-// omitted when empty.
+// TestBuildChromeArgs_StartURL checks the start URL is the last arg, directly
+// after the "--" switch terminator, when set and omitted when empty.
 func TestBuildChromeArgs_StartURL(t *testing.T) {
 	args := buildChromeArgs(cobrowseLaunchOptions{
 		debugPort: 9222, profileDir: "/p", stealth: true, startURL: "https://example.com",
@@ -131,11 +131,14 @@ func TestBuildChromeArgs_StartURL(t *testing.T) {
 	if got := args[len(args)-1]; got != "https://example.com" {
 		t.Errorf("expected start URL last, got %q in %v", got, args)
 	}
+	if got := args[len(args)-2]; got != "--" {
+		t.Errorf("expected \"--\" immediately before the start URL, got %q in %v", got, args)
+	}
 
 	none := buildChromeArgs(cobrowseLaunchOptions{debugPort: 9222, profileDir: "/p", stealth: true})
 	for _, a := range none {
-		if strings.HasPrefix(a, "http://") || strings.HasPrefix(a, "https://") {
-			t.Errorf("expected no URL arg when startURL empty, found %q", a)
+		if a == "--" || strings.HasPrefix(a, "http://") || strings.HasPrefix(a, "https://") {
+			t.Errorf("expected no URL or terminator arg when startURL empty, found %q", a)
 		}
 	}
 }
@@ -177,8 +180,8 @@ func TestBuildChromeArgs_SoftwareGL(t *testing.T) {
 // TestBuildChromeArgs_PasswordStoreBasic checks --password-store=basic is emitted
 // only when passwordStoreBasic is set. The meeting bot sets it so its persistent,
 // externally-seeded profile uses Chromium's build-independent os_crypt key
-// instead of a keyring secret; co-browse leaves it off to keep keyring-backed
-// persistent logins.
+// instead of a keyring secret. The managed-Xvfb co-browse runner sets it too
+// (see TestBuildChromeArgs_LinuxArgsUnchanged).
 func TestBuildChromeArgs_PasswordStoreBasic(t *testing.T) {
 	on := buildChromeArgs(cobrowseLaunchOptions{debugPort: 9222, profileDir: "/p", stealth: true, passwordStoreBasic: true})
 	if !containsArg(on, "--password-store=basic") {
@@ -187,11 +190,6 @@ func TestBuildChromeArgs_PasswordStoreBasic(t *testing.T) {
 	off := buildChromeArgs(cobrowseLaunchOptions{debugPort: 9222, profileDir: "/p", stealth: true})
 	if containsArg(off, "--password-store=basic") {
 		t.Errorf("passwordStoreBasic off: --password-store=basic must be absent in %v", off)
-	}
-	// Default co-browse launch options (as constructed in Start) must NOT enable it.
-	cobrowseLike := buildChromeArgs(cobrowseLaunchOptions{debugPort: 9222, profileDir: "/p", stealth: true, softwareGL: true})
-	if containsArg(cobrowseLike, "--password-store=basic") {
-		t.Errorf("co-browse default: --password-store=basic must be absent in %v", cobrowseLike)
 	}
 }
 

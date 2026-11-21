@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 // launchdLabel is defined in launchd_plist.go (non-tagged) so the pure helpers
@@ -25,7 +27,7 @@ func newPlatformManager() Manager {
 // System mode: /Library/LaunchDaemons/ai.aceteam.citadel.plist
 func plistPath(userMode bool) (string, error) {
 	if userMode {
-		home, err := os.UserHomeDir()
+		home, err := platform.UserHomeDir()
 		if err != nil {
 			return "", fmt.Errorf("cannot determine home directory: %w", err)
 		}
@@ -36,7 +38,7 @@ func plistPath(userMode bool) (string, error) {
 
 // logDir returns the directory for launchd service logs.
 func logDir() (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := platform.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
@@ -52,7 +54,7 @@ func GeneratePlist(cfg ServiceConfig) (string, error) {
 		cfg.Description = DefaultDescription
 	}
 
-	home, err := os.UserHomeDir()
+	home, err := platform.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("cannot determine home directory: %w", err)
 	}

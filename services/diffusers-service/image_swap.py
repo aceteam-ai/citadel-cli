@@ -281,6 +281,11 @@ class ImageModelManager:
         self._idle_timer = None
         self._idle_token = 0
         self._idle_evicting = False
+        # Callback observations only, never evidence that RSS/VRAM was freed.
+        # Keep no exception objects, reflected diagnostics or model references.
+        self._last_idle_cleanup = {
+            "outcome": "not_attempted", "failed_stages": (), "interrupted_stage": None,
+        }
 
         self._cond = threading.Condition()
         self._resident: _Resident | None = None
@@ -387,6 +392,11 @@ class ImageModelManager:
                 "quant_mode": self._quant_mode,
                 "last_load": dict(self._last_load) if self._last_load else None,
                 "idle_evicting": self._idle_evicting,
+                "last_idle_cleanup": {
+                    "outcome": self._last_idle_cleanup["outcome"],
+                    "failed_stages": list(self._last_idle_cleanup["failed_stages"]),
+                    "interrupted_stage": self._last_idle_cleanup["interrupted_stage"],
+                },
             }
 
     # -- internals ----------------------------------------------------------
@@ -551,27 +561,49 @@ class ImageModelManager:
             self._cancel_idle_locked()
             self._resident = None
             self._idle_evicting = True
+            observation = {
+                "outcome": "running", "failed_stages": (), "interrupted_stage": None,
+            }
+            self._last_idle_cleanup = observation
+        failed_stages = []
+        outcome = "interrupted"
+        stage = Stage.UNLOAD
         try:
-            self._drop_pipeline(resident)
+            if not self._drop_pipeline(resident):
+                failed_stages.append(Stage.UNLOAD.value)
             # All manager, lease and unload-frame references are gone before
             # collection/cache release/host allocator trimming happens.
+            stage = Stage.CLEANUP
             self._free_memory()
+            outcome = "callback_error" if failed_stages else "callbacks_returned"
         except Exception as exc:
+            failed_stages.append(stage.value)
+            outcome = "callback_error"
             logger.warning("diffusers: idle memory cleanup failed (stage=%s exception_class=%s)",
-                           Stage.CLEANUP.value, safe_exception_label(exc))
+                           stage.value, safe_exception_label(exc))
         finally:
             with self._cond:
+                # Fence the actual attempt, not a timer token that cancellation
+                # or replacement may invalidate. Stale no-ops never get here.
+                if self._last_idle_cleanup is observation:
+                    self._last_idle_cleanup = {
+                        "outcome": outcome,
+                        "failed_stages": tuple(failed_stages),
+                        "interrupted_stage": stage.value if outcome == "interrupted" else None,
+                    }
                 self._idle_evicting = False
                 self._cond.notify_all()
 
-    def _drop_pipeline(self, resident: _Resident) -> None:
+    def _drop_pipeline(self, resident: _Resident) -> bool:
         pipe = resident.pipe
         resident.pipe = None
         try:
             self._unloader(pipe)
+            return True
         except Exception as exc:
             logger.warning("diffusers: pipeline unload hook failed (stage=%s exception_class=%s)",
                            Stage.UNLOAD.value, safe_exception_label(exc))
+            return False
         finally:
             del pipe
 

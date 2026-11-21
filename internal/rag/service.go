@@ -23,6 +23,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/nodeindex"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 // Service drives node-local indexing and search over a single node-local index.
@@ -152,7 +153,7 @@ func NodeWorkspaceDir() string {
 	if dir := os.Getenv("CITADEL_WORKSPACE"); dir != "" {
 		return dir
 	}
-	home, err := os.UserHomeDir()
+	home, err := platform.UserHomeDir()
 	if err != nil {
 		return ""
 	}

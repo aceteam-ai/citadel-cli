@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
 )
 
@@ -123,13 +124,12 @@ func SyncAuthorizedKeys(config SSHSyncConfig) error {
 	}
 
 	// Determine authorized_keys path
-	homeDir, err := os.UserHomeDir()
+	authKeysPath, err := authorizedKeysPath()
 	if err != nil {
-		return fmt.Errorf("failed to get home directory: %w", err)
+		return err
 	}
 
-	sshDir := filepath.Join(homeDir, ".ssh")
-	authKeysPath := filepath.Join(sshDir, "authorized_keys")
+	sshDir := filepath.Dir(authKeysPath)
 
 	// Ensure .ssh directory exists with correct permissions
 	if err := os.MkdirAll(sshDir, 0700); err != nil {
@@ -184,6 +184,16 @@ func SyncAuthorizedKeys(config SSHSyncConfig) error {
 	}
 
 	return nil
+}
+
+// Resolve without network or filesystem effects so fixtures can assert the
+// destination before SyncAuthorizedKeys is allowed to read/create anything.
+func authorizedKeysPath() (string, error) {
+	home, err := platform.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to get home directory: %w", err)
+	}
+	return filepath.Join(home, ".ssh", "authorized_keys"), nil
 }
 
 // readExistingKeys reads the authorized_keys file and returns keys that are NOT in the managed section

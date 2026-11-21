@@ -18,6 +18,7 @@ package jobs
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/aceteam-ai/citadel-cli/internal/meetingpolicy"
 	"strings"
 )
 
@@ -25,8 +26,7 @@ import (
 // once admitted (capability 4). Kept as a single const so the exact wording is
 // reviewed in one place and the tone stays consistent. TTS voice is out of scope
 // for this PR (chat only); speaking this aloud is a named follow-up.
-const meetAnnouncementText = "Hi, I'm AceTeam. I'm recording this call - audio, video, and text. " +
-	"To give me instructions, say /ace leave or /ace <command>, or just talk to me."
+var meetAnnouncementText = meetingpolicy.Announcement("", "")
 
 // ---------------------------------------------------------------------------
 // LIVE-TUNING REQUIRED (best-guess, UNVERIFIED)

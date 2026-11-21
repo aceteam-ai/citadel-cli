@@ -94,7 +94,7 @@ func TestAgentConfigRedacts(t *testing.T) {
 func TestAgentTailLogsFilters(t *testing.T) {
 	// Point HOME at a temp dir with a synthetic log file.
 	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
+	useCmdFixtureHome(t, tmp)
 	logDir := filepath.Join(tmp, ".citadel-cli", "logs")
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -148,7 +148,7 @@ func TestAgentTailLogsFilters(t *testing.T) {
 // drop a following final line that has no trailing newline.
 func TestAgentTailLogsLongLine(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
+	useCmdFixtureHome(t, tmp)
 	logDir := filepath.Join(tmp, ".citadel-cli", "logs")
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -398,5 +398,15 @@ func TestWorkerLivenessCarriesIdentityUnresolved(t *testing.T) {
 	healthy.SetIdentity("w", "redis-api", "citadel-node-1008", "1008", "org-x")
 	if workerLivenessFrom(healthy.Snapshot()).IdentityUnresolved {
 		t.Error("heartbeat liveness must not report identity_unresolved once the Headscale ID resolved")
+	}
+}
+
+// TestWorkerLivenessFromCarriesRateLimitWindow pins the hand-copied projection
+// of the platform 429 window (citadel-cli#1677).
+func TestWorkerLivenessFromCarriesRateLimitWindow(t *testing.T) {
+	since := time.Now().Add(-time.Minute)
+	got := workerLivenessFrom(worker.WorkerSnapshot{RateLimitedSince: &since, LastRetryAfterSeconds: 9})
+	if got.RateLimitedSince == nil || !got.RateLimitedSince.Equal(since) || got.LastRetryAfterSeconds != 9 {
+		t.Fatalf("rate-limit window lost in projection: %+v", got)
 	}
 }

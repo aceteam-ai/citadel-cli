@@ -28,6 +28,11 @@ type ProgressEvent struct {
 	Current string
 	// Counts carries optional additive per-stage tallies (indexed/skipped/...).
 	Counts map[string]int
+	// Reason is an optional closed-vocabulary outcome (e.g. a meeting's end
+	// reason). Handlers must never put page text, paths or names here.
+	Reason string
+	// NotifyOwner hints that the platform should tell the job's owner.
+	NotifyOwner bool
 	// InFlight is internal accounting for candidates that have begun but do not
 	// yet have a terminal disposition. It is never projected onto the wire.
 	InFlight int

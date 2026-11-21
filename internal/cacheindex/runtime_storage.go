@@ -4,13 +4,15 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 // RuntimeStorageRoots returns the container engine graph roots whose disk use
 // belongs in node cache accounting. Rootless Podman stores its graph under the
 // user's data directory; Docker retains its system graph root.
 func RuntimeStorageRoots(engine string) []string {
-	home, _ := os.UserHomeDir()
+	home, _ := platform.UserHomeDir()
 	return runtimeStorageRoots(engine, home, os.Getenv("XDG_DATA_HOME"))
 }
 

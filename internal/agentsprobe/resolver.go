@@ -23,6 +23,8 @@ import (
 	"os/user"
 	"strconv"
 	"strings"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 // TargetSignal names which resolver tier produced a Target. It is not
@@ -83,7 +85,7 @@ func ResolveTargetUserForNode(in ResolveInputs) (Target, error) {
 		lookupName:  user.Lookup,
 		lookupUID:   func(uid int) (*user.User, error) { return user.LookupId(strconv.Itoa(uid)) },
 		statOwner:   statOwnerUID,
-		processHome: os.UserHomeDir,
+		processHome: platform.UserHomeDir,
 		processPath: os.Getenv("PATH"),
 	})
 }

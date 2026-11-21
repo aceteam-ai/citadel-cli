@@ -534,7 +534,7 @@ func (l *LinuxVNCManager) Uninstall() error {
 	}
 
 	// Clean up VNC password file (best-effort)
-	if homeDir, err := os.UserHomeDir(); err == nil {
+	if homeDir, err := HomeDir(""); err == nil {
 		passwdFile := filepath.Join(homeDir, ".vnc", "passwd")
 		if err := os.Remove(passwdFile); err != nil && !os.IsNotExist(err) {
 			fmt.Printf("Warning: failed to remove VNC password file: %v\n", err)
@@ -557,7 +557,7 @@ func (l *LinuxVNCManager) Configure(password string, port int) error {
 	}
 
 	// Ensure ~/.vnc directory exists
-	homeDir, err := os.UserHomeDir()
+	homeDir, err := HomeDir("")
 	if err != nil {
 		return fmt.Errorf("failed to get home directory: %w", err)
 	}
@@ -588,7 +588,7 @@ func (l *LinuxVNCManager) Start() error {
 
 	port := l.effectivePort()
 
-	homeDir, err := os.UserHomeDir()
+	homeDir, err := HomeDir("")
 	if err != nil {
 		return fmt.Errorf("failed to get home directory: %w", err)
 	}
@@ -664,7 +664,7 @@ func (l *LinuxVNCManager) resolveXAuth() (authFile string, needsSudo bool) {
 	}
 
 	// 2. Check user's own ~/.Xauthority
-	if home, err := os.UserHomeDir(); err == nil {
+	if home, err := HomeDir(""); err == nil {
 		xauth := filepath.Join(home, ".Xauthority")
 		if _, err := os.Stat(xauth); err == nil {
 			return xauth, false

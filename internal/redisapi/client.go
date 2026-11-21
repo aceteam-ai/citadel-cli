@@ -8,21 +8,25 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
 	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
+	"github.com/aceteam-ai/citadel-cli/internal/redact"
 	"github.com/google/uuid"
 )
 
 // Client provides HTTP-based access to the AceTeam Redis API proxy.
 type Client struct {
-	baseURL    string
-	token      string
-	httpClient *http.Client
-	workerID   string
+	consumeProtocols sync.Map
+	baseURL          string
+	token            string
+	httpClient       *http.Client
+	workerID         string
 
 	// wsClient is the WebSocket client for real-time pub/sub. It is built once
 	// in NewClient and NEVER reassigned or nil'd afterwards.
@@ -54,6 +58,13 @@ type Client struct {
 	// introspection path can report it (issue #236). The pre-fix #3924 bug
 	// surfaced here as repeated 400s with no visible error in the log file.
 	lastConsumeStatus int32
+
+	// rateLimitedSinceNano / rateLimitRetryAfterNano track an open platform 429
+	// window (citadel-cli#1677): the first 429 of the streak and the latest
+	// server-requested wait. Any later 2xx clears both. Shared by every route on
+	// this client, which matches the platform's single per-node bucket.
+	rateLimitedSinceNano    int64
+	rateLimitRetryAfterNano int64
 }
 
 // ClientConfig holds configuration for the API client.
@@ -70,6 +81,11 @@ type ClientConfig struct {
 	// DebugFunc is an optional callback for debug logging
 	DebugFunc        func(format string, args ...any)
 	PlatformObserver platformhttp.Observer
+
+	// WebSocketProxy is passed to the WebSocket client as its dial proxy. nil
+	// (every ordinary node) dials directly. The REST transport already honors
+	// HTTPS_PROXY through the cloned default transport.
+	WebSocketProxy func(*http.Request) (*url.URL, error)
 }
 
 // NewClient creates a new Redis API client.
@@ -97,6 +113,7 @@ func NewClient(cfg ClientConfig) *Client {
 		Token:            cfg.Token,
 		ReconnectEnabled: true,
 		DebugFunc:        cfg.DebugFunc,
+		Proxy:            cfg.WebSocketProxy,
 	})
 
 	return c
@@ -127,6 +144,27 @@ func (c *Client) WorkerID() string {
 // consume loop is succeeding (200) or being rejected (e.g. 400/401/403).
 func (c *Client) LastConsumeStatus() int {
 	return int(atomic.LoadInt32(&c.lastConsumeStatus))
+}
+
+// RateLimitWindow reports an open platform 429 window: when the first 429 of the
+// streak arrived and the latest Retry-After. ok is false once any request has
+// succeeded since (or if none was ever limited).
+func (c *Client) RateLimitWindow() (since time.Time, retryAfter time.Duration, ok bool) {
+	n := atomic.LoadInt64(&c.rateLimitedSinceNano)
+	if n == 0 {
+		return time.Time{}, 0, false
+	}
+	return time.Unix(0, n), time.Duration(atomic.LoadInt64(&c.rateLimitRetryAfterNano)), true
+}
+
+func (c *Client) noteRateLimited(retryAfter time.Duration) {
+	atomic.CompareAndSwapInt64(&c.rateLimitedSinceNano, 0, time.Now().UnixNano())
+	atomic.StoreInt64(&c.rateLimitRetryAfterNano, int64(retryAfter))
+}
+
+func (c *Client) clearRateLimited() {
+	atomic.StoreInt64(&c.rateLimitedSinceNano, 0)
+	atomic.StoreInt64(&c.rateLimitRetryAfterNano, 0)
 }
 
 // Ping verifies the API connection by making a simple request.
@@ -314,13 +352,24 @@ func (c *Client) doRequestWithClient(client *http.Client, ctx context.Context, m
 		atomic.StoreInt32(&c.lastConsumeStatus, int32(resp.StatusCode))
 	}
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		c.debug("response: %d - <authorization refusal body omitted>", resp.StatusCode)
+		c.debug("response: %d - <authorization refusal body omitted> token=%s", resp.StatusCode, redact.Fingerprint(c.token))
 		return newAuthorizationError(resp.StatusCode, method, path)
 	}
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	// This exact authenticated route response negotiates the registered queue
+	// protocol before any delivery is read. Never match a generic 409 or echo body.
+	if path == "/api/fabric/redis/jobs/consume" && resp.StatusCode == http.StatusConflict && len(respBody) <= durableControlReplyLimit {
+		if object, parseErr := closedControlObject(respBody, "error"); parseErr == nil {
+			var reason string
+			if json.Unmarshal(object["error"], &reason) == nil && reason == "Queue protocol mismatch" {
+				return errQueueProtocolMismatch
+			}
+		}
 	}
 
 	// Consume bodies can carry in-flight job credentials, including malformed
@@ -342,6 +391,26 @@ func (c *Client) doRequestWithClient(client *http.Client, ctx context.Context, m
 	//
 	// The literal "status %d" substring is load-bearing: contains404 greps for it
 	// so FetchWorkerConfig can fall back to defaults on a 404. Keep it verbatim.
+	if resp.StatusCode == http.StatusTooManyRequests {
+		// Typed so callers (heartbeat, consume loop) can honor the server's
+		// backoff instead of retrying at their normal cadence (#1677). The body
+		// hint wins; the Retry-After header covers an edge proxy's bodyless 429.
+		// Parse timing hints from the real bytes, but retain no response text
+		// from consume: even an error envelope can echo job credentials.
+		rle := parseRateLimitError(resp.StatusCode, string(respBody))
+		rle.Body = string(diagnosticBody)
+		if path == "/api/fabric/redis/jobs/consume" {
+			rle.Message = "rate limit exceeded"
+			rle.Window = ""
+		}
+		if rle.RetryAfter <= 0 && rle.ResetAt.IsZero() {
+			if d, ok := parseRetryAfterHeader(resp.Header.Get("Retry-After"), time.Now()); ok {
+				rle.RetryAfter = d
+			}
+		}
+		c.noteRateLimited(rle.Wait(time.Now()))
+		return rle
+	}
 	if resp.StatusCode >= 400 {
 		var apiErr APIError
 		if err := json.Unmarshal(diagnosticBody, &apiErr); err == nil && apiErr.Error != "" {
@@ -350,6 +419,8 @@ func (c *Client) doRequestWithClient(client *http.Client, ctx context.Context, m
 		}
 		return fmt.Errorf("%s %s failed with status %d: %s", method, path, resp.StatusCode, truncateBody(diagnosticBody))
 	}
+
+	c.clearRateLimited()
 
 	// Parse success response
 	if result != nil && len(respBody) > 0 {

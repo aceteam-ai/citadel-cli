@@ -433,7 +433,7 @@ func TestGotenbergManifestOnlyEntryNeverFalseConverges(t *testing.T) {
 // compose files to run anything from regardless of what the lockfile claims.
 func TestListInstalledNoManifestReportsNothing(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	useCmdFixtureHome(t, home)
 	writeLockfile(t, []catalog.LockEntry{{Name: "module-a", Source: "owner/module-a"}})
 	// No global config / manifest written at all.
 

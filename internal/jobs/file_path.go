@@ -6,7 +6,30 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/aceteam-ai/citadel-cli/internal/botprofile"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
+
+func init() {
+	// Both the machine-convergent node config dir and the invoker-scoped one are
+	// protected (citadel-cli#1761). Resolved at call time, never cached.
+	botprofile.ConfigDirs = func() []string {
+		return []string{network.GetNodeConfigDir(), platform.ConfigDir()}
+	}
+}
+
+// ErrBotProfilesDenied is returned for any path under a bot-profile store.
+var ErrBotProfilesDenied = botprofile.ErrDenied
+
+// DenyBotProfilesPath is the exported form for os.Root based handlers outside
+// this package: pass the absolute path about to be opened or created.
+func DenyBotProfilesPath(p string) error { return botprofile.DenyPath(p) }
+
+// denyBotProfiles refuses p when it is, or resolves into, a bot-profile store.
+// See botprofile.DenyPath for the identity-based rule.
+func denyBotProfiles(p string) error { return botprofile.DenyPath(p) }
 
 // ValidatePath resolves requestedPath within the workspace sandbox and returns
 // the cleaned absolute path. It rejects any path that escapes the workspace
@@ -53,6 +76,9 @@ func ValidatePath(workspace, requestedPath string) (string, error) {
 	if !withinDir(resolvedWorkspace, resolved) {
 		return "", fmt.Errorf("path %q resolves outside workspace", requestedPath)
 	}
+	if err := denyBotProfiles(resolved); err != nil {
+		return "", err
+	}
 
 	// There used to be a SECOND, lexical check here comparing cleanTarget against
 	// resolvedWorkspace. It was removed because it was both WRONG and redundant:
@@ -88,6 +114,18 @@ func withinDir(dir, target string) bool {
 		return false
 	}
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// isBotProfilesDir reports whether a directory entry must be skipped by a
+// walker: a store-named directory under a protected config dir, or ANY symlink
+// whose target lands in the store (a symlinked file would otherwise be opened
+// through the walker and leak a sealed blob or the node share). The cheap type
+// and name tests come first so ordinary entries cost nothing.
+func isBotProfilesDir(p string, d os.DirEntry) bool {
+	if d.Type()&os.ModeSymlink != 0 || (d.IsDir() && botprofile.IsStoreName(d.Name())) {
+		return denyBotProfiles(p) != nil
+	}
+	return false
 }
 
 // ValidateWithinRoots generalizes the single-root ValidatePath boundary to an
@@ -188,7 +226,11 @@ func ValidateReadPath(workspace, requestedPath string, allowOutside bool) (strin
 		}
 		target = filepath.Join(resolvedWorkspace, target)
 	}
-	return filepath.Clean(target), nil
+	cleaned := filepath.Clean(target)
+	if err := denyBotProfiles(cleaned); err != nil {
+		return "", err
+	}
+	return cleaned, nil
 }
 
 // PathNotAuthorizedError is returned by ValidateReadPathWithRoots when a

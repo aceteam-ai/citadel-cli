@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
@@ -17,7 +18,7 @@ func writeManifestWithServices(t *testing.T, services []Service) string {
 	t.Helper()
 
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	useCmdFixtureHome(t, home)
 
 	configDir := filepath.Join(home, ".citadel-cli")
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
@@ -53,7 +54,7 @@ func writeManifestWithServices(t *testing.T, services []Service) string {
 // helper returns immediately with nothing started — service startup must never
 // block or fail the worker just because no manifest exists.
 func TestStartManagedServicesNoManifest(t *testing.T) {
-	t.Setenv("HOME", t.TempDir()) // isolated HOME with no global config / manifest
+	useCmdFixtureHome(t, t.TempDir()) // isolated HOME with no global config / manifest
 
 	started := startManagedServices(context.Background())
 	if started != nil {
@@ -119,5 +120,36 @@ func TestWaitServicesFlagDefaultsToAsync(t *testing.T) {
 	}
 	if flag := workCmd.Flags().Lookup("no-services"); flag == nil {
 		t.Fatal("expected --no-services flag to remain registered")
+	}
+}
+
+// CI only: invalid paths refuse before runtime selection or native execution.
+func TestStartManagedServicesReportsFailuresWithoutSuccessBanner(t *testing.T) {
+	writeManifestWithServices(t, []Service{
+		{Name: "ollama", Type: "docker", ComposeFile: "../escape.yml"},
+		{Name: "llamacpp", Type: "docker", DesiredStatus: "stopped"},
+	})
+	output, err := os.CreateTemp(t.TempDir(), "startup-output")
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := os.Stdout
+	os.Stdout = output
+	defer func() { os.Stdout = previous; _ = output.Close() }()
+	started := startManagedServices(context.Background())
+	os.Stdout = previous
+	if len(started) != 0 {
+		t.Fatal("failed or skipped service recorded as started")
+	}
+	if err := output.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(output.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.Contains(text, "0 started, 1 failed, 1 skipped") || strings.Contains(text, "--- Services started ---") {
+		t.Fatalf("misleading service result: %s", text)
 	}
 }

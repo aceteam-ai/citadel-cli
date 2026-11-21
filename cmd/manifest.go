@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
@@ -68,6 +69,14 @@ type Service struct {
 	// here (and in internal/jobs' two manifest structs) so a cmd-package manifest
 	// rewrite does not silently drop it -- the #528/#850 field-drop failure mode.
 	OllamaMaxLoadedModels *int `yaml:"ollama_max_loaded_models,omitempty"`
+	// OllamaKeepAlive (aceteam-ai/citadel-cli#1560) is the default model
+	// keep_alive for the embedded ollama engine: "-1" or a positive Go duration
+	// ("30m", "24h"). Injected as OLLAMA_KEEP_ALIVE via
+	// services.OllamaKeepAliveComposeEnv; nil => explicit empty (engine default).
+	// OllamaPreload lists models loaded once (with that keep_alive) after ollama
+	// starts. Both are modeled in internal/jobs' manifest structs too (#528/#850).
+	OllamaKeepAlive *string  `yaml:"ollama_keep_alive,omitempty"`
+	OllamaPreload   []string `yaml:"ollama_preload,omitempty"`
 	// Threads is the aceteam-ai/citadel-cli#1269 per-service CPU thread opt-in for
 	// the embedded tei embedding service: the MKL/OMP/RAYON thread count injected
 	// as CITADEL_TEI_NUM_THREADS at `docker compose up`. A *int so nil (unset,
@@ -293,7 +302,7 @@ func resolveNodeConfigDirReadOnly() (string, nodeDirSource, error) {
 	if !os.IsNotExist(err) {
 		return "", nodeDirPointer, fmt.Errorf("inspect global config %s: %w", globalPath, err)
 	}
-	home, err := os.UserHomeDir()
+	home, err := platform.HomeDir("")
 	if err != nil {
 		return "", nodeDirDefault, err
 	}
@@ -615,7 +624,8 @@ func containsTag(tags []string, tag string) bool {
 }
 
 // ensureComposeFile ensures the compose file exists in the services directory.
-// If it doesn't exist, it extracts the embedded compose file from the binary.
+// If absent, it extracts the host-selected embedded compose. On Linux, known
+// Ollama/llama.cpp templates also track CPU/GPU changes on subsequent starts.
 //
 // citadel#860: under an active --node-dir/CITADEL_NODE_DIR override, the
 // materialized file's `container_name: citadel-<serviceName>` line is
@@ -627,8 +637,20 @@ func containsTag(tags []string, tag string) bool {
 // why the "file already exists, leave it alone" fast path below cannot skip
 // it.
 func ensureComposeFile(configDir, serviceName string) error {
+	return ensureComposeFileForHost(configDir, serviceName, runtime.GOOS, platform.NvidiaGPUCountForCompose)
+}
+
+func ensureComposeFileForHost(configDir, serviceName, goos string, gpuCount func() int) error {
 	servicesDir := filepath.Join(configDir, "services")
 	destPath := filepath.Join(servicesDir, serviceName+".yml")
+
+	selection := services.SelectComposeForHost(serviceName, goos, gpuCount)
+	content, embedded := selection.Content, selection.Embedded
+	if embedded && goos == "linux" && !selection.PreserveExisting {
+		if _, err := compose.ReconcileCPUComposeOnDisk(destPath, serviceName, content, resolveNodeDirOverride(), Log); err != nil {
+			return fmt.Errorf("reconcile host compose for %q: %w", serviceName, err)
+		}
+	}
 
 	// Check if file already exists
 	if _, err := os.Stat(destPath); err == nil {
@@ -652,8 +674,7 @@ func ensureComposeFile(configDir, serviceName string) error {
 	}
 
 	// Get content from embedded services
-	content, ok := services.ServiceMap[serviceName]
-	if !ok {
+	if !embedded {
 		return fmt.Errorf("unknown service: %s", serviceName)
 	}
 
@@ -764,4 +785,16 @@ func healStaleGPUReservationOnDisk(destPath, serviceName string) error {
 		return fmt.Errorf("heal stale GPU reservation for %q: %w", serviceName, err)
 	}
 	return nil
+}
+
+// reconcileHostComposeForStart covers canonical manifest/module start paths.
+// Missing files get the initial template even when GPU evidence is unknown;
+// existing flavors retain the same preservation policy as explicit starts.
+// Custom compose paths never acquire embedded-file ownership.
+func reconcileHostComposeForStart(name, path string, gpuCount func() int) error {
+	if runtime.GOOS != "linux" || !services.HasCPUComposeVariant(name) ||
+		filepath.Base(path) != name+".yml" || filepath.Base(filepath.Dir(path)) != "services" {
+		return nil
+	}
+	return ensureComposeFileForHost(filepath.Dir(filepath.Dir(path)), name, runtime.GOOS, gpuCount)
 }

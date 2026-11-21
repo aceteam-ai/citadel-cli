@@ -1,0 +1,454 @@
+package cmd
+
+import (
+	"bytes"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/aceteam-ai/citadel-cli/internal/localaudit"
+)
+
+const auditSentinel = "S3ntinel-passphrase-do-not-log"
+
+func TestLocalAuditRecordsEveryCallWithoutSecrets(t *testing.T) {
+	ownerDir := t.TempDir()
+	rt := newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: func() string { return ownerDir }, browser: newCmdFakeBrowser(), policy: allowAllURLs})
+	defer rt.close()
+	one := func(line string) map[string]any {
+		t.Helper()
+		resp := runLocalBridge(t, rt, nil, line)
+		for _, v := range resp {
+			return v
+		}
+		t.Fatalf("no response to %s", line)
+		return nil
+	}
+	one(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"Audit Harness"}}}`)
+	sid := map[string]any{"session_id": "cb-1"}
+	calls := []struct {
+		tool string
+		args map[string]any
+	}{
+		{"local_cobrowse_start", map[string]any{"url": "https://fixture.test/login?token=abc123", "goal": "check orders"}},
+		{"local_cobrowse_type", map[string]any{"session_id": "cb-1", "text": auditSentinel}}, // refused: no grant
+		{"local_cobrowse_status", sid},
+	}
+	for i, c := range calls {
+		one(call(10+i, c.tool, c.args))
+	}
+	if err := rt.svc.Approve("cb-1", 0); err != nil { // the user's viewer action
+		t.Fatal(err)
+	}
+	more := []struct {
+		tool string
+		args map[string]any
+	}{
+		{"local_cobrowse_type", map[string]any{"session_id": "cb-1", "text": auditSentinel}},
+		{"local_cobrowse_navigate", map[string]any{"session_id": "cb-1", "url": "https://fixture.test/orders"}},
+		{"local_cobrowse_click", map[string]any{"session_id": "cb-1", "selector": "#o1"}},
+		{"local_cobrowse_key", map[string]any{"session_id": "cb-1", "key": "Tab"}},
+		{"local_cobrowse_extract", map[string]any{"session_id": "cb-1", "selector": "#orders"}},
+		{"local_cobrowse_screenshot", sid},
+		{"local_cobrowse_handoff", map[string]any{"session_id": "cb-1", "reason": "log in"}},
+		{"local_cobrowse_screenshot", sid}, // refused: the user drives
+		{"local_cobrowse_resume", sid},
+		{"local_cobrowse_wait", map[string]any{"session_id": "cb-1", "until": "approved", "timeout_seconds": 1}},
+		{"local_cobrowse_stop", sid},
+	}
+	for i, c := range more {
+		one(call(20+i, c.tool, c.args))
+	}
+	agentCalls := len(calls) + len(more)
+
+	dir := filepath.Join(ownerDir, localaudit.DirName)
+	recs, err := localaudit.Read(dir, localaudit.Filter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent, user, refused, pending := 0, 0, 0, 0
+	for _, r := range recs {
+		if r.ResultingAction == "pending" {
+			pending++
+			continue
+		}
+		switch r.Actor {
+		case "agent":
+			agent++
+			if r.Agent != "Audit Harness" {
+				t.Errorf("record %d lacks the MCP client name: %+v", r.Seq, r)
+			}
+		case "user":
+			user++
+		}
+		if r.ResultingAction == "refused" {
+			refused++
+		}
+		if r.Source != "local" {
+			t.Errorf("source: %+v", r)
+		}
+	}
+	if agent != agentCalls || user != 1 {
+		t.Fatalf("want one record per call (%d agent, 1 user), got %d agent, %d user", agentCalls, agent, user)
+	}
+	// The four writes that ran (type, navigate, click, key) each have a
+	// pending record written before they reached the browser, and each
+	// outcome links back to it.
+	if pending != 4 {
+		t.Fatalf("want 4 pending records before writes, got %d", pending)
+	}
+	pendingAt := map[int64]localaudit.Record{}
+	for _, r := range recs {
+		if r.ResultingAction == "pending" {
+			pendingAt[r.Seq] = r
+		}
+	}
+	linked := 0
+	for _, r := range recs {
+		if r.PendingSeq != 0 {
+			p, ok := pendingAt[r.PendingSeq]
+			if !ok || p.IntendedAction != r.IntendedAction || r.Seq <= p.Seq {
+				t.Fatalf("outcome %d links to a wrong pending record %d", r.Seq, r.PendingSeq)
+			}
+			linked++
+		}
+	}
+	if linked != 4 {
+		t.Fatalf("want 4 outcomes linked to their pending records, got %d", linked)
+	}
+	// Refused: type before approval, screenshot while the user drives, and
+	// the agent's resume (only the user hands back).
+	if refused != 3 {
+		t.Errorf("want the 3 refusals recorded, got %d", refused)
+	}
+
+	// Typed text and URL secrets never reach the log.
+	files, _ := filepath.Glob(filepath.Join(dir, "*.jsonl"))
+	for _, f := range files {
+		b, _ := os.ReadFile(f)
+		for _, secret := range []string{auditSentinel, "abc123", "/login", "/orders"} {
+			if bytes.Contains(b, []byte(secret)) {
+				t.Fatalf("%q leaked into %s", secret, f)
+			}
+		}
+	}
+	var out bytes.Buffer
+	if err := runLocalAudit(dir, localAuditOptions{verify: true}, &out); err != nil || !strings.Contains(out.String(), "Audit log OK") {
+		t.Fatalf("verify: %v %s", err, out.String())
+	}
+	out.Reset()
+	if err := runLocalAudit(dir, localAuditOptions{session: "cb-1", limit: 5}, &out); err != nil || strings.Count(out.String(), "\n") != 5 {
+		t.Fatalf("print: %v\n%s", err, out.String())
+	}
+
+	// An edited record fails verification.
+	b, _ := os.ReadFile(files[0])
+	if err := os.WriteFile(files[0], bytes.Replace(b, []byte(`"resulting_action":"refused"`), []byte(`"resulting_action":"ok"`), 1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := runLocalAudit(dir, localAuditOptions{verify: true}, &out); err == nil || !strings.Contains(err.Error(), "modified") {
+		t.Fatalf("edit must be detected, got %v", err)
+	}
+}
+
+func TestLocalAuditArgumentRefusalsAreRecorded(t *testing.T) {
+	ownerDir := t.TempDir()
+	rt := newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: func() string { return ownerDir }, browser: newCmdFakeBrowser(), policy: allowAllURLs})
+	defer rt.close()
+	// Tool calls run concurrently, so send them one at a time.
+	runLocalBridge(t, rt, nil, call(1, "local_cobrowse_start", nil))
+	runLocalBridge(t, rt, nil, call(2, "local_cobrowse_click", map[string]any{"session_id": "cb-1"}))
+	runLocalBridge(t, rt, nil, call(3, "local_cobrowse_screenshot", map[string]any{}))
+	recs, _ := localaudit.Read(filepath.Join(ownerDir, localaudit.DirName), localaudit.Filter{})
+	var click, shot bool
+	for _, r := range recs {
+		if r.IntendedAction == "click" && r.ResultingAction == "refused" {
+			click = true
+		}
+		if r.IntendedAction == "screenshot" && r.ResultingAction == "refused" {
+			shot = true
+		}
+	}
+	if !click || !shot {
+		t.Fatalf("argument refusals must be audited: %+v", recs)
+	}
+}
+
+func TestLocalAuditWriteFailureTurnsCobrowseOff(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file permissions")
+	}
+	ownerDir := t.TempDir()
+	rt := newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: func() string { return ownerDir }, browser: newCmdFakeBrowser(), policy: allowAllURLs})
+	defer rt.close()
+	if r := runLocalBridge(t, rt, nil, call(1, "local_cobrowse_start", nil)); r["1"] == nil {
+		t.Fatal("start")
+	}
+	dir := filepath.Join(ownerDir, localaudit.DirName)
+	files, _ := filepath.Glob(filepath.Join(dir, "*.jsonl"))
+	for _, f := range files {
+		_ = os.Chmod(f, 0o400)
+	}
+	_ = os.Chmod(dir, 0o500)
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	runLocalBridge(t, rt, nil, call(2, "local_cobrowse_status", nil)) // this write fails
+	resp := runLocalBridge(t, rt, nil, call(3, "local_cobrowse_status", nil))
+	content, isErr := toolResult(t, resp["3"])
+	if !isErr || !strings.Contains(firstText(content), "audit log") {
+		t.Fatalf("co-browse must refuse once the audit log cannot be written: %v", resp["3"])
+	}
+	// The user's safety controls still work.
+	if err := rt.svc.HumanTakeControl("cb-1"); err != nil {
+		t.Fatalf("take control after an audit failure: %v", err)
+	}
+	if err := rt.svc.HumanStop("cb-1"); err != nil {
+		t.Fatalf("stop after an audit failure: %v", err)
+	}
+}
+
+func TestLocalAuditPendingFailureBlocksTheWrite(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file permissions")
+	}
+	ownerDir := t.TempDir()
+	fb := newCmdFakeBrowser()
+	rt := newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: func() string { return ownerDir }, browser: fb, policy: allowAllURLs})
+	defer rt.close()
+	runLocalBridge(t, rt, nil, call(1, "local_cobrowse_start", nil))
+	_ = rt.svc.Approve("cb-1", 0)
+	dir := filepath.Join(ownerDir, localaudit.DirName)
+	files, _ := filepath.Glob(filepath.Join(dir, "*"))
+	for _, f := range files {
+		_ = os.Chmod(f, 0o400)
+	}
+	_ = os.Chmod(dir, 0o500)
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	fb.clicks = 0
+	resp := runLocalBridge(t, rt, nil, call(2, "local_cobrowse_click", map[string]any{"session_id": "cb-1", "selector": "#x"}))
+	if _, isErr := toolResult(t, resp["2"]); !isErr {
+		t.Fatalf("a write whose pending record cannot be written must be refused: %v", resp["2"])
+	}
+	if fb.clicks != 0 {
+		t.Fatal("the write reached the browser without a record")
+	}
+}
+
+// The navigate tool result carries the full final URL and title; the audit
+// log carries neither, only the redacted origin and path hash.
+func TestLocalNavigateResultCarriesFinalURLButAuditDoesNot(t *testing.T) {
+	ownerDir := t.TempDir()
+	fb := newCmdFakeBrowser()
+	rt := newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: func() string { return ownerDir }, browser: fb, policy: allowAllURLs})
+	defer rt.close()
+	runLocalBridge(t, rt, nil, call(1, "local_cobrowse_start", nil))
+	_ = rt.svc.Approve("cb-1", 0)
+	fb.landing = "https://fixture.test/account/redirected?session=r3direct-secret"
+	fb.title = "Account " + auditSentinel
+	resp := runLocalBridge(t, rt, nil, call(2, "local_cobrowse_navigate", map[string]any{"session_id": "cb-1", "url": "https://fixture.test/go"}))
+	content, isErr := toolResult(t, resp["2"])
+	if isErr {
+		t.Fatalf("navigate: %v", resp["2"])
+	}
+	text := firstText(content)
+	if !strings.Contains(text, "r3direct-secret") || !strings.Contains(text, "Account") {
+		t.Fatalf("tool result should carry the final url and title: %s", text)
+	}
+	dir := filepath.Join(ownerDir, localaudit.DirName)
+	files, _ := filepath.Glob(filepath.Join(dir, "*.jsonl"))
+	for _, f := range files {
+		b, _ := os.ReadFile(f)
+		for _, secret := range []string{"r3direct-secret", "/account", "/go", auditSentinel} {
+			if bytes.Contains(b, []byte(secret)) {
+				t.Fatalf("%q leaked into %s", secret, f)
+			}
+		}
+	}
+}
+
+func TestLocalToolsAcceptCamelCaseArgumentKeys(t *testing.T) {
+	ownerDir := t.TempDir()
+	rt := newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: func() string { return ownerDir }, browser: newCmdFakeBrowser(), policy: allowAllURLs})
+	defer rt.close()
+	runLocalBridge(t, rt, nil, call(1, "local_cobrowse_start", map[string]any{"url": "https://fixture.test/"}))
+	if err := rt.svc.Approve("cb-1", 0); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		tool string
+		args map[string]any
+	}{
+		{"local_cobrowse_click", map[string]any{"sessionId": "cb-1", "selector": "#o1"}},
+		{"local_cobrowse_type", map[string]any{"sessionID": "cb-1", "text": "hello"}},
+		{"local_cobrowse_navigate", map[string]any{"sessionId": "cb-1", "url": "https://fixture.test/orders"}},
+		{"local_cobrowse_key", map[string]any{"SessionId": "cb-1", "key": "Tab"}},
+		{"local_cobrowse_extract", map[string]any{"sessionId": "cb-1", "selector": "#orders"}},
+		{"local_cobrowse_status", map[string]any{"sessionId": "cb-1"}},
+		{"local_cobrowse_wait", map[string]any{"sessionId": "cb-1", "until": "approved", "timeoutSeconds": 1}},
+	}
+	for i, c := range cases {
+		resp := runLocalBridge(t, rt, nil, call(10+i, c.tool, c.args))
+		content, isErr := toolResult(t, resp[fmt.Sprint(10+i)])
+		if isErr && strings.Contains(firstText(content), "is required") {
+			t.Errorf("%s: camelCase key not accepted: %s", c.tool, firstText(content))
+		}
+	}
+	// Screenshot has its own wrapper.
+	resp := runLocalBridge(t, rt, nil, call(40, "local_cobrowse_screenshot", map[string]any{"sessionId": "cb-1"}))
+	if content, isErr := toolResult(t, resp["40"]); isErr && strings.Contains(firstText(content), "is required") {
+		t.Errorf("screenshot: camelCase key not accepted: %s", firstText(content))
+	}
+	// snake_case is unchanged.
+	resp = runLocalBridge(t, rt, nil, call(41, "local_cobrowse_status", map[string]any{"session_id": "cb-1"}))
+	if content, isErr := toolResult(t, resp["41"]); isErr {
+		t.Errorf("snake_case status failed: %s", firstText(content))
+	}
+}
+
+func TestLocalToolArgumentRefusalNamesKeysNotValues(t *testing.T) {
+	ownerDir := t.TempDir()
+	rt := newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: func() string { return ownerDir }, browser: newCmdFakeBrowser(), policy: allowAllURLs})
+	defer rt.close()
+	runLocalBridge(t, rt, nil, call(1, "local_cobrowse_start", nil))
+
+	// Duplicate: declared name plus a variant.
+	resp := runLocalBridge(t, rt, nil, call(2, "local_cobrowse_click", map[string]any{"session_id": "cb-1", "sessionId": auditSentinel, "selector": "#a"}))
+	content, isErr := toolResult(t, resp["2"])
+	if txt := firstText(content); !isErr || !strings.Contains(txt, "duplicate argument") || strings.Contains(txt, auditSentinel) {
+		t.Fatalf("duplicate must be refused without values: %v %q", isErr, txt)
+	}
+	// Missing session with an unknown key: names listed, value absent.
+	resp = runLocalBridge(t, rt, nil, call(3, "local_cobrowse_click", map[string]any{"sess": auditSentinel, "selector": "#a"}))
+	content, isErr = toolResult(t, resp["3"])
+	txt := firstText(content)
+	if !isErr || !strings.Contains(txt, `received argument keys: ["selector", "sess"]`) || strings.Contains(txt, auditSentinel) {
+		t.Fatalf("want sorted key names and no values: %v %q", isErr, txt)
+	}
+	// The received names are the client's own spelling, not the normalized one.
+	resp = runLocalBridge(t, rt, nil, call(4, "local_cobrowse_screenshot", map[string]any{"sessionID": "", "other": auditSentinel}))
+	content, _ = toolResult(t, resp["4"])
+	if txt := firstText(content); !strings.Contains(txt, `"sessionID"`) || strings.Contains(txt, auditSentinel) {
+		t.Fatalf("screenshot refusal: %q", txt)
+	}
+
+	dir := filepath.Join(ownerDir, localaudit.DirName)
+	recs, _ := localaudit.Read(dir, localaudit.Filter{})
+	found := false
+	for _, r := range recs {
+		if r.ResultingAction == "refused" && strings.Contains(r.Error, `"sess"`) {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("audit must record the received key names: %+v", recs)
+	}
+	files, _ := filepath.Glob(filepath.Join(dir, "*.jsonl"))
+	for _, f := range files {
+		if b, _ := os.ReadFile(f); bytes.Contains(b, []byte(auditSentinel)) {
+			t.Fatalf("argument value leaked into %s", f)
+		}
+	}
+}
+
+func TestLocalCobrowseSessionParamAlias(t *testing.T) {
+	ownerDir := t.TempDir()
+	rt := newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: func() string { return ownerDir }, browser: newCmdFakeBrowser(), policy: allowAllURLs})
+	defer rt.close()
+	runLocalBridge(t, rt, nil, call(1, "local_cobrowse_start", nil))
+
+	// tools/list declares cobrowse_session and requires it where session_id was.
+	resp := runLocalBridge(t, rt, nil, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
+	for _, raw := range resp["2"]["result"].(map[string]any)["tools"].([]any) {
+		tool := raw.(map[string]any)
+		schema := tool["inputSchema"].(map[string]any)
+		props := schema["properties"].(map[string]any)
+		if _, ok := props["session_id"]; ok {
+			t.Errorf("%v still declares session_id", tool["name"])
+		}
+		if _, ok := props["cobrowse_session"]; !ok {
+			continue
+		}
+		if tool["name"] == "local_cobrowse_screenshot" {
+			if req, _ := schema["required"].([]any); len(req) != 1 || req[0] != "cobrowse_session" {
+				t.Errorf("screenshot required: %v", schema["required"])
+			}
+		}
+	}
+
+	for _, key := range []string{"cobrowse_session", "session_id"} {
+		r := runLocalBridge(t, rt, nil, call(3, "local_cobrowse_screenshot", map[string]any{key: "cb-1"}))
+		if content, isErr := toolResult(t, r["3"]); isErr {
+			t.Errorf("%s screenshot refused: %s", key, firstText(content))
+		}
+		r = runLocalBridge(t, rt, nil, call(4, "local_cobrowse_status", map[string]any{key: "cb-1"}))
+		if content, isErr := toolResult(t, r["4"]); isErr || !strings.Contains(firstText(content), "cb-1") {
+			t.Errorf("%s status: %v %s", key, isErr, firstText(content))
+		}
+	}
+	// Same value under both names is fine.
+	r := runLocalBridge(t, rt, nil, call(5, "local_cobrowse_screenshot", map[string]any{"cobrowse_session": "cb-1", "session_id": "cb-1"}))
+	if content, isErr := toolResult(t, r["5"]); isErr {
+		t.Errorf("same value refused: %s", firstText(content))
+	}
+	// Differing values are refused, naming the parameter.
+	r = runLocalBridge(t, rt, nil, call(6, "local_cobrowse_click", map[string]any{"cobrowse_session": "cb-1", "session_id": "cb-9", "selector": "#a"}))
+	content, isErr := toolResult(t, r["6"])
+	if txt := firstText(content); !isErr || !strings.Contains(txt, "different values") || strings.Contains(txt, "cb-9") {
+		t.Errorf("conflict: %v %q", isErr, txt)
+	}
+	// Missing: the error names cobrowse_session.
+	r = runLocalBridge(t, rt, nil, call(7, "local_cobrowse_screenshot", map[string]any{"goal": "x"}))
+	content, isErr = toolResult(t, r["7"])
+	if txt := firstText(content); !isErr || !strings.Contains(txt, "'cobrowse_session' is required") {
+		t.Errorf("missing: %v %q", isErr, txt)
+	}
+}
+
+func TestLocalCobrowseRoutesToNamedSession(t *testing.T) {
+	for _, key := range []string{"cobrowse_session", "session_id"} {
+		ownerDir := t.TempDir()
+		rt := newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: func() string { return ownerDir }, browser: newCmdFakeBrowser(), policy: allowAllURLs})
+		runLocalBridge(t, rt, nil, call(1, "local_cobrowse_start", nil), call(2, "local_cobrowse_start", nil))
+		r := runLocalBridge(t, rt, nil, call(3, "local_cobrowse_stop", map[string]any{key: "cb-2"}))
+		if content, isErr := toolResult(t, r["3"]); isErr {
+			t.Fatalf("%s stop: %s", key, firstText(content))
+		}
+		r = runLocalBridge(t, rt, nil, call(4, "local_cobrowse_status", nil))
+		content, _ := toolResult(t, r["4"])
+		txt := firstText(content)
+		if !strings.Contains(txt, "cb-1") || strings.Contains(txt, "cb-2") {
+			t.Errorf("%s: want only cb-1 left, got %s", key, txt)
+		}
+		rt.close()
+	}
+}
+
+func TestLocalToolRefusesNonASCIIKeys(t *testing.T) {
+	ownerDir := t.TempDir()
+	rt := newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: func() string { return ownerDir }, browser: newCmdFakeBrowser(), policy: allowAllURLs})
+	defer rt.close()
+	runLocalBridge(t, rt, nil, call(1, "local_cobrowse_start", nil), call(2, "local_cobrowse_start", nil))
+	for i, args := range []map[string]any{
+		{"cobrowse_session": "cb-1", "ſession_id": "cb-2"},
+		{"cobrowse_session": "cb-1", "Key": auditSentinel, "selector": "#a"},
+	} {
+		tool := "local_cobrowse_stop"
+		if i == 1 {
+			tool = "local_cobrowse_key"
+			args["key"] = "Tab"
+		}
+		r := runLocalBridge(t, rt, nil, call(10+i, tool, args))
+		content, isErr := toolResult(t, r[strconv.Itoa(10+i)])
+		if txt := firstText(content); !isErr || !strings.Contains(txt, "non-ASCII") || strings.Contains(txt, auditSentinel) {
+			t.Errorf("case %d: %v %q", i, isErr, txt)
+		}
+	}
+	r := runLocalBridge(t, rt, nil, call(20, "local_cobrowse_status", nil))
+	content, _ := toolResult(t, r["20"])
+	if txt := firstText(content); !strings.Contains(txt, "cb-1") || !strings.Contains(txt, "cb-2") {
+		t.Errorf("a refused call changed sessions: %s", txt)
+	}
+}
