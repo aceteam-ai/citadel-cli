@@ -680,6 +680,10 @@ type DeviceAuthConfig struct {
 	// ExpiresAt is captured at the authorization request's entry, before any
 	// network or UI delay. Presentation and token responses never renew it.
 	ExpiresAt time.Time
+	// Optional callbacks are bound to this exact grant's CSR. They are selected
+	// from the captured config, never looked up by a mutable global device code.
+	PollToken func(deviceCode string, interval int) (*nexus.TokenResponse, error) `json:"-"`
+	Connect   func(token *nexus.TokenResponse, deviceCode string) error           `json:"-"`
 }
 
 // DeviceAuthCallbacks holds callbacks for device authorization flow

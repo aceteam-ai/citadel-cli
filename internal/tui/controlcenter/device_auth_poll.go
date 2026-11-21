@@ -147,6 +147,7 @@ func pollDeviceAuthorizationWithCleanup(ctx context.Context, config *DeviceAuthC
 		return nil, errors.New("device authorization polling is unavailable")
 	}
 	flow := *config
+	callbacks = deviceAuthCallbacksFor(&flow, callbacks)
 	if callbacks.EndFlow != nil {
 		defer callbacks.EndFlow(flow.DeviceCode)
 	}
@@ -200,4 +201,26 @@ func pollDeviceAuthorization(ctx context.Context, config *DeviceAuthConfig, expi
 		fetched := *token
 		return &fetched, nil
 	}
+}
+
+// Keep callback selection local to the captured grant. Older callers retain the
+// shared callbacks; CSR-aware callers bind polling and acceptance together.
+func deviceAuthCallbacksFor(config *DeviceAuthConfig, callbacks DeviceAuthCallbacks) DeviceAuthCallbacks {
+	if config != nil {
+		if config.PollToken != nil {
+			callbacks.PollToken = config.PollToken
+		}
+		if config.Connect != nil {
+			callbacks.Connect = config.Connect
+		}
+	}
+	return callbacks
+}
+
+func snapshotDeviceAuthConfig(config *DeviceAuthConfig) *DeviceAuthConfig {
+	if config == nil {
+		return nil
+	}
+	copy := *config
+	return &copy
 }
