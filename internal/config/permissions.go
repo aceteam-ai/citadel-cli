@@ -39,6 +39,7 @@ import (
 type Permissions struct {
 	Console   bool `yaml:"console" json:"console"`     // Terminal WebSocket access (default-deny, opt-in)
 	Desktop   bool `yaml:"desktop" json:"desktop"`     // VNC, screenshots, actions (default-deny, opt-in)
+	AMT       bool `yaml:"amt" json:"amt"`             // Intel AMT control (separate default-deny opt-in)
 	Files     bool `yaml:"files" json:"files"`         // File browser API (default-deny, opt-in)
 	Services  bool `yaml:"services" json:"services"`   // Service list/management (default-on, opt-out)
 	SSH       bool `yaml:"ssh" json:"ssh"`             // SSH authorized_keys sync (default-on, opt-out)
@@ -73,6 +74,7 @@ func DefaultPermissions() *Permissions {
 	return &Permissions{
 		Console:   false,
 		Desktop:   false,
+		AMT:       false,
 		Files:     false,
 		Services:  true,
 		SSH:       true,

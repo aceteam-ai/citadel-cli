@@ -12,8 +12,8 @@ import (
 // operational surfaces (services/ssh/provision) stay on.
 func TestDefaultPermissions_SensitiveSurfacesOff(t *testing.T) {
 	p := DefaultPermissions()
-	if p.Console || p.Desktop || p.Files || p.Shell {
-		t.Errorf("console/desktop/files/shell must be default-DENY on a fresh node, got %+v", p)
+	if p.Console || p.Desktop || p.AMT || p.Files || p.Shell {
+		t.Errorf("console/desktop/AMT/files/shell must be default-DENY on a fresh node, got %+v", p)
 	}
 	if !p.Services || !p.SSH || !p.Provision {
 		t.Errorf("services/ssh/provision should stay default-on (opt-out), got %+v", p)
@@ -28,7 +28,7 @@ func TestDefaultPermissions_SensitiveSurfacesOff(t *testing.T) {
 func TestLoadPermissions_NoFile_FreshNode(t *testing.T) {
 	dir := t.TempDir()
 	p := LoadPermissions(dir)
-	if p.Console || p.Desktop || p.Files || p.Shell {
+	if p.Console || p.Desktop || p.AMT || p.Files || p.Shell {
 		t.Errorf("no-file load must leave sensitive surfaces disabled, got %+v", p)
 	}
 	if !p.Services || !p.SSH || !p.Provision {
