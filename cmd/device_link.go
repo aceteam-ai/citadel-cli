@@ -92,6 +92,18 @@ func enrollmentNodeID(ctx context.Context) string {
 // expires within the hour. That says nothing about the server, so it is fatal
 // on every version, is not retried, and removes this enrollment's credentials.
 func linkDeviceEnrollmentGated(result *DeviceAuthResult, nodeID func(context.Context) string, client deviceLinker) error {
+	return linkDeviceEnrollmentGatedWith(result, nodeID, client, enrollmentRollbackFn, deviceLinkWarnFn)
+}
+
+// linkDeviceEnrollmentGatedWith is linkDeviceEnrollmentGated with the
+// credential rollback and the unverified-link warning supplied by the caller,
+// so the non-interactive enrollment core (citadel-cli#1867) rolls back its own
+// config dir and reports warnings without writing to a terminal. The gating
+// rules are the same for every caller.
+func linkDeviceEnrollmentGatedWith(result *DeviceAuthResult, nodeID func(context.Context) string, client deviceLinker, rollback func(*nexus.TokenResponse) error, warn func(string)) error {
+	if warn == nil {
+		warn = func(string) {}
+	}
 	attempt := func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
@@ -101,7 +113,7 @@ func linkDeviceEnrollmentGated(result *DeviceAuthResult, nodeID func(context.Con
 	if isDeviceLinkUnsent(linkErr) {
 		fatal := deviceEnrollmentRecoveryError(linkErr)
 		if result != nil {
-			if err := enrollmentRollbackFn(result.Token); err != nil {
+			if err := rollback(result.Token); err != nil {
 				return fmt.Errorf("%w (removing this enrollment's saved credentials also failed)", fatal)
 			}
 		}
@@ -124,18 +136,18 @@ func linkDeviceEnrollmentGated(result *DeviceAuthResult, nodeID func(context.Con
 		if ok && enforced {
 			fatal := deviceEnrollmentRecoveryError(linkErr)
 			if !uncertainAttempt && isDeviceLinkRefusal(linkErr) && result != nil {
-				if err := enrollmentRollbackFn(result.Token); err != nil {
+				if err := rollback(result.Token); err != nil {
 					return fmt.Errorf("%w (removing this enrollment's saved credentials also failed)", fatal)
 				}
 			}
 			return fatal
 		}
 		if ok {
-			deviceLinkWarnFn("⚠️  Device link is unverified on this older server (" + nexus.DeviceLinkDiagnostic(linkErr) + "); continuing for compatibility. Saved credentials do not prove completed device binding. Run 'citadel logout && citadel init' with fresh browser approval to register again.")
+			warn("⚠️  Device link is unverified on this older server (" + nexus.DeviceLinkDiagnostic(linkErr) + "); continuing for compatibility. Saved credentials do not prove completed device binding. Run 'citadel logout && citadel init' with fresh browser approval to register again.")
 			return nil
 		}
 	}
-	deviceLinkWarnFn("⚠️  Device link is unverified and the server version could not be verified (" + nexus.DeviceLinkDiagnostic(linkErr) + "); continuing for compatibility. Saved credentials do not prove completed device binding. Run 'citadel logout && citadel init' with fresh browser approval to register again.")
+	warn("⚠️  Device link is unverified and the server version could not be verified (" + nexus.DeviceLinkDiagnostic(linkErr) + "); continuing for compatibility. Saved credentials do not prove completed device binding. Run 'citadel logout && citadel init' with fresh browser approval to register again.")
 	return nil
 }
 

@@ -722,34 +722,51 @@ func getSelectedService() (string, error) {
 }
 
 func getNodeName() (string, error) {
+	name, generated, err := resolveNodeName(initNodeName)
+	if err != nil || !generated {
+		return name, err
+	}
+	// Offer a friendlier name when the resolved name is auto-generated.
+	return offerFriendlierName(name), nil
+}
+
+// resolveNodeNameNonInteractive is getNodeName for a caller with no terminal
+// (citadel-cli#1867): an explicit name, else the saved one, else a meaningful
+// OS hostname, else a generated name. It never prompts and never reads the
+// init command's --node-name flag.
+func resolveNodeNameNonInteractive(explicit string) (string, error) {
+	name, _, err := resolveNodeName(explicit)
+	return name, err
+}
+
+// resolveNodeName reports the node name and whether it was generated.
+func resolveNodeName(explicit string) (string, bool, error) {
 	// 1. Explicit --node-name flag always wins
-	if initNodeName != "" {
-		return initNodeName, nil
+	if explicit != "" {
+		return explicit, false, nil
 	}
 
 	// 2. Check if a hostname was previously saved to config (for re-run stability)
 	if saved := getSavedHostname(); saved != "" {
 		Debug("using saved hostname from config: %s", saved)
-		return saved, nil
+		return saved, false, nil
 	}
 
 	// 3. Use the current OS hostname if it's meaningful (user-chosen).
 	//    Skip generic names from live ISOs and fresh installs.
 	if current, err := os.Hostname(); err == nil && !platform.IsGenericHostname(current) {
 		Debug("preserving existing OS hostname: %s", current)
-		return current, nil
+		return current, false, nil
 	}
 
 	// 4. Generate a citadel-<short_id> hostname for generic/missing hostnames.
 	generated, err := platform.GenerateCitadelHostname()
 	if err != nil {
-		return "", fmt.Errorf("could not generate hostname: %w", err)
+		return "", false, fmt.Errorf("could not generate hostname: %w", err)
 	}
 
 	Debug("generated hostname: %s", generated)
-
-	// Offer a friendlier name when the resolved name is auto-generated.
-	return offerFriendlierName(generated), nil
+	return generated, true, nil
 }
 
 // offerFriendlierName interactively offers to replace an auto-generated
@@ -1204,7 +1221,12 @@ func maskToken(token string) string {
 // to the legacy platform.ConfigDir() location for a node registered before
 // this fix.
 func saveDeviceConfigToFile(token *nexus.TokenResponse) error {
-	globalConfigDir := nodeConfigDirFn()
+	return saveDeviceConfigToDir(nodeConfigDirFn(), token)
+}
+
+// saveDeviceConfigToDir is saveDeviceConfigToFile for an explicit node config
+// dir, so the enrollment core and its tests never resolve the machine's own.
+func saveDeviceConfigToDir(globalConfigDir string, token *nexus.TokenResponse) error {
 	globalConfigFile := filepath.Join(globalConfigDir, "config.yaml")
 
 	// Ensure config directory exists
@@ -1351,7 +1373,11 @@ func verifyConfigPersisted(configFile, expectedToken string) error {
 // prior enrollment must be removed, otherwise runWork will prefer the stale
 // device_api_token and silently ignore this newly issued Redis URL.
 func saveRedisURLToConfig(redisURL string) error {
-	globalConfigDir := nodeConfigDirFn()
+	return saveRedisURLToDir(nodeConfigDirFn(), redisURL)
+}
+
+// saveRedisURLToDir is saveRedisURLToConfig for an explicit node config dir.
+func saveRedisURLToDir(globalConfigDir, redisURL string) error {
 	globalConfigFile := filepath.Join(globalConfigDir, "config.yaml")
 
 	// Ensure config directory exists
@@ -1876,6 +1902,27 @@ func connectToNetworkForceLogin(nodeName, authKey string) error {
 }
 
 func connectToNetworkOpts(nodeName, authKey string, forceLogin bool) error {
+	ip, err := registerOnNetwork(nodeName, authKey, forceLogin)
+	if err != nil {
+		return err
+	}
+	if ip != "" {
+		fmt.Printf("   IP: %s\n", ip)
+	}
+	return nil
+}
+
+// connectToNetworkQuiet is connectToNetwork without terminal output, for the
+// non-interactive enrollment core (citadel-cli#1867).
+func connectToNetworkQuiet(nodeName, authKey string) error {
+	_, err := registerOnNetwork(nodeName, authKey, false)
+	return err
+}
+
+// registerOnNetwork registers this host with authKey, records the registered
+// node ID for the device link and disconnects so tsnet flushes its state. It
+// returns the network IP it was assigned, and prints nothing.
+func registerOnNetwork(nodeName, authKey string, forceLogin bool) (string, error) {
 	// Record the pre-registration OS hostname (once) so it can be restored
 	// later via 'citadel rename'. saveOriginalHostnameToConfig is a no-op if an
 	// original hostname has already been recorded.
@@ -1917,11 +1964,11 @@ func connectToNetworkOpts(nodeName, authKey string, forceLogin bool) error {
 	setRegisteredNodeID("")
 	srv, err := network.Connect(ctx, config)
 	if err != nil {
-		return fmt.Errorf("failed to connect: %w", err)
+		return "", fmt.Errorf("failed to connect: %w", err)
 	}
 	if err := persistPrivateCATrust(authServiceURL, nexusURL); err != nil {
 		_ = network.Disconnect()
-		return err
+		return "", err
 	}
 
 	// Persist the control URL we just enrolled against so every later reconnect
@@ -1933,20 +1980,17 @@ func connectToNetworkOpts(nodeName, authKey string, forceLogin bool) error {
 	// The first successful enroll fixes the durable session mode. Authkey-only
 	// nodes are presence-only; device-authorized nodes default to workers.
 	if _, err := nodesession.LoadOrInitialize(network.GetNodeConfigDir(), hasDeviceConfigured()); err != nil {
-		return fmt.Errorf("persist node session mode: %w", err)
+		return "", fmt.Errorf("persist node session mode: %w", err)
 	}
 
 	ip, _ := srv.GetIPv4()
-	if ip != "" {
-		fmt.Printf("   IP: %s\n", ip)
-	}
 
 	// Disconnect cleanly so tsnet flushes its state files, then the
 	// post-Close chown in Disconnect() fixes ownership for the non-root
 	// worker process. The work command re-establishes its own connection.
 	recordRegistrationThenDisconnect(ctx, srv.Status, network.Disconnect)
 
-	return nil
+	return ip, nil
 }
 
 // recordRegistrationThenDisconnect records the registered node ID and only
@@ -1966,6 +2010,13 @@ func recordRegistrationThenDisconnect(ctx context.Context, status func(context.C
 //
 // The call is best-effort: failures are logged but do not block init.
 func reclaimStaleNodeByHostname(apiToken, hostname string) {
+	reclaimStaleNodeByHostnameWith(authServiceURL, apiToken, hostname, func(msg string) { fmt.Println(msg) })
+}
+
+// reclaimStaleNodeByHostnameWith is reclaimStaleNodeByHostname against an
+// explicit auth service, reporting a completed reclaim through notify (nil:
+// report nothing).
+func reclaimStaleNodeByHostnameWith(authURL, apiToken, hostname string, notify func(string)) {
 	if apiToken == "" || hostname == "" {
 		return
 	}
@@ -1975,14 +2026,14 @@ func reclaimStaleNodeByHostname(apiToken, hostname string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	result, err := nexus.ReclaimStaleNode(ctx, authServiceURL, apiToken, hostname)
+	result, err := nexus.ReclaimStaleNode(ctx, authURL, apiToken, hostname)
 	if err != nil {
 		Debug("stale node reclaim failed (non-fatal): %v", err)
 		return
 	}
 
-	if result.Reclaimed {
-		fmt.Printf("   Reclaimed stale node '%s' (previous registration cleaned up)\n", hostname)
+	if result.Reclaimed && notify != nil {
+		notify(fmt.Sprintf("   Reclaimed stale node '%s' (previous registration cleaned up)", hostname))
 	}
 	Debug("reclaim result: %s", result.Message)
 }
