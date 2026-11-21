@@ -110,9 +110,8 @@ func TestExposeRefusesEverythingButSelfOrigin(t *testing.T) {
 	}
 }
 
-// The other /agent/* routes keep their existing requireVPNOrAuth posture; this
-// change is scoped to expose/unexpose.
-func TestNonExposeAgentRoutesUnchanged(t *testing.T) {
+// Nonexposure agent endpoints refuse plaintext without invoking a provider.
+func TestNonExposeAgentRoutesRefusePlaintext(t *testing.T) {
 	called := false
 	p := &AgentProviders{WorkerStatus: func() any { called = true; return map[string]any{} }}
 	s := NewServer(ServerConfig{Port: 8080, Version: "test", Agent: p, SelfMeshIPs: selfIPs},
@@ -121,8 +120,8 @@ func TestNonExposeAgentRoutesUnchanged(t *testing.T) {
 	s.registerAgentRoutes(mux)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, vpnReq(http.MethodGet, "/agent/worker-status"))
-	if w.Code != http.StatusOK || !called {
-		t.Fatalf("worker-status from a mesh peer: want 200, got %d", w.Code)
+	if w.Code != http.StatusForbidden || called {
+		t.Fatalf("worker-status from a mesh peer: want 403 and no call, got %d and called=%v", w.Code, called)
 	}
 }
 
