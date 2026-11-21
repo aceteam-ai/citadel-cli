@@ -7,12 +7,16 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
 
 func TestSuspendRuntimeRechecksPayloadAnchorAfterFinalProof(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("open Windows directory handles prevent rename; native handle pin/loss cases cover that boundary")
+	}
 	f := newSuspendRuntimeFixture(t)
 	proof := f.s.proc.stopForSuspend
 	retained := f.store.payloads.root.Name() + ".retained"
@@ -201,7 +205,7 @@ func TestSuspendRuntimeCaptureToDurableSlotRetirement(t *testing.T) {
 }
 
 func TestSuspendRuntimeFailureRetainsSlotAndCapture(t *testing.T) {
-	for _, kind := range []string{"unsupported", "staging-busy", "slot-missing", "manager-busy", "wrong-profile", "manager-registry-mismatch", "proof-error", "unreaped", "cleanup-error", "cleanup-noop", "runtime-drift", "state-drift", "reaper-drift", "working-copy-replaced", "late-proof-error", "publish-uncertain"} {
+	for _, kind := range []string{"unsupported", "staging-busy", "slot-missing", "manager-busy", "wrong-profile", "manager-registry-mismatch", "proof-error", "unreaped", "cleanup-error", "cleanup-noop", "runtime-drift", "state-drift", "reaper-drift", "working-copy-replaced", "working-copy-replaced-at-proof", "late-proof-error", "publish-uncertain"} {
 		t.Run(kind, func(t *testing.T) {
 			f := newSuspendRuntimeFixture(t)
 			original := f.s.proc
@@ -256,15 +260,26 @@ func TestSuspendRuntimeFailureRetainsSlotAndCapture(t *testing.T) {
 						f.s.proc.exited = other
 						return nil
 					}
-				case "working-copy-replaced":
-					f.close = func(context.Context, suspendBrowserClosePlan, func() error) error {
+				case "working-copy-replaced", "working-copy-replaced-at-proof":
+					move := func() {
 						if err := os.Rename(f.s.profile, f.s.profile+".retained"); err != nil {
 							t.Fatal(err)
 						}
 						if err := EnsurePrivateDir(f.s.profile); err != nil {
 							t.Fatal(err)
 						}
-						return nil
+					}
+					if kind == "working-copy-replaced" {
+						f.close = func(context.Context, suspendBrowserClosePlan, func() error) error {
+							move()
+							return nil
+						}
+					} else {
+						proof := f.s.proc.stopForSuspend
+						f.s.proc.stopForSuspend = func(ctx context.Context) error {
+							move()
+							return proof(ctx)
+						}
 					}
 				case "late-proof-error":
 					proof := f.s.proc.stopForSuspend
@@ -295,7 +310,12 @@ func TestSuspendRuntimeFailureRetainsSlotAndCapture(t *testing.T) {
 			if kind != "slot-missing" && kind != "manager-busy" && f.m.sessions[f.live.ID] != f.s {
 				t.Fatal("failed completion released the manager slot")
 			}
-			if kind == "working-copy-replaced" {
+			if kind == "working-copy-replaced" || kind == "working-copy-replaced-at-proof" {
+				for _, effect := range f.order {
+					if effect == "clean" {
+						t.Fatal("replacement directory reached cleanup")
+					}
+				}
 				if _, err := os.Stat(f.s.profile); err != nil {
 					t.Fatal("replacement working directory was removed")
 				}

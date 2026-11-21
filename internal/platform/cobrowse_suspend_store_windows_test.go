@@ -2,7 +2,79 @@
 
 package platform
 
-import "testing"
+import (
+	"bytes"
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"golang.org/x/sys/windows"
+)
+
+// Windows pins an open directory against rename. Exercise that native boundary,
+// and separately require a lost root handle to keep the runtime unacknowledged.
+func TestWindowsSuspendRuntimePayloadAnchor(t *testing.T) {
+	for _, lost := range []bool{false, true} {
+		name := "rename-blocked"
+		if lost {
+			name = "handle-lost"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newSuspendRuntimeFixture(t)
+			proof := f.s.proc.stopForSuspend
+			rootPath := f.store.payloads.root.Name()
+			var original []byte
+			var payloadName string
+			f.s.proc.stopForSuspend = func(ctx context.Context) error {
+				if err := proof(ctx); err != nil {
+					return err
+				}
+				if f.proofs != 2 {
+					return nil
+				}
+				current, err := f.store.read(f.live.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				payloadName, err = suspendManifestName(current)
+				if err != nil {
+					t.Fatal(err)
+				}
+				original, err = os.ReadFile(filepath.Join(rootPath, payloadName))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if lost {
+					if err := f.store.payloads.root.Close(); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					if err := os.Rename(rootPath, rootPath+".retained"); !errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
+						t.Fatal("open payload directory did not reject rename with sharing violation", err)
+					}
+					if _, err := os.Lstat(rootPath + ".retained"); !os.IsNotExist(err) {
+						t.Fatal("refused rename created a detached payload directory", err)
+					}
+				}
+				return nil
+			}
+			err := f.run(t, nil)
+			if lost {
+				if err == nil || f.m.sessions[f.live.ID] != f.s || f.s.proc == nil {
+					t.Fatal("lost payload handle acknowledged or released runtime", err)
+				}
+			} else if err != nil || len(f.m.sessions) != 0 || f.s.proc != nil {
+				t.Fatal("OS-pinned payload prevented valid completion", err)
+			}
+			kept, readErr := os.ReadFile(filepath.Join(rootPath, payloadName))
+			if readErr != nil || len(original) == 0 || !bytes.Equal(kept, original) {
+				t.Fatal("payload handle check changed captured bytes", readErr)
+			}
+		})
+	}
+}
 
 // The existing native Windows CI selects TestWindows*. Exercise the same
 // storage/OS-lock contract there without changing or bypassing the workflow.
@@ -13,7 +85,7 @@ func TestWindowsSuspendManifestStorage(t *testing.T) {
 		"runtime-admission":        TestSuspendRuntimeAdmissionBeforeEffects,
 		"runtime-stop-race":        TestSuspendRuntimeStopWaitsUntilCommittedSlotRetirement,
 		"runtime-cancellation":     TestSuspendRuntimeSharesBudgetAndRetainsUncertainEffects,
-		"runtime-payload-anchor":   TestSuspendRuntimeRechecksPayloadAnchorAfterFinalProof,
+		"runtime-payload-anchor":   TestWindowsSuspendRuntimePayloadAnchor,
 		"runtime-reconciliation":   TestSuspendRuntimeReconcilesUncertainPublishWithoutRefreshingCapture,
 		"runtime-cleanup-retry":    TestSuspendRuntimeRetryAfterCleanupFailureKeepsOriginalCapture,
 		"legacy-observer-fixture":  TestRestartFixtureJoinsObserverBeforeReset,

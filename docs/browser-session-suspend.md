@@ -181,6 +181,8 @@ capture-to-intent continuation exercises that composition in tests. Manager and
 staging locks refuse immediately when busy, rather than waiting while holding
 the outer gates. Staging closes before effects, and runtime generation, state,
 proc/reaper, registry and working-directory identity stay pinned around awaits.
+The working-directory identity is snapshotted through a no-follow handle before
+callbacks; a lazy path-based Windows file ID is not a pre-callback snapshot.
 Cleanup receives only the pinned throwaway working-directory path, after positive
 resource proof, and absence is verified before publication and slot retirement.
 An uncertain final publish retains the slot; retry reconciles the exact record
@@ -195,6 +197,10 @@ all-runner resource proofs, saved-profile integration and the surrounding full
 manager lifecycle/recovery remain unfinished. No job or advertised capability
 invokes the private completion. Tests use synthetic captures, fake resources and
 only their own temporary working directories; they do not prove native teardown.
+The late payload-root replacement fixture runs where open directories can be
+renamed. Its Windows counterpart checks that native handle sharing blocks the
+rename and separately requires a lost payload root handle to retain the runtime
+and captured bytes rather than acknowledge completion.
 
 A separate private scope-pair adapter accepts only copied, complete per-launch
 invocation and process-birth observations for the browser and its dedicated

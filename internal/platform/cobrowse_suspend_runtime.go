@@ -66,6 +66,21 @@ func (m *CobrowseSessionManager) completeStagedThrowawaySuspend(ctx context.Cont
 			(runtime.GOOS != "windows" && workInfo.Mode().Perm()&0o077 != 0))) {
 		return refuse()
 	}
+	if e2 == nil {
+		// Path-based Windows FileInfo resolves its file ID lazily in SameFile.
+		// Snapshot through a no-follow handle now, not after an awaited callback
+		// may have replaced that path. Do not retain a handle across cleanup.
+		work, err := openPrivateNoFollow(profile)
+		if err != nil {
+			return refuse()
+		}
+		opened, statErr := work.Stat()
+		closeErr := work.Close()
+		if statErr != nil || closeErr != nil || !opened.IsDir() || !os.SameFile(workInfo, opened) {
+			return refuse()
+		}
+		workInfo = opened
+	}
 	transitioned := false
 	check := func() error {
 		if ctx.Err() != nil || m.sessions[intent.ID] != s || m.registryDir() != managerDir {
