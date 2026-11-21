@@ -2,6 +2,9 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
+	"time"
 
 	redisclient "github.com/aceteam-ai/citadel-cli/internal/redis"
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
@@ -15,6 +18,8 @@ type RedisStreamWriter struct {
 	jobID  string
 	rayID  string
 	ctx    context.Context
+	// retain also stores terminal events under TerminalResultKey.
+	retain bool
 }
 
 // NewRedisStreamWriter creates a new Redis-backed stream writer.
@@ -44,20 +49,43 @@ func (w *RedisStreamWriter) WriteChunk(content string, index int) error {
 	return w.client.PublishChunk(w.ctx, w.jobID, w.rayID, content, index)
 }
 
+// WriteReasoningChunk keeps reasoning out of the answer-content stream.
+func (w *RedisStreamWriter) WriteReasoningChunk(content string, index int) error {
+	return w.client.PublishStreamEvent(w.ctx, w.jobID, w.rayID, "chunk", map[string]any{
+		"reasoning_content": content,
+		"index":             index,
+	})
+}
+
 // WriteEnd signals successful job completion with final result.
 func (w *RedisStreamWriter) WriteEnd(result map[string]any) error {
-	return w.client.PublishStreamEvent(w.ctx, w.jobID, w.rayID, "end", w.clock.data(map[string]any{"result": result}, true))
+	return w.publishTerminal("end", w.clock.data(map[string]any{"result": result}, true))
 }
 
 // WriteError signals job failure.
 func (w *RedisStreamWriter) WriteError(err error, recoverable bool) error {
-	return w.client.PublishStreamEvent(w.ctx, w.jobID, w.rayID, "error", w.clock.data(map[string]any{"error": err.Error(), "recoverable": recoverable}, true))
+	return w.publishTerminal("error", w.clock.data(map[string]any{"error": err.Error(), "recoverable": recoverable}, true))
 }
 
 // WriteCancelled signals job cancellation.
 func (w *RedisStreamWriter) WriteCancelled(reason string) error {
 	w.client.SetJobStatus(w.ctx, w.jobID, "cancelled", nil)
-	return w.client.PublishStreamEvent(w.ctx, w.jobID, w.rayID, "cancelled", w.clock.data(map[string]any{"reason": reason}, true))
+	return w.publishTerminal("cancelled", w.clock.data(map[string]any{"reason": reason}, true))
+}
+
+// publishTerminal publishes a terminal event and, for a retaining writer, then
+// stores the same envelope under TerminalResultKey. Only the publish error is
+// returned, so a retention failure never triggers a publish retry.
+func (w *RedisStreamWriter) publishTerminal(eventType string, data map[string]any) error {
+	eventJSON, err := w.client.StreamEventJSON(w.jobID, w.rayID, eventType, data)
+	if err != nil {
+		return err
+	}
+	publishErr := w.client.PublishStreamEventJSON(w.ctx, w.jobID, eventJSON)
+	if w.retain {
+		retainTerminalEvent(w.ctx, w.client, w.jobID, eventJSON)
+	}
+	return publishErr
 }
 
 // WriteProgress publishes a throttled progress event on the job's pub/sub stream
@@ -76,8 +104,16 @@ var _ StreamWriter = (*RedisStreamWriter)(nil)
 // This is used with Runner.WithStreamWriterFactory().
 func CreateRedisStreamWriterFactory(ctx context.Context, source *RedisSource) func(job *Job) StreamWriter {
 	return func(job *Job) StreamWriter {
-		return NewRedisStreamWriter(ctx, source.Client(), job.ID, job.RayID)
+		return redisStreamWriterFor(ctx, source.Client(), job)
 	}
+}
+
+// redisStreamWriterFor builds a job's direct-Redis writer, retaining terminal
+// events for the job types retainsTerminalResult names.
+func redisStreamWriterFor(ctx context.Context, client *redisclient.Client, job *Job) *RedisStreamWriter {
+	w := NewRedisStreamWriter(ctx, client, job.ID, job.RayID)
+	w.retain = retainsTerminalResult(job.Type)
+	return w
 }
 
 // APIStreamWriter implements StreamWriter using the Redis API proxy.
@@ -89,6 +125,10 @@ type APIStreamWriter struct {
 	jobID   string
 	rayID   string
 	ctx     context.Context
+	// retainer, when set, stores terminal events through the scoped
+	// POST /api/fabric/redis/jobs/{jobId}/result route (citadel-cli#1553).
+	// A durable delivery commits its terminal envelope itself and never retains.
+	retainer terminalRetainer
 }
 
 // NewAPIStreamWriter creates a new API-backed stream writer.
@@ -120,14 +160,22 @@ func (w *APIStreamWriter) WriteChunk(content string, index int) error {
 	return w.client.PublishChunk(w.ctx, w.jobID, w.rayID, content, index)
 }
 
+// WriteReasoningChunk keeps reasoning out of the answer-content stream.
+func (w *APIStreamWriter) WriteReasoningChunk(content string, index int) error {
+	return w.client.PublishStreamEvent(w.ctx, w.jobID, w.rayID, "chunk", map[string]any{
+		"reasoning_content": content,
+		"index":             index,
+	})
+}
+
 // WriteEnd signals successful job completion with final result.
 func (w *APIStreamWriter) WriteEnd(result map[string]any) error {
-	return w.client.PublishStreamEvent(w.ctx, w.jobID, w.rayID, "end", w.clock.data(map[string]any{"result": result}, true))
+	return w.publishTerminal("end", w.clock.data(map[string]any{"result": result}, true))
 }
 
 // WriteError signals job failure.
 func (w *APIStreamWriter) WriteError(err error, recoverable bool) error {
-	return w.client.PublishStreamEvent(w.ctx, w.jobID, w.rayID, "error", w.clock.data(map[string]any{"error": err.Error(), "recoverable": recoverable}, true))
+	return w.publishTerminal("error", w.clock.data(map[string]any{"error": err.Error(), "recoverable": recoverable}, true))
 }
 
 // WriteCancelled signals job cancellation.
@@ -135,7 +183,23 @@ func (w *APIStreamWriter) WriteCancelled(reason string) error {
 	if !w.durable {
 		w.client.SetJobStatus(w.ctx, w.jobID, "cancelled", nil)
 	}
-	return w.client.PublishStreamEvent(w.ctx, w.jobID, w.rayID, "cancelled", w.clock.data(map[string]any{"reason": reason}, true))
+	return w.publishTerminal("cancelled", w.clock.data(map[string]any{"reason": reason}, true))
+}
+
+// publishTerminal publishes a terminal event and, for a non-durable writer with
+// a retainer, then stores the same envelope under TerminalResultKey. Only the
+// publish error is returned.
+func (w *APIStreamWriter) publishTerminal(eventType string, data map[string]any) error {
+	event := w.client.BuildStreamEvent(w.jobID, w.rayID, eventType, data)
+	publishErr := w.client.PublishEvent(w.ctx, event)
+	if w.retainer != nil && !w.durable {
+		if eventJSON, err := json.Marshal(event); err != nil {
+			retentionLogf("job %s: retaining terminal result failed (publish unaffected): %v", w.jobID, err)
+		} else {
+			retainTerminalEvent(w.ctx, w.retainer, w.jobID, eventJSON)
+		}
+	}
+	return publishErr
 }
 
 // WriteProgress publishes a throttled progress event via the API proxy and
@@ -155,8 +219,32 @@ var _ StreamWriter = (*APIStreamWriter)(nil)
 // This is used with Runner.WithStreamWriterFactory().
 func CreateAPIStreamWriterFactory(ctx context.Context, source *APISource) func(job *Job) StreamWriter {
 	return func(job *Job) StreamWriter {
-		return NewAPIStreamWriter(ctx, source.Client(), job.ID, job.RayID)
+		return apiStreamWriterFor(ctx, source.Client(), job)
 	}
+}
+
+// apiStreamWriterFor builds a job's API-proxy writer. API-mode retention is
+// on for the job types retainsTerminalResult names.
+func apiStreamWriterFor(ctx context.Context, client *redisapi.Client, job *Job) *APIStreamWriter {
+	w := NewAPIStreamWriter(ctx, client, job.ID, job.RayID)
+	if retainsTerminalResult(job.Type) {
+		w.retainer = apiTerminalRetainer(client)
+	}
+	return w
+}
+
+// apiTerminalRetainer is the API-mode retention seam: it posts the terminal
+// envelope to the scoped POST /api/fabric/redis/jobs/{jobId}/result route
+// through the node's existing proxy client. A package var so tests can swap it.
+var apiTerminalRetainer = func(c *redisapi.Client) terminalRetainer { return apiResultRetainer{c} }
+
+// apiResultRetainer adapts redisapi.Client to terminalRetainer. The interface
+// carries the direct-mode key, so the job id is recovered from it.
+type apiResultRetainer struct{ client *redisapi.Client }
+
+func (r apiResultRetainer) RetainTerminalEvent(ctx context.Context, key string, eventJSON []byte, ttl time.Duration) (bool, error) {
+	jobID := strings.TrimSuffix(strings.TrimPrefix(key, "job:"), ":result")
+	return r.client.RetainTerminalResult(ctx, jobID, eventJSON, ttl)
 }
 
 // clockStreamWriter observes existing carriers without creating any event or
@@ -165,6 +253,16 @@ func CreateAPIStreamWriterFactory(ctx context.Context, source *APISource) func(j
 type clockStreamWriter struct {
 	StreamWriter
 	clock *deliveryClock
+}
+
+// Preserve optional reasoning delivery through the runner's clock wrapper.
+// Without this forwarding method, the LLM handler sees only the wrapper and
+// drops reasoning chunks even when the underlying writer supports them.
+func (w *clockStreamWriter) WriteReasoningChunk(content string, index int) error {
+	if writer, ok := w.StreamWriter.(reasoningChunkWriter); ok {
+		return writer.WriteReasoningChunk(content, index)
+	}
+	return nil
 }
 
 func observeStream(writer StreamWriter, clock *deliveryClock) StreamWriter {

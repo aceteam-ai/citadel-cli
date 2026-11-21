@@ -20,6 +20,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/meetingpolicy"
+	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
 	"github.com/aceteam-ai/citadel-cli/internal/usage"
 )
 
@@ -164,6 +165,10 @@ func NewRunner(source JobSource, handlers []JobHandler, config RunnerConfig) *Ru
 		workReceiptNodeID:  config.WorkReceiptNodeID,
 	}
 
+	if rep, ok := source.(rateLimitReporter); ok {
+		config.State.SetRateLimitSource(rep.RateLimitWindow)
+	}
+
 	// The general unbounded lane always exists (exec-concurrency 1): it is the
 	// relocated single-writer lock over the unlocked manifest/lockfile paths.
 	r.unboundedLane = newLane("unbounded", resolveUnboundedLaneQueue(), 1, false)
@@ -211,6 +216,38 @@ func (r *Runner) log(level, format string, args ...interface{}) {
 // redisapi client). Used to surface the pre-fix #3924 400s (issue #236).
 type consumeStatusReporter interface {
 	LastConsumeStatus() int
+}
+
+// rateLimitReporter is implemented by sources whose API client tracks an open
+// platform 429 window (APISource). Surfaced on /worker (citadel-cli#1677).
+type rateLimitReporter interface {
+	RateLimitWindow() (since time.Time, retryAfter time.Duration, ok bool)
+}
+
+// Bounds on honoring a server Retry-After in the consume loop (#1677): the
+// floor keeps a tiny hint from becoming a hot loop, the cap keeps a huge one
+// (the daily-quota 429 hints hours) from parking the worker past a recovery.
+const (
+	rateLimitBackoffFloor = time.Second
+	rateLimitBackoffCap   = 30 * time.Second
+)
+
+// fetchBackoff returns how long the fetch loop waits after a failed poll. A 429
+// waits the clamped server hint instead of the exponential schedule, so the
+// consume loop stops adding load to the bucket the heartbeat shares.
+func fetchBackoff(err error, backoff time.Duration, now time.Time) (wait time.Duration, rateLimited bool) {
+	rle, ok := redisapi.AsRateLimitError(err)
+	if !ok {
+		return backoff, false
+	}
+	wait = rle.Wait(now)
+	if wait < rateLimitBackoffFloor {
+		wait = rateLimitBackoffFloor
+	}
+	if wait > rateLimitBackoffCap {
+		wait = rateLimitBackoffCap
+	}
+	return wait, true
 }
 
 // fetchErrLogLevel decides whether (and how loudly) a job-fetch failure on the
@@ -485,19 +522,23 @@ runLoop:
 					continue // intentional drain interrupted the source poll
 				}
 				consecutiveFetchErrs++
+				wait, rateLimited := fetchBackoff(err, backoff, time.Now())
 				if level, ok := fetchErrLogLevel(consecutiveFetchErrs, sustainedFetchErrThreshold, sustainedFetchErrRepeat); ok {
 					if consecutiveFetchErrs == 1 {
 						// First blip in a streak: record quietly (persisted to the
 						// log, info-level so it doesn't alarm) and let backoff retry.
-						r.log(level, "Job fetch retrying (backoff %s): %v", backoff, err)
+						r.log(level, "Job fetch retrying (backoff %s): %v", wait, err)
 					} else {
 						r.log(level, "Job fetching has failed %d cycles in a row: %v", consecutiveFetchErrs, err)
 					}
 				}
 				select {
-				case <-time.After(backoff):
+				case <-time.After(wait):
 				case <-ctx.Done():
 					break runLoop
+				}
+				if rateLimited {
+					continue // the server's hint replaces the exponential schedule
 				}
 				// Exponential backoff up to max
 				backoff *= 2
@@ -1825,7 +1866,7 @@ func (r *Runner) finishQueueWaitExceeded(ctx context.Context, job *Job, stream S
 	output := map[string]any{
 		"status":        "model_warming",
 		"model":         model,
-		"eta_seconds":   0,
+		"eta_seconds":   warmingRetryAfter,
 		"retry_after":   warmingRetryAfter,
 		"warming_for":   "queue",
 		"queue_wait_ms": queueWaitMs,

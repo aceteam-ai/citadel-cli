@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // stubRefresh swaps the package-level catalogRefresh for the duration of a test,
@@ -69,38 +70,65 @@ func TestResolveSelfHealingStillAbsentAfterRefresh(t *testing.T) {
 	}
 }
 
-// TestResolveSelfHealingStillAbsentAndRefreshFailed covers the branch none of
-// the other tests hit: the refresh call itself errors (e.g. a fully offline
-// node -- git clone fails outright, not just a partial multi-source error) AND
-// the module is still absent afterward. This is the message an operator
-// actually reads when self-heal can't help ("no network" rather than "found
-// nothing new"), so it must mention both the not-found and the refresh
-// failure, and still classify as ErrServiceNotFound.
-func TestResolveSelfHealingStillAbsentAndRefreshFailed(t *testing.T) {
+// TestResolveSelfHealingNoCacheAndRefreshFailed: with no catalog cache at all
+// and a failed refresh, the catalog cannot answer, so the error must say the
+// catalog is unavailable (not "not found") and carry the sanitized cause.
+func TestResolveSelfHealingNoCacheAndRefreshFailed(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
 	calls := stubRefresh(t, func() error {
-		return errors.New("dial tcp: lookup github.com: no such host")
+		return errors.New("clone failed: fatal: unable to access\n'https://user:tok@example.invalid/x/': no such host")
 	})
 
-	_, err := ResolveCatalogServiceSelfHealing("nonexistent")
+	_, err := ResolveCatalogServiceSelfHealing("meeting")
 	if err == nil {
-		t.Fatal("expected an error when the module is absent and the refresh itself failed")
+		t.Fatal("expected an error")
 	}
-	if !errors.Is(err, ErrServiceNotFound) {
-		t.Errorf("error = %v, want it to wrap ErrServiceNotFound", err)
+	if !errors.Is(err, ErrCatalogUnavailable) {
+		t.Errorf("error = %v, want ErrCatalogUnavailable", err)
 	}
-	if !strings.Contains(err.Error(), "not found in catalog") {
-		t.Errorf("error = %q, want the not-found message", err.Error())
+	if errors.Is(err, ErrServiceNotFound) || strings.Contains(err.Error(), "not found in catalog") {
+		t.Errorf("error = %q, must not claim the service is not found", err.Error())
 	}
-	if !strings.Contains(err.Error(), "catalog refresh also failed") {
-		t.Errorf("error = %q, want it to also surface the refresh failure", err.Error())
+	if !strings.Contains(err.Error(), "citadel service catalog update") {
+		t.Errorf("error = %q, want the catalog update hint", err.Error())
 	}
 	if !strings.Contains(err.Error(), "no such host") {
-		t.Errorf("error = %q, want the underlying refresh error text", err.Error())
+		t.Errorf("error = %q, want the cause", err.Error())
+	}
+	if strings.Contains(err.Error(), "tok@") || strings.Contains(err.Error(), "\n") {
+		t.Errorf("error = %q, cause not sanitized", err.Error())
 	}
 	if *calls != 1 {
 		t.Errorf("catalog refresh called %d times, want exactly 1", *calls)
+	}
+}
+
+// TestLoadManifestSelfHealingNoCacheAndRefreshFailed covers the manifest path
+// used by `catalog info` / `module info`.
+func TestLoadManifestSelfHealingNoCacheAndRefreshFailed(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	stubRefresh(t, func() error { return errors.New("offline") })
+
+	_, err := LoadServiceManifestSelfHealing("meeting")
+	if !errors.Is(err, ErrCatalogUnavailable) {
+		t.Fatalf("error = %v, want ErrCatalogUnavailable", err)
+	}
+}
+
+// TestResolveSelfHealingPresentCacheLacksNameRefreshFailed: a present catalog
+// that lacks the name still reports not-found, plus the refresh failure.
+func TestResolveSelfHealingPresentCacheLacksNameRefreshFailed(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	seedService(t, GetCatalogPath(), "other", "name: other\nversion: 1.0.0\n")
+	stubRefresh(t, func() error { return errors.New("no such host") })
+
+	_, err := ResolveCatalogServiceSelfHealing("nonexistent")
+	if !errors.Is(err, ErrServiceNotFound) {
+		t.Fatalf("error = %v, want ErrServiceNotFound", err)
+	}
+	if !strings.Contains(err.Error(), "catalog refresh also failed") || !strings.Contains(err.Error(), "no such host") {
+		t.Errorf("error = %q, want the refresh failure surfaced", err.Error())
 	}
 }
 
@@ -170,5 +198,29 @@ func TestLoadServiceManifestSelfHealingColdCache(t *testing.T) {
 	}
 	if *calls != 1 {
 		t.Errorf("catalog refresh called %d times, want exactly 1", *calls)
+	}
+}
+
+func TestSanitizeRefreshCause(t *testing.T) {
+	cases := []struct{ name, in, notWant string }{
+		{"userinfo with at", "clone https://user:p@ss@host.invalid/x failed", "p@ss"},
+		{"token query", "GET https://h.invalid/x?token=abc123&a=1 failed", "abc123"},
+		{"access_token query", "GET https://h.invalid/x?access_token=zzz999 failed", "zzz999"},
+	}
+	for _, c := range cases {
+		got := sanitizeRefreshCause(errors.New(c.in))
+		if strings.Contains(got, c.notWant) || strings.Contains(got, "ss@") {
+			t.Errorf("%s: leaked %q in %q", c.name, c.notWant, got)
+		}
+	}
+}
+
+func TestSanitizeRefreshCauseTruncatesOnRuneBoundary(t *testing.T) {
+	got := sanitizeRefreshCause(errors.New(strings.Repeat("\u00e9", 500)))
+	if !utf8.ValidString(got) {
+		t.Fatal("truncated cause is not valid UTF-8")
+	}
+	if n := utf8.RuneCountInString(got); n != 203 {
+		t.Errorf("rune count = %d, want 203 (200 + ellipsis)", n)
 	}
 }

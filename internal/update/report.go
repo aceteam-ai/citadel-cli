@@ -20,6 +20,7 @@
 package update
 
 import (
+	"errors"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -38,7 +39,11 @@ const (
 	ResultUpToDate             = "up_to_date"             // check succeeded, already current
 	ResultCheckFailed          = "check_failed"           // the release lookup failed (offline etc.)
 	ResultDownloadFailed       = "download_failed"        // download or checksum verification failed
+	ResultSignatureMissing     = "signature_missing"      // release publishes no checksums signature; refused
+	ResultSignatureInvalid     = "signature_invalid"      // checksums signature malformed, untrusted, wrong, or for another release; refused
+	ResultPlatformNotPublished = "platform_not_published" // signed release has no archive for this OS/arch
 	ResultDrainDeferred        = "drain_deferred"         // could not reach idle to swap this cycle
+	ResultDeferredBusy         = "deferred_busy"          // restart held back: a co-browse session has a human involved
 	ResultApplyFailed          = "apply_failed"           // the in-place binary swap failed
 	ResultApplyNotPermitted    = "apply_not_permitted"    // install authority/capability preflight refused
 	ResultRestartPending       = "restart_pending"        // applied/staged; not yet proven running
@@ -47,6 +52,22 @@ const (
 	ResultStateCorrupt         = "state_corrupt"          // persisted state unreadable/corrupt; paused until explicit repair
 	ResultUnknown              = "unknown"                // historical/otherwise unclassified result
 )
+
+// DownloadFailureResult maps a DownloadAndVerify error to its bounded result
+// code: a release-signature refusal is reported distinctly from an ordinary
+// (possibly transient) download failure.
+func DownloadFailureResult(err error) string {
+	switch {
+	case errors.Is(err, ErrUnsignedRelease):
+		return ResultSignatureMissing
+	case errors.Is(err, ErrReleaseSignature):
+		return ResultSignatureInvalid
+	case errors.Is(err, ErrPlatformNotPublished):
+		return ResultPlatformNotPublished
+	default:
+		return ResultDownloadFailed
+	}
+}
 
 // mutateState keeps result writers on the same cross-process transaction as
 // explicit preference changes. Errors leave unreadable/corrupt state untouched.

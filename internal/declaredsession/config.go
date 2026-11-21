@@ -105,7 +105,7 @@ func mappingKeys(node *yaml.Node, allowed ...string) bool {
 }
 
 func declarationNode(node *yaml.Node) bool {
-	if !mappingKeys(node, "name", "harness", "mode", "command", "command_restart", "cwd", "path_prepend", "env", "env_file", "restart", "attach", "scrollback_bytes", "log", "aceteam", "enabled") {
+	if !mappingKeys(node, "name", "harness", "mode", "command", "command_restart", "cwd", "path_prepend", "env", "env_file", "restart", "attach", "scrollback_bytes", "log", "aceteam", "enabled", "runtime", "credentials") {
 		return false
 	}
 	for i := 0; i < len(node.Content); i += 2 {
@@ -155,6 +155,19 @@ func declarationNode(node *yaml.Node) bool {
 		case "enabled":
 			if !scalar(value, "!!bool") {
 				return false
+			}
+		case "runtime":
+			if !typedMap(value, map[string]string{"kind": "!!str", "image": "!!str", "size": "!!str", "on_boot": "!!str"}) {
+				return false
+			}
+		case "credentials":
+			if value.Kind != yaml.SequenceNode || value.Tag != "!!seq" || len(value.Content) > maxCredentials {
+				return false
+			}
+			for _, item := range value.Content {
+				if !typedMap(item, map[string]string{"name": "!!str", "path": "!!str", "env": "!!str"}) {
+					return false
+				}
 			}
 		case "scrollback_bytes":
 			if !scalar(value, "!!int") {
@@ -215,7 +228,7 @@ func ValidateDeclaration(d Declaration) error {
 	if !oneOf(d.Attach.Local, "interactive", "readonly", "deny") || !oneOf(d.Attach.Web, "interactive", "readonly", "deny") || d.Attach.MaxViewers < 1 || d.Attach.MaxViewers > 32 || d.ScrollbackBytes < 0 || d.ScrollbackBytes > 4<<20 || validateLogPolicy(d.Log) != nil {
 		return ErrConfig
 	}
-	return nil
+	return validateContainerDeclaration(d)
 }
 
 func validArgv(argv []string) bool {

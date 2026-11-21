@@ -62,3 +62,55 @@ func fixtureDirectory(dir string) (string, error) {
 	}
 	return clean, nil
 }
+
+// processStateDirectories is the production counterpart of the test fixture
+// above, installed once by a job-scoped profile (the HPC profile,
+// aceteam#12715) before any path is resolved. It shares the fixture's
+// semantics: the node dir replaces every pointer, global-config and
+// owner-home lookup, and the machine dir replaces the machine-wide config dir
+// (so /etc/citadel is never read).
+var (
+	processStateDirectories atomic.Pointer[testStateDirectories]
+	processStateMu          sync.Mutex
+)
+
+// ScopeProcessStateDirectories confines network state, node config and
+// machine pointer discovery to the given absolute, existing, non-symlink
+// directories for the remaining lifetime of this process. It is one-shot: a
+// later call fails unless it names exactly the same directories. A test
+// fixture installed with OverrideStateDirectoriesForTesting still wins.
+func ScopeProcessStateDirectories(nodeDir, machineDir string) error {
+	node, err := fixtureDirectory(nodeDir)
+	if err != nil {
+		return err
+	}
+	machine, err := fixtureDirectory(machineDir)
+	if err != nil {
+		return err
+	}
+	processStateMu.Lock()
+	defer processStateMu.Unlock()
+	if current := processStateDirectories.Load(); current != nil {
+		if current.node == node && current.machine == machine {
+			return nil
+		}
+		return errors.New("network process state directories are already scoped to a different location")
+	}
+	processStateDirectories.Store(&testStateDirectories{node: node, machine: machine})
+	return nil
+}
+
+// ProcessStateDirectoriesScoped reports whether ScopeProcessStateDirectories
+// is in effect.
+func ProcessStateDirectoriesScoped() bool {
+	return processStateDirectories.Load() != nil
+}
+
+// stateScope returns the active directory scope: a test fixture first, then a
+// production process scope, else nil (ordinary machine resolution).
+func stateScope() *testStateDirectories {
+	if fixture := stateDirectoriesForTests.Load(); fixture != nil {
+		return fixture
+	}
+	return processStateDirectories.Load()
+}

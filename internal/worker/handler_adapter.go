@@ -148,6 +148,13 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 					continue
 				}
 			}
+			// A JSON number node id must stay decimal ("1000000", not "1e+06").
+			if a.jobType == JobTypeCobrowseSession && k == "backend_node_id" {
+				if number, ok := v.(float64); ok {
+					nexusJob.Payload[k] = strconv.FormatFloat(number, 'f', -1, 64)
+					continue
+				}
+			}
 			switch val := v.(type) {
 			case string:
 				nexusJob.Payload[k] = val
@@ -452,7 +459,7 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 		// start/status/stop sessions. Registered unconditionally like COBROWSE — the
 		// manager needs no workspace or config dir, and each action is a short
 		// lifecycle call against the node-local session manager.
-		NewLegacyHandlerAdapter(JobTypeCobrowseSession, jobs.NewCobrowseSessionHandler()),
+		NewLegacyHandlerAdapter(JobTypeCobrowseSession, cobrowseSessionHandlerFor(opts)),
 		// Resource snapshot (issue #427): returns the node's full GPU/host
 		// resource-consumer picture over the fabric. Registered unconditionally
 		// like the inference handlers — it needs no workspace sandbox, and gating
@@ -721,5 +728,14 @@ func newMeetingJoinHandler(opts LegacyHandlerOpts) *jobs.MeetingJoinHandler {
 		creds := config.LoadDeviceCredsConverged()
 		return creds.APIBaseURL, creds.Token
 	})
+	return h
+}
+
+// cobrowseSessionHandlerFor wires the live Files permission into the session
+// handler, so file staging and set_file_input follow the same switch as
+// FILE_WRITE_BYTES (citadel-cli#1721).
+func cobrowseSessionHandlerFor(opts LegacyHandlerOpts) *jobs.CobrowseSessionHandler {
+	h := jobs.NewCobrowseSessionHandler()
+	h.Enabled = opts.FilesEnabled
 	return h
 }

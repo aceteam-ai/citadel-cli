@@ -2,6 +2,7 @@ package nodevault
 
 import (
 	"fmt"
+	"math"
 	"unicode"
 )
 
@@ -43,7 +44,8 @@ func (p Policy) normalized() Policy {
 	if p.MinLength <= 0 {
 		p.MinLength = DefaultMinPINLength
 	}
-	if p.E2EThresholdBits <= 0 {
+	if !(p.E2EThresholdBits > 0) || math.IsInf(p.E2EThresholdBits, 0) {
+		// NaN fails every comparison, so test for the good case.
 		p.E2EThresholdBits = DefaultE2EThresholdBits
 	}
 	return p
