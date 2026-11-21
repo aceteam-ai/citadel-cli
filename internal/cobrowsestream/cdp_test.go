@@ -7,6 +7,7 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -19,6 +20,22 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+func TestCDPResolvedTargetDialPreservesParentCancellation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	client, err := dialCDPURLContext(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil, maxCDPMessageBytes)
+	if client != nil {
+		client.Close()
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("resolved target lost parent cancellation: %v", err)
+	}
+}
 
 // fakeChrome is a minimal CDP endpoint over a WebSocket: it emits screencast
 // frames gated on acks (so a test can prove acking is what keeps frames flowing)
@@ -253,7 +270,7 @@ func (f *fakeChrome) mouseEvents() []map[string]any {
 func withFakeCDP(t *testing.T, f *fakeChrome) {
 	t.Helper()
 	orig := cdpTargetURL
-	cdpTargetURL = func(int) (string, error) { return f.wsURL(), nil }
+	cdpTargetURL = func(context.Context, int) (string, error) { return f.wsURL(), nil }
 	t.Cleanup(func() { cdpTargetURL = orig })
 }
 
@@ -420,7 +437,7 @@ func withCDPMessageFixture(t *testing.T, send func(*websocket.Conn) error) (<-ch
 		server.Close()
 	})
 	original := cdpTargetURL
-	cdpTargetURL = func(int) (string, error) {
+	cdpTargetURL = func(context.Context, int) (string, error) {
 		return "ws" + strings.TrimPrefix(server.URL, "http"), nil
 	}
 	t.Cleanup(func() { cdpTargetURL = original })
@@ -574,7 +591,7 @@ func TestCDPDialPinsCompressionOffWithoutMutatingDefault(t *testing.T) {
 func TestCDPSmallLimitSeamCannotDisableOrIncreaseBudget(t *testing.T) {
 	original := cdpTargetURL
 	lookups := 0
-	cdpTargetURL = func(int) (string, error) {
+	cdpTargetURL = func(context.Context, int) (string, error) {
 		lookups++
 		return "", nil
 	}
@@ -705,7 +722,7 @@ func withRawCDPUpgrade(t *testing.T, extensions []string, compressed bool) <-cha
 		server.Close()
 	})
 	original := cdpTargetURL
-	cdpTargetURL = func(int) (string, error) {
+	cdpTargetURL = func(context.Context, int) (string, error) {
 		return "ws" + strings.TrimPrefix(server.URL, "http"), nil
 	}
 	t.Cleanup(func() { cdpTargetURL = original })

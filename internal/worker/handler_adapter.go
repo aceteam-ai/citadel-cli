@@ -712,6 +712,7 @@ func newMeetingJoinHandler(opts LegacyHandlerOpts) *jobs.MeetingJoinHandler {
 // FILE_WRITE_BYTES (citadel-cli#1721).
 func cobrowseSessionHandlerFor(opts LegacyHandlerOpts) *jobs.CobrowseSessionHandler {
 	h := jobs.NewCobrowseSessionHandler()
+	h.WorkspaceDir = opts.WorkspaceDir
 	h.Enabled = opts.FilesEnabled
 	return h
 }
