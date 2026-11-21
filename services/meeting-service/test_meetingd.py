@@ -64,6 +64,13 @@ def test_chrome_args_container_delta():
     assert "--remote-debugging-address=0.0.0.0" not in args
 
 
+def test_browser_signin_and_sync_are_disabled_for_restored_container_profiles():
+    args = meetingd.build_chrome_args(cdp_port=9222, profile_dir="/profile")
+    assert args.count("--allow-browser-signin=false") == 1
+    assert args.count("--disable-sync") == 1
+    assert not any(arg == "--allow-browser-signin=true" for arg in args)
+
+
 def test_record_ffmpeg_args_match_host_format():
     """mono / 16 kHz WAV from a pulse monitor -- identical to the host
     buildAudioFFmpegArgs so the transcribe sidecar consumes it unchanged."""

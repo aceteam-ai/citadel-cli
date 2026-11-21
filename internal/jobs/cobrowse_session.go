@@ -157,6 +157,9 @@ func decorateTargetResult(out []byte, st platform.CobrowseSessionStatus) ([]byte
 		targets = []platform.CobrowseTarget{}
 	}
 	result["targets"], result["open_targets"], result["features"] = targets, len(targets), st.Features
+	if st.Interstitial != "" {
+		result["interstitial"] = st.Interstitial
+	}
 	return json.Marshal(result)
 }
 
@@ -265,25 +268,7 @@ func (h *CobrowseSessionHandler) execute(ctx JobContext, job *nexus.Job, mgr *pl
 		if err != nil {
 			return nil, err
 		}
-		// Mirror the old singleton's screenshot wire shape exactly (image,
-		// format, driver, url) so a consumer that already parses
-		// cobrowse_screenshot's result -- e.g. an aceteam #8131/#8133 rewire
-		// -- does not silently lose driver/url when it switches job types.
-		pageURL := st.URL
-		if page.ID != "" {
-			pageURL = page.URL
-		}
-		fields := map[string]any{
-			"image":  img,
-			"format": "png",
-			"driver": string(st.Driver),
-			"url":    pageURL,
-		}
-		if page.ID != "" {
-			fields["target_id"] = page.ID
-		}
-		out, _ := json.Marshal(fields)
-		return decorateTargetResult(out, st)
+		return sessionScreenshotResult(img, st, page)
 
 	case CobrowseSessionActionClick:
 		id := job.Payload["session_id"]
@@ -578,6 +563,27 @@ type sessionStreamInfo struct {
 type sessionResult struct {
 	platform.CobrowseSessionStatus
 	Stream sessionStreamInfo `json:"stream"`
+}
+
+// sessionScreenshotResult keeps the legacy screenshot fields plus the typed
+// browser-interstitial signal, including on untracked sessions.
+func sessionScreenshotResult(img string, st platform.CobrowseSessionStatus, page platform.CobrowseTarget) ([]byte, error) {
+	pageURL := st.URL
+	if page.ID != "" {
+		pageURL = page.URL
+	}
+	fields := map[string]any{"image": img, "format": "png", "driver": string(st.Driver), "url": pageURL}
+	if page.ID != "" {
+		fields["target_id"] = page.ID
+	}
+	if st.Interstitial != "" {
+		fields["interstitial"] = st.Interstitial
+	}
+	out, err := json.Marshal(fields)
+	if err != nil {
+		return nil, err
+	}
+	return decorateTargetResult(out, st)
 }
 
 // sessionStatusResult marshals one session's status (plus stream endpoint) to

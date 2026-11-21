@@ -27,6 +27,8 @@ func TestBuildChromeArgs_LinuxArgsUnchanged(t *testing.T) {
 		"--user-data-dir=/p",
 		"--no-first-run",
 		"--no-default-browser-check",
+		"--allow-browser-signin=false",
+		"--disable-sync",
 		"--start-maximized",
 		"--disable-blink-features=AutomationControlled",
 		"--lang=en-US",

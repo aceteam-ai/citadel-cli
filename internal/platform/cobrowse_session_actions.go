@@ -453,7 +453,7 @@ func (m *CobrowseSessionManager) Navigate(id, url string) (CobrowseSessionStatus
 		st.URL = ps.URL
 	}
 	st.Title = ps.Title
-	return st, nil
+	return withBrowserInterstitial(st), nil
 }
 
 // NavigateAsHuman navigates on behalf of the human who has taken control (the

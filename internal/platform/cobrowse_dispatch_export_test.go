@@ -9,10 +9,11 @@ import (
 
 // DispatchFixture is test-only: no browser or OS process is launched.
 type DispatchFixture struct {
-	Manager *CobrowseSessionManager
-	Set     func(...[2]string)
-	Calls   func(string) []string
-	OnCall  func(func(string, string))
+	Manager  *CobrowseSessionManager
+	Set      func(...[2]string)
+	Calls    func(string) []string
+	OnCall   func(func(string, string))
+	SetTitle func(string, string)
 }
 
 func NewDispatchFixture(t *testing.T, tracking bool) *DispatchFixture {
@@ -28,5 +29,17 @@ func NewDispatchFixture(t *testing.T, tracking bool) *DispatchFixture {
 		}, nil), nil)
 	}
 	t.Cleanup(func() { m.StopAll(); dropTargetSet(f.port) })
-	return &DispatchFixture{m, f.set, f.callsOn, func(hook func(string, string)) { f.mu.Lock(); f.onCall = hook; f.mu.Unlock() }}
+	return &DispatchFixture{
+		Manager: m, Set: f.set, Calls: f.callsOn,
+		OnCall: func(hook func(string, string)) { f.mu.Lock(); f.onCall = hook; f.mu.Unlock() },
+		SetTitle: func(id, title string) {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			for _, page := range f.pages {
+				if page["id"] == id {
+					page["title"] = title
+				}
+			}
+		},
+	}
 }

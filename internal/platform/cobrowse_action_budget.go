@@ -634,11 +634,11 @@ func (s *cobrowseSession) statusWithURL(ctx context.Context, urls ...string) Cob
 		if u != "" {
 			s.noteURL(u)
 			st.URL = u
-			return st
+			return withBrowserInterstitial(st)
 		}
 	}
 	st.URL = s.cachedURL()
-	return st
+	return withBrowserInterstitial(st)
 }
 
 // typedLength counts the characters sent, for the report.
