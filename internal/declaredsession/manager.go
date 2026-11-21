@@ -82,6 +82,9 @@ func (m *Manager) declaration(name string) (Snapshot, Declaration, error) {
 	if !found {
 		return Snapshot{}, Declaration{}, ErrConfig
 	}
+	if declaration.IsContainer() {
+		return Snapshot{}, Declaration{}, ErrContainerSession
+	}
 	return snapshot, declaration, nil
 }
 
@@ -246,6 +249,9 @@ func (m *Manager) Inventory(ctx context.Context) ([]ManagedStatus, error) {
 	result := make([]ManagedStatus, 0, len(snapshot.Sessions))
 	var failures []error
 	for _, declaration := range snapshot.Sessions {
+		if declaration.IsContainer() {
+			continue // listed by the container runner, which owns their custody
+		}
 		status, err := m.Status(ctx, declaration.Name)
 		result = append(result, status)
 		if err != nil {
@@ -265,6 +271,9 @@ func (m *Manager) Restart(ctx context.Context, name string) (ManagedStatus, erro
 
 func (m *Manager) change(ctx context.Context, name string, restart bool) (ManagedStatus, error) {
 	snapshot, declaration, err := m.declaration(name)
+	if errors.Is(err, ErrContainerSession) {
+		return ManagedStatus{Name: name, Classification: "container_runtime"}, err
+	}
 	if err != nil || !declaration.Enabled {
 		return ManagedStatus{Name: name, Classification: "disabled"}, ErrConfig
 	}

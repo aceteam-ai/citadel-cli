@@ -56,9 +56,37 @@ def archive_names(tag):
     ]
 
 
+GIT_STEPS = frozenset(
+    {'status', 'fetch', 'rev-parse', 'ls-remote', 'push', 'merge-base'}
+)
+GH_STEPS = frozenset({'api', 'run', 'release'})
+GO_STEPS = frozenset({'build', 'run'})
+
+
+def step_label(argv):
+    """Closed set of fixed labels. Never derived from argument values."""
+    try:
+        tool = argv[0]
+        if tool == 'git':
+            rest = argv[1:]
+            if rest[:1] == ['-c']:
+                rest = rest[2:]
+            if rest[0] in GIT_STEPS:
+                return f'git {rest[0]}'
+        elif tool == 'gh' and argv[1] in GH_STEPS:
+            return f'gh {argv[1]}'
+        elif tool == 'go' and argv[1] in GO_STEPS:
+            return f'go {argv[1]}'
+        elif tool == 'bash':
+            return 'homebrew tap'
+    except IndexError:
+        pass
+    return 'release command'
+
+
 class Runner:
     def __init__(self, root):
-        self.root = pathlib.Path(root)
+        self.root = pathlib.Path(root).resolve()
 
     def run(self, argv, *, env=None, timeout=60):
         # Fixed errors only: gh stderr can contain remote data, and signing
@@ -78,9 +106,12 @@ class Runner:
                 data = output.read((16 << 20) + 1)
                 require(len(data) <= 16 << 20, 'release command output exceeds bound')
                 return data.decode()
-        except (OSError, UnicodeError, subprocess.SubprocessError):
+        except (OSError, UnicodeError, subprocess.SubprocessError) as error:
+            code = getattr(error, 'returncode', None)
+            detail = f'exit {code}' if isinstance(code, int) else 'no exit status'
             raise Refused(
-                'release command failed; inspect state before retrying'
+                f'release command failed: {step_label(argv)} ({detail}); '
+                'inspect state before retrying, no automatic retries'
             ) from None
 
     def api(self, path):
@@ -100,7 +131,11 @@ class Runner:
         raise Refused('forge pagination bound exceeded')
 
     def git(self, *args):
-        return self.run(['git', *args]).strip()
+        # Trust exactly this checkout. The CI container runs as a different uid
+        # than the workspace owner; never use '*' or global config.
+        return self.run(
+            ['git', '-c', f'safe.directory={self.root}', *args]
+        ).strip()
 
     def download(self, asset_id, path, size):
         # Download immutable asset IDs with an independent byte/time bound.
@@ -256,6 +291,25 @@ def require_version_floor(runner, tag):
         )
 
 
+def require_tag_absent(runner, tag):
+    """No remote tag of this name, at any commit, may exist before publication."""
+    require(
+        not runner.git('ls-remote', '--refs', 'origin', f'refs/tags/{tag}'),
+        'release tag already exists before publication; inspect state, '
+        'do not overwrite',
+    )
+
+
+def require_tag_at(runner, tag, source):
+    # A lightweight ref (type commit) at exactly the receipt commit.
+    tag_data = runner.api(f'git/ref/tags/{tag}')['object']
+    require(
+        tag_data.get('type') == 'commit' and tag_data.get('sha') == source,
+        'remote release tag differs from the CI commit; inspect state, '
+        'do not retry',
+    )
+
+
 def build_archives(runner, tag, directory):
     names = archive_names(tag)
     # Same gentle Go limits as release.sh, plus the CI container's hard CPU cap.
@@ -348,6 +402,7 @@ def ci_draft(runner, commit, ci_run, run_id):
         not any(r['tag_name'] == tag for r in releases),
         'release already exists; reconcile it instead of overwriting',
     )
+    require_tag_absent(runner, tag)
     with tempfile.TemporaryDirectory(prefix='citadel-release-') as temporary:
         directory = pathlib.Path(temporary)
         build_archives(runner, tag, directory)
@@ -359,15 +414,9 @@ def ci_draft(runner, commit, ci_run, run_id):
             own['check_suite_id'],
         )
         require_version_floor(runner, tag)
-        # A tag may survive a failed draft creation. Retry only at the exact SHA.
-        remote = runner.git('ls-remote', '--refs', 'origin', f'refs/tags/{tag}')
-        if remote:
-            require(
-                remote.split()[0] == commit,
-                'existing remote tag differs from the source',
-            )
-        else:
-            runner.git('push', 'origin', f'{commit}:refs/tags/{tag}')
+        # CI never creates tags (the tag ruleset admits only an admin). The tag
+        # is created when the admin-run sign mode publishes the draft.
+        require_tag_absent(runner, tag)
         receipt = {
             'tag': tag,
             'commit': commit,
@@ -399,7 +448,6 @@ def ci_draft(runner, commit, ci_run, run_id):
                 '--repo',
                 REPO,
                 '--draft',
-                '--verify-tag',
                 '--target',
                 commit,
                 '--title',
@@ -476,10 +524,16 @@ def sign_draft(runner, tag):
     release = runner.api(f'releases/{releases[0]["id"]}')
     initial = asset_snapshot(release, tag)
     receipt = receipt_from(release['body'])
-    # GitHub may retain a branch-valued target_commitish for an existing tag.
-    # Bind source through the exact remote tag and immutable CI log instead.
     require(receipt['tag'] == tag, 'draft tag/source mismatch')
     source = receipt['commit']
+    if release['draft']:
+        # CI pushes no tag: the draft must name the exact source commit, and the
+        # tag must not exist yet. Publishing below creates it as the admin.
+        require(
+            release['target_commitish'] == source,
+            'draft target differs from the CI commit',
+        )
+        require_tag_absent(runner, tag)
     runner.git('merge-base', '--is-ancestor', source, 'HEAD')
     ci_identity(
         runner.api(f'actions/runs/{receipt["run_id"]}'),
@@ -504,11 +558,9 @@ def sign_draft(runner, tag):
     green_checks(runner.pages(f'commits/{source}/check-runs?filter=all', 'check_runs'))
     pr = runner.api(f'pulls/{receipt["pr"]}')
     require(bumped_pr([pr], source) == receipt['pr'], 'bump PR provenance changed')
-    tag_data = runner.api(f'git/ref/tags/{tag}')['object']
-    require(
-        tag_data.get('type') == 'commit' and tag_data.get('sha') == source,
-        'remote release tag differs from the CI commit',
-    )
+    if not release['draft']:
+        # Published retry (tap only): the tag must already be at the commit.
+        require_tag_at(runner, tag, source)
     with tempfile.TemporaryDirectory(prefix='citadel-sign-') as temporary:
         directory = pathlib.Path(temporary)
         for name in initial:
@@ -615,6 +667,7 @@ def sign_draft(runner, tag):
             'release changed immediately before publication',
         )
         if release['draft']:
+            require_tag_absent(runner, tag)
             runner.run(
                 [
                     'gh',
@@ -628,6 +681,8 @@ def sign_draft(runner, tag):
                     'make_latest=legacy',
                 ]
             )
+        # Publication created the tag as this admin; it must be at the source.
+        require_tag_at(runner, tag, source)
         # Published, verified retries can finish a failed tap update without
         # republishing, replacing any asset, or resigning.
         require_version_floor(runner, tag)

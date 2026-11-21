@@ -107,6 +107,9 @@ class Fake(release.Runner):
         self.fault = None
         self.release_reads = 0
         self.remote_tags = ''
+        # Tag state: absent until the admin publish creates it.
+        self.tag_sha = None
+        self.created_tag_sha = SHA
 
     def sync_assets(self):
         self.release['assets'] = [
@@ -128,7 +131,9 @@ class Fake(release.Runner):
         if path == 'pulls/5':
             return copy.deepcopy(self.pr)
         if path == 'git/ref/tags/' + TAG:
-            return {'object': {'type': 'commit', 'sha': SHA}}
+            if self.tag_sha is None:
+                raise release.Refused('release command failed: gh api (exit 1)')
+            return {'object': {'type': 'commit', 'sha': self.tag_sha}}
         if path == 'releases/8':
             self.release_reads += 1
             result = copy.deepcopy(self.release)
@@ -156,7 +161,11 @@ class Fake(release.Runner):
         if args[0] == 'rev-parse':
             return SHA
         if args[0] == 'ls-remote':
-            return self.remote_tags if '--tags' in args else ''
+            if '--tags' in args:
+                return self.remote_tags
+            if self.tag_sha:
+                return f'{self.tag_sha}\trefs/tags/{TAG}'
+            return ''
         return ''
 
     def download(self, asset_id, path, size):
@@ -205,6 +214,7 @@ class Fake(release.Runner):
                         self.packaged[pathlib.Path(item).name] = archive.getnames()
         elif argv[:3] == ['gh', 'api', '--method']:
             self.release['draft'] = False
+            self.tag_sha = self.created_tag_sha
         return ''
 
     def has_command(self, prefix):
@@ -342,6 +352,7 @@ class ReleaseDraftTests(unittest.TestCase):
                 self.fake.bytes['checksums.txt.sig'] = b'synthetic signature'
                 self.fake.sync_assets()
                 self.fake.release['draft'] = False
+                self.fake.tag_sha = SHA
             with self.assertRaisesRegex(release.Refused, 'remote version floor'):
                 self.sign()
             self.assertFalse(any(k == 'download' for k, _ in self.fake.calls))
@@ -370,6 +381,7 @@ class ReleaseDraftTests(unittest.TestCase):
         self.fake.bytes['checksums.txt.sig'] = b'synthetic signature'
         self.fake.sync_assets()
         self.fake.release['draft'] = False
+        self.fake.tag_sha = SHA
         self.sign()
         self.assertFalse(
             self.fake.has_command(['go', 'run', './scripts/releasesign', 'sign'])
@@ -380,23 +392,76 @@ class ReleaseDraftTests(unittest.TestCase):
             self.fake.has_command(['bash', 'scripts/update-homebrew-tap.sh'])
         )
 
-    def test_branch_valued_commitish_still_requires_the_exact_remote_tag(self):
-        self.fake.release['target_commitish'] = 'main'
-        self.sign()
-        self.fake = Fake(pathlib.Path(self.tmp.name))
-        original = self.fake.api
-
-        def wrong_tag(path):
-            if path == 'git/ref/tags/' + TAG:
-                return {'object': {'type': 'commit', 'sha': 'b' * 40}}
-            return original(path)
-
-        with mock.patch.object(self.fake, 'api', side_effect=wrong_tag):
-            with self.assertRaisesRegex(release.Refused, 'remote release tag'):
+    def test_sign_refuses_target_commitish_mismatch(self):
+        for value in ('main', 'b' * 40):
+            self.fake = Fake(pathlib.Path(self.tmp.name))
+            self.fake.release['target_commitish'] = value
+            with self.assertRaisesRegex(release.Refused, 'draft target'):
                 self.sign()
-        self.assertFalse(
-            self.fake.has_command(['go', 'run', './scripts/releasesign', 'sign'])
+            self.assertFalse(any(k == 'download' for k, _ in self.fake.calls))
+            self.assertFalse(self.fake.has_command(['gh', 'api', '--method']))
+
+    def test_sign_refuses_when_tag_exists_at_another_commit_or_exact(self):
+        for sha in ('b' * 40, SHA):
+            self.fake = Fake(pathlib.Path(self.tmp.name))
+            self.fake.tag_sha = sha
+            with self.assertRaisesRegex(release.Refused, 'already exists'):
+                self.sign()
+            self.assertFalse(any(k == 'download' for k, _ in self.fake.calls))
+            self.assertFalse(self.fake.has_command(['gh', 'api', '--method']))
+
+    def test_tag_at_wrong_commit_after_publish_refuses_before_tap(self):
+        self.fake.created_tag_sha = 'b' * 40
+        with self.assertRaisesRegex(release.Refused, 'differs from the CI commit'):
+            self.sign()
+        self.assertTrue(self.fake.has_command(['gh', 'api', '--method']))
+        self.assertFalse(self.fake.has_command(['bash']))
+
+    def test_publish_creates_tag_at_receipt_commit_then_taps(self):
+        self.sign()
+        self.assertEqual(self.fake.tag_sha, SHA)
+        self.assertTrue(
+            self.fake.has_command(['bash', 'scripts/update-homebrew-tap.sh'])
         )
+
+    def test_published_retry_with_tag_at_another_commit_refuses(self):
+        self.fake.bytes['checksums.txt.sig'] = b'synthetic signature'
+        self.fake.sync_assets()
+        self.fake.release['draft'] = False
+        self.fake.tag_sha = 'b' * 40
+        with self.assertRaisesRegex(release.Refused, 'differs from the CI commit'):
+            self.sign()
+        self.assertFalse(self.fake.has_command(['bash']))
+
+    def test_ci_never_pushes_and_drafts_with_target_commit(self):
+        self.fake.listed = False
+        with (
+            mock.patch.object(
+                release.version, 'plan', return_value={'candidate': True, 'tag': TAG}
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            release.ci_draft(self.fake, SHA, '11', '12')
+        self.assertFalse(any(k == 'git' and v[0] == 'push' for k, v in self.fake.calls))
+        create = next(
+            v
+            for k, v in self.fake.calls
+            if k == 'run' and v[:3] == ['gh', 'release', 'create']
+        )
+        self.assertEqual(create[create.index('--target') + 1], SHA)
+        self.assertNotIn('--verify-tag', create)
+
+    def test_ci_refuses_existing_remote_tag_at_any_commit(self):
+        self.fake.listed = False
+        for sha in ('b' * 40, SHA):
+            self.fake.tag_sha = sha
+            with mock.patch.object(
+                release.version, 'plan', return_value={'candidate': True, 'tag': TAG}
+            ):
+                with self.assertRaisesRegex(release.Refused, 'already exists'):
+                    release.ci_draft(self.fake, SHA, '11', '12')
+            self.assertFalse(self.fake.has_command(['go', 'build']))
+            self.assertFalse(self.fake.has_command(['gh', 'release', 'create']))
 
     def test_ci_cannot_sign_and_dirty_or_stale_checkout_refused(self):
         os.environ['GITHUB_ACTIONS'] = 'true'
@@ -456,7 +521,6 @@ class ReleaseDraftTests(unittest.TestCase):
             if k == 'run' and v[:3] == ['gh', 'release', 'create']
         )
         self.assertIn('--draft', create)
-        self.assertIn('--verify-tag', create)
         self.assertEqual(len([x for x in create if x.endswith(('.zip', '.tar.gz'))]), 6)
         self.assertFalse(
             self.fake.has_command(['go', 'run', './scripts/releasesign', 'sign'])
@@ -553,6 +617,44 @@ class ReleaseDraftTests(unittest.TestCase):
             with self.assertRaisesRegex(release.Refused, 'pagination bound'):
                 runner.pages('releases')
             self.assertEqual(api.call_count, 20)
+
+    def test_git_trust_is_scoped_to_exact_checkout_root(self):
+        runner = release.Runner(self.tmp.name)
+        with mock.patch.object(runner, 'run', return_value='') as run:
+            runner.git('status', '--porcelain')
+        argv = run.call_args.args[0]
+        root = str(pathlib.Path(self.tmp.name).resolve())
+        self.assertEqual(argv[:3], ['git', '-c', f'safe.directory={root}'])
+        self.assertNotIn('safe.directory=*', argv)
+        self.assertEqual(argv[3:], ['status', '--porcelain'])
+
+    def test_failure_names_step_and_exit_code_without_leaks(self):
+        error = release.subprocess.CalledProcessError(
+            128, ['x'], stderr=b'synthetic-stderr-sentinel'
+        )
+        runner = release.Runner(self.tmp.name)
+        with mock.patch.object(release.subprocess, 'run', side_effect=error):
+            with self.assertRaises(release.Refused) as result:
+                runner.git('fetch', 'synthetic-private-ref')
+        message = str(result.exception)
+        self.assertIn('git fetch', message)
+        self.assertIn('exit 128', message)
+        self.assertIn('no automatic retries', message)
+        for leaked in ('synthetic', self.tmp.name, 'safe.directory'):
+            self.assertNotIn(leaked, message)
+
+    def test_step_labels_are_a_closed_set(self):
+        cases = {
+            ('git', '-c', 'safe.directory=/p', 'rev-parse', 'HEAD'): 'git rev-parse',
+            ('gh', 'api', 'repos/x'): 'gh api',
+            ('gh', 'release', 'create'): 'gh release',
+            ('go', 'build', '-o', 'x'): 'go build',
+            ('go', 'run', './scripts/releasesign'): 'go run',
+            ('weird-tool', 'secret-arg'): 'release command',
+            ('git', 'secret-subcommand'): 'release command',
+        }
+        for argv, label in cases.items():
+            self.assertEqual(release.step_label(list(argv)), label)
 
     def test_command_errors_do_not_reveal_raw_output_or_arguments(self):
         error = release.subprocess.CalledProcessError(
