@@ -24,6 +24,9 @@ type Native struct {
 	openHostRoot  func(string) (*os.File, error)
 	syncJournal   func(*os.File) error
 	freeHostBytes func(*os.File) (uint64, error)
+	// Tests replace only these syscalls; no native chown runs in fake proofs.
+	chownFile func(*os.File, int, int) error
+	chownLink func(int, string, int, int, int) error
 }
 
 func NewNative(root string, runtime func() string) *Native {
@@ -580,4 +583,77 @@ func (n *Native) DestroyVolume(ctx context.Context, ref string) error {
 		return ErrUnavailable
 	}
 	return nil
+}
+
+// HandoffWorkspaceFile changes only an already-open new file/directory inode.
+// No request can choose IDs and no path lookup can redirect this operation.
+func (n *Native) HandoffWorkspaceFile(file *os.File) error {
+	info, err := file.Stat()
+	if err != nil || (!info.IsDir() && (!info.Mode().IsRegular() || !singleFileLink(info))) {
+		return ErrInvalid
+	}
+	change := n.chownFile
+	if change == nil {
+		change = func(file *os.File, uid, gid int) error { return file.Chown(uid, gid) }
+	}
+	if err := change(file, WorkspaceUID, WorkspaceGID); err != nil {
+		return ErrUnavailable
+	}
+	return nil
+}
+
+// HandoffWorkspaceSymlink changes the opened link inode, never a second lookup
+// of a name that an entry replacement could redirect.
+func (n *Native) HandoffWorkspaceSymlink(root *os.Root, name string) error {
+	link, err := openFinalNoFollow(root, name, unix.O_PATH, 0)
+	if err != nil {
+		return ErrUnavailable
+	}
+	defer link.Close()
+	info, err := link.Stat()
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		return ErrInvalid
+	}
+	change := n.chownLink
+	if change == nil {
+		change = unix.Fchownat
+	}
+	if err := change(int(link.Fd()), "", WorkspaceUID, WorkspaceGID, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return ErrUnavailable
+	}
+	return nil
+}
+
+// PrepareImportRoot makes the fresh mounted tree inaccessible to ace before
+// creating any import entries. Directory creation and reopen therefore happen
+// under a privileged parent, even after individual child ownership handoffs.
+func (n *Native) PrepareImportRoot(root *os.Root) error {
+	file, err := root.Open(".")
+	if err != nil {
+		return ErrUnavailable
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.IsDir() {
+		return ErrInvalid
+	}
+	change := n.chownFile
+	if change == nil {
+		change = func(file *os.File, uid, gid int) error { return file.Chown(uid, gid) }
+	}
+	if change(file, 0, 0) != nil || file.Chmod(0700) != nil {
+		return ErrUnavailable
+	}
+	return nil
+}
+
+// Publish only after archive verification and all entry handoffs have succeeded.
+// Any earlier error leaves the import private for explicit operator handling.
+func (n *Native) PublishImportRoot(root *os.Root) error {
+	file, err := root.Open(".")
+	if err != nil {
+		return ErrUnavailable
+	}
+	defer file.Close()
+	return n.HandoffWorkspaceFile(file)
 }
