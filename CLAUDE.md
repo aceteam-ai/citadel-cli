@@ -31,6 +31,12 @@ So, when adding to this file:
 
 ## Project Overview
 
+`status.collectCapacityMetrics` owns additive optional heartbeat placement
+signals and per-source unknown handling. `nativeCapacityProbes` owns the
+build-tagged OS readers; `TestCapacity*` exercises bounded procfs parsing and
+both heartbeat transports without native sampling. See
+`docs/heartbeat-capacity.md` for field semantics and platform limits.
+
 `localcobrowse.UploadSettings` owns local mode's upload opt-out: environment
 captured at owner construction, live bounded settings reads, and fail-closed
 permissions/parsing. `Service.CheckUploads` and `Service.UploadsAllowed` are the
@@ -100,6 +106,8 @@ relative path in the receipt. See `docs/file-fetch.md` for
 the contract.
 
 `platform.containerRunner` (citadel-cli#1760) is the browserRunner that runs each node co-browse session in its own browser-runtime container. `selectingRunner.useContainer` is the one per-launch decision, made by `launch` before it lays out the session dir (`LaunchOptions.UseContainer`): only the node-wide manager, only while `containerRunner.healthy` holds (engine reachable, pinned image present or pulled, contract label AND the `browserruntime.ImageLabelSandbox` marker that #1788 must set, since the contract-1 image runs Chromium with `--no-sandbox`), otherwise the host runner, logged once per reason. The argv is only `browserruntime.RunSpec.Args` (name, owner label, pull policy, userns, cache env and the read-only staging bind are RunSpec fields); engine calls go through the `ContainerEngine` seam wired in `cmd.configureBrowserRuntime`, with output capped by `cappedBuffer`. Only `<session>/profile` (`containerProfileSubdir`) is mounted writable: the pidfile, `.citadel-profile` marker and `.citadel-stage` stay outside it, staging is bound read-only at `StageMountPath`, and `cobrowseProc.browserFilePath` fails closed for anything else. `Launch` owns the fresh per-session network, `checkIsolation`, and `cleanupFailedLaunch` (known id, else the deterministic name after a label check); `verifyCDPIdentity` compares the in-container and published-port browser ids; `containerIdentity` gives a Windows host (no uid) the image user. `ownerFor` (base dir, registry dir, uid) stamps the owner label, and `sweepContainers` removes only containers and networks matching owner, `purpose=cobrowse`, the name `aceteam-brc-<id>` and `sessionIDPattern`, skipping the rest. `adoptContainer` owns re-adoption (id, StartedAt, labels incl. owner, network, ports, CDP id); `recoverContainer` leaves a record on `errCDPCheck` or `errRecordNotOurs` (which includes an owner or purpose label mismatch, so another worker's container is never removed) and expires and discards one that fails verification; `discardContainer` removes a container only when `ownsLabels` (runtime, session, owner, purpose) holds and a network only when `networkOwned` finds the same labels on the network itself. `ShutdownSessions` retains container sessions like scoped ones. `browserruntime.PinnedImage` is empty until a release pins an image, which keeps host runners in charge. The slot count is `BrowserSlots` in device config via `platform.SetBrowserSlots`; `CITADEL_COBROWSE_MAX_SESSIONS` still wins. Tests: `internal/platform/cobrowse_container_test.go`.
+
+The renderer sandbox in the browser-runtime container (citadel-cli#1788) has three owners and is opt-in per run. `browserruntime.RunSpec.Args` requires `SeccompProfile` (emits `--security-opt seccomp=<file>`) and passes `-e MEETING_REQUIRE_SANDBOX=1`; without that env the image behaves as it always did (`--no-sandbox`, no check), which keeps the catalog meeting module, which pulls `:latest` under the engine's default seccomp, unaffected. The profile is `browserruntime.SeccompProfileJSON` (Docker's default plus one unconditional allow of clone/unshare/chroot for Chromium's user-namespace sandbox, no capabilities, no `--privileged`), pinned by `SeccompProfileSHA256` and `TestSeccompProfilePinned`, written into the session dir by `WriteSeccompProfile` from `containerRunner.Launch`. Accepted risk: that rule lets every process in the container create user and network namespaces, the nf_tables/netlink CVE class Docker's default withholds; it is still better than `--no-sandbox`, and a `socket()` argument filter refusing netlink-netfilter is an optional follow-up. A host that forbids unprivileged user namespaces cannot run it and the session is refused. `sandbox_check.inspect_tree` (stdlib, `/proc`) is the proof, and it deliberately does not trust `Seccomp: 2` (the engine profile puts every container process in mode 2): every renderer must have a different user namespace and strictly more `Seccomp_filters` than the browser, a missing field fails, no process may carry `--no-sandbox` (cmdline is whitespace-tokenized because Chromium retitles processes), and no renderer is not a pass. `wait_for_sandbox` retries only "not there yet" verdicts and returns at once when the browser exits. `meetingd.start_session` runs it when `REQUIRE_SANDBOX` and tears the session down with `sandbox_unverified`; `defaultStartBrowser` trusts a 201 only when the reply says `sandboxed:true` and `browser=chromium`, with a POST timeout above meetingd's verify window. `meetingd.py --sandbox-selfcheck` implies require. The image label is `ARG SANDBOX_VERIFIED` (default empty, so nodes refuse the image); a build step may pass `1` only after the self-check exits 0 under the pinned profile, and that workflow step is not wired yet, so `PinnedImage` stays empty. `RunSpec.Browser` is a closed set (`browserruntime.browsers`, only `chromium`), stamped as `LabelBrowser` and `MEETING_BROWSER`; meetingd reports `browser` and `sandboxed` in session status. CloakBrowser is deferred: its binary license forbids redistributing it in a published image.
 
 `platform.browserRunner` owns the per-OS half of a co-browse session:
 discovery, launch, owner-lifetime binding and the orphan sweep. The Linux
@@ -171,6 +179,36 @@ modifiers outside 0..15, a selector that matches nothing or is not editable) sen
 confirmation. Status `input_edit` (`InputEditV1`, non-tracking sessions only, like `FileUploadPageFence`)
 is the marker a caller checks first. Local mode does not pass the new fields.
 `TestCobrowseRealBrowserTypeEdit` pins it on Linux and Windows.
+
+`containersession.Runner` owns a declared session that runs as one container plus an
+engine-managed named volume (#1533, #1165 S1; `Declaration.IsContainer` selects it). The
+`aceteam.session*` labels (`RecordFromLabels` validates them, failing closed on a volume that is
+not the name-derived one) are the only record: `Runner.Observe` recovers state from the engine,
+with no store. `Runner.Wake` decides the argv (`buildRunArgs`: cap-drop, no-new-privileges,
+preflighted cpu/memory/pids, the node's own binary bind-mounted read-only, `--restart no`, `--mount`
+never `-v`, one bind of a host-built `Runner.ViewDir` at `/run/session`); `Runner.Sleep` records the
+operator's durable sleep intent, stops, re-seals and removes the container but keeps the volume.
+Wake, sleep and `Runner.ResealOnce` serialize on one flock in the host run dir (never mounted), and
+a failed wake removes only the container id its own `run` returned. Credentials never
+reach the volume: `SealedFileStore` keeps one bundle per session, sealed under
+`nodevault.OpenKeyCompartment` (a node key file, so wake is unattended and the master PIN stays
+human-only); `Materialize` writes them only under a run dir `Runner.RunDir` has proven tmpfs. That tmpfs tree is
+bound over the whole harness config dir, and `declaredsession.HarnessConfigFor` pins which subpaths
+(transcripts, memory) are bound from the volume on top, so a rename-based writer's temp file stays
+on tmpfs. `ResealBundle` captures a rotated token before `Wipe`; the worker re-seals awake sessions
+on a poll (`ResealOnce`) so a reboot does not lose a rotation; a failed re-seal keeps the secrets
+for a retry. `nodevault.KeyCompartment` is deliberately not a `Session`, so it cannot satisfy an
+at-rest passphrase-floor consumer. `containersession.Decide` is the boot wake rule (`cmd.reconcileContainerSessions`, run by
+the single-instance worker): a stopped container exiting non-zero is woken, exit 0 stays down
+(`declaredsession.RunContainerHolder` exits non-zero whenever signalled, so a reboot-killed
+session never looks like a clean exit), and no container with a volume is a deliberate sleep.
+`LaunchCommand` decides resume inside the container from the transcript on the volume.
+`declaredsession.DialContainerHolder` owns host-side attach verification (the engine proves the
+incarnation and that the socket peer is the container's PID 1; the host holder's PID checks do not
+apply across the PID namespace). Known limit: on a kernel-TUN `citadel up` node the default bridge
+may NAT container traffic out as the host's mesh address, which `requireVPNOrAuth` admits; no
+dedicated network is created yet. And
+`Manager` refuses container declarations with `ErrContainerSession`.
 
 `InspectTarget` owns the browser-created isolated world used for the complete
 target probe and form snapshot. The session caches only its latest target,
@@ -525,20 +563,21 @@ go test -v ./cmd -run TestReadManifest
 
 ### Windows E2E Test
 ```bash
+# Set WIN_HOST, WIN_USER and WIN_PASSWORD for your Windows test machine first.
 # Full E2E test (clean → install → init → verify) on a Windows machine via WinRM
-./scripts/windows-e2e-test.sh --host 192.168.2.207 --user aceteam --password 'P@ssword' --authkey tskey-auth-xxx
+./scripts/windows-e2e-test.sh --host "$WIN_HOST" --user "$WIN_USER" --password "$WIN_PASSWORD" --authkey tskey-auth-xxx
 
 # Run a single phase
-./scripts/windows-e2e-test.sh verify --host 192.168.2.207 --user aceteam --password 'P@ssword'
+./scripts/windows-e2e-test.sh verify --host "$WIN_HOST" --user "$WIN_USER" --password "$WIN_PASSWORD"
 
 # Skip clean phase (test on already-dirty machine)
-./scripts/windows-e2e-test.sh --skip-clean --host 192.168.2.207 ...
+./scripts/windows-e2e-test.sh --skip-clean --host "$WIN_HOST" ...
 
 # Install a specific version
-./scripts/windows-e2e-test.sh --version v2.3.0 --host 192.168.2.207 ...
+./scripts/windows-e2e-test.sh --version v2.3.0 --host "$WIN_HOST" ...
 
 # Dry run (show commands without executing)
-./scripts/windows-e2e-test.sh --dry-run --host 192.168.2.207 ...
+./scripts/windows-e2e-test.sh --dry-run --host "$WIN_HOST" ...
 ```
 
 Requires `pywinrm` (`pip install pywinrm`) and WinRM enabled on the target machine. See `scripts/windows-e2e-test.sh` header for WinRM setup instructions.
@@ -820,7 +859,7 @@ type to `"Tailscale"` AND a static adapter GUID, and Wintun keys on the GUID —
 so citadel collided with an installed Tailscale (`0x800700B7`, "file already
 exists") regardless of the interface name. `internal/network/tun_windows.go`
 overrides both (its init runs after tstun's). The GUID is fixed so restarts
-re-attach instead of leaking adapters. Verified on DESKTOP-6UKHJAN with
+re-attach instead of leaking adapters. Verified on a Windows test machine with
 Tailscale running and undisturbed — but note that test (`--check`) installs no
 routes, so it proves only that the **adapter** no longer collides. Both
 products want to route `100.64.0.0/10`; route-level coexistence is untested.
@@ -2379,7 +2418,7 @@ adoption short-circuits before native startup/readiness. Preserve those ownershi
 boundaries rather than copying endpoint rules into consumers.
 
 **Adopt an already-running EXTERNAL vLLM instead of launching one — even with NO
-docker runtime (citadel-cli#1081 + #1084, RM-01 / aceteam#9945).**
+docker runtime (citadel-cli#1081 + #1084, aceteam#9945).**
 `status.AdoptableExternalEnginePort` (the allowlist — vLLM only) +
 `status.OpenAICompatServing` (the probe) are the authority. The consequence: a
 `SERVICE_START vllm` (or a boot-time start) on a box where an external OpenAI-compat
@@ -2401,7 +2440,7 @@ PATH, `resolveKind` returns "native" and the pre-existing #649
 `IsNativeServiceServing` short-circuit already skips the launch (a `type: docker`
 entry pins docker regardless of PATH, so it reaches this branch); (2) **#1084 fixed
 #1083's docker-reachability gate.** #1083 DECLINED adoption whenever the container
-runtime was unreachable — which meant the docker-less RM-01 (vendor vLLM under its
+runtime was unreachable — which meant a docker-less appliance (vendor vLLM under its
 own systemd on `CITADEL_VLLM_HOST_PORT`) errored on `SERVICE_START vllm` instead of
 adopting. Ownership (`ourContainerRunning`'s two-state return / the `runtimeAvailable`
 seam) now DECLINES adoption ONLY when the runtime is reachable AND our own container
@@ -2410,7 +2449,7 @@ unreachable runtime no longer declines: a box with no container runtime cannot b
 running our container, so a live OpenAI-compat engine there is necessarily external
 and is adopted. Consequence for hermeticity: post-#1084 the external probe fires on
 a neutered-PATH box, so a docker-branch unit test that must not hit the real
-resolved vLLM endpoint (node 1297 serves a real vLLM) injects the probe via
+resolved vLLM endpoint (a dev box may serve a real vLLM) injects the probe via
 `externalEngineServingFn` (jobs) / the `servingCheck` seam (cmd) — `newModelTestHandler`
 seams it to "nothing serving" for exactly this reason. TCP reachability is necessary
 but not sufficient: the body must decode as OpenAI-shaped `{"data":[...]}` (an empty
@@ -2649,7 +2688,7 @@ Quantized V-cache requires flash attention, so `--flash-attn on` is mandatory he
 Flag names verified against the PrismML fork's `common/arg.cpp` (`-fa` takes an
 `[on|off|auto]` value). Override the context via the `BONSAI_CTX` env var.
 
-**Live inference is a documented human step:** node 1084's GPU is VRAM-contended
+**Live inference is a documented human step:** a shared GPU node may be VRAM-contended
 (vLLM holds ~21GB); do NOT stop vLLM to validate. Bonsai fits alongside once VRAM
 is free.
 
@@ -3994,7 +4033,7 @@ case of the semaphore pool: it never touches `sem`, so it can never occupy a
 pool slot either, and it applies regardless of `--max-concurrency`.
 
 **#903 Stage 1 (GPU-bound extension):** on a `--max-concurrency=1` GPU node
-(the node-1297 incident node — a discrete GPU, so `cmd/work.go` constructs a
+(the incident node — a discrete GPU, so `cmd/work.go` constructs a
 non-nil `r.gpuTracker`), a long-running `llm_inference` job used to run INLINE
 in the fetch loop exactly like any other job — blocking `source.Next()` until
 it returned, so a *targeted* dispatch to that node (e.g. `FILE_READ_BYTES` in
@@ -4256,7 +4295,7 @@ a layered resolver, first match wins — explicit `agents_probe_user` (manifest)
 owner uid of `network.GetStateDir()` (home from PASSWD via `user.LookupId`, NOT
 the dir path) > `SUDO_USER` (the #1012 branch) > process user. Each `Target`
 carries a `Signal` (`config`/`node-dir-owner`/`sudo-user`/`process`) so "probed
-jason's env" is distinguishable from "probed root's env on a root-owned node" —
+the operator's env" is distinguishable from "probed root's env on a root-owned node" —
 the two outcomes that look identical otherwise. A configured user missing from
 passwd is an ERROR (→ honest Unknown probe), never a silent fallback. Do NOT add
 systemd `User=` reading (answers the wrong question) or `/home/*` enumeration (a
@@ -4623,7 +4662,7 @@ service/installer and native acceptance scope.
 
 **Lesson that bit the live node: every `internal/update` test MUST sandbox HOME.**
 The update state file resolves from HOME (`getUserHomeDir`), and the shipped
-`citadel.service` is a systemd USER unit (HOME=/home/jason), so that file is the
+`citadel.service` is a systemd USER unit (HOME=the operator's home), so that file is the
 LIVE node's updater state — not a throwaway. `runOnce` now records a result on
 every terminal path (not just apply-success as before), so a `go test
 ./internal/update/` with no HOME sandbox writes bogus telemetry (e.g.
@@ -4752,7 +4791,7 @@ seam for tests, and also driving the new `citadel service refresh-unit`). Before
 this, `sudo citadel update install` on an up-to-date node exited at "You are
 running the latest version" without ever re-materializing the unit, so a node
 deployed by a pre-#444 binary never received the restart-storm hardening (seen on
-node 1314). `finishManualNoOp` also honors an explicit `--restart`: a managed
+a production node). `finishManualNoOp` also honors an explicit `--restart`: a managed
 worker may still run an older image even when the CLI is already current. A
 requested restart without a verified active target exits nonzero. Separately, the
 unprivileged-system-unit remediation (`service.rootRemediationCommand`) resolves
@@ -4805,7 +4844,7 @@ runs `citadel init --authkey`, which writes NO device creds
 (`saveDeviceConfigToFile` is reached only on the device-auth path), so
 `hasDeviceConfigured()` is false there and install.sh keeps sole ownership of
 `citadel-worker.service` — there is no competing-unit race. It fires on the
-interactive device-auth enroll (the RM-01/Jetson demo path).
+interactive device-auth enroll (the Jetson demo path).
 
 Two halves:
 - **Scaffold (`ensureNodeScaffoldAt`, root or not):** writes a minimal
@@ -5085,8 +5124,7 @@ Citadel CLI has full cross-platform support for Linux, macOS (darwin), and Windo
   any owner-home fallback — and that path is NOT `$HOME`-scoped, so a test's
   `t.Setenv("HOME", tempdir)` does not redirect it on a dev box where
   `/etc/citadel/config.yaml` already points `node_config_dir` at a real,
-  possibly-live node's directory (this repo's own dev machine is such a box —
-  see the RESUME notes on node 1297). A test that calls
+  possibly-live node's directory (a maintainer's dev machine can be such a box). A test that calls
   `config.SaveX(network.GetNodeConfigDir(), ...)` to seed a scenario silently
   WRITES into that real node's config, not a sandbox — caught only because the
   written file was visible afterward, not because any test failed. The fix
@@ -5261,7 +5299,7 @@ Docker Desktop on Windows requires WSL2:
 
 A remote E2E test script (`scripts/windows-e2e-test.sh`) validates the full first-time user experience on a Windows machine via WinRM. It tests: clean → install → init → verify.
 
-**Test machine**: `192.168.2.207` (DESKTOP-6UKHJAN, Windows 11, 8 GiB RAM, user: `acewin`)
+**Test machine**: a Windows 11 machine on the maintainers' LAN (8 GiB RAM, a local test user)
 
 **WinRM prerequisites** (one-time on the Windows machine, elevated PowerShell):
 ```powershell
@@ -5275,7 +5313,7 @@ New-NetFirewallRule -Name "WinRM-HTTP" -DisplayName "WinRM HTTP" -Protocol TCP -
 ```bash
 # Requires pywinrm in a venv
 PYTHON=~/.venvs/winrm/bin/python3 ./scripts/windows-e2e-test.sh \
-  --host 192.168.2.207 --user acewin --password '***' --authkey tskey-auth-xxx
+  --host "$WIN_HOST" --user "$WIN_USER" --password "$WIN_PASSWORD" --authkey tskey-auth-xxx
 ```
 
 **Current test status** (as of v2.3.0):

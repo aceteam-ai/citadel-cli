@@ -726,6 +726,11 @@ func runWork(cmd *cobra.Command, args []string) {
 		} else {
 			Debug("skipping reservation reconcile: this process does not hold the single-instance worker lock")
 		}
+		// Wake declared container sessions a reboot interrupted (#1533). Same
+		// single-worker precondition: two workers must not race one wake.
+		if workerLockHeld {
+			reconcileContainerSessions(network.GetNodeConfigDir())
+		}
 
 		// Default-serve reconcile (citadel-cli#628, appliance-mode opt-in):
 		// on a truly blank GPU node with default-serve opted in, auto-serve a

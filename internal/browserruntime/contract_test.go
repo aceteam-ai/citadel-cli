@@ -1,14 +1,18 @@
 package browserruntime
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 )
 
 func spec() RunSpec {
-	return RunSpec{Image: Image + ":abc@sha256:" + strings.Repeat("0", 64), Network: NetworkName("s-1"), SessionID: "s-1", Purpose: "cobrowse", UID: 1000, GID: 1000}
+	return RunSpec{Image: Image + ":abc@sha256:" + strings.Repeat("0", 64), Network: NetworkName("s-1"), SessionID: "s-1", Purpose: "cobrowse", UID: 1000, GID: 1000, SeccompProfile: "/tmp/seccomp.json"}
 }
 
 func TestArgsContract(t *testing.T) {
@@ -23,6 +27,7 @@ func TestArgsContract(t *testing.T) {
 		" --user 1000:1000 ", " --cap-drop ALL ", " no-new-privileges ", " --read-only ",
 		" -p 127.0.0.1::8102 ", " -p 127.0.0.1::9223 ",
 		" aceteam.browser-runtime.session=s-1 ", " aceteam.browser-runtime.purpose=cobrowse ",
+		" --security-opt seccomp=/tmp/seccomp.json ", " aceteam.browser-runtime.browser=chromium ", " MEETING_BROWSER=chromium ", " MEETING_REQUIRE_SANDBOX=1 ",
 		" --mount type=bind,src=/tmp/p,dst=/profile ", " --network aceteam-br-s-1 ", "/home/bot:rw,size=256m,mode=0700,uid=1000,gid=1000",
 	} {
 		if !strings.Contains(j, want) {
@@ -217,5 +222,125 @@ func TestArgsRunnerFields(t *testing.T) {
 		if _, err := bad.Args(); err == nil {
 			t.Errorf("%s must be rejected", name)
 		}
+	}
+}
+
+func TestBrowserChoice(t *testing.T) {
+	for _, b := range []string{"", "chromium"} {
+		s := spec()
+		s.Browser = b
+		if _, err := s.Args(); err != nil {
+			t.Errorf("browser %q: %v", b, err)
+		}
+	}
+	for _, b := range []string{"cloakbrowser", "Chromium", "firefox", "chromium "} {
+		s := spec()
+		s.Browser = b
+		if _, err := s.Args(); err == nil || !strings.Contains(err.Error(), "unsupported browser") {
+			t.Errorf("browser %q must be refused with a clear error, got %v", b, err)
+		}
+	}
+}
+
+func TestSeccompPathRequired(t *testing.T) {
+	for _, p := range []string{"", "rel.json", "/tmp/a,b", "/tmp/../tmp/x", "/tmp/a=b"} {
+		s := spec()
+		s.SeccompProfile = p
+		if _, err := s.Args(); err == nil {
+			t.Errorf("seccomp path %q must be rejected", p)
+		}
+	}
+}
+
+func TestSeccompProfilePinned(t *testing.T) {
+	sum := sha256.Sum256(SeccompProfileJSON)
+	if got := hex.EncodeToString(sum[:]); got != SeccompProfileSHA256 {
+		t.Fatalf("seccomp.json changed: sha256 %s, pinned %s (update the pin only with review)", got, SeccompProfileSHA256)
+	}
+	var prof struct {
+		DefaultAction string `json:"defaultAction"`
+		Syscalls      []struct {
+			Names    []string        `json:"names"`
+			Action   string          `json:"action"`
+			Args     json.RawMessage `json:"args"`
+			Includes json.RawMessage `json:"includes"`
+			Excludes json.RawMessage `json:"excludes"`
+		} `json:"syscalls"`
+	}
+	if err := json.Unmarshal(SeccompProfileJSON, &prof); err != nil {
+		t.Fatal(err)
+	}
+	// Still a deny-by-default profile, not an allow-all one.
+	if prof.DefaultAction != "SCMP_ACT_ERRNO" {
+		t.Errorf("defaultAction %q", prof.DefaultAction)
+	}
+	// The namespace-sandbox syscalls are allowed unconditionally (no caps, args
+	// or arch filters), and nothing that Docker's default withholds from an
+	// unprivileged container is opened beyond those three.
+	need := map[string]bool{"clone": false, "unshare": false, "chroot": false}
+	for _, r := range prof.Syscalls {
+		if r.Action != "SCMP_ACT_ALLOW" || len(r.Args) > 0 || len(r.Includes) > 0 || len(r.Excludes) > 0 {
+			continue
+		}
+		for _, n := range r.Names {
+			if _, ok := need[n]; ok {
+				need[n] = true
+			}
+			for _, banned := range []string{"mount", "setns", "bpf", "ptrace", "perf_event_open", "pivot_root", "reboot", "kexec_load", "init_module"} {
+				if n == banned {
+					t.Errorf("syscall %q must not be unconditionally allowed", n)
+				}
+			}
+		}
+	}
+	for n, ok := range need {
+		if !ok {
+			t.Errorf("%s must be unconditionally allowed for Chromium's sandbox", n)
+		}
+	}
+}
+
+func TestWriteSeccompProfile(t *testing.T) {
+	dir := t.TempDir()
+	p, err := WriteSeccompProfile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p != filepath.Join(dir, SeccompFileName) {
+		t.Errorf("path %s", p)
+	}
+	b, _ := os.ReadFile(p)
+	if string(b) != string(SeccompProfileJSON) {
+		t.Error("written profile differs from the pinned one")
+	}
+	if fi, _ := os.Stat(p); fi.Mode().Perm() != 0o600 {
+		t.Errorf("mode %v", fi.Mode())
+	}
+	if _, err := WriteSeccompProfile(dir); err == nil {
+		t.Error("a pre-existing file must not be overwritten")
+	}
+}
+
+func TestSandboxStaysOffInDockerfileUntilVerified(t *testing.T) {
+	b, err := os.ReadFile("../../services/meeting-service/Dockerfile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	df := string(b)
+	// The sandbox label is derived from a build arg that defaults to empty, so an
+	// image is never marked sandboxed unless the build proved it.
+	if !strings.Contains(df, `ARG SANDBOX_VERIFIED=""`) || !strings.Contains(df, `aceteam.browser-runtime.sandbox="${SANDBOX_VERIFIED}"`) {
+		t.Error("Dockerfile must set the sandbox label from the SANDBOX_VERIFIED build arg (default empty)")
+	}
+	if strings.Contains(df, `sandbox="1"`) {
+		t.Error("the sandbox label must never be hard-coded")
+	}
+	m, err := os.ReadFile("../../services/meeting-service/meetingd.py")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// --no-sandbox is only ever appended behind the REQUIRE_SANDBOX switch.
+	if strings.Count(string(m), `"--no-sandbox"`) != 1 || !strings.Contains(string(m), "if not REQUIRE_SANDBOX:\n        # Historical behaviour") {
+		t.Error("build_chrome_args must add --no-sandbox only when MEETING_REQUIRE_SANDBOX is unset")
 	}
 }

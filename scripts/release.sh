@@ -1,20 +1,16 @@
 #!/bin/bash
 # release.sh — Release automation for Citadel CLI
 #
-# Builds cross-platform binaries, tags the release, and creates a GitHub
-# Release with binaries attached. Idempotent — re-running after a failure
-# resumes from the last completed step.
+# CI builds the unsigned draft after a reviewed VERSION bump. This operator
+# entrypoint verifies it, signs locally, publishes and updates Homebrew.
+# The previous all-local engine is explicit emergency recovery only.
 #
 # Usage:
-#   ./scripts/release.sh              # Minor bump release
-#   ./scripts/release.sh patch        # Patch release
-#   ./scripts/release.sh --dry-run    # Preview without changes
-#   ./scripts/release.sh --status     # Check last release state
-#   ./scripts/release.sh --resume     # Resume after failure
-#   ./scripts/release.sh --clean      # Clear state and start fresh
+#   ./scripts/release.sh --sign-draft vX.Y.Z  # Sign and publish a verified CI draft
+#   ./scripts/release.sh --legacy ...        # Operator-only old-engine recovery
 #
-# Version is derived from git tags (vX.Y.Z). The binary version is set
-# at build time via ldflags.
+# Normal releases use VERSION from the merged PR and ldflags at build time.
+# The legacy engine retains its tag-derived version and resume journal.
 
 set -euo pipefail
 
@@ -57,6 +53,22 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
+
+# Primary release path: CI builds the unsigned draft; the operator performs
+# only verification, local signing, publication and the Homebrew update here.
+if [[ "${1:-}" == "--sign-draft" ]]; then
+  if [[ "$#" -ne 2 ]]; then
+    echo "Usage: scripts/release.sh --sign-draft vX.Y.Z" >&2
+    exit 1
+  fi
+  exec python3 -I -B "$SCRIPT_DIR/release_draft.py" sign "$2"
+fi
+if [[ "${1:-}" != "--legacy" ]]; then
+  echo "Use a reviewed VERSION bump PR, then scripts/release.sh --sign-draft vX.Y.Z." >&2
+  echo "The old all-local engine requires the explicit --legacy recovery option." >&2
+  exit 2
+fi
+shift
 
 # ── Project config ─────────────────────────────────────────────────────────
 
