@@ -12,6 +12,7 @@ import (
 
 func provisionTestMutationLock(t *testing.T, destination string) {
 	t.Helper()
+	ensureFixtureOwnedByCurrentUser(t, destination)
 	lock, err := acquireMutationLock(context.Background(), destination, true)
 	if err != nil {
 		t.Fatalf("provision validated mutation lock: %v", err)
