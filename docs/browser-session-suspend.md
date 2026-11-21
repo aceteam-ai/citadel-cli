@@ -48,6 +48,20 @@ lifecycle recovery. Completely unreadable or unparseable records still follow
 the legacy scan behavior; this increment does not provide process-aware recovery
 or a cross-process sweep lease. Local mode keeps its isolated legacy behavior.
 
+Ordinary Stop/StopAll now also preserve retained lifecycle entries instead of
+silently deleting a just-published capture intent. The deletion guard rereads
+only bounded metadata after registry exclusion, validates its anchored root and
+file identity, and removes only recognized live/non-suspension ended entries.
+Retained, malformed, unreadable, unsafe and unknown-version/state metadata is
+left intact. Stop reports a generic metadata-retained error while continuing its
+existing best-effort process and private working-directory cleanup; it does not
+claim positive complete-resource proof or a successful capture discard. StopAll
+still attempts its other sessions. Local mode opens no node registry, and a
+missing registry is not created. The guard has a five-second cooperative budget,
+including exclusion wait, not a hard filesystem-I/O or whole-teardown deadline.
+This is in-process protection, not a cross-process compare-and-delete lease;
+strict recovery and an explicit retained-session discard remain unfinished.
+
 The managed worker also owns metadata-only housekeeping under its root context.
 It runs a bounded pass on startup and hourly, with one-second follow-ups only
 after a successful full batch. Errors back off to the hourly cadence. Each pass
@@ -139,7 +153,9 @@ returns, rather than leaving an unlock/relock gap after capture. Its trusted
 caller still owns registry exclusion and must revalidate around its own awaits;
 it must not re-enter ordinary actions or teardown. Cancellation after a durable
 effect is an unacknowledged result, not permission to delete referenced data.
-The manager transaction is not wired to this continuation yet.
+The manager transaction is not wired to this continuation yet. Ordinary
+teardown remains forbidden inside its non-reentrant registry exclusion, even
+though the legacy delete path now withholds deletion of retained metadata.
 The private throwaway capture-to-intent composition additionally holds registry
 exclusion, pins the pre-capture runtime pointer and record, and checks a trusted
 manager-incarnation fence during publication. Its continuation starts only after

@@ -872,9 +872,12 @@ func (s *cobrowseSession) teardown() error {
 	// never contain them.
 	s.closeStaging()
 	_ = s.removeStagingDir()
-	// A stopped session leaves no registry record: it did not "end" unexpectedly.
+	// Ordinary live metadata may be removed. Retained/uncertain lifecycle data
+	// is not Stop's discard authority: keep it for strict recovery and report
+	// that refusal while still attempting the legacy resource cleanup below.
+	var recordErr error
 	if regDir != "" {
-		deleteRecord(regDir, s.id)
+		recordErr = deleteRecord(regDir, s.id)
 	}
 
 	var err error
@@ -922,6 +925,9 @@ func (s *cobrowseSession) teardown() error {
 			// failure to remove it must be visible, never silent.
 			err = fmt.Errorf("the decrypted working copy of a saved profile could not be removed from %s: %w", profile, rerr)
 		}
+	}
+	if recordErr != nil {
+		return errors.Join(err, recordErr)
 	}
 	return err
 }

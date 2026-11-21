@@ -351,13 +351,13 @@ func listRecords(regDir string) []sessionRecord {
 	return out
 }
 
-func deleteRecord(regDir, id string) {
-	release, err := acquireBrowserRegistryGate(context.Background(), regDir)
-	if err != nil {
-		return
+func deleteRecord(regDir, id string) error {
+	if regDir == "" {
+		return nil // Isolated/local sessions have no node registry.
 	}
-	defer release()
-	_ = os.Remove(recordFile(regDir, id))
+	ctx, cancel := context.WithTimeout(context.Background(), suspendDeleteLimit)
+	defer cancel()
+	return deleteLegacyBrowserRecord(ctx, regDir, id)
 }
 
 // persistRecord writes (best-effort) the registry record for a live session.

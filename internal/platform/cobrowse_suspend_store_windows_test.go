@@ -8,6 +8,13 @@ import "testing"
 // storage/OS-lock contract there without changing or bypassing the workflow.
 func TestWindowsSuspendManifestStorage(t *testing.T) {
 	for name, test := range map[string]func(*testing.T){
+		"delete-retained-stop":     TestSuspendDeletePublicStopRetainsLifecycle,
+		"delete-stop-all":          TestSuspendDeleteStopAllStillCleansOrdinarySessions,
+		"delete-publication-wait":  TestSuspendDeleteRechecksAfterPublicationDuringWait,
+		"delete-unknown-metadata":  TestSuspendDeleteUnknownMetadataIsNotDiscardAuthority,
+		"delete-legacy-admission":  TestSuspendDeleteLegacyCompatibilityAndAdmission,
+		"delete-budget-root":       TestSuspendDeleteWaitBudgetAndRootReplacement,
+		"delete-long-budget":       TestSuspendDeleteLongWaitIsCapped,
 		"legacy-cleanup-markers":   TestSuspendLegacyCleanupRetentionMarkers,
 		"legacy-sweep-protection":  TestSuspendRecoveryProtectsRetainedResourcesFromLegacySweep,
 		"legacy-sweep-local":       TestSuspendRecoveryLocalSweepDoesNotReadNodeRegistry,

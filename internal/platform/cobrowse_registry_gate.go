@@ -89,7 +89,8 @@ func acquireBrowserRegistryGate(ctx context.Context, dir string) (func(), error)
 
 // The trusted callback uses anchored store transitions, NEVER legacy save/
 // delete helpers (the gate is deliberately non-reentrant). In particular it
-// must not call ordinary teardown, which deletes the authoritative intent.
+// must not call ordinary teardown: it re-enters this non-reentrant gate and
+// uses best-effort resource cleanup, not exact lifecycle completion.
 // This entry only excludes in-process registry mutations, not live processes.
 func (s *suspendIntentStore) withLifecycleExclusive(ctx context.Context, run func(context.Context) error) error {
 	fail := func() error { return errors.New("browser lifecycle transaction incomplete") }
