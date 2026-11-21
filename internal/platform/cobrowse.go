@@ -108,7 +108,8 @@ type cobrowseLaunchOptions struct {
 	// (--password-store=basic) instead of the OS keyring. See buildChromeArgs for
 	// the full rationale: it makes cookie encryption binary- and
 	// environment-independent, which a persistent, externally-seeded profile
-	// requires. Left false for co-browse (keeps keyring-backed persistent logins).
+	// requires. Also set for the managed-Xvfb co-browse runner (buildXvfbChromeArgs), where
+	// the keyring wait stalled the first page load ~25s (citadel-cli#1694).
 	passwordStoreBasic bool
 	// autoplayNoUserGesture relaxes Chrome's autoplay policy
 	// (--autoplay-policy=no-user-gesture-required). An automated browser has no
@@ -187,6 +188,10 @@ func buildChromeArgs(opts cobrowseLaunchOptions) []string {
 		"--user-data-dir=" + opts.profileDir,
 		"--no-first-run",
 		"--no-default-browser-check",
+		// Session-local: browser identity is never the site's SSO identity.
+		// Chromium's command-line refusal overrides restored sign-in prefs.
+		"--allow-browser-signin=false",
+		"--disable-sync",
 	}
 	if opts.headless {
 		args = append(args, "--headless=new")
@@ -287,13 +292,14 @@ var ErrNotStarted = fmt.Errorf("no co-browse session; call cobrowse_start first"
 
 // CobrowseStatus is the queryable state of the session.
 type CobrowseStatus struct {
-	Running   bool           `json:"running"`
-	Driver    CobrowseDriver `json:"driver"`
-	URL       string         `json:"url"`
-	DebugPort int            `json:"debug_port"`
-	Profile   string         `json:"profile"`
-	Display   string         `json:"display,omitempty"`
-	StartedAt string         `json:"started_at,omitempty"`
+	Interstitial BrowserInterstitial `json:"interstitial,omitempty"`
+	Running      bool                `json:"running"`
+	Driver       CobrowseDriver      `json:"driver"`
+	URL          string              `json:"url"`
+	DebugPort    int                 `json:"debug_port"`
+	Profile      string              `json:"profile"`
+	Display      string              `json:"display,omitempty"`
+	StartedAt    string              `json:"started_at,omitempty"`
 }
 
 // CobrowseManager owns the single managed browser process and its driver state.
@@ -444,6 +450,12 @@ var managedXvfbMu sync.Mutex
 // a confusing downstream "CDP not ready" timeout. Concurrent-safe: display
 // allocation is serialized under managedXvfbMu.
 func startManagedXvfb(resolution string) (*exec.Cmd, string, error) {
+	return startManagedXvfbWrapped(resolution, nil)
+}
+
+// startManagedXvfbWrapped is startManagedXvfb with an optional argv wrapper
+// (for example a transient systemd scope), applied to the Xvfb command.
+func startManagedXvfbWrapped(resolution string, wrap func([]string) []string) (*exec.Cmd, string, error) {
 	if !isCommandAvailable("Xvfb") {
 		return nil, "", fmt.Errorf(
 			"Xvfb not found: install it (e.g. 'apt-get install xvfb') to run headless co-browse, "+
@@ -453,7 +465,11 @@ func startManagedXvfb(resolution string) (*exec.Cmd, string, error) {
 	defer managedXvfbMu.Unlock()
 	n := findFreeDisplay()
 	display := fmt.Sprintf(":%d", n)
-	cmd := exec.Command("Xvfb", display, "-screen", "0", resolution, "-nolisten", "tcp")
+	argv := []string{"Xvfb", display, "-screen", "0", resolution, "-nolisten", "tcp"}
+	if wrap != nil {
+		argv = wrap(argv)
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	if err := cmd.Start(); err != nil {
@@ -757,6 +773,8 @@ func (m *CobrowseManager) statusLocked() CobrowseStatus {
 			st.URL = url
 		}
 	}
+	safe := withBrowserInterstitial(CobrowseSessionStatus{URL: st.URL})
+	st.URL, st.Interstitial = safe.URL, safe.Interstitial
 	return st
 }
 

@@ -2,6 +2,7 @@ package cobrowseprofile
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -12,8 +13,9 @@ import (
 
 // The test vault runs full Argon2id (paramsOverride is private to nodevault), so
 // it is created exactly once for the whole package and shared across tests. Each
-// OpenHandle still pays one Unlock; tests are written to keep those few.
-const testPIN = "123456"
+// OpenHandle still pays one Unlock; tests are written to keep those few. The
+// secret is an at-rest-grade passphrase: a short PIN cannot open a profile (#820).
+const testPIN = "lantern orbit pebble saffron"
 
 var (
 	sharedVaultOnce sync.Once
@@ -159,7 +161,7 @@ func TestWrongPINFailsClosed(t *testing.T) {
 	v, baseDir := testVault(t)
 	name := uniqueName(t)
 
-	if _, err := OpenHandle(baseDir, name, "000000", v); err == nil {
+	if _, err := OpenHandle(baseDir, name, "lantern orbit pebble saffrom", v); err == nil {
 		t.Fatal("OpenHandle with wrong PIN returned no error")
 	}
 	// The lock must have been released: a correct PIN now succeeds.
@@ -263,4 +265,68 @@ func TestInvalidName(t *testing.T) {
 			t.Errorf("Reset(%q) accepted an invalid name", bad)
 		}
 	}
+}
+
+// TestShortPINVaultRefused is #820's acceptance for the profile: a vault whose
+// secret is a 6-digit access PIN cannot open a persistent profile, even with the
+// correct PIN, and the refusal leaks neither the profile lock nor a session.
+// Mutation check: OpenHandle calling Unlock instead of UnlockAtRest passes the
+// PIN and this fails.
+func TestShortPINVaultRefused(t *testing.T) {
+	baseDir := t.TempDir()
+	v := nodevault.Open(baseDir)
+	if err := v.SetPIN("654321", nodevault.DefaultPolicy(), true); err != nil {
+		t.Fatalf("SetPIN: %v", err)
+	}
+	if _, err := OpenHandle(baseDir, "default", "654321", v); !errors.Is(err, nodevault.ErrWeakSecret) {
+		t.Fatalf("OpenHandle with a short PIN = %v, want ErrWeakSecret", err)
+	}
+	if err := Reset(baseDir, "default"); err != nil {
+		t.Fatalf("profile lock leaked after refusal: %v", err)
+	}
+}
+
+// TestOSLockConflictsAcrossHandles proves the cross-process lock: a second OS
+// lock on the same file conflicts even with the in-process map bypassed, which
+// is what another Citadel process sees. Mutation check: a no-op lockFile passes
+// the second call and this fails.
+func TestOSLockConflictsAcrossHandles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "profiles", "p.enc.lock")
+	release, err := lockFile(path)
+	if err != nil {
+		t.Fatalf("first lock: %v", err)
+	}
+	if _, err := lockFile(path); !errors.Is(err, ErrProfileBusy) {
+		t.Fatalf("second lock = %v, want ErrProfileBusy", err)
+	}
+	release()
+	release2, err := lockFile(path)
+	if err != nil {
+		t.Fatalf("lock after release: %v", err)
+	}
+	release2()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("the lock file must stay in place (never unlinked): %v", err)
+	}
+}
+
+// TestReleasedHandleFreesOSLock checks Close drops the OS lock, not only the
+// in-process entry.
+func TestReleasedHandleFreesOSLock(t *testing.T) {
+	v, baseDir := testVault(t)
+	name := uniqueName(t)
+	h, err := OpenHandle(baseDir, name, testPIN, v)
+	if err != nil {
+		t.Fatalf("OpenHandle: %v", err)
+	}
+	lockPath := storePath(baseDir, name) + lockFileExt
+	if _, err := lockFile(lockPath); !errors.Is(err, ErrProfileBusy) {
+		t.Fatalf("OS lock not held while the handle is open: %v", err)
+	}
+	_ = h.Close()
+	release, err := lockFile(lockPath)
+	if err != nil {
+		t.Fatalf("OS lock still held after Close: %v", err)
+	}
+	release()
 }

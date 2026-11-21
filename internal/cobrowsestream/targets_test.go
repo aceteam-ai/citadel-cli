@@ -1,0 +1,415 @@
+package cobrowsestream
+
+import (
+	"encoding/json"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
+	"github.com/gorilla/websocket"
+)
+
+// fakeTargetSession is a TargetSession over two fake pages: an opener "a" and
+// a popup "b".
+type fakeTargetSession struct {
+	*fakeSession
+	pages map[string]*fakeChrome
+	open  []string // ids in browser order
+
+	failNext int
+	active   string
+	switched []string
+	closed   []string
+}
+
+func (s *fakeTargetSession) snapshot() TargetSnapshot {
+	snap := TargetSnapshot{Active: s.active, ActiveWebSocketURL: s.pages[s.active].wsURL()}
+	for _, id := range s.open {
+		snap.Targets = append(snap.Targets, TargetInfo{ID: id, URL: "http://page.test/" + id, Active: id == s.active})
+	}
+	return snap
+}
+
+func (s *fakeTargetSession) Targets(id string) (TargetSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failNext > 0 {
+		s.failNext--
+		return TargetSnapshot{}, fmt.Errorf("transient")
+	}
+	return s.snapshot(), nil
+}
+
+func (s *fakeTargetSession) SwitchTarget(id, target string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.switched = append(s.switched, target)
+	s.active = target
+	return nil
+}
+
+func (s *fakeTargetSession) CloseTarget(id, target string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = append(s.closed, target)
+	return nil
+}
+
+func (s *fakeTargetSession) set(active string, open ...string) {
+	s.mu.Lock()
+	s.active, s.open = active, open
+	s.mu.Unlock()
+}
+
+func readTargets(t *testing.T, conn *websocket.Conn, wantActive string) TargetsMessage {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		mt, data, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if mt != websocket.TextMessage {
+			continue
+		}
+		var m TargetsMessage
+		if json.Unmarshal(data, &m) == nil && m.Type == TargetsType && m.Active == wantActive {
+			return m
+		}
+	}
+	t.Fatalf("no targets message with active=%q", wantActive)
+	return TargetsMessage{}
+}
+
+func waitConns(t *testing.T, f *fakeChrome, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		f.mu.Lock()
+		n := len(f.conns)
+		f.mu.Unlock()
+		if n >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("fake page never saw %d connections", want)
+}
+
+func TestStreamFollowsPopupAndReturnsToOpener(t *testing.T) {
+	a, b := newFakeChrome(), newFakeChrome()
+	defer a.close()
+	defer b.close()
+	sess := &fakeTargetSession{fakeSession: &fakeSession{port: 9222, attachable: true},
+		pages: map[string]*fakeChrome{"a": a, "b": b}}
+	sess.set("a", "a")
+	ts := newHarness(t, sess, a)
+
+	conn, _, err := dialViewer(t, ts, "cb-1")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	first := readTargets(t, conn, "a")
+	if len(first.Targets) != 1 {
+		t.Fatalf("first targets = %+v", first)
+	}
+	waitConns(t, a, 1)
+
+	// A popup opens and becomes active: the viewer is told and the screencast
+	// moves to the popup.
+	sess.set("b", "a", "b")
+	m := readTargets(t, conn, "b")
+	if len(m.Targets) != 2 || !m.Targets[1].Active {
+		t.Fatalf("popup targets = %+v", m)
+	}
+	waitConns(t, b, 1)
+
+	// The popup closes itself: back to the opener.
+	sess.set("a", "a")
+	readTargets(t, conn, "a")
+	waitConns(t, a, 2)
+}
+
+func TestViewerTargetSwitchNeedsControl(t *testing.T) {
+	a, b := newFakeChrome(), newFakeChrome()
+	defer a.close()
+	defer b.close()
+	sess := &fakeTargetSession{fakeSession: &fakeSession{port: 9222, attachable: true},
+		pages: map[string]*fakeChrome{"a": a, "b": b}}
+	sess.set("a", "a", "b")
+	ts := newHarness(t, sess, a)
+
+	conn, _, err := dialViewer(t, ts, "cb-1")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readTargets(t, conn, "a")
+
+	in, _ := json.Marshal(InputMessage{Type: InputTypeTargetSwitch, Target: "b"})
+	if err := conn.WriteMessage(websocket.TextMessage, in); err != nil {
+		t.Fatal(err)
+	}
+	sess.waitInputChecks(t, 1)
+	sess.mu.Lock()
+	n := len(sess.switched)
+	sess.mu.Unlock()
+	if n != 0 {
+		t.Fatal("an observing viewer switched pages")
+	}
+
+	sess.setHumanControl(true)
+	if err := conn.WriteMessage(websocket.TextMessage, in); err != nil {
+		t.Fatal(err)
+	}
+	readTargets(t, conn, "b")
+	waitConns(t, b, 1)
+
+	cl, _ := json.Marshal(InputMessage{Type: InputTypeTargetClose, Target: "b"})
+	if err := conn.WriteMessage(websocket.TextMessage, cl); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		sess.mu.Lock()
+		c := len(sess.closed)
+		sess.mu.Unlock()
+		if c == 1 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("close request never reached the session")
+}
+
+func TestParseTargetMessages(t *testing.T) {
+	for _, tc := range []struct {
+		in string
+		ok bool
+	}{
+		{`{"type":"target_switch","target":"abc"}`, true},
+		{`{"type":"target_close","target":"abc"}`, true},
+		{`{"type":"target_switch"}`, false},
+		{`{"type":"target_close","target":"` + string(make([]byte, 200)) + `"}`, false},
+	} {
+		if _, ok := parseInputMessage([]byte(tc.in)); ok != tc.ok {
+			t.Errorf("%.40s: ok=%v want %v", tc.in, ok, tc.ok)
+		}
+	}
+}
+
+// A popup that closes itself drops its CDP socket while the browser still lists
+// it for a moment. The viewer must stay connected and return to the opener.
+func TestStreamSurvivesPopupClosingItself(t *testing.T) {
+	a, b := newFakeChrome(), newFakeChrome()
+	defer a.close()
+	defer b.close()
+	sess := &fakeTargetSession{fakeSession: &fakeSession{port: 9222, attachable: true},
+		pages: map[string]*fakeChrome{"a": a, "b": b}}
+	sess.set("a", "a")
+	ts := newHarness(t, sess, a)
+
+	conn, _, err := dialViewer(t, ts, "cb-1")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	readTargets(t, conn, "a")
+	sess.set("b", "a", "b")
+	readTargets(t, conn, "b")
+	waitConns(t, b, 1)
+
+	b.killConns()
+	time.AfterFunc(400*time.Millisecond, func() { sess.set("a", "a") })
+	readTargets(t, conn, "a")
+	waitConns(t, a, 2)
+
+	// Still connected: a later page change still reaches the viewer.
+	sess.set("b", "a", "b")
+	readTargets(t, conn, "b")
+}
+
+// Only a manager that tracks pages (local mode) offers page frames and
+// switching; recovered legacy sessions still stream the first page.
+func TestNodeWideManagerSessionTracksNewRemotePages(t *testing.T) {
+	plain := NewManagerSessionFrom(platform.NewCobrowseSessionManager(t.TempDir(), 1))
+	if _, ok := plain.(TargetSession); ok {
+		t.Fatal("a manager without page tracking offers target frames")
+	}
+	if _, ok := NewManagerSession().(TargetSession); !ok {
+		t.Fatal("the node-wide adapter must offer targets for new sessions")
+	}
+	tracked := platform.NewCobrowseSessionManager(t.TempDir(), 1)
+	tracked.EnableTargetTracking(nil, nil)
+	if _, ok := NewManagerSessionFrom(tracked).(TargetSession); !ok {
+		t.Fatal("a tracking manager does not offer target frames")
+	}
+}
+
+// One slow or failed page-list read must not end a healthy stream.
+func TestStreamSurvivesTransientTargetReadErrors(t *testing.T) {
+	a, b := newFakeChrome(), newFakeChrome()
+	defer a.close()
+	defer b.close()
+	sess := &fakeTargetSession{fakeSession: &fakeSession{port: 9222, attachable: true},
+		pages: map[string]*fakeChrome{"a": a, "b": b}}
+	sess.set("a", "a")
+	ts := newHarness(t, sess, a)
+	conn, _, err := dialViewer(t, ts, "cb-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	readTargets(t, conn, "a")
+	sess.mu.Lock()
+	sess.failNext = 2
+	sess.mu.Unlock()
+	time.Sleep(time.Second)
+	sess.set("b", "a", "b")
+	readTargets(t, conn, "b")
+}
+
+// A session whose only page is refused is never attached; the stream holds,
+// shows the page as refused, and attaches when the page becomes allowed.
+func TestStreamDoesNotAttachToARefusedPage(t *testing.T) {
+	a := newFakeChrome()
+	defer a.close()
+	sess := &refusedSession{fakeTargetSession: &fakeTargetSession{fakeSession: &fakeSession{port: 9222, attachable: true},
+		pages: map[string]*fakeChrome{"a": a}}}
+	sess.refused = true
+	ts := newHarness(t, sess, a)
+	conn, _, err := dialViewer(t, ts, "cb-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		mt, data, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m TargetsMessage
+		if mt == websocket.TextMessage && json.Unmarshal(data, &m) == nil && m.Type == TargetsType {
+			if len(m.Targets) != 1 || !m.Targets[0].Refused || m.Active != "" {
+				t.Fatalf("targets = %+v", m)
+			}
+			break
+		}
+	}
+	time.Sleep(600 * time.Millisecond)
+	a.mu.Lock()
+	n := len(a.conns)
+	a.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("the stream attached to a refused page (%d connections)", n)
+	}
+	// The page navigates to an allowed address: the stream attaches.
+	sess.mu.Lock()
+	sess.refused = false
+	sess.mu.Unlock()
+	readTargets(t, conn, "a")
+	waitConns(t, a, 1)
+}
+
+type refusedSession struct {
+	*fakeTargetSession
+	refused bool
+}
+
+func (s *refusedSession) Targets(id string) (TargetSnapshot, error) {
+	s.mu.Lock()
+	refused := s.refused
+	s.mu.Unlock()
+	if refused {
+		return TargetSnapshot{Targets: []TargetInfo{{ID: "a", URL: "http://private.test/", Refused: true}}}, nil
+	}
+	s.set("a", "a")
+	return s.fakeTargetSession.Targets(id)
+}
+
+// On an allowed-to-refused transition the stream detaches before it tells the
+// viewer, so input sent after the viewer sees the refusal reaches nothing.
+func TestInputAfterRefusalFrameReachesNoPage(t *testing.T) {
+	a := newFakeChrome()
+	defer a.close()
+	sess := &refusedSession{fakeTargetSession: &fakeTargetSession{fakeSession: &fakeSession{port: 9222, attachable: true},
+		pages: map[string]*fakeChrome{"a": a}}}
+	sess.setHumanControl(true)
+	ts := newHarness(t, sess, a)
+	conn, _, err := dialViewer(t, ts, "cb-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	readTargets(t, conn, "a")
+	waitConns(t, a, 1)
+	mouse, _ := json.Marshal(InputMessage{Type: InputTypeMouse, Event: "mouseMoved", X: 0.5, Y: 0.5})
+	// Prove input does flow while attached.
+	deadline := time.Now().Add(5 * time.Second)
+	for len(a.mouseEvents()) == 0 && time.Now().Before(deadline) {
+		_ = conn.WriteMessage(websocket.TextMessage, mouse)
+		time.Sleep(50 * time.Millisecond)
+	}
+	if len(a.mouseEvents()) == 0 {
+		t.Fatal("input never reached the attached page")
+	}
+
+	sess.mu.Lock()
+	sess.refused = true
+	sess.mu.Unlock()
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		mt, data, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m TargetsMessage
+		if mt == websocket.TextMessage && json.Unmarshal(data, &m) == nil && m.Type == TargetsType && len(m.Targets) == 1 && m.Targets[0].Refused {
+			break
+		}
+	}
+	before := len(a.mouseEvents())
+	for i := 0; i < 10; i++ {
+		_ = conn.WriteMessage(websocket.TextMessage, mouse)
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if after := len(a.mouseEvents()); after != before {
+		t.Fatalf("%d input events reached the refused page", after-before)
+	}
+}
+
+type legacyModeTargetSession struct{ *fakeTargetSession }
+
+func (legacyModeTargetSession) TracksTargets(string) bool { return false }
+
+func TestNodeWideManagerSessionHonorsPerSessionLegacyMode(t *testing.T) {
+	f := newFakeChrome()
+	defer f.close()
+	sess := legacyModeTargetSession{&fakeTargetSession{fakeSession: &fakeSession{port: 9222, attachable: true}, pages: map[string]*fakeChrome{"a": f}, open: []string{"a"}, active: "a"}}
+	server := newHarness(t, sess, f)
+	conn, _, err := dialViewer(t, server, "legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	for {
+		kind, raw, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if kind == websocket.BinaryMessage {
+			return
+		}
+		var msg map[string]any
+		if json.Unmarshal(raw, &msg) == nil && msg["type"] == "targets" {
+			t.Fatal("legacy session gained target frames")
+		}
+	}
+}

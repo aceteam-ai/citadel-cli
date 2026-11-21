@@ -239,6 +239,9 @@ func (o liveTemplateRunOps) resolveInputs(ctx context.Context, files []jobs.Temp
 			hashes = append(hashes, digest)
 			continue
 		}
+		if err := jobs.DenyBotProfilesPath(filepath.Join(workspaceRoot.Name(), rel)); err != nil {
+			return nil, nil, nil, fmt.Errorf("input file %q is not present on this node", f.NodePath)
+		}
 		src, err := workspaceRoot.Open(rel)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("open input %q: %w", f.NodePath, err)

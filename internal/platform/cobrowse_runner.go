@@ -20,6 +20,7 @@
 package platform
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,7 +36,9 @@ import (
 
 // EnvCobrowseBrowser pins the browser executable a co-browse session launches.
 // When set, discovery uses exactly this path and fails if it does not exist; it
-// never silently falls back to another browser.
+// never silently falls back to another browser. On Windows the value may also be
+// a browser name (chrome or edge, case-insensitive), resolved through the normal
+// discovery restricted to that browser.
 const EnvCobrowseBrowser = "CITADEL_COBROWSE_BROWSER"
 
 // BrowserInfo identifies the browser a runner found.
@@ -85,6 +88,14 @@ type LaunchOptions struct {
 	// Quiet turns off the browser's own background networking and component
 	// updates, so a session only makes the connections its pages need.
 	Quiet bool
+	// Detach asks for the browser and Xvfb to run in their own systemd scopes so
+	// they outlive a service restart. Only the node-wide manager of the managed
+	// worker sets it; everything else launches directly.
+	Detach bool
+	// UseContainer is the manager's per-launch decision (made before it lays out
+	// the session dir) to run this session in a container. Only the node-wide
+	// manager sets it; local mode keeps the user's own host browser.
+	UseContainer bool
 }
 
 // devToolsActivePortFile is where a browser launched with
@@ -137,26 +148,81 @@ func waitForDevToolsActivePort(profileDir string, timeout time.Duration, exited 
 // verifyCDPBrowserID checks the endpoint on port is the browser whose id was
 // read from its own profile dir.
 func verifyCDPBrowserID(port int, browserID string) error {
-	resp, err := cdpHTTPClient.Get(fmt.Sprintf("http://127.0.0.1:%d/json/version", port))
+	if browserID == "" {
+		return errCDPImpostor
+	}
+	got, err := fetchCDPBrowserID(port)
 	if err != nil {
 		return err
+	}
+	if got != browserID {
+		return errCDPImpostor
+	}
+	return nil
+}
+
+// fetchCDPBrowserID reads the browser id the loopback endpoint on port reports
+// (bounded client, no redirects).
+func fetchCDPBrowserID(port int) (string, error) {
+	ws, err := fetchCDPBrowserWS(port)
+	if err != nil {
+		return "", err
+	}
+	const marker = "/devtools/browser/"
+	i := strings.LastIndex(ws, marker)
+	if i < 0 || i+len(marker) == len(ws) {
+		return "", errors.New("endpoint reports no browser id")
+	}
+	return ws[i+len(marker):], nil
+}
+
+// fetchCDPBrowserWS reads the browser-level WebSocket URL the loopback endpoint
+// on port reports (bounded client, no redirects).
+func fetchCDPBrowserWS(port int) (string, error) {
+	return fetchCDPBrowserWSContext(context.Background(), port)
+}
+
+// fetchCDPBrowserWSContext is fetchCDPBrowserWS bounded by ctx as well as the
+// client timeout.
+func fetchCDPBrowserWSContext(ctx context.Context, port int) (string, error) {
+	// The id is identity evidence: never follow a redirect to another origin.
+	client := *cdpHTTPClient
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/json/version", port), nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return "", fmt.Errorf("endpoint answered %s", resp.Status)
 	}
 	defer resp.Body.Close()
 	var v struct {
 		WS string `json:"webSocketDebuggerUrl"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&v); err != nil {
-		return err
+		return "", err
 	}
-	if !strings.HasSuffix(v.WS, "/devtools/browser/"+browserID) {
-		return errCDPImpostor
+	// A containerized browser advertises its container-internal port; the
+	// loopback endpoint we probed is the one that is reachable. Host browsers
+	// already advertise exactly this authority, so the rewrite is a no-op there.
+	if rewritten, rerr := rewriteLoopbackWSPort(v.WS, port); rerr == nil {
+		return rewritten, nil
 	}
-	return nil
+	return v.WS, nil
 }
 
 // activeBrowserRunner is the runner for this OS. A package var so tests can
 // substitute one; production sets it in cobrowse_runner_{windows,other}.go.
-var activeBrowserRunner = newDefaultBrowserRunner()
+var activeBrowserRunner browserRunner = browserSelector
+
+// browserSelector fronts the host runner and, once ConfigureBrowserRuntime has
+// run, the container runner.
+var browserSelector = &selectingRunner{host: newDefaultBrowserRunner()}
 
 // DiscoverCobrowseBrowser reports the browser co-browse sessions would launch on
 // this machine, without launching it.
@@ -228,6 +294,27 @@ func (xvfbRunner) SweepOrphans(baseDir string) { sweepXvfbSessions(baseDir) }
 // Mirrors MeetingBrowser.Start's teardown-on-partial-failure, but the profile is
 // throwaway so a failed launch removal is handled by the caller.
 func launchXvfbCobrowseProc(profileDir, startURL string, lo LaunchOptions) (*cobrowseProc, error) {
+	if !lo.Detach {
+		return launchXvfbAttempt(profileDir, startURL, lo, nil)
+	}
+	plan, reason := planCobrowseScope()
+	if plan == nil {
+		logScopeFailOpen(reason)
+		return launchXvfbAttempt(profileDir, startURL, lo, nil)
+	}
+	proc, err := launchXvfbAttempt(profileDir, startURL, lo, plan)
+	if err != nil {
+		// Fail open like tmux: a scope the manager refuses must not cost the
+		// session. Retry once as a direct child (it then dies with a restart).
+		scopeBroken.Store(true)
+		logScopeFailOpen("scoped launch failed: " + err.Error())
+		return launchXvfbAttempt(profileDir, startURL, lo, nil)
+	}
+	return proc, nil
+}
+
+// launchXvfbAttempt starts one session, in transient scopes when plan is set.
+func launchXvfbAttempt(profileDir, startURL string, lo LaunchOptions, plan *scopePlan) (*cobrowseProc, error) {
 	chrome, err := findChromium()
 	if err != nil {
 		return nil, err
@@ -238,27 +325,33 @@ func launchXvfbCobrowseProc(profileDir, startURL string, lo LaunchOptions) (*cob
 		return nil, err
 	}
 
+	sessionID := filepath.Base(profileDir)
+	if plan != nil && !sessionIDPattern.MatchString(sessionID) {
+		plan = nil
+	}
+	var xvfbUnit, browserUnit string
+	var wrapXvfb func([]string) []string
+	if plan != nil {
+		xvfbUnit, browserUnit = plan.unit(sessionID, "xvfb"), plan.unit(sessionID, "browser")
+		wrapXvfb = func(a []string) []string { return plan.wrap(xvfbUnit, a) }
+	}
+
 	// startManagedXvfb serializes display allocation internally, so concurrent
 	// launches never collide on one virtual display.
-	xvfb, display, err := startManagedXvfb(xvfbResolution())
+	xvfb, display, err := startManagedXvfbWrapped(xvfbResolution(), wrapXvfb)
 	if err != nil {
 		return nil, err
 	}
 
 	// A managed Xvfb has no GPU, so force software rendering (matches the sibling
 	// launchers). stealthEnabled() keeps parity with the other browser launches.
-	args := buildChromeArgs(cobrowseLaunchOptions{
-		debugPort:   debugPort,
-		profileDir:  profileDir,
-		startURL:    startURL,
-		stealth:     stealthEnabled(),
-		userAgent:   os.Getenv(EnvCobrowseUserAgent),
-		softwareGL:  true,
-		proxyServer: lo.ProxyServer,
-		quiet:       lo.Quiet,
-	})
+	args := buildXvfbChromeArgs(debugPort, profileDir, startURL, lo)
 
-	cmd := exec.Command(chrome, args...)
+	argv := append([]string{chrome}, args...)
+	if plan != nil {
+		argv = plan.wrap(browserUnit, argv)
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Env = withDisplay(os.Environ(), display)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
@@ -289,12 +382,32 @@ func launchXvfbCobrowseProc(profileDir, startURL string, lo LaunchOptions) (*cob
 		browserPID: pidOf(cmd),
 		xvfbPID:    pidOf(xvfb),
 		exited:     exited,
-		stop: func() error {
-			return stopBrowserProc(cmd, exited, xvfb, xvfbExited)
-		},
+	}
+	var bStart, xStart uint64
+	if plan != nil {
+		proc.browserScope, proc.xvfbScope, proc.scopeUser = browserUnit, xvfbUnit, plan.user
+		bStart, _, _ = procIdentity(proc.browserPID)
+		xStart, _, _ = procIdentity(proc.xvfbPID)
+	}
+	proc.stop = func() error {
+		// Browser scope first, then Xvfb, each only while the recorded process
+		// still lives in it; the handle kill below is the backstop.
+		var serr error
+		if plan != nil {
+			if err := stopScope(plan.user, browserUnit, proc.browserPID, bStart); err != nil {
+				serr = err
+			}
+			if err := stopScope(plan.user, xvfbUnit, proc.xvfbPID, xStart); err != nil && serr == nil {
+				serr = err
+			}
+		}
+		if err := stopBrowserProc(cmd, exited, xvfb, xvfbExited); err != nil {
+			return err
+		}
+		return serr
 	}
 
-	if err := waitForCDPReady(debugPort, 20*time.Second); err != nil {
+	if err := waitForCDPReady(debugPort, cobrowseCDPReadyTimeout()); err != nil {
 		// Best-effort teardown so a browser that launched but never exposed CDP does
 		// not leak a process or display.
 		_ = proc.stop()
@@ -344,4 +457,41 @@ func removeAllRetry(dir string, attempts int, delay time.Duration) error {
 		time.Sleep(delay)
 	}
 	return err
+}
+
+// cobrowseCDPReadyTimeout is the CDP-ready wait. The default is 20s; the
+// real-browser CI tests raise it through CITADEL_COBROWSE_CDP_WAIT_SECONDS
+// because shared runners start Chrome slowly.
+func cobrowseCDPReadyTimeout() time.Duration {
+	if v, err := strconv.Atoi(os.Getenv("CITADEL_COBROWSE_CDP_WAIT_SECONDS")); err == nil && v > 0 && v <= 300 {
+		return time.Duration(v) * time.Second
+	}
+	return 20 * time.Second
+}
+
+// buildXvfbChromeArgs is the Chrome command line for the managed-Xvfb co-browse
+// runner, shared by local mode and the remote `citadel work` path. A managed
+// Xvfb has no GPU, so software rendering is forced; stealthEnabled() keeps
+// parity with the other browser launches.
+//
+// passwordStoreBasic is load-bearing for first-load latency: without it Chrome
+// waits on the desktop keyring over D-Bus at its first cookie-store use and
+// stalls the first request for ~25s on a host with no unlocked keyring
+// (citadel-cli#1694). Consequence: cookies in a profile are encrypted with
+// Chromium's fixed basic key, so a local-mode saved login (#1647) created
+// earlier on desktop Linux with a working keyring is not readable once and the
+// user signs in again. The working dir is 0700 and the sealed blob is
+// vault-encrypted either way.
+func buildXvfbChromeArgs(debugPort int, profileDir, startURL string, lo LaunchOptions) []string {
+	return buildChromeArgs(cobrowseLaunchOptions{
+		debugPort:          debugPort,
+		profileDir:         profileDir,
+		startURL:           startURL,
+		stealth:            stealthEnabled(),
+		userAgent:          os.Getenv(EnvCobrowseUserAgent),
+		softwareGL:         true,
+		proxyServer:        lo.ProxyServer,
+		quiet:              lo.Quiet,
+		passwordStoreBasic: true,
+	})
 }

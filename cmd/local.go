@@ -13,8 +13,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
 
 	"github.com/aceteam-ai/citadel-cli/internal/localviewer"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
@@ -123,21 +121,25 @@ func newLocalOnlyBridge(tools []localMCPTool, rt *localCobrowseRuntime, in io.Re
 	return b
 }
 
+// localE2EHook is nil in every shipped binary. Only local_e2e_hook.go, built
+// with the citadel_e2e tag, sets it, so the end-to-end test can point the real
+// binary at a local page without changing the production address policy.
+var localE2EHook func(*localCobrowseOptions)
+
 func runLocalMCP(cmd *cobra.Command, args []string) error {
 	debugToStderr = true
-	rt := newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: localStateDir, viewer: true})
+	opts := localCobrowseOptions{ownerDir: localStateDir, viewer: true}
+	if localE2EHook != nil {
+		localE2EHook(&opts)
+	}
+	rt := newLocalCobrowseRuntime(opts)
 	defer rt.close()
 
 	// A harness usually stops its MCP server by closing stdin, which ends run.
 	// On a signal, stop the browser sessions before exiting so no logged-in
-	// browser outlives the server (Windows also kills it through the Job Object).
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigs
-		rt.close()
-		os.Exit(0)
-	}()
+	// browser outlives the server (Windows also kills it through the Job Object)
+	// and saved logins are re-sealed.
+	handleLocalCobrowseSignals(rt)
 
 	deps := realLocalMCPDeps()
 	deps.cobrowse = rt

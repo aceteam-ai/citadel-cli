@@ -135,6 +135,32 @@ func TestWorkerControlQueueCannotBeSubscribedByLegacySources(t *testing.T) {
 	}
 }
 
+func TestWorkerControlLegacyQueueGuardsComposeWithPinnedQueues(t *testing.T) {
+	control := workerControlQueue(fixtureOrg, "758")
+	const own = "jobs:v1:shell:org_fixture:node:own"
+	for _, tc := range []struct {
+		name, pin, queue string
+		refused          bool
+	}{
+		{"control-matching-pin", control, control, true},
+		{"control-unpinned", "", control, true},
+		{"ordinary-foreign", own, DefaultCPUQueue, true},
+		{"ordinary-own", own, own, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			source := NewRedisSource(RedisSourceConfig{PinnedQueue: tc.pin, LogFn: func(string, string) {}})
+			before := source.QueueNames()
+			err := source.AddQueue(context.Background(), tc.queue)
+			if (err != nil) != tc.refused {
+				t.Fatalf("refused=%t, want %t: %v", err != nil, tc.refused, err)
+			}
+			if tc.refused && !reflect.DeepEqual(source.QueueNames(), before) {
+				t.Fatal("refused subscription changed the queue set")
+			}
+		})
+	}
+}
+
 func TestWorkerControlV1OptOutPreservesOrdinaryJobsAndHealth(t *testing.T) {
 	const ordinaryJob = "ordinary-job"
 	var mu sync.Mutex

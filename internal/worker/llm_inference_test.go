@@ -24,6 +24,161 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
+type reasoningRecordingStream struct {
+	MockStreamWriter
+	reasoningChunks []string
+}
+
+func (w *reasoningRecordingStream) WriteReasoningChunk(content string, _ int) error {
+	w.reasoningChunks = append(w.reasoningChunks, content)
+	return nil
+}
+
+func TestReasoningChunksStayOutOfAnswerStream(t *testing.T) {
+	h := NewLLMInferenceHandler()
+	underlying := &reasoningRecordingStream{}
+	stream := &clockStreamWriter{StreamWriter: underlying}
+	frames := "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think \"}}]}\n" +
+		"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"more\"}}]}\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\"Answer\"},\"finish_reason\":\"stop\"}]}\n" +
+		"data: [DONE]\n"
+	result, err := h.streamChatCompletions(stream, strings.NewReader(frames))
+	if err != nil || result == nil {
+		t.Fatalf("result=%v err=%v", result, err)
+	}
+	if got := strings.Join(underlying.chunks, ""); got != "Answer" {
+		t.Fatalf("answer chunks=%q, want Answer", got)
+	}
+	if got := strings.Join(underlying.reasoningChunks, ""); got != "think more" {
+		t.Fatalf("reasoning chunks=%q, want think more", got)
+	}
+	if got := result.Output["reasoning_content"]; got != "think more" {
+		t.Fatalf("terminal reasoning=%v, want think more", got)
+	}
+}
+
+func TestOllamaReasoningChunksStayOutOfAnswerStream(t *testing.T) {
+	h := NewLLMInferenceHandler()
+	underlying := &reasoningRecordingStream{}
+	stream := &clockStreamWriter{StreamWriter: underlying}
+	frames := "{\"message\":{\"thinking\":\"think\"},\"done\":false}\n" +
+		"{\"message\":{\"content\":\"Answer\"},\"done\":true}\n"
+	result, err := h.streamOllamaChat(stream, strings.NewReader(frames))
+	if err != nil || result == nil {
+		t.Fatalf("result=%v err=%v", result, err)
+	}
+	if got := strings.Join(underlying.chunks, ""); got != "Answer" {
+		t.Fatalf("answer chunks=%q, want Answer", got)
+	}
+	if got := strings.Join(underlying.reasoningChunks, ""); got != "think" {
+		t.Fatalf("reasoning chunks=%q, want think", got)
+	}
+	if got := result.Output["reasoning_content"]; got != "think" {
+		t.Fatalf("terminal reasoning=%v, want think", got)
+	}
+}
+
+func TestAbsentReasoningKeyStaysAbsent(t *testing.T) {
+	h := NewLLMInferenceHandler()
+	openAI := `{"choices":[{"message":{"content":"Answer"},"finish_reason":"stop"}]}`
+	openAIStream := "data: {\"choices\":[{\"delta\":{\"content\":\"Answer\"},\"finish_reason\":\"stop\"}]}\n" +
+		"data: [DONE]\n"
+	ollama := `{"message":{"content":"Answer"},"done":true}`
+	ollamaStream := "{\"message\":{\"content\":\"Answer\"},\"done\":true}\n"
+	for _, tc := range []struct {
+		name string
+		run  func(StreamWriter) (*JobResult, error)
+	}{
+		{"openai buffered", func(stream StreamWriter) (*JobResult, error) {
+			return h.bufferedChatCompletions(stream, strings.NewReader(openAI))
+		}},
+		{"openai streaming", func(stream StreamWriter) (*JobResult, error) {
+			return h.streamChatCompletions(stream, strings.NewReader(openAIStream))
+		}},
+		{"ollama buffered", func(stream StreamWriter) (*JobResult, error) {
+			return h.bufferedOllamaChat(stream, strings.NewReader(ollama))
+		}},
+		{"ollama streaming", func(stream StreamWriter) (*JobResult, error) {
+			return h.streamOllamaChat(stream, strings.NewReader(ollamaStream))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := tc.run(&MockStreamWriter{})
+			if err != nil || result == nil {
+				t.Fatalf("result=%v err=%v", result, err)
+			}
+			if result.Output["content"] != "Answer" {
+				t.Errorf("content=%v, want Answer", result.Output["content"])
+			}
+			if _, present := result.Output["reasoning_content"]; present {
+				t.Errorf("reasoning_content must be absent: %+v", result.Output)
+			}
+		})
+	}
+}
+
+func TestReasoningEffortPrecedence(t *testing.T) {
+	if got := supportedReasoningEffort(&jobs.LLMInferencePayload{ReasoningEffort: "high"}); got != "high" {
+		t.Fatalf("effort=%q, want high", got)
+	}
+	disabled := false
+	if got := supportedReasoningEffort(&jobs.LLMInferencePayload{Think: &disabled, ReasoningEffort: "high"}); got != "" {
+		t.Fatalf("effort=%q, want explicit think:false to win", got)
+	}
+	if got := supportedReasoningEffort(&jobs.LLMInferencePayload{ReasoningEffort: "unbounded"}); got != "" {
+		t.Fatalf("effort=%q, want unsupported value rejected", got)
+	}
+}
+
+func TestReasoningEffortReachesEngine(t *testing.T) {
+	for _, tc := range []struct {
+		backend string
+		field   string
+	}{
+		{backend: "ollama", field: "think"},
+		{backend: "vllm", field: "reasoning_effort"},
+	} {
+		t.Run(tc.backend, func(t *testing.T) {
+			var request map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if serveReadinessProbe(w, r) {
+					return
+				}
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Errorf("decode engine request: %v", err)
+				}
+				if tc.backend == "ollama" {
+					_, _ = w.Write([]byte(`{"message":{"content":"Answer","thinking":"thought"},"done":true}`))
+				} else {
+					_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Answer","reasoning_content":"thought"},"finish_reason":"stop"}]}`))
+				}
+			}))
+			defer server.Close()
+			h := NewLLMInferenceHandler()
+			h.baseURLs[tc.backend] = server.URL
+			job := &Job{
+				ID:   "reasoning-effort-" + tc.backend,
+				Type: JobTypeLLMInference,
+				Payload: map[string]any{
+					"model": "qwen3.5:9b", "backend": tc.backend,
+					"messages":         []map[string]any{{"role": "user", "content": "hi"}},
+					"reasoning_effort": "high",
+				},
+			}
+			result, err := h.Execute(context.Background(), job, &MockStreamWriter{})
+			if err != nil || result == nil || result.Status != JobStatusSuccess {
+				t.Fatalf("result=%v err=%v", result, err)
+			}
+			if request[tc.field] != "high" {
+				t.Errorf("engine %s = %v, want high", tc.field, request[tc.field])
+			}
+			if result.Output["content"] != "Answer" || result.Output["reasoning_content"] != "thought" {
+				t.Errorf("result = %+v, want separate answer and reasoning", result.Output)
+			}
+		})
+	}
+}
+
 // TestLLMInferenceHandler_CanHandle asserts the handler only claims the
 // "llm_inference" job type (issue #590).
 // TestAEPSigningStoreDir_PureFunctionOfNodeConfigDir pins that
@@ -232,10 +387,7 @@ func TestLLMInferenceHandler_ChatStreaming(t *testing.T) {
 	}
 }
 
-// TestLLMInferenceHandler_ChatStreamingReasoningFallback covers the thinking-model
-// path: when a stream carries only delta.reasoning_content and no answer (token
-// budget spent mid-reasoning, e.g. Bonsai), the reasoning is surfaced as the final
-// content so the reply is never blank — mirroring the buffered fallback.
+// A thinking-only stream must never promote private reasoning to answer content.
 func TestLLMInferenceHandler_ChatStreamingReasoningFallback(t *testing.T) {
 	frames := []string{
 		`data: {"choices":[{"delta":{"reasoning_content":"thinking hard..."}}]}`,
@@ -266,12 +418,17 @@ func TestLLMInferenceHandler_ChatStreamingReasoningFallback(t *testing.T) {
 	if result == nil || result.Status != JobStatusSuccess {
 		t.Fatalf("result = %+v, want success", result)
 	}
-	if got, _ := result.Output["content"].(string); got != "thinking hard..." {
-		t.Errorf("Output content = %q, want reasoning fallback", got)
+	if got, _ := result.Output["content"].(string); got != "" {
+		t.Errorf("Output content = %q, want no answer", got)
 	}
-	// The reasoning is surfaced as a single chunk once no answer was produced.
-	if len(stream.chunks) != 1 || stream.chunks[0] != "thinking hard..." {
-		t.Errorf("chunks = %v, want [thinking hard...]", stream.chunks)
+	if got, _ := result.Output["reasoning_content"].(string); got != "thinking hard..." {
+		t.Errorf("reasoning_content = %q, want the reasoning", got)
+	}
+	if len(stream.chunks) != 0 {
+		t.Errorf("answer chunks = %v, want none", stream.chunks)
+	}
+	if got := result.Output["finish_reason"]; got != "length" {
+		t.Errorf("finish_reason = %v, want length", got)
 	}
 }
 
@@ -1950,14 +2107,17 @@ func TestLLMInferenceHandler_ToolCallsNullOrEmptyTreatedAsAbsent(t *testing.T) {
 			if result == nil || result.Status != JobStatusSuccess {
 				t.Fatalf("result = %+v, want success", result)
 			}
-			if got, _ := result.Output["content"].(string); got != "thinking hard about the weather" {
-				t.Errorf("content = %q, want the reasoning fallback to fire (tool_calls=%s must behave as absent)", got, tc.toolCallsRaw)
+			if got, _ := result.Output["content"].(string); got != "" {
+				t.Errorf("content = %q, want no reasoning in answer", got)
+			}
+			if got := result.Output["reasoning_content"]; got != "thinking hard about the weather" {
+				t.Errorf("reasoning_content = %v, want the separate reasoning", got)
 			}
 			if _, present := result.Output["tool_calls"]; present {
 				t.Errorf("Output = %+v, want no \"tool_calls\" key (tool_calls=%s means absent)", result.Output, tc.toolCallsRaw)
 			}
-			if len(stream.chunks) != 1 || stream.chunks[0] != "thinking hard about the weather" {
-				t.Errorf("chunks = %v, want the reasoning published as a single parity chunk", stream.chunks)
+			if len(stream.chunks) > 0 && strings.Join(stream.chunks, "") != "" {
+				t.Errorf("answer chunks = %v, want no reasoning", stream.chunks)
 			}
 		})
 	}
@@ -2531,11 +2691,7 @@ func TestLLMInferenceHandler_OllamaThinkForwarded(t *testing.T) {
 	}
 }
 
-// TestLLMInferenceHandler_OllamaBufferedThinkingFallback asserts the buffered
-// path surfaces message.thinking as the reply when content is empty and no tool
-// call was made (a thinking model that spent its budget mid-reasoning) -- and
-// does NOT surface it when content is present. Before S2, bufferedOllamaChat
-// decoded only message.content, so this was a blank reply.
+// Ollama's thinking channel stays separate even when no answer was produced.
 func TestLLMInferenceHandler_OllamaBufferedThinkingFallback(t *testing.T) {
 	t.Run("empty content falls back to thinking", func(t *testing.T) {
 		body := `{"message":{"role":"assistant","content":"","thinking":"the reasoning"},` +
@@ -2568,11 +2724,14 @@ func TestLLMInferenceHandler_OllamaBufferedThinkingFallback(t *testing.T) {
 		if result == nil || result.Status != JobStatusSuccess {
 			t.Fatalf("result = %+v, want success", result)
 		}
-		if got, _ := result.Output["content"].(string); got != "the reasoning" {
-			t.Errorf("content = %q, want the thinking fallback \"the reasoning\"", got)
+		if got, _ := result.Output["content"].(string); got != "" {
+			t.Errorf("content = %q, want no answer", got)
 		}
-		if len(stream.chunks) != 1 || stream.chunks[0] != "the reasoning" {
-			t.Errorf("chunks = %v, want a single \"the reasoning\" chunk", stream.chunks)
+		if got := result.Output["reasoning_content"]; got != "the reasoning" {
+			t.Errorf("reasoning_content = %v, want the separate reasoning", got)
+		}
+		if len(stream.chunks) > 0 && strings.Join(stream.chunks, "") != "" {
+			t.Errorf("answer chunks = %v, want no reasoning", stream.chunks)
 		}
 	})
 
@@ -2607,12 +2766,13 @@ func TestLLMInferenceHandler_OllamaBufferedThinkingFallback(t *testing.T) {
 		if got, _ := result.Output["content"].(string); got != "the answer" {
 			t.Errorf("content = %q, want the visible answer \"the answer\" (thinking must not override)", got)
 		}
+		if got := result.Output["reasoning_content"]; got != "the reasoning" {
+			t.Errorf("reasoning_content = %v, want the separate reasoning", got)
+		}
 	})
 }
 
-// TestLLMInferenceHandler_OllamaStreamingThinkingFallback asserts the streaming
-// path surfaces accumulated message.thinking on the terminal result (and as a
-// terminal chunk) when no content frame ever arrived and no tool call was made.
+// Ollama's streamed thinking remains separate when no answer arrives.
 func TestLLMInferenceHandler_OllamaStreamingThinkingFallback(t *testing.T) {
 	frames := []string{
 		`{"message":{"role":"assistant","content":"","thinking":"think "},"done":false}`,
@@ -2650,11 +2810,14 @@ func TestLLMInferenceHandler_OllamaStreamingThinkingFallback(t *testing.T) {
 	if result == nil || result.Status != JobStatusSuccess {
 		t.Fatalf("result = %+v, want success", result)
 	}
-	if got, _ := result.Output["content"].(string); got != "think harder" {
-		t.Errorf("content = %q, want accumulated thinking \"think harder\"", got)
+	if got, _ := result.Output["content"].(string); got != "" {
+		t.Errorf("content = %q, want no answer", got)
 	}
-	if len(stream.chunks) != 1 || stream.chunks[0] != "think harder" {
-		t.Errorf("chunks = %v, want a single terminal \"think harder\" chunk", stream.chunks)
+	if got := result.Output["reasoning_content"]; got != "think harder" {
+		t.Errorf("reasoning_content = %v, want accumulated thinking", got)
+	}
+	if len(stream.chunks) != 0 {
+		t.Errorf("answer chunks = %v, want none", stream.chunks)
 	}
 }
 
@@ -2927,7 +3090,11 @@ func TestApplyTrustEngine_DetectorChecksRegistered(t *testing.T) {
 
 	t.Run("all four checks + verdict_hash present when guardrail on", func(t *testing.T) {
 		t.Setenv(groundingGuardrailEnvVar, "1")
-		result := h.success(map[string]any{"content": "hello world, nothing sensitive here"})
+		const answer = "hello world, nothing sensitive here"
+		result := h.success(map[string]any{
+			"content":           answer,
+			"reasoning_content": "separate model reasoning",
+		})
 		h.applyTrustEngine(payload, "job-a", result)
 
 		verdict, ok := result.Output["trust_verdict"].(map[string]any)
@@ -2946,6 +3113,9 @@ func TestApplyTrustEngine_DetectorChecksRegistered(t *testing.T) {
 		}
 		if _, ok := verdict["verdict_hash"].(string); !ok {
 			t.Errorf("verdict_hash = %#v, want a string", verdict["verdict_hash"])
+		}
+		if got := verdict["output_sha256"]; got != sha256Hex(answer) {
+			t.Errorf("output hash = %v, want digest of answer content only", got)
 		}
 		if verdict["action"] != "pass" {
 			t.Errorf("action = %v, want pass (benign content)", verdict["action"])

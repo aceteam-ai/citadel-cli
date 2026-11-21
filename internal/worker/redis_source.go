@@ -52,6 +52,8 @@ type RedisSource struct {
 
 // RedisSourceConfig holds configuration for RedisSource.
 type RedisSourceConfig struct {
+	// PinnedQueue also constrains later AddQueue calls, not just boot routing.
+	PinnedQueue string
 	// URL is the Redis connection URL
 	URL string
 
@@ -92,7 +94,9 @@ func NewRedisSource(cfg RedisSourceConfig) *RedisSource {
 
 	// Resolve queue names: prefer QueueNames, fall back to QueueName
 	var queues []string
-	if len(cfg.QueueNames) > 0 {
+	if cfg.PinnedQueue != "" {
+		queues = []string{cfg.PinnedQueue}
+	} else if len(cfg.QueueNames) > 0 {
 		queues = cfg.QueueNames
 	} else if cfg.QueueName != "" {
 		queues = []string{cfg.QueueName}
@@ -297,7 +301,7 @@ func (s *RedisSource) nextSingle(ctx context.Context, queue string, blockMs int)
 		if err := s.client.MoveToDLQ(ctx, redisJob, "Exceeded max retry attempts"); err != nil {
 			s.log("error", "   - Failed to move job to DLQ: %v", err)
 		}
-		if err := s.ackDelivery(ctx, redisJob.Type, queue, redisJob.MessageID); err != nil {
+		if err := s.ackDelivery(ctx, redisJob.Type, redisJob.Payload, queue, redisJob.MessageID); err != nil {
 			return nil, err
 		}
 		return nil, nil
@@ -385,7 +389,7 @@ func (s *RedisSource) nextMulti(ctx context.Context, queues []string, blockMs in
 		if err := s.client.MoveToDLQFromQueue(ctx, sourceQueue, redisJob, "Exceeded max retry attempts"); err != nil {
 			s.log("error", "   - Failed to move job to DLQ: %v", err)
 		}
-		if err := s.ackDelivery(ctx, redisJob.Type, sourceQueue, redisJob.MessageID); err != nil {
+		if err := s.ackDelivery(ctx, redisJob.Type, redisJob.Payload, sourceQueue, redisJob.MessageID); err != nil {
 			return nil, err
 		}
 		return nil, nil
@@ -426,7 +430,7 @@ func (s *RedisSource) convertJob(rj *redisclient.Job) *Job {
 // Ack acknowledges successful job completion.
 func (s *RedisSource) Ack(ctx context.Context, job *Job) error {
 	s.client.SetJobStatus(ctx, job.ID, "completed", nil)
-	return s.ackDelivery(ctx, job.Type, job.SourceQueue, job.MessageID)
+	return s.ackDelivery(ctx, job.Type, job.Payload, job.SourceQueue, job.MessageID)
 }
 
 // Nack indicates job failure.
@@ -474,7 +478,7 @@ func (s *RedisSource) DeferHuddleTerminalIntent(ctx context.Context, job *Job, e
 func (s *RedisSource) Fail(ctx context.Context, job *Job, err error, data map[string]any) error {
 	status := jobprivacy.FailureData(job.Type, job.Payload, err, data)
 	s.client.SetJobStatus(ctx, job.ID, "failed", status)
-	return s.ackDelivery(ctx, job.Type, job.SourceQueue, job.MessageID)
+	return s.ackDelivery(ctx, job.Type, job.Payload, job.SourceQueue, job.MessageID)
 }
 
 // Close cleanly disconnects from Redis.
@@ -509,6 +513,9 @@ func (s *RedisSource) QueueNames() []string {
 func (s *RedisSource) AddQueue(ctx context.Context, queue string) error {
 	if isWorkerControlQueue(queue) {
 		return fmt.Errorf("worker control requires authenticated API transport")
+	}
+	if s.config.PinnedQueue != "" && queue != s.config.PinnedQueue {
+		return fmt.Errorf("control worker cannot subscribe to another stream")
 	}
 	if queue == "" {
 		return nil

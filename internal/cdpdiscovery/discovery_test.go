@@ -3,7 +3,10 @@ package cdpdiscovery
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -58,4 +61,52 @@ func TestDiscoverPreservesEarlierClientTimeoutClassification(t *testing.T) {
 			t.Fatal("earlier client timeout lost", got, err, time.Since(start))
 		}
 	})
+}
+
+func TestListReturnsEveryPageWithPinnedDebuggerURL(t *testing.T) {
+	body := `[
+	 {"id":"a","type":"page","title":"App","url":"http://app.test/","webSocketDebuggerUrl":"ws://elsewhere:1/devtools/page/a"},
+	 {"id":"w","type":"service_worker","url":"http://app.test/sw.js","webSocketDebuggerUrl":"ws://127.0.0.1:1/devtools/page/w"},
+	 {"id":"p","type":"page","title":"Login","url":"http://login.test/","webSocketDebuggerUrl":"ws://127.0.0.1:1/devtools/page/p"}]`
+	c := &http.Client{Transport: fakeTransport(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: http.Header{}}, nil
+	})}
+	got, err := List(context.Background(), 4321, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].ID != "a" || got[1].ID != "p" || got[1].Title != "Login" {
+		t.Fatalf("targets = %+v", got)
+	}
+	for _, tg := range got {
+		if !strings.HasPrefix(tg.WebSocketDebuggerURL, "ws://127.0.0.1:4321/") {
+			t.Fatalf("debugger URL not pinned: %s", tg.WebSocketDebuggerURL)
+		}
+	}
+	first, err := Discover(context.Background(), 4321, c)
+	if err != nil || first.ID != "a" {
+		t.Fatalf("Discover = %+v %v", first, err)
+	}
+}
+
+func TestListBoundedKeepsWorkingPastThePageCap(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("[")
+	for i := 0; i < MaxPageTargets+5; i++ {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, `{"id":"p%d","type":"page","url":"http://app.test/","webSocketDebuggerUrl":"ws://127.0.0.1:1/devtools/page/p%d"}`, i, i)
+	}
+	b.WriteString("]")
+	c := &http.Client{Transport: fakeTransport(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(b.String())), Header: http.Header{}}, nil
+	})}
+	if _, err := List(context.Background(), 4321, c); err == nil {
+		t.Fatal("List accepted more than the page cap")
+	}
+	got, overflow, err := ListBounded(context.Background(), 4321, c)
+	if err != nil || !overflow || len(got) != MaxPageTargets {
+		t.Fatalf("ListBounded: %d targets overflow=%v err=%v", len(got), overflow, err)
+	}
 }
