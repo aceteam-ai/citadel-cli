@@ -142,9 +142,9 @@ var darwinCapableServices = map[string]bool{
 
 // linuxOnlyServices names the embedded engines NOT advertised on darwin: the
 // CUDA-only inference engines (a CUDA image and/or a mandatory NVIDIA runtime).
-// It exists only so TestServiceMapDarwinClassificationExhaustive can prove every
-// ServiceMap key is classified exactly once — the runtime filter keys off
-// darwinCapableServices (the allow-list) alone.
+// TestServiceMapDarwinClassificationExhaustive proves every ServiceMap key is
+// classified exactly once. Darwin uses the allow-list; live Linux hardware
+// policy uses this CUDA-only classification on proven NVIDIA absence.
 var linuxOnlyServices = map[string]bool{
 	"vllm":          true,
 	"sglang":        true,
