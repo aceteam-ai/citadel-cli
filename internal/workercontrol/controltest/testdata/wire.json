@@ -1,0 +1,147 @@
+{
+  "fixture_version": "worker-control-v2-review-1",
+  "identity": {
+    "protocol": "worker-control-v2",
+    "org_id": "11111111-1111-4111-8111-111111111111",
+    "control_plane_id": "77777777-7777-4777-8777-777777777777",
+    "target_node": "758",
+    "api_key_id": "22222222-2222-4222-8222-222222222222",
+    "binding_version": 7,
+    "authorization_generation": 11,
+    "attempt_id": "44444444-4444-4444-8444-444444444444",
+    "jobId": "33333333-3333-4333-8333-333333333333",
+    "queue": "jobs:v2:control:org_11111111-1111-4111-8111-111111111111:node:758",
+    "group": "worker-control-v2",
+    "expires_at": 1800000030000,
+    "payload_digest": "b928a17b0011d84d7c78a58827b4d1257db5ff1958465cbc67612ac35592b7a9"
+  },
+  "deliveries": {
+    "A": {
+      "association_id": "55555555-5555-4555-8555-555555555555",
+      "queue": "jobs:v2:control:org_11111111-1111-4111-8111-111111111111:node:758",
+      "group": "worker-control-v2",
+      "message_id": "1800000000000-0"
+    },
+    "B": {
+      "association_id": "55555555-5555-4555-8555-555555555556",
+      "queue": "jobs:v2:control:org_11111111-1111-4111-8111-111111111111:node:758",
+      "group": "worker-control-v2",
+      "message_id": "1800000000100-0"
+    }
+  },
+  "process_id": "66666666-6666-4666-8666-666666666666",
+  "claim_epoch": "88888888-8888-4888-8888-888888888888",
+  "payload": {"action": "restart", "target_node": "758"},
+  "cases": {
+    "claimA": {
+      "delivery": "A",
+      "request_id": "99999999-9999-4999-8999-999999999991",
+      "operation": "claim_and_ack",
+      "claim_epoch": "",
+      "outcome": "",
+      "code": "",
+      "outcome_digest": "",
+      "operation_digest": "8ca90ccfc2242ea3f93e85d90ede9061a087c6a916996213179d35b72069118c",
+      "request_digest": "aaa16385616ef229fd7ba3e2c9b4eb2696b428847820abcc3e7c5158f22368c1"
+    },
+    "claimB": {
+      "delivery": "B",
+      "request_id": "99999999-9999-4999-8999-999999999992",
+      "operation": "claim_and_ack",
+      "claim_epoch": "",
+      "outcome": "",
+      "code": "",
+      "outcome_digest": "",
+      "operation_digest": "8ca90ccfc2242ea3f93e85d90ede9061a087c6a916996213179d35b72069118c",
+      "request_digest": "4ad54dcab9b15733bc93dbd7cbb0111aeed0aa0073133eca923029aa6613378a"
+    },
+    "completeA": {
+      "delivery": "A",
+      "request_id": "99999999-9999-4999-8999-999999999993",
+      "operation": "complete",
+      "claim_epoch": "88888888-8888-4888-8888-888888888888",
+      "outcome": "prepared",
+      "code": "prepared",
+      "outcome_digest": "9e612a4ecfaadd65f60461ec9e23a9b707807d84abb22d600d8f5a16a31787e7",
+      "operation_digest": "9effda5a47cda1b3a9fe7c934efa83f9e10b3afad9cdb32e14dddee88a65abcc",
+      "request_digest": "33bf5f87716b9ba785435dbc72091494a827ff2b489396de67debe10f13c7fff"
+    },
+    "statusA": {
+      "delivery": "A",
+      "request_id": "99999999-9999-4999-8999-999999999994",
+      "operation": "read_status",
+      "claim_epoch": "88888888-8888-4888-8888-888888888888",
+      "outcome": "",
+      "code": "",
+      "outcome_digest": "",
+      "operation_digest": "694ed9f74bb0c30847e25a331d15600f6c1594b1f3d5cabc6afede180533bea5",
+      "request_digest": "a24c8ce79fcb71e3298308f4ec840371262f128449a61686da16d4810284c736"
+    }
+  },
+  "receipts": {
+    "claim": {
+      "receipt_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+      "operation": "claim_and_ack",
+      "operation_digest": "8ca90ccfc2242ea3f93e85d90ede9061a087c6a916996213179d35b72069118c",
+      "process_id": "66666666-6666-4666-8666-666666666666",
+      "claim_epoch": "88888888-8888-4888-8888-888888888888",
+      "delivery": {
+        "association_id": "55555555-5555-4555-8555-555555555555",
+        "queue": "jobs:v2:control:org_11111111-1111-4111-8111-111111111111:node:758",
+        "group": "worker-control-v2",
+        "message_id": "1800000000000-0"
+      },
+      "outcome": "",
+      "code": "",
+      "outcome_digest": "",
+      "state": "claimed",
+      "state_version": 2,
+      "decided_at_ms": 1800000000000
+    },
+    "complete": {
+      "receipt_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
+      "operation": "complete",
+      "operation_digest": "9effda5a47cda1b3a9fe7c934efa83f9e10b3afad9cdb32e14dddee88a65abcc",
+      "process_id": "66666666-6666-4666-8666-666666666666",
+      "claim_epoch": "88888888-8888-4888-8888-888888888888",
+      "delivery": {
+        "association_id": "55555555-5555-4555-8555-555555555555",
+        "queue": "jobs:v2:control:org_11111111-1111-4111-8111-111111111111:node:758",
+        "group": "worker-control-v2",
+        "message_id": "1800000000000-0"
+      },
+      "outcome": "prepared",
+      "code": "prepared",
+      "outcome_digest": "9e612a4ecfaadd65f60461ec9e23a9b707807d84abb22d600d8f5a16a31787e7",
+      "state": "commit_authorized",
+      "state_version": 3,
+      "decided_at_ms": 1800000001000
+    }
+  },
+  "observations": {
+    "claim": {
+      "server_time_ms": 1800000000001,
+      "state": "claimed",
+      "state_version": 2,
+      "binding_version": 7,
+      "authorization_generation": 11,
+      "permit_usable": false
+    },
+    "complete": {
+      "server_time_ms": 1800000001001,
+      "state": "commit_authorized",
+      "state_version": 3,
+      "binding_version": 7,
+      "authorization_generation": 11,
+      "permit_usable": true
+    },
+    "status": {
+      "server_time_ms": 1800000002001,
+      "state": "commit_authorized",
+      "state_version": 3,
+      "binding_version": 7,
+      "authorization_generation": 11,
+      "permit_usable": false
+    }
+  }
+}

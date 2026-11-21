@@ -3,12 +3,14 @@ package worker
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
 	"github.com/aceteam-ai/citadel-cli/internal/redisapi"
+	"github.com/aceteam-ai/citadel-cli/internal/workercontrol"
 )
 
 // WSSource implements JobSource using the existing WebSocket connection for
@@ -16,8 +18,9 @@ import (
 // persistent XREADGROUP BLOCK loop and pushes "job" messages to the client.
 type WSSource struct {
 	deliveryRefusals
-	client *redisapi.Client
-	config WSSourceConfig
+	client  *redisapi.Client
+	config  WSSourceConfig
+	control *workerControlBinding
 
 	// mu guards queueNames which may be mutated by AddQueue at runtime.
 	mu         sync.RWMutex
@@ -111,6 +114,11 @@ func (s *WSSource) debug(format string, args ...any) {
 func (s *WSSource) Connect(ctx context.Context) error {
 	if s.client == nil {
 		return fmt.Errorf("WSSource requires a non-nil redisapi.Client")
+	}
+	for _, q := range s.snapshotQueues() {
+		if isWorkerControlQueue(q) && (s.control == nil || q != s.control.queue || s.config.ConsumerGroup != WorkerControlProtocol || len(s.snapshotQueues()) != 1) {
+			return workercontrol.ErrDenied
+		}
 	}
 
 	// Enable WebSocket if not already connected
@@ -209,6 +217,11 @@ func (s *WSSource) sendConsume() error {
 	}
 
 	queues := s.snapshotQueues()
+	for _, q := range queues {
+		if isWorkerControlQueue(q) && (s.control == nil || q != s.control.queue || s.config.ConsumerGroup != WorkerControlProtocol || len(queues) != 1) {
+			return workercontrol.ErrDenied
+		}
+	}
 	return ws.StartConsume(queues, s.config.ConsumerGroup, s.client.WorkerID(), 1, s.config.BlockMs)
 }
 
@@ -227,6 +240,12 @@ func (s *WSSource) Next(ctx context.Context) (*Job, error) {
 // Ack acknowledges successful job completion. Sends an ack over WebSocket
 // and also updates job status via HTTP (same as APISource).
 func (s *WSSource) Ack(ctx context.Context, job *Job) error {
+	if s.control != nil {
+		if !s.control.matches(job) || !job.controlSession.CanPrepare() {
+			return workercontrol.ErrDenied
+		}
+		return nil
+	}
 	// Update job status via HTTP
 	s.client.SetJobStatus(ctx, job.ID, "completed", nil)
 
@@ -261,6 +280,9 @@ func (s *WSSource) Ack(ctx context.Context, job *Job) error {
 
 // Nack indicates job failure. Updates status but does NOT ack, allowing retry.
 func (s *WSSource) Nack(ctx context.Context, job *Job, err error) error {
+	if s.control != nil {
+		return nil
+	}
 	s.client.SetJobStatus(ctx, job.ID, "failed", jobprivacy.FailureData(job.Type, job.Payload, err, nil))
 	return nil
 }
@@ -316,6 +338,9 @@ func (s *WSSource) DeferHuddleTerminalIntent(ctx context.Context, job *Job, err 
 // failures that will never succeed on retry (e.g. an unsupported job type). The
 // ack mirrors Ack: over WebSocket when connected, falling back to HTTP.
 func (s *WSSource) Fail(ctx context.Context, job *Job, err error, data map[string]any) error {
+	if s.control != nil {
+		return s.Ack(ctx, job)
+	}
 	status := jobprivacy.FailureData(job.Type, job.Payload, err, data)
 	s.client.SetJobStatus(ctx, job.ID, "failed", status)
 
@@ -348,6 +373,9 @@ func (s *WSSource) Fail(ctx context.Context, job *Job, err error, data map[strin
 
 // IsJobCancelled checks whether a job has been cancelled by the producer.
 func (s *WSSource) IsJobCancelled(ctx context.Context, jobID string) bool {
+	if s.control != nil {
+		return false
+	}
 	cancelled, err := s.client.IsJobCancelled(ctx, jobID)
 	if err != nil {
 		s.log("warning", "Failed to check cancellation for %s: %v", jobID, err)
@@ -390,6 +418,9 @@ func (s *WSSource) QueueNames() []string {
 // Thread-safe. After adding the queue, re-sends the consume message with the
 // updated queue list (the server stops the old loop and starts a new one).
 func (s *WSSource) AddQueue(queue string) {
+	if s.control != nil || isWorkerControlQueue(queue) {
+		return
+	}
 	if queue == "" {
 		return
 	}
@@ -433,11 +464,12 @@ func (s *WSSource) convertWSJob(msg redisapi.WSMessage) (*Job, error) {
 	streamMsg := redisapi.StreamMessage{
 		ID: msg.ID,
 		Data: redisapi.StreamMessageData{
-			JobID:      msg.Data["jobId"],
-			Type:       msg.Data["type"],
-			Payload:    msg.Data["payload"],
-			EnqueuedAt: msg.Data["enqueuedAt"],
-			RayID:      msg.Data["rayId"],
+			JobID:         msg.Data["jobId"],
+			Type:          msg.Data["type"],
+			Payload:       msg.Data["payload"],
+			EnqueuedAt:    msg.Data["enqueuedAt"],
+			RayID:         msg.Data["rayId"],
+			WorkerControl: msg.Data["worker_control"],
 		},
 	}
 
@@ -455,6 +487,20 @@ func (s *WSSource) convertWSJob(msg redisapi.WSMessage) (*Job, error) {
 		Source:      "websocket",
 		MessageID:   apiJob.MessageID,
 		SourceQueue: msg.Queue,
+	}
+	if workercontrol.IsQueue(msg.Queue) || apiJob.Control != nil {
+		if s.control == nil || apiJob.Control == nil || s.config.ConsumerGroup != WorkerControlProtocol || apiJob.Control.Identity.Queue != msg.Queue || !s.control.config.Matches(apiJob.Control.Identity) {
+			return nil, workercontrol.ErrDenied
+		}
+		// Enforce the exact four-field schema even for programmatic adapters.
+		raw, _ := json.Marshal(msg.Data)
+		e, _, err := workercontrol.ParseData(raw, msg.ID, msg.Queue, s.config.ConsumerGroup)
+		if err != nil {
+			return nil, err
+		}
+		job.control = s.control
+		job.controlEnvelope = &e
+		job.controlSession = s.control.session(e)
 	}
 
 	// Extract rayId

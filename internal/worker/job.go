@@ -23,11 +23,16 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/clockstate"
 	"github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
+	"github.com/aceteam-ai/citadel-cli/internal/workercontrol"
 )
 
 // Job represents a unit of work to be processed.
 // This is the common job format used internally, regardless of source.
 type Job struct {
+	// Set only by the dedicated authenticated control source, never from payload.
+	control         *workerControlBinding
+	controlSession  *workercontrol.Session
+	controlEnvelope *workercontrol.Envelope
 	// Opaque capture prevents reflective formatting from walking into the
 	// delivery control client, credential, terminal bytes or publisher.
 	delivery func() *durableDelivery `json:"-"`
