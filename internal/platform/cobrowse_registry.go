@@ -646,6 +646,14 @@ func (m *CobrowseSessionManager) recoverSessions() {
 	now := time.Now()
 	var expired []sessionRecord
 	for _, rec := range listRecords(regDir) {
+		if retainedSuspendRecord(rec) {
+			// Metadata preservation alone is insufficient: the following host
+			// sweep must also leave the session's working directory/processes
+			// alone. Only exact-resource lifecycle recovery may resolve these
+			// records; legacy adoption/expiry must not claim or rewrite them.
+			sweepProtected.Store(filepath.Join(m.baseDir, rec.ID), struct{}{})
+			continue
+		}
 		switch rec.State {
 		case RecordSuspended:
 			continue
@@ -751,8 +759,8 @@ func (m *CobrowseSessionManager) recoverSessions() {
 	}
 }
 
-// sweepProtected holds the dirs of sessions this process just re-adopted, so
-// the orphan sweep (which treats a dir owned by our own PID as stale) skips them.
+// sweepProtected holds dirs re-adopted or retained for suspend recovery, so the
+// orphan sweep (which treats a dir owned by our own PID as stale) skips them.
 var sweepProtected sync.Map
 
 // Recover re-adopts surviving sessions and sweeps the rest. Idempotent; the

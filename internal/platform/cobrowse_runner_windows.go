@@ -478,6 +478,9 @@ func sweepWindowsSessions(baseDir string) {
 			continue
 		}
 		dir := filepath.Join(baseDir, e.Name())
+		if _, keep := sweepProtected.Load(dir); keep {
+			continue // Retained lifecycle data is not an orphan profile.
+		}
 		owner, _, _ := readSessionPidfile(dir)
 		start := readSessionOwnerStart(dir)
 		if owner == 0 {

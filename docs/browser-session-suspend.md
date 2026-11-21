@@ -37,6 +37,17 @@ still belong to the unfinished housekeeping integration. Old expiry metadata
 is hidden after its seven-day retention window. This is status wiring, not an
 enabled suspend/reopen action or real node-restart acceptance.
 
+Legacy restart recovery now also withholds adoption, expiry and orphan cleanup
+for records carrying suspension metadata, an in-flight/suspended state or a
+suspension-expiry marker. Host working directories are protected from the
+following sweep, and the container sweep retains their container/network. A
+marker is only a reason not to destroy resources: it does not prove a capture
+valid, a process live or resources freed, and it grants no reopen authority.
+Malformed combinations with a recognizable marker are retained for strict
+lifecycle recovery. Completely unreadable or unparseable records still follow
+the legacy scan behavior; this increment does not provide process-aware recovery
+or a cross-process sweep lease. Local mode keeps its isolated legacy behavior.
+
 The managed worker also owns metadata-only housekeeping under its root context.
 It runs a bounded pass on startup and hourly, with one-second follow-ups only
 after a successful full batch. Errors back off to the hourly cadence. Each pass

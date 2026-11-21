@@ -1246,7 +1246,8 @@ func (m *CobrowseSessionManager) sweep() {
 	activeBrowserRunner.SweepOrphans(m.baseDir)
 	// Containers are swept by label, never by pidfile: only the node-wide manager
 	// does it, and a session is live when the manager tracks it or a live or
-	// suspended registry record names it.
+	// suspended/in-flight registry record names it. Retained captures require
+	// exact lifecycle recovery, never ordinary orphan removal.
 	if cs, ok := activeBrowserRunner.(containerSweeper); ok && m.useResolver {
 		cs.sweepContainers(m.baseDir, m.sessionIsLive)
 	}
@@ -1260,7 +1261,15 @@ func (m *CobrowseSessionManager) sessionIsLive(id string) bool {
 		return true
 	}
 	rec, err := loadRecord(m.registryDir(), id)
-	return err == nil && (rec.State == RecordLive || rec.State == RecordSuspended)
+	return err == nil && (rec.State == RecordLive || retainedSuspendRecord(rec))
+}
+
+// A retention marker is enough to withhold destructive legacy cleanup, not
+// proof of a valid/restorable capture, live process or authority to reopen.
+// Incomplete and unexpected combinations remain for strict lifecycle recovery.
+func retainedSuspendRecord(rec sessionRecord) bool {
+	return rec.Suspension != nil || rec.State == RecordSuspended || rec.State == "suspending" ||
+		rec.State == "resuming" || rec.EndedReason == "suspend_expired"
 }
 
 // sweepXvfbSessions is the Linux runner's orphan sweep; see sweep above.
