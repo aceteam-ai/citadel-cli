@@ -23,7 +23,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +30,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/localviewer"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"gopkg.in/yaml.v3"
 )
 
@@ -461,18 +461,18 @@ func pathStrictlyWithin(root, p string) bool {
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-// setupUserHomes are the folders that belong to the user running the setup
-// page: the home dir and, on Windows, the local app data dir the node config
-// dir defaults to.
+// setupUserHomes is the folder that belongs to the user running the setup
+// page: the home dir from platform.UserHomeDir (the repo's fixture-aware
+// resolver). On Windows the default node config dir sits under
+// %LOCALAPPDATA%, which is inside the profile, so the home covers it; a
+// %LOCALAPPDATA% moved outside the profile is refused rather than trusted from
+// an environment variable.
 func setupUserHomes() []string {
-	var homes []string
-	if h, err := os.UserHomeDir(); err == nil {
-		homes = append(homes, h)
+	h, err := platform.UserHomeDir()
+	if err != nil || h == "" {
+		return nil
 	}
-	if runtime.GOOS == "windows" {
-		homes = append(homes, os.Getenv("LOCALAPPDATA"))
-	}
-	return homes
+	return []string{h}
 }
 
 // productionSetupNodeDirCheck is checkSetupNodeDir for this process's user

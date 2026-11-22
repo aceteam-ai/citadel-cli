@@ -20,6 +20,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/localviewer"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 // Tests for "Connect this PC to AceTeam" on the setup page (citadel-cli#1867
@@ -666,8 +667,16 @@ func TestSetupPageChecksQualifyTheNoCallsLine(t *testing.T) {
 // inside it is accepted.
 func TestSetupEnrollRefusesANodeDirOutsideTheUserFolder(t *testing.T) {
 	f := newSetupFixture(t)
-	t.Setenv("HOME", f.home)
-	t.Setenv("USERPROFILE", f.home)
+	// This user's home, through the platform fixture the resolver honors.
+	restoreHome, err := platform.OverrideHomeDirectoryForTesting(f.home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := restoreHome(); err != nil {
+			t.Error(err)
+		}
+	})
 	machine := t.TempDir()
 	pointAt := func(nodeDir string) {
 		restore, err := network.OverrideStateDirectoriesForTesting(nodeDir, machine)
