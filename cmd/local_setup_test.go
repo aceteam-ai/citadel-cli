@@ -68,6 +68,7 @@ func newSetupFixture(t *testing.T) *setupFixture {
 			return []localviewer.SetupCheck{
 				{Status: "ok", What: "Browser", Detail: "Microsoft Edge at C:\\edge.exe"},
 				{Status: "FAIL", What: "Viewer port", Detail: "cannot listen. Fix: check security software"},
+				{Status: "ok", What: "Network", Detail: "Citadel makes no calls of its own (no account)"},
 			}
 		},
 		enroll: func(ctx context.Context, o enrollOptions) (*enrollResult, error) {
@@ -332,8 +333,13 @@ func TestSetupStateRendersDoctorAppsLimitAndGenericEntry(t *testing.T) {
 	f := newSetupFixture(t)
 	_ = os.MkdirAll(filepath.Join(f.home, ".codex"), 0o700)
 	st := f.state()
-	if len(st.Checks) != 2 || st.Checks[1].Status != "FAIL" || !strings.Contains(st.Checks[1].Detail, "Fix:") {
+	if len(st.Checks) != 3 || st.Checks[1].Status != "FAIL" || !strings.Contains(st.Checks[1].Detail, "Fix:") {
 		t.Fatalf("doctor results: %+v", st.Checks)
+	}
+	// The page has a Connect to AceTeam button, so its "no calls" line says
+	// that button is the exception (#1867 C2).
+	if !strings.HasSuffix(st.Checks[2].Detail, setupNetworkCheckSuffix) {
+		t.Fatalf("network check on the setup page: %q", st.Checks[2].Detail)
 	}
 	states := map[string]string{}
 	for _, a := range st.Apps {

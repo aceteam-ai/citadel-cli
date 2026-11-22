@@ -223,7 +223,13 @@ func newCachedSetupDoctor(run func(full bool) []localviewer.SetupCheck) func(ful
 func newLocalSetupServer(d localSetupDeps) (*localviewer.Server, *setupEnroller) {
 	dir := d.stateDir()
 	setup := &localviewer.SetupConfig{
-		Doctor:      newCachedSetupDoctor(d.doctor),
+		Doctor: newCachedSetupDoctor(func(full bool) []localviewer.SetupCheck {
+			checks := d.doctor(full)
+			if d.enroll != nil {
+				checks = setupPageChecks(checks)
+			}
+			return checks
+		}),
 		Apps:        func() []localviewer.SetupApp { return setupApps(d.env()) },
 		MaxSessions: localcobrowse.DefaultMaxSessions,
 		Connect: func(name, path string) (localviewer.SetupConnectResult, error) {

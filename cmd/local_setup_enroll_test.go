@@ -565,3 +565,43 @@ func TestSetupEnrollShutdownCancelsAndWaits(t *testing.T) {
 		t.Fatalf("after shutdown: %+v", st)
 	}
 }
+
+func TestSetupEnrollCancelBeforeTheCodeOpensNothing(t *testing.T) {
+	f := newSetupFixture(t)
+	release := make(chan struct{})
+	f.setEnroll(func(ctx context.Context, o enrollOptions) (*enrollResult, error) {
+		<-release
+		o.OnCode(enrollCode{UserCode: "ABCD-1234", VerificationURIComplete: o.AuthServiceURL + "/device?code=ABCD-1234"})
+		<-ctx.Done()
+		return nil, &enrollError{Stage: enrollStageAuthorize, Kind: enrollCanceled, Err: ctx.Err()}
+	})
+	f.enrollCall("POST", "/api/setup/enroll/start", nil)
+	if code, body := f.enrollCall("POST", "/api/setup/enroll/cancel", nil); code != 200 || !strings.Contains(body, `"stage":"canceling"`) {
+		t.Fatalf("cancel: %d %s", code, body)
+	}
+	close(release)
+	st := f.waitEnroll(nil, stageIs(setupEnrollCanceled))
+	if st.UserCode != "" || st.VerificationURL != "" {
+		t.Fatalf("canceled state shows a code: %+v", st)
+	}
+	if len(f.openedURLs()) != 1 {
+		t.Fatalf("a canceled enrollment opened the approval page: %v", f.openedURLs())
+	}
+}
+
+func TestSetupPageChecksQualifyTheNoCallsLine(t *testing.T) {
+	in := []localviewer.SetupCheck{
+		{Status: "ok", What: "Browser", Detail: "Edge"},
+		{Status: "ok", What: "Network", Detail: "Citadel makes no calls of its own (no account)"},
+	}
+	out := setupPageChecks(in)
+	if !strings.HasSuffix(out[1].Detail, setupNetworkCheckSuffix) || out[0] != in[0] {
+		t.Fatalf("checks: %+v", out)
+	}
+	if in[1].Detail != "Citadel makes no calls of its own (no account)" {
+		t.Fatal("the doctor's own result was modified")
+	}
+	if again := setupPageChecks(out); again[1].Detail != out[1].Detail {
+		t.Fatalf("applied twice: %q", again[1].Detail)
+	}
+}

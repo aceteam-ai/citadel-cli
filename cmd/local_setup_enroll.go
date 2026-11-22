@@ -158,19 +158,21 @@ func (e *setupEnroller) onCode(c enrollCode, authURL string, cancel context.Canc
 		cancel()
 		return
 	}
-	if e.open != nil {
-		// Best effort: the page also shows the link.
-		_ = e.open(link)
-	}
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if e.state.Stage == setupEnrollCanceling {
+		// Canceled before the code arrived: do not open the approval page.
+		e.mu.Unlock()
 		return
 	}
 	e.state.Stage = setupEnrollWaiting
 	e.state.UserCode = c.UserCode
 	e.state.VerificationURL = link
 	e.state.Message = setupEnrollWaitingCopy
+	e.mu.Unlock()
+	if e.open != nil {
+		// Best effort, outside the lock: the page also shows the link.
+		_ = e.open(link)
+	}
 }
 
 func (e *setupEnroller) onStage(p enrollProgress) {
@@ -321,6 +323,25 @@ func plausibleUserCode(c string) bool {
 		}
 	}
 	return true
+}
+
+// setupNetworkCheckSuffix qualifies the doctor's "makes no calls" line on the
+// setup page, which also has the Connect to AceTeam button.
+const setupNetworkCheckSuffix = " The setup page connects to AceTeam only when you click Connect to AceTeam."
+
+// setupPageChecks adapts the doctor results for the setup page: the Network
+// check's "Citadel makes no calls of its own" holds for local mode, and the
+// page says plainly that its Connect to AceTeam button is the exception.
+// `local doctor` itself is unchanged.
+func setupPageChecks(checks []localviewer.SetupCheck) []localviewer.SetupCheck {
+	out := make([]localviewer.SetupCheck, len(checks))
+	copy(out, checks)
+	for i := range out {
+		if out[i].What == "Network" && !strings.HasSuffix(out[i].Detail, setupNetworkCheckSuffix) {
+			out[i].Detail = strings.TrimRight(out[i].Detail, ". ") + "." + setupNetworkCheckSuffix
+		}
+	}
+	return out
 }
 
 // setupAlreadyInfo reads the node and org names of this PC's existing
