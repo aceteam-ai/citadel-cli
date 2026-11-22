@@ -318,7 +318,9 @@ session runs on the host browser, never in the container (the container's
 network cannot reach the loopback guard) and never in a detached scope.
 `guardProc` closes the guard whenever the browser stops. Such sessions are
 stopped before a self-restart and on shutdown, and `verifyAdoptable` never
-re-adopts one: the browser still points at the old guard port. Status reports
+re-adopts one: the browser still points at the old guard port. The legacy
+single-browser `CobrowseManager` has no guard, so `refuseLegacyWhenPublicOnly`
+refuses its start and navigate on such a node. Status reports
 `egress: public_only`. Refusals are logged as scheme plus host
 (`egressAudit`). APPLY_DEVICE_CONFIG `cobrowsePublicOnly` may only turn it on
 (`jobs.applyCobrowsePublicOnly`); `citadel permission cobrowse-public-only`

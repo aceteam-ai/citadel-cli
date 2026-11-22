@@ -362,3 +362,20 @@ func TestEgressAuditLogsOncePerDestinationAndCaps(t *testing.T) {
 		t.Fatalf("seen = %d capped = %v", len(a.seen), a.capped)
 	}
 }
+
+// TestLegacyCobrowseRefusedWhenPublicOnly: the legacy single browser has no
+// guard, so a public-only node refuses to start or navigate it.
+func TestLegacyCobrowseRefusedWhenPublicOnly(t *testing.T) {
+	setNodeEgress(t, func() bool { return true })
+	m := &CobrowseManager{driver: DriverAI, debugPort: DefaultCobrowseDebugPort}
+	if _, err := m.Start(t.TempDir(), "https://a.example", 0); !errors.Is(err, ErrLegacyCobrowsePublicOnly) {
+		t.Fatalf("start: want public-only refusal, got %v", err)
+	}
+	if _, err := m.Navigate("https://a.example"); !errors.Is(err, ErrLegacyCobrowsePublicOnly) {
+		t.Fatalf("navigate: want public-only refusal, got %v", err)
+	}
+	setNodeEgress(t, func() bool { return false })
+	if _, err := m.Navigate("https://a.example"); errors.Is(err, ErrLegacyCobrowsePublicOnly) {
+		t.Fatal("refused with public-only off")
+	}
+}

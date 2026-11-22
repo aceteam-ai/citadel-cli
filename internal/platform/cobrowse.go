@@ -530,6 +530,9 @@ func (m *CobrowseManager) Start(profileDir, startURL string, debugPort int) (Cob
 	if err := ValidateCobrowseURL(startURL); err != nil {
 		return CobrowseStatus{}, err
 	}
+	if err := refuseLegacyWhenPublicOnly(); err != nil {
+		return CobrowseStatus{}, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -781,6 +784,9 @@ func (m *CobrowseManager) statusLocked() CobrowseStatus {
 // Navigate drives the browser to a URL. Refused while handed off to the human.
 func (m *CobrowseManager) Navigate(url string) (CobrowseStatus, error) {
 	if err := ValidateCobrowseURL(url); err != nil {
+		return CobrowseStatus{}, err
+	}
+	if err := refuseLegacyWhenPublicOnly(); err != nil {
 		return CobrowseStatus{}, err
 	}
 	m.mu.Lock()

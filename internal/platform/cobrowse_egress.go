@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -51,6 +52,22 @@ func (m *CobrowseSessionManager) egressRequiredNow() bool {
 		nodeEgressMu.Unlock()
 	}
 	return f != nil && f()
+}
+
+// ErrLegacyCobrowsePublicOnly refuses the legacy single-browser COBROWSE job
+// on a public-only node: that browser has no egress guard.
+var ErrLegacyCobrowsePublicOnly = errors.New("this node allows public-only co-browsing, which the legacy single-browser co-browse does not support; use a browser session (COBROWSE_SESSION) instead")
+
+// refuseLegacyWhenPublicOnly is the legacy CobrowseManager's gate, checked on
+// start and on every navigate (the setting may turn on while it runs).
+func refuseLegacyWhenPublicOnly() error {
+	nodeEgressMu.Lock()
+	f := nodeEgressRequired
+	nodeEgressMu.Unlock()
+	if f != nil && f() {
+		return ErrLegacyCobrowsePublicOnly
+	}
+	return nil
 }
 
 // startSessionEgressGuard starts one session's guard on loopback. A package
