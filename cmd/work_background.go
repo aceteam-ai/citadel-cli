@@ -270,6 +270,7 @@ func runWorkSupervisor() int {
 		return 1
 	}
 	lockPath := service.SupervisorLockPath(nodeDir)
+	beforeLock := time.Now()
 	lock, err := acquireSupervisorLock(lockPath, supervisorLockRetry)
 	if err != nil {
 		var running *worklock.ErrAlreadyRunning
@@ -283,9 +284,10 @@ func runWorkSupervisor() int {
 	defer func() { lock.Release() }()
 
 	self := os.Getpid()
-	// Holding the lock, every request addressed to another PID is stale. One
-	// addressed to us (written since we took the lock) is honoured below.
-	service.RemoveStaleStopRequests(nodeDir, self)
+	// Holding the lock, drop requests for other PIDs and any for our PID left by
+	// an earlier process that had it. One written since we took the lock is
+	// honoured below.
+	service.RemoveStaleStopRequests(nodeDir, self, beforeLock)
 	stopPath := service.SupervisorStopPath(nodeDir, self)
 	defer func() { _ = os.Remove(stopPath) }()
 
@@ -337,7 +339,7 @@ func runWorkSupervisor() int {
 		Log:     logf,
 	}
 
-	logf("supervisor: started (PID %d, %s); worker: %s %s", self, Version, exe, strings.Join(childArgs, " "))
+	logf("supervisor: started (PID %d, %s); worker: %s %s", self, Version, exe, argvFlagSummary(childArgs))
 	err = service.RunSupervisor(ctx, service.SupervisorConfig{
 		Start: func() (service.SupervisedChild, error) {
 			return startSupervisedWorker(exe, childArgs)
@@ -352,6 +354,28 @@ func runWorkSupervisor() int {
 	}
 	logf("supervisor: stopped")
 	return 0
+}
+
+// argvFlagSummary describes a command line for the log by flag names only, the
+// same convention as the root command's invocationSummary: flag values (an
+// --api-key, a --debug-redis-password) and positional arguments never reach
+// the background log.
+func argvFlagSummary(args []string) string {
+	var flags []string
+	others := 0
+	for _, a := range args {
+		if a == "-" || a == "--" || !strings.HasPrefix(a, "-") {
+			others++
+			continue
+		}
+		name, _, _ := strings.Cut(a, "=")
+		flags = append(flags, name)
+	}
+	out := strings.Join(flags, " ")
+	if others > 0 {
+		out = strings.TrimSpace(out + fmt.Sprintf(" (%d other arguments)", others))
+	}
+	return out
 }
 
 // watchStopFile calls onStop once when path appears, polling every interval,

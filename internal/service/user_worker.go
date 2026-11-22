@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
@@ -50,16 +51,23 @@ func SupervisorStopPath(nodeConfigDir string, pid int) string {
 	return filepath.Join(nodeConfigDir, SupervisorStopFilePrefix+strconv.Itoa(pid))
 }
 
-// RemoveStaleStopRequests deletes stop requests addressed to any PID other than
-// self. The caller must hold the supervisor lock: then no other PID is a live
-// supervisor, so every such request is stale.
-func RemoveStaleStopRequests(nodeConfigDir string, self int) {
+// RemoveStaleStopRequests deletes stop requests that cannot be meant for this
+// supervisor. The caller must hold the supervisor lock and pass a time taken
+// before it tried to acquire it. Requests for any other PID are stale (no other
+// PID is a live supervisor). A request for self is stale when it was modified
+// before that time: `citadel worker stop` writes only after it sees self holding
+// the lock, so such a file was left for an earlier process that had the same
+// PID. A request written since is kept and honoured.
+func RemoveStaleStopRequests(nodeConfigDir string, self int, before time.Time) {
 	matches, _ := filepath.Glob(filepath.Join(nodeConfigDir, SupervisorStopFilePrefix+"*"))
-	keep := SupervisorStopPath(nodeConfigDir, self)
+	own := SupervisorStopPath(nodeConfigDir, self)
 	for _, m := range matches {
-		if m != keep {
-			_ = os.Remove(m)
+		if m == own {
+			if info, err := os.Stat(m); err != nil || !info.ModTime().Before(before) {
+				continue
+			}
 		}
+		_ = os.Remove(m)
 	}
 }
 

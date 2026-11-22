@@ -68,8 +68,9 @@ type SupervisorConfig struct {
 	// (update.SupervisorRestartExitCode in production). Zero disables it.
 	RestartExitCode int
 	// Handover, when set, runs after a restart-code exit instead of relaunching
-	// the worker here. It returns true when a fresh supervisor has taken over,
-	// and RunSupervisor then returns; false keeps this supervisor in charge.
+	// the worker here. It returns true when this supervisor must stop (a fresh
+	// supervisor has taken over, or the lock was lost), and RunSupervisor then
+	// returns; false keeps this supervisor in charge, still holding its lock.
 	// Windows uses it so the supervisor, too, moves onto the updated binary:
 	// otherwise its image stays mapped from the renamed old file, and the next
 	// update cannot delete that file.
@@ -217,8 +218,10 @@ type SupervisorHandover struct {
 	Log     func(format string, args ...any)
 }
 
-// Run performs the handover and reports whether another supervisor now holds
-// the lock (true) or this one is still in charge (false).
+// Run performs the handover. It returns false only when this supervisor still
+// holds its lock and should keep supervising. It returns true when this
+// supervisor must stop: another supervisor holds the lock, or the lock could
+// not be retaken (a supervisor never runs without its lock).
 func (h SupervisorHandover) Run() bool {
 	clock := h.Clock
 	if clock == nil {
@@ -255,8 +258,8 @@ func (h SupervisorHandover) Run() bool {
 		return true
 	}
 	if err != nil {
-		logf("supervisor: successor PID %d never took the lock and it could not be retaken: %v", pid, err)
-		return false
+		logf("supervisor: successor PID %d never took the lock and it could not be retaken (%v); exiting so no supervisor runs without its lock. Start it again with 'citadel work --background'", pid, err)
+		return true
 	}
 	logf("supervisor: successor PID %d never took the lock; continuing", pid)
 	return false

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/worklock"
 )
@@ -166,11 +167,29 @@ func TestRemoveStaleStopRequests(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	RemoveStaleStopRequests(dir, 20)
-	for pid, want := range map[int]bool{10: false, 20: true, 30: false} {
+	before := time.Now().Add(time.Hour) // every file predates it
+	if err := os.Chtimes(SupervisorStopPath(dir, 20), time.Now(), before.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(SupervisorStopPath(dir, 40), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// 20 is written after "before" (a real request since the lock was taken).
+	RemoveStaleStopRequests(dir, 20, before)
+	for pid, want := range map[int]bool{10: false, 20: true, 30: false, 40: false} {
 		_, err := os.Stat(SupervisorStopPath(dir, pid))
 		if (err == nil) != want {
 			t.Errorf("request for %d present=%v, want %v", pid, err == nil, want)
 		}
+	}
+
+	// A request for our own PID that predates this process (left by an earlier
+	// supervisor that had the same PID) is stale.
+	if err := os.Chtimes(SupervisorStopPath(dir, 20), time.Now(), before.Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	RemoveStaleStopRequests(dir, 20, before)
+	if _, err := os.Stat(SupervisorStopPath(dir, 20)); !os.IsNotExist(err) {
+		t.Fatalf("stale request for our own PID kept: %v", err)
 	}
 }

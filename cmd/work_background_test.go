@@ -86,6 +86,20 @@ func TestAgentUpdateIsServiceKeepsServiceEnv(t *testing.T) {
 	}
 }
 
+func TestSupervisorLogNeverContainsFlagValues(t *testing.T) {
+	const secret = "sk-test-0123456789abcdef"
+	invocation := []string{"--debug", "work", "--api-key", secret, "--debug-redis-password=" + secret, "--device-code", secret, "--no-gateway"}
+	line := argvFlagSummary(supervisedWorkerArgv(supervisorArgv(invocation), 4242, `C:\n\citadel-supervisor.lock`))
+	if strings.Contains(line, secret) || strings.Contains(line, "4242") || strings.Contains(line, "citadel-supervisor.lock") {
+		t.Fatalf("log line leaks a flag value: %q", line)
+	}
+	for _, name := range []string{"--api-key", "--debug-redis-password", "--no-gateway", "--supervisor-pid", "--supervisor-lock"} {
+		if !strings.Contains(line, name) {
+			t.Errorf("log line %q lacks %s", line, name)
+		}
+	}
+}
+
 func TestWatchStopFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), service.SupervisorStopPath("", 1))
 	ctx, cancel := context.WithCancel(context.Background())

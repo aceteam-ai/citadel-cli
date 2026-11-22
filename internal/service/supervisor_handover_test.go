@@ -136,6 +136,15 @@ func TestSupervisorHandover(t *testing.T) {
 			t.Fatalf("events = %v", l.events)
 		}
 	})
+	t.Run("lock cannot be retaken: stop rather than run unlocked", func(t *testing.T) {
+		l := &handoverLock{holder: 1}
+		clock := &fakeClock{now: time.Unix(0, 0)}
+		h := newHandover(l, clock, func() (int, error) { return 2, nil })
+		h.Reacquire = func() (int, error) { return 0, errors.New("access denied") }
+		if !h.Run() {
+			t.Fatal("handover kept supervising without its lock")
+		}
+	})
 	t.Run("another supervisor took the lock", func(t *testing.T) {
 		l := &handoverLock{holder: 1}
 		clock := &fakeClock{now: time.Unix(0, 0)}
