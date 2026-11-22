@@ -44,6 +44,7 @@ type setupFixture struct {
 	runs     int
 	optsFn   func() enrollOptions
 	already  func(string) (string, string)
+	check    func(string) error
 }
 
 func newSetupFixture(t *testing.T) *setupFixture {
@@ -87,6 +88,15 @@ func newSetupFixture(t *testing.T) *setupFixture {
 			f.mu.Lock()
 			defer f.mu.Unlock()
 			return f.already(dir)
+		},
+		enrollCheck: func(dir string) error {
+			f.mu.Lock()
+			check := f.check
+			f.mu.Unlock()
+			if check == nil {
+				return nil
+			}
+			return check(dir)
 		},
 	}
 	// The default enrollment never touches the network: it reports a code

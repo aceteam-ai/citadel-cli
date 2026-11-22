@@ -123,14 +123,17 @@ computer, behind a one-time link:
    **Open the viewer** opens the hand-off viewer.
 4. Optional: **Connect this PC to AceTeam**. You do not need it for local
    mode. Press **Connect**, and an AceTeam page opens in your browser (or scan
-   the QR code with your phone). Check that it shows the same code as the setup
-   page, then approve. The PC joins the account and organization you approve it
-   in, and the setup page then shows the PC's name and that organization.
-   **Cancel** stops it, unless the last step has already started. Connecting saves
-   a device key in your user folder; AceTeam agents can use this PC only while
-   Citadel's worker runs. Your cookies and saved logins stay on the PC. If the
-   page says the PC already has a registration, run `citadel logout` in a
-   terminal and press **Connect** again.
+   the QR code with your phone). Enter the code the setup page shows, then
+   approve. The PC joins the account and organization you approve it in, and
+   the setup page then shows the PC's name and that organization. **Cancel**
+   stops it, unless the last step has already started. Connecting saves a
+   device key only inside your own user folder; if Citadel on this PC was set
+   up for all users, the page refuses and you use `citadel enroll` instead.
+   The PC stays registered after you close the window, but AceTeam agents can
+   use it only while Citadel's worker runs. Your cookies and saved logins stay
+   on the PC. If the page says the PC already has a registration (for example
+   after a try that did not finish), run `citadel logout` in a terminal and
+   press **Connect** again.
 
 The page also opens for any launch that gives `citadel.exe` a console of its
 own, such as `start citadel` or `Start-Process citadel`, not only a double-click.

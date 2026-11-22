@@ -10,11 +10,15 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/localviewer"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
 
@@ -33,6 +37,23 @@ func waitingFakeEnroll(ctx context.Context, o enrollOptions) (*enrollResult, err
 	o.OnCode(enrollCode{UserCode: "ABCD-1234", VerificationURI: o.AuthServiceURL + "/device", VerificationURIComplete: o.AuthServiceURL + "/device?code=ABCD-1234"})
 	<-ctx.Done()
 	return nil, &enrollError{Stage: enrollStageAuthorize, Kind: enrollCanceled, Err: ctx.Err()}
+}
+
+// doHost sends a fully authenticated request with a different Host header.
+func (f *setupFixture) doHost(host, method, path, body string, hdr map[string]string) *http.Response {
+	f.t.Helper()
+	req, _ := http.NewRequest(method, f.base+path, strings.NewReader(body))
+	for k, v := range hdr {
+		req.Header.Set(k, v)
+	}
+	req.AddCookie(f.cookie)
+	req.Host = host
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	f.t.Cleanup(func() { resp.Body.Close() })
+	return resp
 }
 
 func (f *setupFixture) setEnroll(fn func(context.Context, enrollOptions) (*enrollResult, error)) {
@@ -160,6 +181,7 @@ func TestSetupEnrollRoutesAreGuarded(t *testing.T) {
 			{"wrong bearer", with("X-Citadel-CSRF", "nope"), true},
 			{"no cookie", f.good(), false},
 			{"cross-site", with("Sec-Fetch-Site", "cross-site"), true},
+			{"wrong host", f.good(), true},
 		}
 		if rt.method == "POST" {
 			cases = append(cases, struct {
@@ -169,7 +191,13 @@ func TestSetupEnrollRoutesAreGuarded(t *testing.T) {
 			}{"missing origin", with("Origin", ""), true})
 		}
 		for _, c := range cases {
-			if r := f.do(rt.method, rt.path, rt.body, c.hdr, c.cookie); r.StatusCode != http.StatusForbidden {
+			var r *http.Response
+			if c.name == "wrong host" {
+				r = f.doHost("attacker.test", rt.method, rt.path, rt.body, c.hdr)
+			} else {
+				r = f.do(rt.method, rt.path, rt.body, c.hdr, c.cookie)
+			}
+			if r.StatusCode != http.StatusForbidden {
 				t.Errorf("%s %s %s: want 403, got %d", rt.method, rt.path, c.name, r.StatusCode)
 			}
 		}
@@ -246,7 +274,7 @@ func TestSetupEnrollEndToEndCarriesNoSecrets(t *testing.T) {
 	}
 	st := f.waitEnroll(&seen, stageIs(setupEnrollWaiting, setupEnrollConnecting, setupEnrollConnected))
 	if st.Stage == setupEnrollWaiting {
-		if st.UserCode == "" || !strings.HasPrefix(st.VerificationURL, h.mock.URL()+"/device?code=") {
+		if st.UserCode == "" || st.VerificationURL != h.mock.URL()+"/device" {
 			t.Fatalf("waiting state: %+v", st)
 		}
 		// One enrollment at a time: a second start leaves this one alone.
@@ -256,12 +284,14 @@ func TestSetupEnrollEndToEndCarriesNoSecrets(t *testing.T) {
 		}
 		f.enrollCall("GET", "/api/setup/enroll/qr", &seen)
 	}
+	userCode := st.UserCode
 	st = f.waitEnroll(&seen, stageIs(setupEnrollConnected, setupEnrollFailed))
+	st.UserCode = userCode
 	if st.Stage != setupEnrollConnected || st.OrgName != "Test Org" || st.NodeName != "enroll-test-node" || st.Message != setupEnrollConnectedCopy {
 		t.Fatalf("success state: %+v", st)
 	}
-	if st.UserCode != "" || st.VerificationURL != "" {
-		t.Fatalf("the code is still shown after connecting: %+v", st)
+	if st.VerificationURL != "" {
+		t.Fatalf("the link is still shown after connecting: %+v", st)
 	}
 	if n := f.runCount(); n != 1 {
 		t.Fatalf("ran %d enrollments", n)
@@ -269,13 +299,19 @@ func TestSetupEnrollEndToEndCarriesNoSecrets(t *testing.T) {
 	// The approval page was opened in the default browser (after the setup
 	// page itself), on the mock's own host.
 	opened := f.openedURLs()
-	if len(opened) != 2 || !strings.HasPrefix(opened[1], h.mock.URL()+"/device?code=") {
+	if len(opened) != 2 || opened[1] != h.mock.URL()+"/device" {
 		t.Fatalf("opened: %v", opened)
 	}
 	// The setup state poll (the page's other request) must not leak either.
 	r := f.do("GET", "/api/setup/state", "", f.good(), true)
 	b, _ := io.ReadAll(r.Body)
 	seen = append(seen, string(b), strings.Join(opened, "\n"))
+	// The user code is never on the command line that opens the browser.
+	for _, u := range opened {
+		if strings.Contains(u, "code=") || (st.UserCode != "" && strings.Contains(u, st.UserCode)) {
+			t.Fatalf("an opened URL carries the user code: %q", u)
+		}
+	}
 	for _, body := range seen {
 		for _, secret := range []string{enrollTestDeviceCode, enrollTestAuthkey, enrollTestAPIToken} {
 			if strings.Contains(body, secret) {
@@ -507,14 +543,14 @@ func TestSetupVerificationURL(t *testing.T) {
 		raw, auth, want string
 		ok              bool
 	}{
-		{"https://aceteam.example/device?code=ABCD-1234", auth, "https://aceteam.example/device?code=ABCD-1234", true},
-		{"https://aceteam.example/device?code=AB%26x=1&next=//evil", auth, "https://aceteam.example/device?code=AB%26x%3D1", true},
+		{"https://aceteam.example/device", auth, "https://aceteam.example/device", true},
+		{"https://aceteam.example/device?code=ABCD-1234&next=//evil#x", auth, "https://aceteam.example/device", true},
 		{"https://other.example/device?code=A", auth, "", false},
 		{"http://aceteam.example/device?code=A", auth, "", false},
 		{"file:///C:/x.exe", auth, "", false},
 		{"javascript:alert(1)", auth, "", false},
 		{"https://u:p@aceteam.example/device", auth, "", false},
-		{"http://127.0.0.1:9/device?code=A", "http://127.0.0.1:9", "http://127.0.0.1:9/device?code=A", true},
+		{"http://127.0.0.1:9/device?code=A", "http://127.0.0.1:9", "http://127.0.0.1:9/device", true},
 		{"http://10.0.0.1:9/device?code=A", "http://10.0.0.1:9", "", false},
 	} {
 		got, ok := setupVerificationURL(c.raw, c.auth)
@@ -530,6 +566,24 @@ func TestSetupVerificationURL(t *testing.T) {
 	for _, c := range []string{"", "AB CD", "AB<script>", strings.Repeat("A", 33)} {
 		if plausibleUserCode(c) {
 			t.Errorf("user code %q accepted", c)
+		}
+	}
+	// The approval link: bare, and any code it carries must be the user code.
+	for _, c := range []struct {
+		code enrollCode
+		want string
+		ok   bool
+	}{
+		{enrollCode{UserCode: "ABCD-1234", VerificationURI: auth + "/device", VerificationURIComplete: auth + "/device?code=ABCD-1234"}, auth + "/device", true},
+		{enrollCode{UserCode: "ABCD-1234", VerificationURIComplete: auth + "/device?code=ABCD-1234"}, auth + "/device", true},
+		{enrollCode{UserCode: "ABCD-1234", VerificationURI: auth + "/device", VerificationURIComplete: auth + "/device?code=WXYZ-9999"}, "", false},
+		{enrollCode{UserCode: "ABCD-1234", VerificationURI: auth + "/device?code=WXYZ-9999"}, "", false},
+		{enrollCode{UserCode: "AB CD", VerificationURI: auth + "/device"}, "", false},
+		{enrollCode{UserCode: "ABCD-1234", VerificationURI: "https://other.example/device"}, "", false},
+	} {
+		got, ok := setupApprovalLink(c.code, auth)
+		if ok != c.ok || got != c.want {
+			t.Errorf("%+v: got %q %v, want %q %v", c.code, got, ok, c.want, c.ok)
 		}
 	}
 	if !plausibleUserCode("ABCD-1234") {
@@ -603,5 +657,167 @@ func TestSetupPageChecksQualifyTheNoCallsLine(t *testing.T) {
 	}
 	if again := setupPageChecks(out); again[1].Detail != out[1].Detail {
 		t.Fatalf("applied twice: %q", again[1].Detail)
+	}
+}
+
+// TestSetupEnrollRefusesANodeDirOutsideTheUserFolder: a planted machine-wide
+// pointer moves node dir resolution, which the state-dir fixture reproduces.
+// A node dir outside this user's home is refused before anything runs; one
+// inside it is accepted.
+func TestSetupEnrollRefusesANodeDirOutsideTheUserFolder(t *testing.T) {
+	f := newSetupFixture(t)
+	t.Setenv("HOME", f.home)
+	t.Setenv("USERPROFILE", f.home)
+	machine := t.TempDir()
+	pointAt := func(nodeDir string) {
+		restore, err := network.OverrideStateDirectoriesForTesting(nodeDir, machine)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := restore(); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	f.mu.Lock()
+	f.optsFn = func() enrollOptions {
+		return enrollOptions{AuthServiceURL: "https://auth.example.test", ConfigDir: nodeConfigDirFn()}
+	}
+	f.check = productionSetupNodeDirCheck
+	f.mu.Unlock()
+
+	// Another user's folder (here: a dir outside this user's home).
+	outside := t.TempDir()
+	pointAt(outside)
+	if got := nodeConfigDirFn(); got != outside {
+		t.Fatalf("fixture did not redirect the node dir: %s", got)
+	}
+	var seen []string
+	if code, body := f.enrollCall("POST", "/api/setup/enroll/start", &seen); code != 200 {
+		t.Fatalf("start: %d %s", code, body)
+	}
+	st := f.enrollState(&seen)
+	if st.Stage != setupEnrollFailed || st.Failure != string(setupEnrollUntrustedNodeDir) || st.Message != setupEnrollCopy[setupEnrollUntrustedNodeDir] {
+		t.Fatalf("outside node dir: %+v", st)
+	}
+	if n := f.runCount(); n != 0 {
+		t.Fatalf("an untrusted node dir ran %d enrollment(s)", n)
+	}
+	if strings.Contains(strings.Join(seen, ""), outside) {
+		t.Fatal("the refusal shows the path")
+	}
+
+	// This user's own folder.
+	inside := filepath.Join(f.home, "citadel-node")
+	if err := os.MkdirAll(inside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pointAt(inside)
+	if code, _ := f.enrollCall("POST", "/api/setup/enroll/start", nil); code != 200 {
+		t.Fatalf("start: %d", code)
+	}
+	f.waitEnroll(nil, stageIs(setupEnrollWaiting))
+	f.enrollCall("POST", "/api/setup/enroll/cancel", nil)
+	f.waitEnroll(nil, stageIs(setupEnrollCanceled))
+}
+
+func TestCheckSetupNodeDir(t *testing.T) {
+	home := t.TempDir()
+	other := t.TempDir()
+	inside := filepath.Join(home, "citadel-node")
+	if err := os.MkdirAll(inside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	trusted := func() error { return nil }
+	for _, c := range []struct {
+		name    string
+		dir     string
+		machine func() error
+		ok      bool
+	}{
+		{"inside", inside, trusted, true},
+		{"inside, not created yet", filepath.Join(home, "new", "citadel-node"), trusted, true},
+		{"outside", filepath.Join(other, "citadel-node"), trusted, false},
+		{"home itself", home, trusted, false},
+		{"dot-dot out", filepath.Join(home, "..", filepath.Base(other), "x"), trusted, false},
+		{"relative", "citadel-node", trusted, false},
+		{"empty", "", trusted, false},
+		{"untrusted machine dir", inside, func() error { return errors.New("not admin-only") }, false},
+	} {
+		err := checkSetupNodeDir(c.dir, []string{home}, c.machine)
+		if (err == nil) != c.ok {
+			t.Errorf("%s: %v", c.name, err)
+		}
+		if err != nil && !errors.Is(err, errSetupNodeDirUntrusted) {
+			t.Errorf("%s: wrong error %v", c.name, err)
+		}
+	}
+	// A link inside the home that leads out is followed and refused.
+	link := filepath.Join(home, "escape")
+	if err := os.Symlink(other, link); err == nil {
+		if err := checkSetupNodeDir(filepath.Join(link, "citadel-node"), []string{home}, trusted); err == nil {
+			t.Error("a symlink out of the home was accepted")
+		}
+	}
+}
+
+// TestSetupEnrollRechecksTheNodeDirBeforeConnect: a redirect that appears
+// while the user approves is caught before the network connect, and the saved
+// grant is rolled back.
+func TestSetupEnrollRechecksTheNodeDirBeforeConnect(t *testing.T) {
+	h := newEnrollHarness(t, 1)
+	f := newSetupFixture(t)
+	useHarness(f, h)
+	var mu sync.Mutex
+	calls := 0
+	check := func() error {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		if calls > 1 { // the save passes; the connect finds a planted redirect
+			return errSetupNodeDirUntrusted
+		}
+		return nil
+	}
+	f.setEnroll(func(ctx context.Context, o enrollOptions) (*enrollResult, error) {
+		deps := h.deps
+		deps.authorize = func(ctx context.Context) (*DeviceAuthResult, error) {
+			return authorizeDeviceNonInteractive(ctx, nexus.NewDeviceAuthClient(h.mock.URL()), o.ForceNew, o.OnCode)
+		}
+		guardEnrollDeps(&deps, check)
+		return enrollDevice(ctx, o, deps)
+	})
+	f.enrollCall("POST", "/api/setup/enroll/start", nil)
+	st := f.waitEnroll(nil, stageIs(setupEnrollFailed, setupEnrollConnected))
+	if st.Failure != string(setupEnrollUntrustedNodeDir) || st.Message != setupEnrollCopy[setupEnrollUntrustedNodeDir] {
+		t.Fatalf("recheck: %+v", st)
+	}
+	h.mu.Lock()
+	connects := len(h.connects)
+	h.mu.Unlock()
+	if connects != 0 {
+		t.Fatal("connected despite the failed recheck")
+	}
+	if cfg := h.config(); cfg["device_api_token"] != nil {
+		t.Fatalf("the grant was not rolled back: %v", cfg)
+	}
+}
+
+func TestSetupEnrollLateCancelSaysConnected(t *testing.T) {
+	f := newSetupFixture(t)
+	release := make(chan struct{})
+	f.setEnroll(func(ctx context.Context, o enrollOptions) (*enrollResult, error) {
+		o.OnStage(enrollProgress{Stage: enrollStageLink, NodeName: "desk-pc"})
+		<-release // the link step ignores cancel
+		return &enrollResult{NodeName: "desk-pc", OrgName: "Example Org"}, nil
+	})
+	f.enrollCall("POST", "/api/setup/enroll/start", nil)
+	f.waitEnroll(nil, stageIs(setupEnrollConnecting))
+	f.enrollCall("POST", "/api/setup/enroll/cancel", nil)
+	close(release)
+	st := f.waitEnroll(nil, stageIs(setupEnrollConnected))
+	if st.Message != setupEnrollLateCancelCopy || st.NodeName != "desk-pc" {
+		t.Fatalf("late cancel: %+v", st)
 	}
 }

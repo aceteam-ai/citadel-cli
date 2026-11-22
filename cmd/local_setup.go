@@ -169,6 +169,9 @@ type localSetupDeps struct {
 	enrollOptions func() enrollOptions
 	// enrollAlready names this PC's existing registration.
 	enrollAlready func(configDir string) (nodeName, orgName string)
+	// enrollCheck refuses a node config dir outside this user's own folder
+	// (productionSetupNodeDirCheck); it runs before each start.
+	enrollCheck func(configDir string) error
 }
 
 func realLocalSetupDeps() (localSetupDeps, error) {
@@ -188,6 +191,7 @@ func realLocalSetupDeps() (localSetupDeps, error) {
 		enroll:        productionEnroll,
 		enrollOptions: productionEnrollOptions,
 		enrollAlready: setupAlreadyInfo,
+		enrollCheck:   productionSetupNodeDirCheck,
 		doctor: func(full bool) []localviewer.SetupCheck {
 			checks, _ := collectLocalDoctor(realLocalDoctorDeps(!full))
 			out := make([]localviewer.SetupCheck, len(checks))
@@ -258,6 +262,7 @@ func newLocalSetupServer(d localSetupDeps) (*localviewer.Server, *setupEnroller)
 	var enroller *setupEnroller
 	if d.enroll != nil && d.enrollOptions != nil {
 		enroller = newSetupEnroller(d.enrollOptions, d.enroll, d.openURL, d.enrollAlready)
+		enroller.check = d.enrollCheck
 		enroller.hooks(setup)
 	}
 	return localviewer.New(localviewer.Config{
