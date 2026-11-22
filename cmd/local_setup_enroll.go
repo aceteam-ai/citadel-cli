@@ -337,6 +337,16 @@ func (e *setupEnroller) Busy() bool {
 	return e.running || e.action
 }
 
+// resetAfterDisconnect returns the page to idle once Disconnect logged this
+// PC out, so the worker is no longer offered and Connect is shown again.
+func (e *setupEnroller) resetAfterDisconnect() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.running {
+		e.state = localviewer.SetupEnrollState{Stage: setupEnrollIdle}
+	}
+}
+
 // workerOffered reports whether this page connected the PC and saved its
 // co-browse-only posture, which the worker start requires.
 func (e *setupEnroller) workerOffered() bool {

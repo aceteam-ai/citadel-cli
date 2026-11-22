@@ -508,6 +508,7 @@ func recordWorker(calls *[]string, goos string, offered, posture bool, releaseEr
 	return setupWorkerDeps{
 		goos:            goos,
 		offered:         func() bool { return offered },
+		registered:      func() bool { return true },
 		postureHolds:    func() bool { return posture },
 		releaseNetwork:  func() error { *calls = append(*calls, "release"); return releaseErr },
 		enableAutostart: func() error { *calls = append(*calls, "autostart"); return autoErr },
@@ -566,6 +567,9 @@ func TestSetupPageStartsTheWorkerAfterConnect(t *testing.T) {
 	var seen []string
 	f.enrollCall("POST", "/api/setup/enroll/start", &seen)
 	f.waitEnroll(&seen, stageIs(setupEnrollConnected))
+	f.mu.Lock()
+	f.connected = true
+	f.mu.Unlock()
 	if r := f.do("POST", "/api/setup/worker/start", `{}`, f.good(), true); r.StatusCode != http.StatusBadRequest || len(calls) != 0 {
 		t.Fatalf("worker start without confirmation: %d %v", r.StatusCode, calls)
 	}
@@ -581,5 +585,56 @@ func TestSetupPageStartsTheWorkerAfterConnect(t *testing.T) {
 	calls = nil
 	if code, _ := f.enrollCall("POST", "/api/setup/worker/start", nil); code != http.StatusConflict || len(calls) != 0 {
 		t.Fatalf("worker start without the public-only guard: %d %v", code, calls)
+	}
+}
+
+// TestSetupPageDisconnectWithdrawsTheWorkerOffer: after Disconnect logged the
+// PC out, the page is back to idle and the worker start is refused, so one
+// click cannot restart the worker on a PC the user just disconnected.
+func TestSetupPageDisconnectWithdrawsTheWorkerOffer(t *testing.T) {
+	f := newSetupFixture(t)
+	var calls []string
+	f.mu.Lock()
+	f.worker.releaseNetwork = func() error { calls = append(calls, "release"); return nil }
+	f.worker.enableAutostart = func() error { calls = append(calls, "autostart"); return nil }
+	f.worker.start = func(context.Context) error { calls = append(calls, "start"); return nil }
+	f.disconnect = recordDisconnect(&calls, nil, nil, nil, true, logoutOutcome{})
+	f.disconnect.logout = func() (logoutOutcome, error) {
+		calls = append(calls, "logout")
+		f.mu.Lock()
+		f.connected = false // the logout removes the registration
+		f.mu.Unlock()
+		return logoutOutcome{}, nil
+	}
+	f.mu.Unlock()
+	f.setEnroll(connectedEnroll)
+	var seen []string
+	f.enrollCall("POST", "/api/setup/enroll/start", &seen)
+	if st := f.waitEnroll(&seen, stageIs(setupEnrollConnected)); !st.WorkerOffer {
+		t.Fatalf("connected: %+v", st)
+	}
+	f.mu.Lock()
+	f.connected = true
+	f.mu.Unlock()
+	if code, body := f.enrollCall("POST", "/api/setup/disconnect", nil); code != http.StatusOK {
+		t.Fatalf("disconnect: %d %s", code, body)
+	}
+	if st := f.enrollState(&seen); st.Stage != setupEnrollIdle || st.WorkerOffer || st.Posture != "" {
+		t.Fatalf("after disconnect the page must be idle: %+v", st)
+	}
+	calls = nil
+	if code, _ := f.enrollCall("POST", "/api/setup/worker/start", nil); code != http.StatusConflict || len(calls) != 0 {
+		t.Fatalf("worker start after disconnect: %d %v", code, calls)
+	}
+	// A disconnect whose logout failed keeps the state: the PC is still
+	// registered, and the page says so through the step.
+	f2 := newSetupFixture(t)
+	f2.setEnroll(connectedEnroll)
+	var seen2 []string
+	f2.enrollCall("POST", "/api/setup/enroll/start", &seen2)
+	f2.waitEnroll(&seen2, stageIs(setupEnrollConnected))
+	f2.enrollCall("POST", "/api/setup/disconnect", nil) // the fixture's fakes all fail
+	if st := f2.enrollState(&seen2); st.Stage != setupEnrollConnected {
+		t.Fatalf("a failed logout must not reset the page: %+v", st)
 	}
 }

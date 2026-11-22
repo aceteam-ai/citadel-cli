@@ -299,7 +299,13 @@ func newLocalSetupServer(d localSetupDeps) (*localviewer.Server, *setupEnroller)
 		}
 	}
 	if d.disconnect != nil {
-		setup.Disconnect = exclusive(func() (localviewer.SetupActionResult, error) { return d.disconnect(), nil })
+		setup.Disconnect = exclusive(func() (localviewer.SetupActionResult, error) {
+			res := d.disconnect()
+			if enroller != nil && disconnectLoggedOut(res) {
+				enroller.resetAfterDisconnect()
+			}
+			return res, nil
+		})
 	}
 	if d.worker != nil && enroller != nil {
 		setup.StartWorker = exclusive(func() (localviewer.SetupActionResult, error) {

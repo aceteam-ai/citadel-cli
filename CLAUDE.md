@@ -443,9 +443,10 @@ on needs `confirm_shell` and still fails closed without a passcode.
 files may call it. `cmd.disconnectThisPC` (page and `citadel local disconnect`)
 stops the per-user worker, removes autostart, then `logoutThisNode`; a failed
 stop skips the logout, and local-mode state is never touched.
-`cmd.startSetupWorker` starts the worker only after this page connected the PC
-and the public-only guard still holds, and drops the page's own network
-connection first so one node key has one endpoint.
+`cmd.startSetupWorker` starts the worker only after this page connected the PC,
+the registration still exists and the public-only guard still holds, and drops
+the page's own network connection first so one node key has one endpoint; a
+Disconnect that logged out returns the page to idle.
 
 `nodevault.Vault.UnlockAtRest` owns #820: every consumer that encrypts data
 at rest unlocks through it, and it refuses a secret below

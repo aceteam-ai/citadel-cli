@@ -32,8 +32,8 @@ import (
 )
 
 // setupPostureCopy is shown on the setup page after a connect.
-const setupPostureCopy = "AceTeam agents can browse public websites on this PC. They can't open files, run commands or reach your home network. " +
-	"You can allow files or commands below when a task needs them."
+const setupPostureCopy = "AceTeam agents can browse public websites on this PC. They can't open files or run commands, " +
+	"and their browser sessions can't reach your home network. You can allow files or commands below when a task needs them."
 
 // setupPostureFailedCopy is shown when the connect succeeded but the posture
 // could not be saved. The worker is then not offered.

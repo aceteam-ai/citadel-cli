@@ -143,6 +143,16 @@ func disconnectThisPC(d disconnectDeps) localviewer.SetupActionResult {
 	return res
 }
 
+// disconnectLoggedOut reports whether res's logout step succeeded.
+func disconnectLoggedOut(res localviewer.SetupActionResult) bool {
+	for _, s := range res.Steps {
+		if s.Name == disconnectStepLogout {
+			return s.Status == stepOK
+		}
+	}
+	return false
+}
+
 // logoutDeps are logoutThisNode's side effects, as seams.
 type logoutDeps struct {
 	hasState    func() bool

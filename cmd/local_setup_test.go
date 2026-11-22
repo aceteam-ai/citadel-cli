@@ -143,7 +143,12 @@ func newSetupFixture(t *testing.T) *setupFixture {
 		logout:           func() (logoutOutcome, error) { return logoutOutcome{}, nothing },
 	}
 	f.worker = setupWorkerDeps{
-		goos:            "windows",
+		goos: "windows",
+		registered: func() bool {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			return f.connected
+		},
 		postureHolds:    func() bool { return setupPostureHolds(f.nodeDir) },
 		releaseNetwork:  func() error { return nothing },
 		enableAutostart: func() error { return nothing },

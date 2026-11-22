@@ -53,6 +53,9 @@ type setupWorkerDeps struct {
 	goos string
 	// offered reports that this page connected the PC and saved its posture.
 	offered func() bool
+	// registered reports that this PC still has its AceTeam registration (a
+	// Disconnect since the connect removes it).
+	registered func() bool
 	// postureHolds re-reads the permissions file: the public-only guard must
 	// still be on.
 	postureHolds    func() bool
@@ -67,7 +70,7 @@ func startSetupWorker(d setupWorkerDeps) (localviewer.SetupActionResult, error) 
 	if d.goos != "windows" {
 		return localviewer.SetupActionResult{OK: true, Message: workerOtherOSCopy}, nil
 	}
-	if !d.offered() || !d.postureHolds() {
+	if !d.offered() || !d.registered() || !d.postureHolds() {
 		return localviewer.SetupActionResult{}, errors.New(workerRefusedCopy)
 	}
 	res := localviewer.SetupActionResult{OK: true}
@@ -116,6 +119,7 @@ func productionSetupWorkerDeps(goos, exe string, offered func() bool) setupWorke
 	return setupWorkerDeps{
 		goos:            goos,
 		offered:         offered,
+		registered:      hasNodeRegistration,
 		postureHolds:    func() bool { return setupPostureHolds(nodeConfigDirFn()) },
 		releaseNetwork:  network.Disconnect,
 		enableAutostart: func() error { return enableUserAutostart(exe, autostartExeOwnership, service.EnableUserAutostart) },

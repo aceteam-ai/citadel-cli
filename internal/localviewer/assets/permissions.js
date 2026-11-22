@@ -38,7 +38,7 @@
     const body = { confirm: true, surface, enabled };
     if (surface === "shell" && enabled) {
       const ok = window.confirm("Allow AceTeam agents to run commands on this PC?\n\n" +
-        "Commands run as you and can read, change or delete anything your account can. " +
+        "Commands run with the Citadel worker's permissions and can read, change or delete anything it can. " +
         "Allow this only for a task that needs it, and turn it off afterwards.");
       if (!ok) { input.checked = false; return; }
       body.confirm_shell = true;
