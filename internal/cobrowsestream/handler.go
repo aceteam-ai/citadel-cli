@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -511,4 +513,46 @@ func (s *Server) rejectViewer(conn *websocket.Conn, reason string) {
 	_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
 	msg := websocket.FormatCloseMessage(websocket.ClosePolicyViolation, reason)
 	_ = conn.WriteMessage(websocket.CloseMessage, msg)
+}
+
+// guardLocalhost wraps the stream route served by Server.Start (not the
+// mountable StreamHandler, which has its own authenticated guard) with
+// localhostRequestAllowed.
+func (s *Server) guardLocalhost(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !localhostRequestAllowed(r) {
+			s.logger.Printf("refused browser-origin or foreign-host request on localhost listener from %s", r.RemoteAddr)
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// localhostRequestAllowed guards the loopback listener against a web page in the
+// user's own browser (or a page inside the session) opening the stream. The
+// listeners share one mux, so the decision is per connection: a request whose
+// local address is loopback must carry no Origin and a Host of 127.0.0.1:<port>
+// or localhost:<port>. Any other local address (the mesh listener) is untouched.
+// A request with no recoverable local address fails closed (guard applies).
+func localhostRequestAllowed(r *http.Request) bool {
+	var port string
+	if la, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok {
+		host, p, err := net.SplitHostPort(la.String())
+		if err == nil {
+			ip := net.ParseIP(host)
+			if ip == nil || !ip.IsLoopback() {
+				return true // mesh/VPN listener: unchanged
+			}
+			port = p
+		}
+	}
+	if len(r.Header.Values("Origin")) > 0 {
+		return false
+	}
+	if port == "" {
+		return false
+	}
+	h := strings.ToLower(r.Host)
+	return h == "127.0.0.1:"+port || h == "localhost:"+port
 }
