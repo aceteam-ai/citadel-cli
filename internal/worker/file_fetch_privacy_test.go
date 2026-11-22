@@ -73,6 +73,101 @@ func TestFileFetchJobDiagnosticsOmitCredentials(t *testing.T) {
 	}
 }
 
+func TestAMTJobDiagnosticsOmitCapabilities(t *testing.T) {
+	const token = "synthetic-amt-capability"
+	const endpoint = "https://example.test/api/fabric/amt/credential"
+	payload := map[string]any{"credential_token": token, "credential_url": endpoint, "host": "192.168.1.20"}
+	raw, _ := json.Marshal(payload)
+	for _, job := range []any{
+		&Job{Type: JobTypeAMTKVM, Payload: payload, RawPayload: raw},
+		&redisclient.Job{Type: JobTypeAMTKVM, Payload: payload, RawPayload: raw, RawData: map[string]any{"payload": string(raw)}},
+		&redisapi.Job{Type: JobTypeAMTKVM, Payload: payload, RawPayload: raw, RawData: map[string]any{"payload": string(raw)}},
+	} {
+		encoded, err := json.Marshal(job)
+		if err != nil || strings.Contains(string(encoded), token) || strings.Contains(string(encoded), endpoint) {
+			t.Fatal("retained AMT job envelope contains a capability")
+		}
+		for _, format := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d"} {
+			text := fmt.Sprintf(format, job)
+			if strings.Contains(text, token) || strings.Contains(text, endpoint) {
+				t.Fatal("AMT job diagnostic contains a capability")
+			}
+		}
+	}
+	if payload["credential_token"] != token {
+		t.Fatal("diagnostics mutated AMT execution authority")
+	}
+}
+
+func TestAMTAckAndStagedFileAckKeepSeparateRetentionRules(t *testing.T) {
+	raw, url := fileFetchDisposableRedis(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	queue := "jobs:v1:privacy:node:combined"
+	source := NewRedisSource(RedisSourceConfig{URL: url, QueueName: queue, ConsumerGroup: "workers", BlockMs: 1, LogFn: func(string, string) {}})
+	if err := source.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	for _, tc := range []struct {
+		kind    string
+		payload string
+		deleted bool
+	}{
+		{JobTypeAMTKVM, `{"credential_token":"synthetic-amt-capability"}`, true},
+		{JobTypeFileFetch, `{"capability":"synthetic-file-capability"}`, true},
+		{JobTypeCobrowseSession, `{"action":"stage_file","bytes_b64":"QUJD"}`, true},
+		{JobTypeCobrowseSession, `{"action":"status"}`, false},
+	} {
+		id := enqueueTestJob(t, raw, queue, map[string]any{"jobId": "combined-fixture", "type": tc.kind, "payload": tc.payload})
+		job, err := source.Next(ctx)
+		if err != nil || job == nil {
+			t.Fatalf("delivery fixture failed: %v", err)
+		}
+		if err := source.Ack(ctx, job); err != nil {
+			t.Fatal(err)
+		}
+		rows, err := raw.XRange(ctx, queue, id, id).Result()
+		if err != nil || (len(rows) == 0) != tc.deleted {
+			t.Fatalf("retention changed for %s: deleted=%t, rows=%d, err=%v", tc.kind, tc.deleted, len(rows), err)
+		}
+	}
+}
+
+func TestAMTTerminalRedisDeliveryDropsCapability(t *testing.T) {
+	raw, url := fileFetchDisposableRedis(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	queue := "jobs:v1:privacy:node:fixture"
+	source := NewRedisSource(RedisSourceConfig{
+		URL: url, QueueName: queue, ConsumerGroup: "privacy-workers", BlockMs: 1,
+		MaxAttempts: 1, LogFn: func(string, string) {},
+	})
+	if err := source.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	const token = "synthetic-amt-capability"
+	const endpoint = "https://example.test/api/fabric/amt/credential"
+	payload, _ := json.Marshal(map[string]any{"credential_token": token, "credential_url": endpoint, "host": "192.168.1.20"})
+	id := enqueueTestJob(t, raw, queue, map[string]any{"jobId": "amt-fixture", "type": JobTypeAMTKVM, "payload": string(payload)})
+	job, err := source.Next(ctx)
+	if err != nil || job != nil {
+		t.Fatalf("max-attempts AMT delivery should be terminal: job=%v err=%v", job, err)
+	}
+	retained, err := raw.XRange(ctx, queue, id, id).Result()
+	if err != nil || len(retained) != 0 {
+		t.Fatal("terminal AMT source entry retained a capability")
+	}
+	dlq, err := raw.XRange(ctx, "dlq:v1:fixture", "-", "+").Result()
+	if err != nil || len(dlq) != 1 || dlq[0].Values["payload"] != "null" {
+		t.Fatal("AMT dead letter did not omit the credential payload")
+	}
+	if text := fmt.Sprint(dlq); strings.Contains(text, token) || strings.Contains(text, endpoint) {
+		t.Fatal("AMT dead letter retained a credential capability")
+	}
+}
+
 // This starts an isolated real Redis process with no TCP listener or persistence.
 // It never contacts a node or an operator's Redis instance.
 func fileFetchDisposableRedis(t *testing.T) (*goredis.Client, string) {

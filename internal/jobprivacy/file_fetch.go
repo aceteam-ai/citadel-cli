@@ -4,12 +4,17 @@ package jobprivacy
 import "strings"
 
 const FileFetch = "FILE_FETCH"
+const AMTKVM = "AMT_KVM"
+
+// OmitPayload reports jobs whose entire payload is a delivery credential or
+// contains one. Execution keeps the original payload; retention does not.
+func OmitPayload(kind string) bool { return kind == FileFetch || kind == AMTKVM }
 
 // Payload is for retention/diagnostics only, never execution or redispatch.
-// It drops a FILE_FETCH payload entirely and removes the node passcode field
-// from every other job type.
+// It drops FILE_FETCH and AMT_KVM payloads entirely and removes the node
+// passcode field from every other job type.
 func Payload(kind string, payload map[string]any) map[string]any {
-	if kind == FileFetch {
+	if OmitPayload(kind) {
 		return nil
 	}
 	return WithoutPasscode(payload)
@@ -21,6 +26,13 @@ func Text(kind string, payload map[string]any, text string) string {
 	if kind == FileFetch {
 		if token, ok := payload["capability"].(string); ok && token != "" {
 			text = replaceAll(text, token)
+		}
+	}
+	if kind == AMTKVM {
+		for _, key := range []string{"credential_token", "credential_url"} {
+			if value, ok := payload[key].(string); ok && value != "" {
+				text = replaceAll(text, value)
+			}
 		}
 	}
 	return redactPasscode(payload, text)
@@ -56,7 +68,7 @@ func FailureData(kind string, payload map[string]any, err error, data map[string
 		message = Error(kind, payload, err).Error()
 	}
 	fields := map[string]any{"error": message}
-	if kind != FileFetch {
+	if !OmitPayload(kind) {
 		for key, value := range data {
 			fields[key] = value
 		}
