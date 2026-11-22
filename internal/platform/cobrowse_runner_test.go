@@ -307,6 +307,8 @@ func TestBuildChromeArgs_ProxyAndQuiet(t *testing.T) {
 		"--proxy-server=http://127.0.0.1:4000",
 		"--proxy-bypass-list=<-loopback>",
 		"--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+		"--webrtc-ip-handling-policy=disable_non_proxied_udp",
+		"--disable-extensions",
 		"--disable-background-networking",
 		"--disable-component-update",
 	} {

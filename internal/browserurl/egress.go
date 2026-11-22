@@ -2,6 +2,8 @@ package browserurl
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -19,15 +21,21 @@ import (
 // co-browse browser goes through (--proxy-server, with loopback not bypassed).
 // Local mode always uses one; a node-wide session uses one when the node is set
 // to public-only browsing (citadel-cli#1867). It resolves each destination
-// itself, refuses any address BlockedAddr rejects,
-// and connects to the exact address it checked. So the address policy holds
+// itself, refuses any address BlockedAddr rejects or that is this machine's
+// own or on one of its directly attached networks (ownNet), and connects to
+// the exact address it checked. So the address policy holds
 // where the browser actually connects: for redirects, scripts, iframes and
 // subresources, and across DNS rebinding, not only for the URL an agent asked
 // to open. Plain HTTP is forwarded; HTTPS and WebSockets use CONNECT.
+//
+// Known gap: a destination that is the home router's own public IPv4 address
+// can be answered by hairpin NAT with a port-forwarded service on the home
+// network. The guard cannot tell that address from any other public one.
 type EgressGuard struct {
 	resolve   Resolver
 	dial      func(ctx context.Context, network, addr string) (net.Conn, error)
 	onRefused func(scheme, host string)
+	own       *ownNet
 	ln        net.Listener
 	srv       *http.Server
 	fwd       *http.Transport
@@ -35,6 +43,13 @@ type EgressGuard struct {
 	refused atomic.Int64
 	mu      sync.Mutex
 	conns   map[net.Conn]struct{}
+
+	// canaryHost is a random name the guard answers itself (VerifyRouted).
+	canaryHost string
+	canarySeen atomic.Bool
+	// closing is set by Close; failed is closed when Serve exits without it.
+	closing atomic.Bool
+	failed  chan struct{}
 }
 
 // ErrEgressRefused is returned when a destination is not a public address.
@@ -50,6 +65,9 @@ type EgressGuardOptions struct {
 	// lower-cased host, without port, path or query. It runs on the request's
 	// goroutine and must not block.
 	OnRefused func(scheme, host string)
+	// Interfaces lists this machine's interface addresses and on-link
+	// prefixes. Nil reads the machine's own (DefaultInterfacePrefixes).
+	Interfaces InterfacePrefixes
 }
 
 // StartEgressGuard listens on 127.0.0.1. resolve and dial default to the
@@ -72,7 +90,17 @@ func StartEgressGuardWithOptions(o EgressGuardOptions) (*EgressGuard, error) {
 	if err != nil {
 		return nil, fmt.Errorf("start co-browse egress guard: %w", err)
 	}
-	g := &EgressGuard{resolve: resolve, dial: dial, onRefused: o.OnRefused, ln: ln, conns: map[net.Conn]struct{}{}}
+	var tok [12]byte
+	if _, err := rand.Read(tok[:]); err != nil {
+		_ = ln.Close()
+		return nil, fmt.Errorf("start co-browse egress guard: %w", err)
+	}
+	g := &EgressGuard{
+		resolve: resolve, dial: dial, onRefused: o.OnRefused, own: newOwnNet(o.Interfaces),
+		ln: ln, conns: map[net.Conn]struct{}{},
+		canaryHost: hex.EncodeToString(tok[:]) + canarySuffix,
+		failed:     make(chan struct{}),
+	}
 	g.fwd = &http.Transport{
 		Proxy:                 nil,
 		DialContext:           g.guardedDial,
@@ -82,8 +110,40 @@ func StartEgressGuardWithOptions(o EgressGuardOptions) (*EgressGuard, error) {
 		ResponseHeaderTimeout: 60 * time.Second,
 	}
 	g.srv = &http.Server{Handler: g, ReadHeaderTimeout: 30 * time.Second}
-	go func() { _ = g.srv.Serve(ln) }()
+	go func() {
+		_ = g.srv.Serve(ln)
+		if !g.closing.Load() {
+			close(g.failed)
+		}
+	}()
 	return g, nil
+}
+
+// canarySuffix is under the reserved .invalid TLD, so a canary request that
+// bypassed the guard could never resolve anywhere.
+const canarySuffix = ".egress-canary.invalid"
+
+// CanaryURL is a URL only this guard answers. A browser that loads it has
+// sent at least that request through the guard.
+func (g *EgressGuard) CanaryURL() string { return "http://" + g.canaryHost + "/" }
+
+// CanarySeen reports whether a request for CanaryURL's host reached the guard.
+func (g *EgressGuard) CanarySeen() bool { return g.canarySeen.Load() }
+
+// Failed is closed when the guard stops serving without Close being called.
+// A browser behind a dead guard has no route, but its session should end.
+func (g *EgressGuard) Failed() <-chan struct{} { return g.failed }
+
+// isCanary answers a canary request itself, never dialing anything.
+func (g *EgressGuard) isCanary(host string) bool {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	if strings.TrimSuffix(strings.ToLower(host), ".") != g.canaryHost {
+		return false
+	}
+	g.canarySeen.Store(true)
+	return true
 }
 
 // ProxyURL is the value for LaunchOptions.ProxyServer.
@@ -94,6 +154,7 @@ func (g *EgressGuard) Refused() int64 { return g.refused.Load() }
 
 // Close stops the guard and drops open tunnels.
 func (g *EgressGuard) Close() {
+	g.closing.Store(true)
 	_ = g.srv.Close()
 	g.fwd.CloseIdleConnections()
 	g.mu.Lock()
@@ -112,7 +173,7 @@ func (g *EgressGuard) checkedAddrs(ctx context.Context, host string) ([]netip.Ad
 		return nil, ErrEgressRefused
 	}
 	if a, ok := ParseBrowserHost(host); ok {
-		if BlockedAddr(a) {
+		if BlockedAddr(a) || g.own.contains(a) {
 			return nil, ErrEgressRefused
 		}
 		return []netip.Addr{a}, nil
@@ -125,7 +186,7 @@ func (g *EgressGuard) checkedAddrs(ctx context.Context, host string) ([]netip.Ad
 		return nil, fmt.Errorf("resolve %s: %v", host, err)
 	}
 	for _, a := range addrs {
-		if BlockedAddr(a) {
+		if BlockedAddr(a) || g.own.contains(a) {
 			return nil, ErrEgressRefused
 		}
 	}
@@ -215,6 +276,10 @@ func (g *EgressGuard) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "proxy requests only", http.StatusBadRequest)
 		return
 	}
+	if g.isCanary(r.URL.Host) {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	out := r.Clone(r.Context())
 	out.RequestURI = ""
 	for _, h := range []string{"Proxy-Connection", "Proxy-Authorization", "Connection", "Keep-Alive", "Te", "Trailer", "Upgrade"} {
@@ -237,6 +302,12 @@ func (g *EgressGuard) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (g *EgressGuard) serveConnect(w http.ResponseWriter, r *http.Request) {
+	if g.isCanary(r.Host) {
+		// A browser may upgrade the canary to HTTPS; seeing the CONNECT is
+		// enough, and nothing is tunneled.
+		http.Error(w, "Citadel co-browse: canary", http.StatusForbidden)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	upstream, err := g.guardedDial(ctx, "tcp", r.Host)
 	cancel()

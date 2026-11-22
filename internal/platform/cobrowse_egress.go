@@ -1,10 +1,13 @@
 package platform
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/browserurl"
 )
@@ -58,8 +61,18 @@ func (m *CobrowseSessionManager) egressRequiredNow() bool {
 // on a public-only node: that browser has no egress guard.
 var ErrLegacyCobrowsePublicOnly = errors.New("this node allows public-only co-browsing, which the legacy single-browser co-browse does not support; use a browser session (COBROWSE_SESSION) instead")
 
-// refuseLegacyWhenPublicOnly is the legacy CobrowseManager's gate, checked on
-// start and on every navigate (the setting may turn on while it runs).
+// refuseWhenPublicOnly is the legacy CobrowseManager's gate, checked on every
+// action. The setting may turn on while a legacy browser runs; that browser is
+// then stopped, not just refused, since its pages keep their network access.
+func (m *CobrowseManager) refuseWhenPublicOnly() error {
+	err := refuseLegacyWhenPublicOnly()
+	if err != nil && m.IsRunning() {
+		log.Printf("[cobrowse] stopping the legacy co-browse browser: this node is now public-only")
+		_ = m.Stop()
+	}
+	return err
+}
+
 func refuseLegacyWhenPublicOnly() error {
 	nodeEgressMu.Lock()
 	f := nodeEgressRequired
@@ -119,15 +132,18 @@ func (a *egressAudit) refused(scheme, host string) {
 // guardProc ties a session's guard to its browser: the guard closes once the
 // browser has stopped, on every path that stops it (teardown, a stop during
 // launch). It also logs how many connections the guard refused.
-func guardProc(proc *cobrowseProc, g *browserurl.EgressGuard, id string) {
+// The returned channel is closed once the guard has been closed that way.
+func guardProc(proc *cobrowseProc, g *browserurl.EgressGuard, id string) <-chan struct{} {
 	inner := proc.stop
 	var once sync.Once
+	stopped := make(chan struct{})
 	proc.stop = func() error {
 		var err error
 		if inner != nil {
 			err = inner()
 		}
 		once.Do(func() {
+			close(stopped)
 			g.Close()
 			if n := g.Refused(); n > 0 {
 				log.Printf("[cobrowse] session %s: egress guard refused %d connection(s)", id, n)
@@ -135,6 +151,67 @@ func guardProc(proc *cobrowseProc, g *browserurl.EgressGuard, id string) {
 		})
 		return err
 	}
+	return stopped
+}
+
+// watchGuard stops session id if its guard stops serving on its own. A
+// browser behind a dead guard has no route, but the session must not stay up
+// looking healthy.
+func (m *CobrowseSessionManager) watchGuard(id string, failed, stopped <-chan struct{}) {
+	select {
+	case <-stopped:
+	case <-failed:
+		log.Printf("[cobrowse] session %s: egress guard stopped unexpectedly; stopping the session", id)
+		_ = m.Stop(id)
+	}
+}
+
+// egressCanaryWait bounds the post-launch route check.
+const egressCanaryWait = 15 * time.Second
+
+// errEgressNotRouted refuses a session whose browser did not send the canary
+// through its guard: a managed policy or similar override routes it elsewhere.
+var errEgressNotRouted = errors.New("the browser did not route its traffic through the egress guard (a browser policy may override the proxy), so the public-only session was refused")
+
+// egressRouteCheck verifies, after launch, that the browser really uses its
+// guard. A package var so unit tests without a browser substitute it.
+var egressRouteCheck = verifyEgressRoute
+
+// verifyEgressRoute opens the guard's canary URL in a background tab through
+// the browser's own CDP endpoint and waits for the guard to see it.
+func verifyEgressRoute(proc *cobrowseProc, g *browserurl.EgressGuard) error {
+	if proc == nil || proc.debugPort <= 0 {
+		return errEgressNotRouted
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), egressCanaryWait)
+	defer cancel()
+	ws, err := fetchCDPBrowserWSContext(ctx, proc.debugPort)
+	if err != nil {
+		return fmt.Errorf("public-only route check: %w", err)
+	}
+	prefix := fmt.Sprintf("ws://127.0.0.1:%d/devtools/browser/", proc.debugPort)
+	if !strings.HasPrefix(ws, prefix) || (proc.browserID != "" && ws != prefix+proc.browserID) {
+		return fmt.Errorf("public-only route check: %w", errCDPImpostor)
+	}
+	res, err := cdpDialAndSendContext(ctx, ws, "Target.createTarget", map[string]any{"url": g.CanaryURL(), "background": true})
+	if err != nil {
+		return fmt.Errorf("public-only route check: %w", err)
+	}
+	if tid, _ := res["targetId"].(string); tid != "" {
+		defer func() {
+			cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer ccancel()
+			_, _ = cdpDialAndSendContext(cctx, ws, "Target.closeTarget", map[string]any{"targetId": tid})
+		}()
+	}
+	for !g.CanarySeen() {
+		select {
+		case <-ctx.Done():
+			return errEgressNotRouted
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	return nil
 }
 
 var egressContainerNote sync.Once

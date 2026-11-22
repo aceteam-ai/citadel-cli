@@ -83,6 +83,12 @@ type ConfigSubscriberConfig struct {
 	// ConfigDir is where citadel config is stored (optional, defaults to ~/citadel-node)
 	ConfigDir string
 
+	// PermissionsDir is the machine-convergent node directory holding
+	// permissions.yaml (the worker's nodePermissionsDir). Empty keeps the
+	// handler's legacy invoker-scoped location, which a worker must not use:
+	// a config push would then write a file the worker never reads.
+	PermissionsDir string
+
 	// LogFn is an optional callback for logging (if nil, prints to stdout)
 	LogFn func(level, msg string)
 }
@@ -115,7 +121,7 @@ func NewConfigSubscriber(cfg ConfigSubscriberConfig) (*ConfigSubscriber, error) 
 		client:        client,
 		nodeID:        cfg.NodeID,
 		channel:       fmt.Sprintf("config:node:%s", cfg.NodeID),
-		configHandler: jobs.NewConfigHandler(cfg.ConfigDir),
+		configHandler: newConfigHandler(cfg.ConfigDir, cfg.PermissionsDir),
 		minBackoff:    1 * time.Second,
 		maxBackoff:    5 * time.Minute,
 		backoff:       1 * time.Second,

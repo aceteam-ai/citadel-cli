@@ -81,3 +81,34 @@ func TestApplyDeviceConfig_CobrowsePublicOnly(t *testing.T) {
 		t.Fatalf("absent field must be nil: %+v %v", c.CobrowsePublicOnly, err)
 	}
 }
+
+// TestApplyDeviceConfig_DamagedPermissionsNotRewritten: a remote permission
+// push over a damaged file must not rewrite it from defaults, which would
+// drop every setting there, including public-only.
+func TestApplyDeviceConfig_DamagedPermissionsNotRewritten(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("SUDO_USER", "")
+	workerDir := filepath.Join(home, "resolved-node")
+	if err := os.MkdirAll(workerDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(workerDir, "permissions.yaml")
+	damaged := "cobrowse_public_only: true\nfiles: [\n"
+	if err := os.WriteFile(path, []byte(damaged), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := NewConfigHandler(workerDir)
+	h.PermissionsDir = workerDir
+	payload, _ := json.Marshal(map[string]any{"filesEnabled": true})
+	out, err := h.Execute(JobContext{}, &nexus.Job{Type: "APPLY_DEVICE_CONFIG", Payload: map[string]string{"config": string(payload)}})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !strings.Contains(string(out), "permissions not changed") {
+		t.Fatalf("result does not explain the skipped save: %q", out)
+	}
+	if data, _ := os.ReadFile(path); string(data) != damaged {
+		t.Fatalf("damaged permissions file rewritten: %q", data)
+	}
+}

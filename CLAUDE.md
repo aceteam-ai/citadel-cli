@@ -316,11 +316,26 @@ false keeps the old behavior; an unparseable permissions file counts as on.
 `startEgressForLaunch` refuses the start when the guard cannot listen. A guarded
 session runs on the host browser, never in the container (the container's
 network cannot reach the loopback guard) and never in a detached scope.
-`guardProc` closes the guard whenever the browser stops. Such sessions are
+`guardProc` closes the guard whenever the browser stops, and `watchGuard` stops
+the session if the guard's server exits on its own (`EgressGuard.Failed`).
+Before the session is usable, `verifyEgressRoute` opens the guard's random
+`.invalid` canary URL through CDP and refuses the session unless the guard saw
+it (a managed proxy policy would otherwise route around it). Besides
+`BlockedAddr`, the guard refuses this machine's own interface addresses and
+their on-link prefixes (`ownNet`, refreshed every 30s, fail-closed with no
+list), which covers a global IPv6 /64 or a public IPv4 LAN; hairpin NAT through
+the router's public IPv4 stays a known gap. A proxied browser also gets
+`--disable-extensions` and BOTH WebRTC policy spellings: Chrome 156 ignores
+`--force-webrtc-ip-handling-policy` and honors only
+`--webrtc-ip-handling-policy`. Such sessions are
 stopped before a self-restart and on shutdown, and `verifyAdoptable` never
 re-adopts one: the browser still points at the old guard port. The legacy
 single-browser `CobrowseManager` has no guard, so `refuseLegacyWhenPublicOnly`
-refuses its start and navigate on such a node. Status reports
+refuses every legacy action on such a node, and stops a legacy browser
+that was already running when the setting turned on. The APPLY_DEVICE_CONFIG
+permissions block loads strictly, so a push never rewrites a damaged
+permissions file from defaults, and the direct-Redis config consumer and
+subscriber carry the worker's `PermissionsDir`. Status reports
 `egress: public_only`. Refusals are logged as scheme plus host
 (`egressAudit`). APPLY_DEVICE_CONFIG `cobrowsePublicOnly` may only turn it on
 (`jobs.applyCobrowsePublicOnly`); `citadel permission cobrowse-public-only`

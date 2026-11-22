@@ -32,11 +32,35 @@ func runEgressGuardRealBrowser(t *testing.T, m *CobrowseSessionManager) {
 		fmt.Fprint(w, "local secret")
 	}))
 	defer secret.Close()
+	secretHost := strings.TrimPrefix(secret.URL, "http://")
+	// A loopback UDP socket stands in for a STUN server: WebRTC must not send
+	// it anything, because a guarded browser forbids non-proxied UDP.
+	udp, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udp.Close()
+	var udpHits atomic.Int64
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			if _, _, err := udp.ReadFrom(buf); err != nil {
+				return
+			}
+			udpHits.Add(1)
+		}
+	}()
 	page := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		fmt.Fprintf(w, `<!doctype html><h1 id="t">Allowed page</h1>`+
 			`<img src="%s/pixel"><iframe src="%s/frame"></iframe>`+
-			`<img src="http://router.test/admin?token=x"><img src="http://mesh.test/status">`, secret.URL, secret.URL)
+			`<img src="http://router.test/admin?token=x"><img src="http://mesh.test/status">`+
+			// This machine's own global IPv6 address and its on-link router.
+			`<img src="http://[2606:4700:10::5]/own"><img src="http://[2606:4700:10::1]/router">`+
+			`<script>try{new WebSocket("ws://%s/ws")}catch(e){}`+
+			`try{const pc=new RTCPeerConnection({iceServers:[{urls:"stun:%s"}]});pc.createDataChannel("x");`+
+			`pc.createOffer().then(o=>pc.setLocalDescription(o))}catch(e){}</script>`,
+			secret.URL, secret.URL, secretHost, udp.LocalAddr().String())
 	}))
 	defer page.Close()
 
@@ -68,6 +92,11 @@ func runEgressGuardRealBrowser(t *testing.T, m *CobrowseSessionManager) {
 	startSessionEgressGuard = func(onRefused func(scheme, host string)) (*browserurl.EgressGuard, error) {
 		g, err := browserurl.StartEgressGuardWithOptions(browserurl.EgressGuardOptions{
 			Resolve: resolve, Dial: dial,
+			// The test's stand-in for this machine's interfaces: one global
+			// IPv6 address with its /64.
+			Interfaces: func() ([]netip.Prefix, error) {
+				return []netip.Prefix{netip.MustParsePrefix("2606:4700:10::5/64")}, nil
+			},
 			OnRefused: func(scheme, host string) {
 				mu.Lock()
 				refused[scheme+"://"+host] = true
@@ -109,7 +138,10 @@ func runEgressGuardRealBrowser(t *testing.T, m *CobrowseSessionManager) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	for _, want := range []string{"http://127.0.0.1", "http://router.test", "http://mesh.test"} {
+	if n := udpHits.Load(); n != 0 {
+		t.Errorf("WebRTC sent %d UDP packet(s) around the guard", n)
+	}
+	for _, want := range []string{"http://127.0.0.1", "http://router.test", "http://mesh.test", "http://2606:4700:10::5", "http://2606:4700:10::1"} {
 		if !refused[want] {
 			t.Errorf("guard did not report refusing %s (reported %v)", want, refused)
 		}

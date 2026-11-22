@@ -4,6 +4,8 @@ import (
 	"errors"
 	"net"
 	"os"
+	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,14 +22,23 @@ type egressEnv struct {
 	opts     []LaunchOptions
 	guards   []*browserurl.EgressGuard
 	launches int
+	stops    int
 	startErr error
+	routeErr error
+	routed   int
 	gate     chan struct{}
 }
 
 func newEgressEnv(t *testing.T) *egressEnv {
 	t.Helper()
 	e := &egressEnv{}
-	prevLaunch, prevStart := launchCobrowseProc, startSessionEgressGuard
+	prevLaunch, prevStart, prevRoute := launchCobrowseProc, startSessionEgressGuard, egressRouteCheck
+	egressRouteCheck = func(proc *cobrowseProc, g *browserurl.EgressGuard) error {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		e.routed++
+		return e.routeErr
+	}
 	launchCobrowseProc = func(profileDir, startURL string, lo LaunchOptions) (*cobrowseProc, error) {
 		if e.gate != nil {
 			<-e.gate
@@ -41,7 +52,12 @@ func newEgressEnv(t *testing.T) *egressEnv {
 			debugPort: 9100 + n, display: ":" + strconv.Itoa(70+n),
 			browserPID: 100000 + n, xvfbPID: 200000 + n,
 			exited: make(chan struct{}),
-			stop:   func() error { return nil },
+			stop: func() error {
+				e.mu.Lock()
+				e.stops++
+				e.mu.Unlock()
+				return nil
+			},
 		}, nil
 	}
 	startSessionEgressGuard = func(onRefused func(scheme, host string)) (*browserurl.EgressGuard, error) {
@@ -57,7 +73,7 @@ func newEgressEnv(t *testing.T) *egressEnv {
 		return g, err
 	}
 	t.Cleanup(func() {
-		launchCobrowseProc, startSessionEgressGuard = prevLaunch, prevStart
+		launchCobrowseProc, startSessionEgressGuard, egressRouteCheck = prevLaunch, prevStart, prevRoute
 		e.mu.Lock()
 		for _, g := range e.guards {
 			g.Close()
@@ -377,5 +393,98 @@ func TestLegacyCobrowseRefusedWhenPublicOnly(t *testing.T) {
 	setNodeEgress(t, func() bool { return false })
 	if _, err := m.Navigate("https://a.example"); errors.Is(err, ErrLegacyCobrowsePublicOnly) {
 		t.Fatal("refused with public-only off")
+	}
+}
+
+// TestEgressRouteCheckFailureRefusesSession: a browser that does not send the
+// canary through its guard (a managed proxy policy) is stopped and refused.
+func TestEgressRouteCheckFailureRefusesSession(t *testing.T) {
+	e := newEgressEnv(t)
+	e.routeErr = errEgressNotRouted
+	setNodeEgress(t, func() bool { return true })
+	m := adoptMgr(trustedBaseDir(t))
+	if _, err := m.StartSession(""); !errors.Is(err, errEgressNotRouted) {
+		t.Fatalf("want a route refusal, got %v", err)
+	}
+	if e.routed != 1 || e.stops != 1 {
+		t.Fatalf("route checks = %d, browser stops = %d; want 1 and 1", e.routed, e.stops)
+	}
+	if guardListening(e.guards[0]) {
+		t.Fatal("guard still listening after a refused start")
+	}
+	if n := len(m.List()); n != 0 {
+		t.Fatalf("%d session(s) left", n)
+	}
+	// Unguarded sessions are never route-checked.
+	setNodeEgress(t, func() bool { return false })
+	if _, err := m.StartSession(""); err != nil {
+		t.Fatal(err)
+	}
+	defer m.StopAll()
+	if e.routed != 1 {
+		t.Fatalf("an unguarded session was route-checked")
+	}
+}
+
+// TestWatchGuardStopsSessionOnGuardFailure: a guard that stops serving on its
+// own ends the session; a normal stop does not trigger it.
+func TestWatchGuardStopsSessionOnGuardFailure(t *testing.T) {
+	newEgressEnv(t)
+	m := adoptMgr(trustedBaseDir(t))
+	m.SetEgressRequired(func() bool { return true })
+	st, err := m.StartSession("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed, stopped := make(chan struct{}), make(chan struct{})
+	done := make(chan struct{})
+	go func() { m.watchGuard(st.ID, failed, stopped); close(done) }()
+	close(failed)
+	<-done
+	if _, ok := m.SessionStatus(st.ID); ok {
+		t.Fatal("session kept running after its guard failed")
+	}
+
+	st2, _ := m.StartSession("")
+	defer m.StopAll()
+	failed2, stopped2 := make(chan struct{}), make(chan struct{})
+	done2 := make(chan struct{})
+	go func() { m.watchGuard(st2.ID, failed2, stopped2); close(done2) }()
+	close(stopped2)
+	<-done2
+	if _, ok := m.SessionStatus(st2.ID); !ok {
+		t.Fatal("a normally stopped guard must not stop another path's session")
+	}
+}
+
+// TestLegacyCobrowseStoppedWhenPublicOnlyTurnsOn: a legacy browser already
+// running when the setting turns on is stopped at its next action.
+func TestLegacyCobrowseStoppedWhenPublicOnlyTurnsOn(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses POSIX sleep as a stand-in process")
+	}
+	if _, err := exec.LookPath("sleep"); err != nil {
+		t.Skip("sleep not available")
+	}
+	m := &CobrowseManager{driver: DriverAI, debugPort: DefaultCobrowseDebugPort}
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan struct{})
+	m.cmd, m.exited = cmd, exited
+	go func() { _ = cmd.Wait(); close(exited) }()
+	defer m.Stop()
+	if !m.IsRunning() {
+		t.Fatal("stand-in not running")
+	}
+	setNodeEgress(t, func() bool { return true })
+	if _, err := m.Handoff(); !errors.Is(err, ErrLegacyCobrowsePublicOnly) {
+		t.Fatalf("want public-only refusal, got %v", err)
+	}
+	select {
+	case <-exited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the legacy browser kept running after public-only turned on")
 	}
 }

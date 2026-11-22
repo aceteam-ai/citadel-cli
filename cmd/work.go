@@ -2354,8 +2354,9 @@ func runWork(cmd *cobra.Command, args []string) {
 
 			// Start config queue consumer for device configuration jobs
 			configConsumer, err := heartbeat.NewConfigConsumer(heartbeat.ConfigConsumerConfig{
-				RedisURL:      workRedisURL,
-				RedisPassword: workRedisPass,
+				RedisURL:       workRedisURL,
+				RedisPassword:  workRedisPass,
+				PermissionsDir: nodePermissionsDir(),
 			})
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "   - ⚠️ Failed to create config consumer: %v\n", err)
@@ -2370,9 +2371,10 @@ func runWork(cmd *cobra.Command, args []string) {
 
 			// Start config Pub/Sub subscriber for real-time config updates
 			configSubscriber, err := heartbeat.NewConfigSubscriber(heartbeat.ConfigSubscriberConfig{
-				RedisURL:      workRedisURL,
-				RedisPassword: workRedisPass,
-				NodeID:        nodeName,
+				RedisURL:       workRedisURL,
+				RedisPassword:  workRedisPass,
+				NodeID:         nodeName,
+				PermissionsDir: nodePermissionsDir(),
 			})
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "   - ⚠️ Failed to create config subscriber: %v\n", err)

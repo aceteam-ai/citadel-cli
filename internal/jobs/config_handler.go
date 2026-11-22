@@ -355,60 +355,67 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 		if permissionsDir == "" {
 			permissionsDir = platform.ConfigDir()
 		}
-		perms := citadelconfig.LoadPermissions(permissionsDir)
-		if config.ConsoleEnabled != nil {
-			perms.Console = *config.ConsoleEnabled
-		}
-		if config.DesktopEnabled != nil {
-			perms.Desktop = *config.DesktopEnabled
-		}
-		if config.FilesEnabled != nil {
-			perms.Files = *config.FilesEnabled
-		}
-		if config.ShellEnabled != nil {
-			perms.Shell = *config.ShellEnabled
-		}
-		if config.NodePasscode != nil {
-			// The master PIN (aceteam-ai/citadel-cli#796) is set LOCALLY only, so
-			// it never transits AceTeam infra. When one is enrolled, SetPasscode
-			// refuses a non-empty set — surface that as an explicit, non-alarming
-			// message rather than a generic warning: the platform push is
-			// deliberately disabled for this node, not failing.
-			if err := perms.SetPasscode(*config.NodePasscode); err != nil {
-				if citadelconfig.VaultConfigured != nil && citadelconfig.VaultConfigured() {
-					result += "\nNode passcode push ignored: a local master PIN is enrolled (set it locally with 'citadel passcode rotate'; the platform passcode push is disabled)"
-				} else {
-					result += fmt.Sprintf("\nWarning: failed to set node passcode: %v", err)
-				}
-			}
-		}
-		if err := citadelconfig.SavePermissions(permissionsDir, perms); err != nil {
-			result += fmt.Sprintf("\nWarning: failed to persist permissions: %v", err)
+		// Strict: a lenient load reads a damaged file as the defaults, and the
+		// full save below would then rewrite every permission from defaults
+		// (including turning co-browse public-only off).
+		perms, perr := citadelconfig.LoadPermissionsStrict(permissionsDir)
+		if perr != nil {
+			result += fmt.Sprintf("\nWarning: permissions not changed, the node permissions file could not be read: %v", perr)
 		} else {
 			if config.ConsoleEnabled != nil {
-				result += fmt.Sprintf("\nConsole (terminal) access %s", enabledLabel(*config.ConsoleEnabled))
+				perms.Console = *config.ConsoleEnabled
 			}
 			if config.DesktopEnabled != nil {
-				result += fmt.Sprintf("\nDesktop (screen/VNC) access %s", enabledLabel(*config.DesktopEnabled))
+				perms.Desktop = *config.DesktopEnabled
 			}
 			if config.FilesEnabled != nil {
-				result += fmt.Sprintf("\nFiles (browse/host) access %s", enabledLabel(*config.FilesEnabled))
+				perms.Files = *config.FilesEnabled
 			}
 			if config.ShellEnabled != nil {
-				result += fmt.Sprintf("\nShell (remote command) access %s", enabledLabel(*config.ShellEnabled))
+				perms.Shell = *config.ShellEnabled
 			}
 			if config.NodePasscode != nil {
-				if perms.HasPasscode() {
-					result += "\nNode passcode set"
-				} else {
-					result += "\nNode passcode cleared (sensitive surfaces re-locked)"
+				// The master PIN (aceteam-ai/citadel-cli#796) is set LOCALLY only, so
+				// it never transits AceTeam infra. When one is enrolled, SetPasscode
+				// refuses a non-empty set — surface that as an explicit, non-alarming
+				// message rather than a generic warning: the platform push is
+				// deliberately disabled for this node, not failing.
+				if err := perms.SetPasscode(*config.NodePasscode); err != nil {
+					if citadelconfig.VaultConfigured != nil && citadelconfig.VaultConfigured() {
+						result += "\nNode passcode push ignored: a local master PIN is enrolled (set it locally with 'citadel passcode rotate'; the platform passcode push is disabled)"
+					} else {
+						result += fmt.Sprintf("\nWarning: failed to set node passcode: %v", err)
+					}
 				}
 			}
-			// Guardrail: an enabled surface with no passcode fails closed. Surface
-			// that in the job result so an operator who enabled without a passcode
-			// understands why access is still denied.
-			if (perms.Console || perms.Desktop || perms.Files || perms.Shell) && !perms.HasPasscode() {
-				result += "\nNote: a sensitive surface is enabled but no passcode is set — access stays denied until a passcode is set"
+			if err := citadelconfig.SavePermissions(permissionsDir, perms); err != nil {
+				result += fmt.Sprintf("\nWarning: failed to persist permissions: %v", err)
+			} else {
+				if config.ConsoleEnabled != nil {
+					result += fmt.Sprintf("\nConsole (terminal) access %s", enabledLabel(*config.ConsoleEnabled))
+				}
+				if config.DesktopEnabled != nil {
+					result += fmt.Sprintf("\nDesktop (screen/VNC) access %s", enabledLabel(*config.DesktopEnabled))
+				}
+				if config.FilesEnabled != nil {
+					result += fmt.Sprintf("\nFiles (browse/host) access %s", enabledLabel(*config.FilesEnabled))
+				}
+				if config.ShellEnabled != nil {
+					result += fmt.Sprintf("\nShell (remote command) access %s", enabledLabel(*config.ShellEnabled))
+				}
+				if config.NodePasscode != nil {
+					if perms.HasPasscode() {
+						result += "\nNode passcode set"
+					} else {
+						result += "\nNode passcode cleared (sensitive surfaces re-locked)"
+					}
+				}
+				// Guardrail: an enabled surface with no passcode fails closed. Surface
+				// that in the job result so an operator who enabled without a passcode
+				// understands why access is still denied.
+				if (perms.Console || perms.Desktop || perms.Files || perms.Shell) && !perms.HasPasscode() {
+					result += "\nNote: a sensitive surface is enabled but no passcode is set — access stays denied until a passcode is set"
+				}
 			}
 		}
 	}

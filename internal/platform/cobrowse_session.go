@@ -704,8 +704,9 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 		}
 		return nil, err
 	}
+	var guardStopped <-chan struct{}
 	if guard != nil {
-		guardProc(proc, guard, s.id)
+		guardStopped = guardProc(proc, guard, s.id)
 	}
 	// Best-effort pidfile so a future process can reap this browser + Xvfb if THIS
 	// process is SIGKILLed before graceful teardown. A write failure is non-fatal:
@@ -725,6 +726,16 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 			proc.browserID = id
 		}
 	}
+	// Public-only: prove the browser really sends traffic through its guard
+	// before the session becomes usable (a managed proxy policy could route
+	// it elsewhere). Stopping the proc also closes the guard.
+	if guard != nil {
+		if err := egressRouteCheck(proc, guard); err != nil {
+			dropTargetSet(proc.debugPort)
+			_ = proc.stop()
+			return nil, err
+		}
+	}
 	s.mu.Lock()
 	s.proc = proc
 	s.state = SessionRunning
@@ -736,6 +747,9 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	s.startChooserWatch(proc.debugPort)
 	// Durable registry record so a restart by exec can re-adopt this session.
 	s.persistRecord()
+	if guard != nil {
+		go m.watchGuard(s.id, guard.Failed(), guardStopped)
+	}
 	return proc, nil
 }
 
