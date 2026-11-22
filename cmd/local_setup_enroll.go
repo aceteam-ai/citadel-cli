@@ -19,6 +19,7 @@ package cmd
 import (
 	"context"
 	"errors"
+	"log"
 	"net"
 	"net/url"
 	"os"
@@ -101,7 +102,7 @@ const (
 	setupEnrollConnectingCopy = "Approved. Connecting this PC..."
 	setupEnrollCancelingCopy  = "Canceling..."
 	setupEnrollConnectedCopy  = "Connected. This PC stays registered after you close this window, but AceTeam agents can use it only " +
-		"while Citadel's worker runs, and this page does not start the worker yet."
+		"while Citadel's worker runs. To start it, use Keep this PC available to AceTeam below."
 	setupEnrollUnverifiedCopy = "Connected, but AceTeam could not confirm it yet. If this PC does not appear in your account, " +
 		"run \"citadel status\" in a terminal."
 	setupEnrollLateCancelCopy = "Cancel came too late: the last step had already started, and this PC is now connected. " +
@@ -137,6 +138,10 @@ type setupEnroller struct {
 	// check refuses a node config dir this page must not save to
 	// (checkSetupNodeDir in production). Nil checks nothing.
 	check func(configDir string) error
+	// posture writes the co-browse-only permissions after a successful
+	// enrollment (see local_setup_posture.go). Nil writes nothing and offers
+	// no worker.
+	posture func(configDir string) error
 
 	mu              sync.Mutex
 	state           localviewer.SetupEnrollState
@@ -146,6 +151,9 @@ type setupEnroller struct {
 	warned          bool
 	untrusted       bool
 	cancelRequested bool
+	// action is set while Disconnect or the worker start runs; an enrollment
+	// cannot start then, and neither can run during an enrollment.
+	action bool
 }
 
 func newSetupEnroller(base func() enrollOptions, run func(context.Context, enrollOptions) (*enrollResult, error), open func(string) error, already func(string) (string, string)) *setupEnroller {
@@ -165,7 +173,7 @@ func (e *setupEnroller) State() localviewer.SetupEnrollState {
 func (e *setupEnroller) Start() (localviewer.SetupEnrollState, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.running {
+	if e.running || e.action {
 		return e.state, errors.New(setupEnrollCopyFor(enrollBusy))
 	}
 	opts := e.base()
@@ -250,6 +258,16 @@ func (e *setupEnroller) runOnce(ctx context.Context, opts enrollOptions, done ch
 	if err != nil && (kind == enrollAlreadyEnrolled || kind == enrollAlreadyConnected) && e.already != nil {
 		already.node, already.org = e.already(opts.ConfigDir)
 	}
+	// Only a successful enrollment from this page writes the posture, into the
+	// node config dir it enrolled; an "already" result writes nothing.
+	postureSaved := false
+	if err == nil && res != nil && e.posture != nil {
+		if perr := e.posture(opts.ConfigDir); perr != nil {
+			log.Printf("[setup] co-browse-only posture not saved: %v", perr)
+		} else {
+			postureSaved = true
+		}
+	}
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -268,6 +286,13 @@ func (e *setupEnroller) runOnce(ctx context.Context, opts enrollOptions, done ch
 		default:
 			st.Message = setupEnrollConnectedCopy
 		}
+		if e.posture != nil {
+			if postureSaved {
+				st.Posture, st.WorkerOffer = setupPostureCopy, true
+			} else {
+				st.Posture = setupPostureFailedCopy
+			}
+		}
 	case e.untrusted:
 		st.Stage, st.Failure = setupEnrollFailed, string(setupEnrollUntrustedLink)
 		st.Message = setupEnrollCopyFor(setupEnrollUntrustedLink)
@@ -285,6 +310,39 @@ func (e *setupEnroller) runOnce(ctx context.Context, opts enrollOptions, done ch
 		st.Stage, st.Failure, st.Message = setupEnrollFailed, string(kind), setupEnrollCopyFor(kind)
 	}
 	e.state = st
+}
+
+// beginAction marks a Disconnect or worker start as running. It refuses while
+// an enrollment or another action runs; the caller must call endAction.
+func (e *setupEnroller) beginAction() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.running || e.action {
+		return errors.New(nodePermsBusyCopy)
+	}
+	e.action = true
+	return nil
+}
+
+func (e *setupEnroller) endAction() {
+	e.mu.Lock()
+	e.action = false
+	e.mu.Unlock()
+}
+
+// Busy reports a running enrollment or action.
+func (e *setupEnroller) Busy() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.running || e.action
+}
+
+// workerOffered reports whether this page connected the PC and saved its
+// co-browse-only posture, which the worker start requires.
+func (e *setupEnroller) workerOffered() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return !e.running && e.state.Stage == setupEnrollConnected && e.state.WorkerOffer
 }
 
 // Cancel asks the running enrollment to stop. The state reads canceling until

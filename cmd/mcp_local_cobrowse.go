@@ -71,6 +71,9 @@ type localCobrowseOptions struct {
 	// default-browser opener (tests).
 	viewer  bool
 	openURL func(string) error
+	// nodePermissions serves the viewer's Files and Shell toggles for this
+	// PC's AceTeam node (citadel-cli#1867 C5); nil hides them.
+	nodePermissions *localviewer.NodePermissionHooks
 	// auditRetention overrides the audit retention (default 90 days, or
 	// CITADEL_LOCAL_AUDIT_RETENTION_DAYS).
 	auditRetention time.Duration
@@ -206,7 +209,7 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 			openURL = platform.OpenURL
 		}
 		rt.viewerFactory = func() (*localviewer.Server, error) {
-			cfg := localviewer.Config{Service: rt.svc, OpenURL: openURL, MaxSessions: localcobrowse.DefaultMaxSessions}
+			cfg := localviewer.Config{Service: rt.svc, OpenURL: openURL, MaxSessions: localcobrowse.DefaultMaxSessions, NodePermissions: opts.nodePermissions}
 			if opts.ownerDir != nil {
 				dir := filepath.Join(opts.ownerDir(), localaudit.DirName)
 				cfg.Activity = func(session string, limit int) ([]localaudit.Record, error) {

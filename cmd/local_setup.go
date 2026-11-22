@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -172,6 +173,16 @@ type localSetupDeps struct {
 	// enrollCheck refuses a node config dir outside this user's own folder
 	// (productionSetupNodeDirCheck); it runs before each start.
 	enrollCheck func(configDir string) error
+	// posture writes the co-browse-only permissions after a successful
+	// enrollment from this page (writeSetupPosture).
+	posture func(configDir string) error
+	// nodePerms builds the Files and Shell toggles; busy refuses a change
+	// while an enrollment or action runs. Nil hides them.
+	nodePerms func(busy func() bool) *localviewer.NodePermissionHooks
+	// disconnect is Disconnect this PC (nil hides it); worker builds the
+	// worker start's deps (nil hides it).
+	disconnect func() localviewer.SetupActionResult
+	worker     func(offered func() bool) setupWorkerDeps
 }
 
 func realLocalSetupDeps() (localSetupDeps, error) {
@@ -192,6 +203,14 @@ func realLocalSetupDeps() (localSetupDeps, error) {
 		enrollOptions: productionEnrollOptions,
 		enrollAlready: setupAlreadyInfo,
 		enrollCheck:   productionSetupNodeDirCheck,
+		posture:       writeSetupPosture,
+		nodePerms: func(busy func() bool) *localviewer.NodePermissionHooks {
+			return newNodePermissionHooks(productionNodePermissionDeps("setup_page", busy))
+		},
+		disconnect: func() localviewer.SetupActionResult { return disconnectThisPC(productionDisconnectDeps()) },
+		worker: func(offered func() bool) setupWorkerDeps {
+			return productionSetupWorkerDeps(runtime.GOOS, exe, offered)
+		},
 		doctor: func(full bool) []localviewer.SetupCheck {
 			checks, _ := collectLocalDoctor(realLocalDoctorDeps(!full))
 			out := make([]localviewer.SetupCheck, len(checks))
@@ -263,15 +282,46 @@ func newLocalSetupServer(d localSetupDeps) (*localviewer.Server, *setupEnroller)
 	if d.enroll != nil && d.enrollOptions != nil {
 		enroller = newSetupEnroller(d.enrollOptions, d.enroll, d.openURL, d.enrollAlready)
 		enroller.check = d.enrollCheck
+		enroller.posture = d.posture
 		enroller.hooks(setup)
 	}
+	// exclusive runs a Disconnect or worker start alone: never during an
+	// enrollment, and no enrollment starts while it runs.
+	exclusive := func(run func() (localviewer.SetupActionResult, error)) func() (localviewer.SetupActionResult, error) {
+		return func() (localviewer.SetupActionResult, error) {
+			if enroller != nil {
+				if err := enroller.beginAction(); err != nil {
+					return localviewer.SetupActionResult{}, err
+				}
+				defer enroller.endAction()
+			}
+			return run()
+		}
+	}
+	if d.disconnect != nil {
+		setup.Disconnect = exclusive(func() (localviewer.SetupActionResult, error) { return d.disconnect(), nil })
+	}
+	if d.worker != nil && enroller != nil {
+		setup.StartWorker = exclusive(func() (localviewer.SetupActionResult, error) {
+			return startSetupWorker(d.worker(enroller.workerOffered))
+		})
+	}
+	var nodePerms *localviewer.NodePermissionHooks
+	if d.nodePerms != nil {
+		var busy func() bool
+		if enroller != nil {
+			busy = enroller.Busy
+		}
+		nodePerms = d.nodePerms(busy)
+	}
 	return localviewer.New(localviewer.Config{
-		TokenDir:    dir,
-		PrivateDir:  localviewer.SetupDirName,
-		OpenURL:     d.openURL,
-		Now:         d.now,
-		MaxSessions: localcobrowse.DefaultMaxSessions,
-		Setup:       setup,
+		TokenDir:        dir,
+		PrivateDir:      localviewer.SetupDirName,
+		OpenURL:         d.openURL,
+		Now:             d.now,
+		MaxSessions:     localcobrowse.DefaultMaxSessions,
+		Setup:           setup,
+		NodePermissions: nodePerms,
 	}), enroller
 }
 

@@ -87,6 +87,31 @@ type SetupConfig struct {
 	EnrollState func() SetupEnrollState
 	// EnrollCancel asks a running enrollment to stop.
 	EnrollCancel func() SetupEnrollState
+
+	// StartWorker keeps this PC available to AceTeam after a connect: it turns
+	// on sign-in autostart and starts the background worker
+	// (citadel-cli#1867 C5). Nil answers 404. Its error is fixed copy.
+	StartWorker func() (SetupActionResult, error)
+	// Disconnect stops the background worker, removes autostart and logs this
+	// PC out of the AceTeam Network, reporting each step. Local mode keeps
+	// working and saved logins are never touched. Nil answers 404.
+	Disconnect func() (SetupActionResult, error)
+}
+
+// SetupStep is one step of a setup action and how it went. Status is "ok",
+// "failed", "skipped" or "not_applicable"; Message is fixed copy.
+type SetupStep struct {
+	Name    string `json:"name"`
+	Status  string `json:"status"`
+	Message string `json:"message"`
+}
+
+// SetupActionResult is a multi-step setup action: every step it ran, in
+// order, and a summary. OK is true only when no step failed.
+type SetupActionResult struct {
+	OK      bool        `json:"ok"`
+	Steps   []SetupStep `json:"steps"`
+	Message string      `json:"message"`
 }
 
 // SetupEnrollState is what the page shows of a "Connect to AceTeam"
@@ -106,6 +131,10 @@ type SetupEnrollState struct {
 	// fixed copy shown for the stage or failure.
 	Failure string `json:"failure,omitempty"`
 	Message string `json:"message,omitempty"`
+	// Posture is fixed copy describing what AceTeam agents may do on this PC
+	// after a connect; WorkerOffer shows "Keep this PC available to AceTeam".
+	Posture     string `json:"posture,omitempty"`
+	WorkerOffer bool   `json:"worker_offer,omitempty"`
 }
 
 type setupState struct {
@@ -117,6 +146,8 @@ type setupState struct {
 	GenericEntry string         `json:"generic_entry"`
 	// EnrollAvailable shows the Connect to AceTeam section.
 	EnrollAvailable bool `json:"enroll_available"`
+	// DisconnectAvailable shows the Disconnect this PC button.
+	DisconnectAvailable bool `json:"disconnect_available"`
 }
 
 func (s *Server) setupRoutes(mux *http.ServeMux) {
@@ -128,11 +159,37 @@ func (s *Server) setupRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/setup/enroll/state", s.withCookie(s.withCSRF(s.handleSetupEnrollState)))
 	mux.HandleFunc("POST /api/setup/enroll/cancel", s.withCookie(s.withCSRF(s.handleSetupEnrollCancel)))
 	mux.HandleFunc("GET /api/setup/enroll/qr", s.withCookie(s.withCSRF(s.handleSetupEnrollQR)))
+	mux.HandleFunc("POST /api/setup/worker/start", s.withCookie(s.withCSRF(s.handleSetupAction(func(c *SetupConfig) func() (SetupActionResult, error) { return c.StartWorker }))))
+	mux.HandleFunc("POST /api/setup/disconnect", s.withCookie(s.withCSRF(s.handleSetupAction(func(c *SetupConfig) func() (SetupActionResult, error) { return c.Disconnect }))))
+}
+
+// handleSetupAction runs one multi-step action after a JSON confirmation. A
+// failed step is still 200 with OK false, so the page can show every step;
+// an error (for example, a refusal before any step ran) is 409.
+func (s *Server) handleSetupAction(pick func(*SetupConfig) func() (SetupActionResult, error)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		run := pick(s.cfg.Setup)
+		if run == nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "this action is not available here"})
+			return
+		}
+		if !readConfirm(w, r) {
+			return
+		}
+		s.setupMu.Lock()
+		defer s.setupMu.Unlock()
+		res, err := run()
+		if err != nil {
+			writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "result": res})
+			return
+		}
+		writeJSON(w, http.StatusOK, res)
+	}
 }
 
 func (s *Server) handleSetupState(w http.ResponseWriter, r *http.Request) {
 	c := s.cfg.Setup
-	st := setupState{MaxSessions: c.MaxSessions, GenericEntry: c.GenericEntry, Sessions: []SetupSession{}, EnrollAvailable: c.enrollAvailable()}
+	st := setupState{MaxSessions: c.MaxSessions, GenericEntry: c.GenericEntry, Sessions: []SetupSession{}, EnrollAvailable: c.enrollAvailable(), DisconnectAvailable: c.Disconnect != nil}
 	if c.Doctor != nil {
 		st.Checks = c.Doctor(false)
 	}

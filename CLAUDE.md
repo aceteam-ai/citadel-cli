@@ -428,6 +428,25 @@ before the save and the connect. The setup process skips
 private CA trust (local-mode pre-run), so a private-CA control plane cannot be
 enrolled from the page.
 
+The co-browse-only posture of a setup-page PC (#1867 C5) is
+`cmd.writeSetupPosture`, run by `setupEnroller` only after a successful
+enrollment, into the node config dir it enrolled: every surface off,
+services/SSH/provision off, `cobrowse_public_only` on, passcode hash kept, a
+damaged file refused. Co-browse has no key of its own. `DefaultPermissions` and
+other enrollment paths are unchanged. `cmd.setNodeSurface` is the one writer for
+the human Files/Shell grant (setup page, viewer, `citadel permission
+files|shell`): strict load, never a rewrite from defaults, one `[permission]
+audit` log line per change. Both pages serve it at `/api/node-permissions`
+(`localviewer.NodePermissionHooks`, behind the guard, cookie and bearer); Shell
+on needs `confirm_shell` and still fails closed without a passcode.
+`TestNodePermissionGrantHasNoMCPPath` pins that no MCP tool reaches it and which
+files may call it. `cmd.disconnectThisPC` (page and `citadel local disconnect`)
+stops the per-user worker, removes autostart, then `logoutThisNode`; a failed
+stop skips the logout, and local-mode state is never touched.
+`cmd.startSetupWorker` starts the worker only after this page connected the PC
+and the public-only guard still holds, and drops the page's own network
+connection first so one node key has one endpoint.
+
 `nodevault.Vault.UnlockAtRest` owns #820: every consumer that encrypts data
 at rest unlocks through it, and it refuses a secret below
 `nodevault.AtRestThresholdBits` (never below the 60-bit default, whatever

@@ -181,6 +181,9 @@
         "This PC is now " + node + org + "." :
         node + " is already connected" + org + ".";
     }
+    $("enroll-posture").hidden = !(st.stage === "connected" && st.posture);
+    $("enroll-posture").textContent = st.posture || "";
+    $("worker").hidden = !(st.stage === "connected" && st.worker_offer);
     if (active && !enrollTimer) enrollTimer = setInterval(pollEnroll, 1500);
     if (!active && enrollTimer) { clearInterval(enrollTimer); enrollTimer = null; }
   }
@@ -198,9 +201,45 @@
     try { renderEnroll(await api("POST", "/api/setup/enroll/cancel", { confirm: true })); } catch (e) { /* next poll */ }
   };
 
+  const STEP = { ok: "Done", failed: "Failed", skipped: "Skipped", not_applicable: "Not needed" };
+
+  function renderSteps(listId, msgId, res) {
+    const ul = $(listId);
+    ul.replaceChildren();
+    for (const s of res.steps || []) {
+      li(ul, s.name + ": " + (STEP[s.status] || s.status) + ". " + s.message, s.status === "failed" ? "danger" : "");
+    }
+    $(msgId).textContent = res.message || "";
+    $(msgId).className = res.ok ? "" : "refused";
+  }
+
+  async function runAction(path, button, listId, msgId) {
+    button.disabled = true;
+    $(msgId).textContent = "Working...";
+    $(msgId).className = "";
+    try {
+      renderSteps(listId, msgId, await api("POST", path, { confirm: true }));
+    } catch (e) {
+      $(listId).replaceChildren();
+      $(msgId).textContent = e.message;
+      $(msgId).className = "refused";
+    }
+    button.disabled = false;
+  }
+
+  $("worker-start").onclick = () => runAction("/api/setup/worker/start", $("worker-start"), "worker-steps", "worker-message");
+  $("disconnect-start").onclick = async () => {
+    const ok = window.confirm("Disconnect this PC from AceTeam?\n\nThe background worker stops, Citadel no longer starts when you sign in, " +
+      "and this PC is logged out of AceTeam. Local mode keeps working, and your saved logins are not touched.");
+    if (!ok) return;
+    await runAction("/api/setup/disconnect", $("disconnect-start"), "disconnect-steps", "disconnect-message");
+    await pollEnroll();
+  };
+
   async function loadEnroll() {
     try {
       const st = await api("GET", "/api/setup/state");
+      $("disconnect").hidden = !st.disconnect_available;
       if (!st.enroll_available) return;
       $("enroll").hidden = false;
       await pollEnroll();
