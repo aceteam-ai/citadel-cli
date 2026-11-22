@@ -326,7 +326,7 @@ func (m *CobrowseSessionManager) ShutdownSessions() error {
 	var lastErr error
 	for _, s := range all {
 		s.mu.Lock()
-		keep := s.proc != nil && (s.proc.browserScope != "" || s.proc.containerID != "") && !s.persistent && s.encProfile == nil
+		keep := s.proc != nil && (s.proc.browserScope != "" || s.proc.containerID != "") && !s.persistent && s.encProfile == nil && s.egress == ""
 		s.mu.Unlock()
 		if keep {
 			_ = m.MarkSessionEnding(s, EndedReasonServiceRestart,

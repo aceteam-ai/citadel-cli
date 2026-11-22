@@ -133,6 +133,10 @@ type CobrowseSessionStatus struct {
 	// and would append instead of replace. Reported only by non-tracking
 	// sessions, like FileUploadPageFence.
 	InputEdit string `json:"input_edit,omitempty"`
+	// Egress is EgressPublicOnly when every browser connection goes through an
+	// egress guard that refuses loopback, private, link-local and mesh
+	// addresses (citadel-cli#1867 C4b); absent when the session has no guard.
+	Egress string `json:"egress,omitempty"`
 	// PageText and PasswordField are page content signals for the platform's
 	// login-wall detection (aceteam#13773). Set only by WithPageSignals on a
 	// node-wide session's start and single-session status result; omitted on
@@ -256,6 +260,9 @@ type CobrowseSessionManager struct {
 	// attach (SetFilesAllowed). Nil denies, so a manager nobody wired never lets
 	// a viewer attach (local mode is one).
 	filesAllowed func() bool
+	// egressRequired is this manager's public-only source (SetEgressRequired).
+	// Nil falls back to the node source for the node-wide manager only.
+	egressRequired func() bool
 	// useResolver is set on the process-wide manager only, so its registry
 	// follows registryDirResolver; other managers keep a sibling of baseDir.
 	useResolver bool
@@ -290,6 +297,9 @@ type cobrowseSession struct {
 	id        string
 	profile   string
 	startedAt time.Time
+	// egress is EgressPublicOnly when the browser runs behind its own egress
+	// guard (set once at launch, guarded by mu); empty otherwise.
+	egress string
 	// workDir is where the browser profile working copy lives: profile itself
 	// for host runners, <profile>/profile for a container session. Guarded by mu;
 	// empty means profile.
@@ -626,15 +636,24 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	if err := os.MkdirAll(s.profile, 0o700); err != nil {
 		return nil, fmt.Errorf("create session profile dir: %w", err)
 	}
+	// Public-only is read live per session start (citadel-cli#1867 C4b). It is
+	// decided before the container choice: a guarded session runs on the host.
+	publicOnly := m.egressRequiredNow()
 	// A container session mounts only <session>/profile, so the profile working
 	// copy lives there; everything else stays out of the container's reach.
 	useContainer := false
 	workDir := s.profile
 	if ch, ok := activeBrowserRunner.(containerChooser); ok && ch.useContainer(m.useResolver) {
-		useContainer = true
-		workDir = filepath.Join(s.profile, containerProfileSubdir)
-		if err := os.MkdirAll(workDir, 0o700); err != nil {
-			return nil, fmt.Errorf("create container profile dir: %w", err)
+		if publicOnly {
+			egressContainerNote.Do(func() {
+				log.Printf("[cobrowse] public-only sessions run on the host browser behind the egress guard, not in the browser-runtime container")
+			})
+		} else {
+			useContainer = true
+			workDir = filepath.Join(s.profile, containerProfileSubdir)
+			if err := os.MkdirAll(workDir, 0o700); err != nil {
+				return nil, fmt.Errorf("create container profile dir: %w", err)
+			}
 		}
 	}
 	s.mu.Lock()
@@ -670,9 +689,23 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	m.mu.Unlock()
 	lo.Detach = m.useResolver && detachedWorker.Load()
 	lo.UseContainer = useContainer
+	var guard *browserurl.EgressGuard
+	if publicOnly {
+		g, err := startEgressForLaunch(s.id, &lo)
+		if err != nil {
+			return nil, err
+		}
+		guard = g
+	}
 	proc, err := launchCobrowseProc(s.profile, startURL, lo)
 	if err != nil {
+		if guard != nil {
+			guard.Close()
+		}
 		return nil, err
+	}
+	if guard != nil {
+		guardProc(proc, guard, s.id)
 	}
 	// Best-effort pidfile so a future process can reap this browser + Xvfb if THIS
 	// process is SIGKILLed before graceful teardown. A write failure is non-fatal:
@@ -696,6 +729,9 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	s.proc = proc
 	s.state = SessionRunning
 	s.persistent = enc != nil
+	if guard != nil {
+		s.egress = EgressPublicOnly
+	}
 	s.mu.Unlock()
 	s.startChooserWatch(proc.debugPort)
 	// Durable registry record so a restart by exec can re-adopt this session.
@@ -983,6 +1019,7 @@ func (s *cobrowseSession) statusBase() (CobrowseSessionStatus, int) {
 		Profile:    s.profile,
 		Driver:     driverFor(s.humanDrivingLocked()),
 		Generation: s.generation,
+		Egress:     s.egress,
 	}
 	if !s.tracking {
 		st.FileUploadPageFence = FileUploadPageFenceV1

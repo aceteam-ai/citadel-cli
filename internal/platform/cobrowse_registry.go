@@ -126,6 +126,9 @@ type sessionRecord struct {
 	ContainerStart string `json:"container_start,omitempty"`
 	ControlPort    int    `json:"control_port,omitempty"`
 	Tracking       bool   `json:"tracking,omitempty"`
+	// Egress records a public-only session. Its guard lives in the process
+	// that launched it, so such a record is never adopted.
+	Egress string `json:"egress,omitempty"`
 
 	// State is live, suspended or expired. Generation increases on every
 	// re-adopt or ownership change so a later owner can order its claims.
@@ -368,6 +371,7 @@ func (s *cobrowseSession) persistRecord() {
 		ScopeUser:    proc.scopeUser,
 		Handoff:      s.explicitHandoff,
 		Tracking:     s.tracking,
+		Egress:       s.egress,
 		State:        RecordLive,
 		Generation:   s.generation,
 		PendingEnd:   s.pendingEnd,
@@ -415,6 +419,12 @@ func verifyAdoptable(baseDir, dir string, rec sessionRecord) error {
 	}
 	if rec.Persistent {
 		return fmt.Errorf("persistent profile sessions are sealed, not adopted")
+	}
+	if rec.Egress != "" {
+		// The browser still points at the old process's loopback guard port.
+		// Whatever binds that port next would become its proxy, so such a
+		// browser is never taken over (citadel-cli#1867 C4b).
+		return fmt.Errorf("public-only sessions lose their egress guard on restart and are not adopted")
 	}
 	if rec.BrowserStart == 0 {
 		return fmt.Errorf("browser start time not recorded")

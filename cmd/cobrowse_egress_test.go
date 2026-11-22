@@ -1,0 +1,78 @@
+package cmd
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/aceteam-ai/citadel-cli/internal/config"
+)
+
+// TestCobrowsePublicOnlyActivation: absent and false keep today's behavior,
+// true turns the guard on, and a damaged file counts as on.
+func TestCobrowsePublicOnlyActivation(t *testing.T) {
+	cases := []struct {
+		name, file string
+		want       bool
+	}{
+		{"absent file", "", false},
+		{"absent key", "shell: true\n", false},
+		{"false", "cobrowse_public_only: false\n", false},
+		{"true", "cobrowse_public_only: true\n", true},
+		{"unparseable", "cobrowse_public_only: [\n", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if tc.file != "" {
+				if err := os.WriteFile(filepath.Join(dir, "permissions.yaml"), []byte(tc.file), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := cobrowsePublicOnlyIn(dir); got != tc.want {
+				t.Fatalf("public-only = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSetCobrowsePublicOnlyKeepsOtherPermissions(t *testing.T) {
+	dir := t.TempDir()
+	p := config.DefaultPermissions()
+	p.Shell = true
+	if err := config.SavePermissions(dir, p); err != nil {
+		t.Fatal(err)
+	}
+	if err := setCobrowsePublicOnly(dir, true); err != nil {
+		t.Fatal(err)
+	}
+	got := config.LoadPermissions(dir)
+	if !got.CobrowsePublicOnly || !got.Shell {
+		t.Fatalf("after enable: %+v", got)
+	}
+	if err := setCobrowsePublicOnly(dir, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := config.LoadPermissions(dir); got.CobrowsePublicOnly || !got.Shell {
+		t.Fatalf("after disable: %+v", got)
+	}
+	data, _ := os.ReadFile(filepath.Join(dir, "permissions.yaml"))
+	if strings.Contains(string(data), "cobrowse_public_only") {
+		t.Fatalf("a disabled setting should not be written: %s", data)
+	}
+}
+
+func TestSetCobrowsePublicOnlyRefusesDamagedFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "permissions.yaml")
+	if err := os.WriteFile(path, []byte("shell: [\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := setCobrowsePublicOnly(dir, false); err == nil {
+		t.Fatal("a damaged permissions file must not be rewritten from defaults")
+	}
+	if data, _ := os.ReadFile(path); string(data) != "shell: [\n" {
+		t.Fatalf("file changed: %q", data)
+	}
+}

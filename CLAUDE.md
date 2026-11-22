@@ -306,6 +306,26 @@ fallthrough, and `isLocalModeCommand` skips the root pre-run's CA trust and
 update check. `localcobrowse.AcquireOwner` enforces one co-browse owner per OS
 user. `TestLocalMCPStdioMakesNoOutboundCalls` pins the no-egress contract.
 
+The guard itself is `browserurl.EgressGuard` (the `localcobrowse` names are
+aliases), so remote sessions can use it too (citadel-cli#1867 C4b).
+`CobrowseSessionManager.egressRequiredNow` decides, at every session start,
+whether a node-wide session runs behind its own per-session guard. It reads
+`Permissions.CobrowsePublicOnly` through the source `cmd` installs
+(`platform.SetNodeCobrowseEgressSource`, `cmd.cobrowsePublicOnlyIn`). Absent or
+false keeps the old behavior; an unparseable permissions file counts as on.
+`startEgressForLaunch` refuses the start when the guard cannot listen. A guarded
+session runs on the host browser, never in the container (the container's
+network cannot reach the loopback guard) and never in a detached scope.
+`guardProc` closes the guard whenever the browser stops. Such sessions are
+stopped before a self-restart and on shutdown, and `verifyAdoptable` never
+re-adopts one: the browser still points at the old guard port. Status reports
+`egress: public_only`. Refusals are logged as scheme plus host
+(`egressAudit`). APPLY_DEVICE_CONFIG `cobrowsePublicOnly` may only turn it on
+(`jobs.applyCobrowsePublicOnly`); `citadel permission cobrowse-public-only`
+turns it off locally. `TestEgress*` in `internal/platform` and the
+`RealBrowserEgressGuard` tests for Linux and Windows pin it. #1858 is the
+separate document-level host policy that sits above this address floor.
+
 `platform.targetSet` owns a session's open pages (S15, aceteam#13503): popups
 and new tabs. It is local mode only: a manager opts in with
 `EnableTargetTracking`; the node-wide manager does not, and its status, actions

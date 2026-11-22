@@ -78,6 +78,30 @@ func applyEgressRelayConfig(relayConfigDir string, config *DeviceConfig) string 
 	return result
 }
 
+// applyCobrowsePublicOnly applies a remote cobrowsePublicOnly request to the
+// permissions file in permissionsDir and returns the job-result line. Only
+// enabling is honored remotely (see DeviceConfig.CobrowsePublicOnly). A
+// permissions file that cannot be read or parsed is left as it is: rewriting it
+// from defaults would drop the operator's other settings, and an unreadable
+// file already makes remote sessions public-only.
+func applyCobrowsePublicOnly(permissionsDir string, enable bool) string {
+	if !enable {
+		return "\nCo-browse public-only egress can only be turned off on this computer ('citadel permission cobrowse-public-only disable'); remote request ignored"
+	}
+	perms, err := citadelconfig.LoadPermissionsStrict(permissionsDir)
+	if err != nil {
+		return fmt.Sprintf("\nWarning: co-browse public-only egress not saved, the permissions file could not be read (remote sessions are public-only until it is fixed): %v", err)
+	}
+	if perms.CobrowsePublicOnly {
+		return "\nCo-browse public-only egress already enabled"
+	}
+	perms.CobrowsePublicOnly = true
+	if err := citadelconfig.SavePermissions(permissionsDir, perms); err != nil {
+		return fmt.Sprintf("\nWarning: failed to persist co-browse public-only egress: %v", err)
+	}
+	return "\nCo-browse public-only egress enabled (applies from the next remote session start)"
+}
+
 // serviceNamePattern validates service names to prevent path traversal.
 // Only allows lowercase alphanumeric characters and hyphens.
 var serviceNamePattern = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
@@ -164,6 +188,14 @@ type DeviceConfig struct {
 	// passcode leaves it fail-closed, so the platform should set this alongside
 	// the *Enabled flags.
 	NodePasscode *string `json:"nodePasscode,omitempty"`
+
+	// CobrowsePublicOnly turns on the public-only egress guard for remote
+	// co-browse sessions (citadel-cli#1867 C4b). Only `true` is applied: a
+	// remote request cannot loosen it, because any agent on the account could
+	// otherwise switch the guard off. `false` is reported as ignored; the
+	// operator turns it off locally with `citadel permission
+	// cobrowse-public-only disable`. Nil leaves the persisted value untouched.
+	CobrowsePublicOnly *bool `json:"cobrowsePublicOnly,omitempty"`
 
 	// DefaultServe is the platform-pushed opt-IN for the "default-serve"
 	// appliance-mode reconcile (citadel-cli#628): on a truly blank GPU node,
@@ -379,6 +411,14 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 				result += "\nNote: a sensitive surface is enabled but no passcode is set — access stays denied until a passcode is set"
 			}
 		}
+	}
+
+	if config.CobrowsePublicOnly != nil {
+		permissionsDir := h.PermissionsDir
+		if permissionsDir == "" {
+			permissionsDir = platform.ConfigDir()
+		}
+		result += applyCobrowsePublicOnly(permissionsDir, *config.CobrowsePublicOnly)
 	}
 
 	// Start services if autoStartServices is enabled
