@@ -1,6 +1,9 @@
 package update
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // RestartReasonNodeUpdate is the reason for a restart onto a new binary.
 const RestartReasonNodeUpdate = "node_update"
@@ -50,26 +53,15 @@ func runBeforeRestart(reason string) {
 // constant, so the two cannot drift.
 const SupervisorRestartExitCode = 75
 
-var (
-	supervisorRestartMu sync.Mutex
-	supervisorRestart   func() bool
-)
+var supervisedRestart atomic.Bool
 
-// SetSupervisorRestart registers a check that reports, at restart time, whether a
-// live per-user supervisor owns this process. When it returns true the Windows
-// restart exits with SupervisorRestartExitCode instead of spawning a copy of
-// itself: a spawned copy would race the supervisor's relaunch for the worker
-// lock and would run unsupervised. Unix keeps execve, which preserves the PID
-// and so the supervisor's view of its child.
-func SetSupervisorRestart(owned func() bool) {
-	supervisorRestartMu.Lock()
-	supervisorRestart = owned
-	supervisorRestartMu.Unlock()
-}
+// SetSupervisedRestart marks this process as a worker started by the per-user
+// supervisor. The Windows restart then always exits with
+// SupervisorRestartExitCode and never spawns a copy of itself: a copy would
+// race the supervisor's relaunch for the worker lock, and if the supervisor
+// misread that exit as a clean stop its job would kill the copy, leaving no
+// worker. Set it from the supervisor's flag alone, not from a lock probe that
+// could fail. Unix keeps execve, which preserves the PID.
+func SetSupervisedRestart(on bool) { supervisedRestart.Store(on) }
 
-func restartBySupervisor() bool {
-	supervisorRestartMu.Lock()
-	f := supervisorRestart
-	supervisorRestartMu.Unlock()
-	return f != nil && f()
-}
+func restartBySupervisor() bool { return supervisedRestart.Load() }

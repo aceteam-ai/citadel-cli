@@ -14,6 +14,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/localaudit"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/service"
+	"github.com/aceteam-ai/citadel-cli/internal/update"
 )
 
 func TestBackgroundArgvStripsModeFlags(t *testing.T) {
@@ -23,14 +24,14 @@ func TestBackgroundArgvStripsModeFlags(t *testing.T) {
 	if !reflect.DeepEqual(sup, wantSup) {
 		t.Fatalf("supervisorArgv = %v, want %v", sup, wantSup)
 	}
-	worker := supervisedWorkerArgv(sup, 4242)
-	wantWorker := []string{"--debug", "work", "--no-gateway", "--status-port", "8080", "--supervisor-pid=4242"}
+	worker := supervisedWorkerArgv(sup, 4242, `C:\n\citadel-supervisor.lock`)
+	wantWorker := []string{"--debug", "work", "--no-gateway", "--status-port", "8080", "--supervisor-pid=4242", `--supervisor-lock=C:\n\citadel-supervisor.lock`}
 	if !reflect.DeepEqual(worker, wantWorker) {
 		t.Fatalf("supervisedWorkerArgv = %v, want %v", worker, wantWorker)
 	}
 	// Every spelling of the mode flags is removed, so no forwarded command line
 	// can re-enter a background mode.
-	got := stripWorkModeFlags([]string{"work", "--background=true", "--supervise=true", "--supervisor-pid", "7", "--supervisor-pid=8", "--terminal-port", "7860"})
+	got := stripWorkModeFlags([]string{"work", "--background=true", "--supervise=true", "--supervisor-pid", "7", "--supervisor-pid=8", "--supervisor-lock", "x", "--supervisor-lock=y", "--terminal-port", "7860"})
 	if want := []string{"work", "--terminal-port", "7860"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("stripWorkModeFlags = %v, want %v", got, want)
 	}
@@ -86,7 +87,7 @@ func TestAgentUpdateIsServiceKeepsServiceEnv(t *testing.T) {
 }
 
 func TestWatchStopFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), service.SupervisorStopFileName)
+	path := filepath.Join(t.TempDir(), service.SupervisorStopPath("", 1))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	stopped := make(chan struct{})
@@ -143,8 +144,8 @@ func TestStopUserWorker(t *testing.T) {
 		if err := stopUserWorker(dir, time.Second, &out); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := os.Stat(service.SupervisorStopPath(dir)); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("stop file written with no supervisor running: %v", err)
+		if m, _ := filepath.Glob(filepath.Join(dir, service.SupervisorStopFilePrefix+"*")); len(m) != 0 {
+			t.Fatalf("stop request written with no supervisor running: %v", m)
 		}
 	})
 	t.Run("supervisor exits after the request", func(t *testing.T) {
@@ -153,8 +154,8 @@ func TestStopUserWorker(t *testing.T) {
 			if lock != service.SupervisorLockPath(dir) {
 				t.Errorf("probed %s", lock)
 			}
-			_, err := os.Stat(service.SupervisorStopPath(dir))
-			return err != nil, 99 // held until the stop file exists
+			_, err := os.Stat(service.SupervisorStopPath(dir, 99))
+			return err != nil, 99 // held until the request naming PID 99 exists
 		})
 		var out bytes.Buffer
 		if err := stopUserWorker(dir, 5*time.Second, &out); err != nil {
@@ -162,6 +163,21 @@ func TestStopUserWorker(t *testing.T) {
 		}
 		if !strings.Contains(out.String(), "Stopped.") {
 			t.Fatalf("output = %q", out.String())
+		}
+	})
+	t.Run("another supervisor took over", func(t *testing.T) {
+		dir := t.TempDir()
+		calls := 0
+		withSupervisorHeld(t, func(string) (bool, int) {
+			calls++
+			if calls == 1 {
+				return true, 99
+			}
+			return true, 100
+		})
+		err := stopUserWorker(dir, 5*time.Second, &bytes.Buffer{})
+		if err == nil || !strings.Contains(err.Error(), "100") {
+			t.Fatalf("err = %v, want a message naming the new PID 100", err)
 		}
 	})
 	t.Run("supervisor never exits", func(t *testing.T) {
@@ -231,5 +247,39 @@ func TestLocalDoctorReportsUserWorker(t *testing.T) {
 	}))
 	if c := find(checks, "Autostart"); c.Status != "note" || !strings.Contains(c.Detail, "switched off") {
 		t.Fatalf("disabled autostart line = %+v", c)
+	}
+}
+
+func TestEnableUserAutostartRefusesUnownedOrRemoteExe(t *testing.T) {
+	mine := func(string) (update.OwnerInfo, error) {
+		return update.OwnerInfo{OwnerSID: "S-1-5-21-1", OwnerName: "me", UserSID: "S-1-5-21-1", UserName: "me"}, nil
+	}
+	theirs := func(string) (update.OwnerInfo, error) {
+		return update.OwnerInfo{OwnerSID: "S-1-5-32-544", OwnerName: "Administrators", UserSID: "S-1-5-21-1", UserName: "me"}, nil
+	}
+	unknown := func(string) (update.OwnerInfo, error) { return update.OwnerInfo{}, errors.New("access denied") }
+	exe := `C:\Users\Test User\AppData\Local\Citadel\citadel.exe`
+
+	var wrote []string
+	write := func(p string) error { wrote = append(wrote, p); return nil }
+	if err := enableUserAutostart(exe, mine, write); err != nil || len(wrote) != 1 {
+		t.Fatalf("owned exe: err=%v wrote=%v", err, wrote)
+	}
+	wrote = nil
+	for name, tc := range map[string]struct {
+		exe   string
+		owner func(string) (update.OwnerInfo, error)
+	}{
+		"owned by someone else": {exe, theirs},
+		"owner unreadable":      {exe, unknown},
+		"UNC path":              {`\\server\share\citadel.exe`, mine},
+		"device path":           {`\\?\C:\citadel.exe`, mine},
+	} {
+		if err := enableUserAutostart(tc.exe, tc.owner, write); err == nil {
+			t.Errorf("%s: enable succeeded", name)
+		}
+	}
+	if len(wrote) != 0 {
+		t.Fatalf("a refused enable wrote the Run value: %v", wrote)
 	}
 }

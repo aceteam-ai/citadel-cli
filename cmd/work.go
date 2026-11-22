@@ -446,6 +446,14 @@ func runWork(cmd *cobra.Command, args []string) {
 		lock, lockErr := worklock.Acquire(network.GetStateDir(), Version, Log)
 		if lockErr != nil {
 			var running *worklock.ErrAlreadyRunning
+			if errors.As(lockErr, &running) && workSupervisorPID > 0 {
+				// Under the per-user supervisor (citadel-cli#1867), another worker
+				// already serving this node is the intended outcome, so exit 0 and
+				// let the supervisor stop, whatever the holder probe says (on
+				// Windows it cannot always read the holder, #1875).
+				fmt.Fprintf(os.Stderr, "Another citadel worker already serves this node (lock %s, PID %d); the background supervisor will stop.\n", running.Path, running.PID)
+				os.Exit(0)
+			}
 			if errors.As(lockErr, &running) {
 				// An ErrAlreadyRunning means the OS advisory lock is CONTENDED — a
 				// live process genuinely holds it (the kernel frees flock on death).

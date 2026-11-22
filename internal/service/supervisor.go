@@ -67,6 +67,13 @@ type SupervisorConfig struct {
 	// RestartExitCode is the code that asks for an immediate relaunch
 	// (update.SupervisorRestartExitCode in production). Zero disables it.
 	RestartExitCode int
+	// Handover, when set, runs after a restart-code exit instead of relaunching
+	// the worker here. It returns true when a fresh supervisor has taken over,
+	// and RunSupervisor then returns; false keeps this supervisor in charge.
+	// Windows uses it so the supervisor, too, moves onto the updated binary:
+	// otherwise its image stays mapped from the renamed old file, and the next
+	// update cannot delete that file.
+	Handover func() bool
 }
 
 // RunSupervisor starts the worker and keeps it running until it exits 0 or ctx
@@ -117,8 +124,16 @@ func RunSupervisor(ctx context.Context, cfg SupervisorConfig) error {
 			logf("supervisor: worker exited cleanly; not restarting")
 			return nil
 		case err == nil && cfg.RestartExitCode != 0 && code == cfg.RestartExitCode && uptime >= minRestart:
-			logf("supervisor: worker asked for a restart; relaunching")
 			backoff = base
+			if cfg.Handover != nil {
+				logf("supervisor: worker asked for a restart; handing over to a fresh supervisor")
+				if cfg.Handover() {
+					return nil
+				}
+				logf("supervisor: handover failed; relaunching the worker here")
+			} else {
+				logf("supervisor: worker asked for a restart; relaunching")
+			}
 		default:
 			if err == nil && uptime >= stableAfter {
 				backoff = base
@@ -172,4 +187,77 @@ func durationOr(d, def time.Duration) time.Duration {
 		return d
 	}
 	return def
+}
+
+// Handover defaults.
+const (
+	DefaultHandoverTimeout = 15 * time.Second
+	DefaultHandoverPoll    = 200 * time.Millisecond
+)
+
+// SupervisorHandover moves supervision to a successor process without ever
+// leaving two supervisors, and without leaving none unless the successor dies.
+// The successor is started first and retries the lock; this supervisor then
+// releases it and waits for another PID to hold it. If none does in time it
+// takes the lock back and keeps supervising.
+type SupervisorHandover struct {
+	// Spawn starts the successor supervisor and returns its PID.
+	Spawn func() (int, error)
+	// Release releases this supervisor's lock.
+	Release func()
+	// Reacquire takes the lock back. It returns held=true and the holder PID
+	// when another process holds it instead.
+	Reacquire func() (otherHolder int, err error)
+	// Holder probes the lock without taking it.
+	Holder  func() (held bool, pid int)
+	SelfPID int
+	Clock   SupervisorClock
+	Timeout time.Duration
+	Poll    time.Duration
+	Log     func(format string, args ...any)
+}
+
+// Run performs the handover and reports whether another supervisor now holds
+// the lock (true) or this one is still in charge (false).
+func (h SupervisorHandover) Run() bool {
+	clock := h.Clock
+	if clock == nil {
+		clock = realClock{}
+	}
+	logf := h.Log
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+	pid, err := h.Spawn()
+	if err != nil {
+		logf("supervisor: could not start a successor: %v", err)
+		return false
+	}
+	h.Release()
+	deadline := clock.Now().Add(durationOr(h.Timeout, DefaultHandoverTimeout))
+	for {
+		if held, holder := h.Holder(); held && holder != h.SelfPID {
+			if holder == pid {
+				logf("supervisor: handed over to PID %d", holder)
+			} else {
+				logf("supervisor: PID %d took the lock (successor was %d)", holder, pid)
+			}
+			return true
+		}
+		if !clock.Now().Before(deadline) {
+			break
+		}
+		<-clock.After(durationOr(h.Poll, DefaultHandoverPoll))
+	}
+	other, err := h.Reacquire()
+	if other > 0 {
+		logf("supervisor: PID %d took the lock", other)
+		return true
+	}
+	if err != nil {
+		logf("supervisor: successor PID %d never took the lock and it could not be retaken: %v", pid, err)
+		return false
+	}
+	logf("supervisor: successor PID %d never took the lock; continuing", pid)
+	return false
 }

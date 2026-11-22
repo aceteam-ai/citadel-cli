@@ -2,6 +2,8 @@ package service
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -28,6 +30,11 @@ func TestBuildRunValueRefusesUnsafePaths(t *testing.T) {
 		`.\citadel.exe`,
 		`C:citadel.exe`,
 		`C:\Program Files\"evil\citadel.exe`,
+		`\\server\share\citadel.exe`,
+		`//server/share/citadel.exe`,
+		`\\?\C:\citadel.exe`,
+		`\\.\C:\citadel.exe`,
+		"/usr/local/bin/citadel",
 		"C:\\citadel.exe\r\nwork",
 	} {
 		if v, err := BuildRunValue(p); err == nil {
@@ -37,7 +44,7 @@ func TestBuildRunValueRefusesUnsafePaths(t *testing.T) {
 }
 
 func TestBuildRunValueAcceptsAbsoluteForms(t *testing.T) {
-	for _, p := range []string{`C:\citadel.exe`, `d:/tools/citadel.exe`, `\\server\share\citadel.exe`} {
+	for _, p := range []string{`C:\citadel.exe`, `d:/tools/citadel.exe`, `C:\Users\Test User\citadel.exe`} {
 		if _, err := BuildRunValue(p); err != nil {
 			t.Errorf("BuildRunValue(%q): %v", p, err)
 		}
@@ -117,4 +124,53 @@ func TestSupervisorLockIsSingleInstance(t *testing.T) {
 		t.Fatalf("acquire after release: %v", err)
 	}
 	again.Release()
+}
+
+func TestCheckUserWorkerDir(t *testing.T) {
+	home := t.TempDir()
+	other := t.TempDir()
+	inside := filepath.Join(home, "citadel-node")
+	if err := CheckUserWorkerDir(inside, []string{home}); err != nil {
+		t.Fatalf("node dir in the profile refused: %v", err)
+	}
+	if err := CheckUserWorkerDir(filepath.Join(home, "not-yet", "created"), []string{home}); err != nil {
+		t.Fatalf("a not-yet-created dir in the profile refused: %v", err)
+	}
+	for name, dir := range map[string]string{
+		"the profile root itself": home,
+		"outside the profile":     filepath.Join(other, "citadel-node"),
+		"dot-dot escape":          filepath.Join(home, "..", filepath.Base(other)),
+		"relative":                "citadel-node",
+		"empty":                   "",
+	} {
+		if err := CheckUserWorkerDir(dir, []string{home}); err == nil {
+			t.Errorf("%s (%q) accepted", name, dir)
+		}
+	}
+	// A symlink inside the profile that points outside it is refused.
+	link := filepath.Join(home, "escape")
+	if err := os.Symlink(other, link); err == nil {
+		if err := CheckUserWorkerDir(filepath.Join(link, "citadel-node"), []string{home}); err == nil {
+			t.Error("a symlink out of the profile was accepted")
+		}
+	}
+	if err := CheckUserWorkerDir(inside, nil); err == nil {
+		t.Error("accepted with no profile dirs")
+	}
+}
+
+func TestRemoveStaleStopRequests(t *testing.T) {
+	dir := t.TempDir()
+	for _, pid := range []int{10, 20, 30} {
+		if err := os.WriteFile(SupervisorStopPath(dir, pid), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	RemoveStaleStopRequests(dir, 20)
+	for pid, want := range map[int]bool{10: false, 20: true, 30: false} {
+		_, err := os.Stat(SupervisorStopPath(dir, pid))
+		if (err == nil) != want {
+			t.Errorf("request for %d present=%v, want %v", pid, err == nil, want)
+		}
+	}
 }

@@ -13,8 +13,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/service"
+	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/aceteam-ai/citadel-cli/internal/worklock"
 	"github.com/spf13/cobra"
 )
@@ -45,12 +45,32 @@ var workerAutostartEnableCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("resolve the citadel executable: %w", err)
 		}
-		if err := service.EnableUserAutostart(exe); err != nil {
+		if err := enableUserAutostart(exe, autostartExeOwnership, service.EnableUserAutostart); err != nil {
 			return err
 		}
 		fmt.Fprintf(cmd.OutOrStdout(), "Autostart enabled: %s will start at sign-in.\nIt does not start now; run '%s work --background' to start it.\n", exe, quoteExe(exe))
 		return nil
 	},
+}
+
+// autostartExeOwnership is the doctor's self-update owner check (a test seam).
+var autostartExeOwnership = update.ExecutableOwnership
+
+// enableUserAutostart refuses to persist an executable this user does not own:
+// whoever owns it could replace what runs at every sign-in. The Run value
+// builder separately refuses relative, UNC and device paths.
+func enableUserAutostart(exe string, ownership func(string) (update.OwnerInfo, error), write func(string) error) error {
+	if _, err := service.BuildRunValue(exe); err != nil {
+		return err
+	}
+	info, err := ownership(exe)
+	if err != nil {
+		return fmt.Errorf("autostart: could not verify who owns %s: %w", exe, err)
+	}
+	if !info.Matches() {
+		return fmt.Errorf("autostart: %s is owned by %s, not by you (%s), so it will not be started at sign-in. Fix: reinstall citadel as yourself, or from an elevated PowerShell run: icacls \"%s\" /setowner \"%s\"", exe, info.OwnerName, info.UserName, exe, info.UserName)
+	}
+	return write(exe)
 }
 
 var workerAutostartDisableCmd = &cobra.Command{
@@ -89,7 +109,11 @@ var workerStopCmd = &cobra.Command{
 	Args:         cobra.NoArgs,
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return stopUserWorker(network.GetNodeConfigDir(), userWorkerStopTimeout, cmd.OutOrStdout())
+		nodeDir, err := userWorkerNodeDir()
+		if err != nil {
+			return err
+		}
+		return stopUserWorker(nodeDir, userWorkerStopTimeout, cmd.OutOrStdout())
 	},
 }
 
@@ -125,25 +149,29 @@ var userWorkerPoll = 250 * time.Millisecond
 // userSupervisorHeld probes a supervisor lock without taking it (a test seam).
 var userSupervisorHeld = worklock.IsHeldFile
 
-// stopUserWorker asks the supervisor for nodeDir to stop and waits for its lock
-// to be released.
+// stopUserWorker asks the supervisor holding nodeDir's lock to stop, with a
+// request that names its PID, and waits until that PID no longer holds it.
 func stopUserWorker(nodeDir string, timeout time.Duration, out io.Writer) error {
 	lockPath := service.SupervisorLockPath(nodeDir)
 	held, pid := userSupervisorHeld(lockPath)
-	if !held {
+	if !held || pid <= 0 {
 		fmt.Fprintln(out, "No background worker is running for this user.")
 		return nil
 	}
-	stopPath := service.SupervisorStopPath(nodeDir)
+	stopPath := service.SupervisorStopPath(nodeDir, pid)
 	if err := os.WriteFile(stopPath, []byte(fmt.Sprintf("stop requested by PID %d\n", os.Getpid())), 0o600); err != nil {
 		return fmt.Errorf("request stop: %w", err)
 	}
 	fmt.Fprintf(out, "Stopping the background worker (supervisor PID %d)...\n", pid)
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if held, _ := userSupervisorHeld(lockPath); !held {
+		held, holder := userSupervisorHeld(lockPath)
+		switch {
+		case !held:
 			fmt.Fprintln(out, "Stopped.")
 			return nil
+		case holder != pid:
+			return fmt.Errorf("supervisor PID %d stopped, but PID %d now runs the background worker (it started meanwhile); run 'citadel worker stop' again", pid, holder)
 		}
 		time.Sleep(userWorkerPoll)
 	}

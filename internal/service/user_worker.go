@@ -3,7 +3,9 @@ package service
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -29,7 +31,10 @@ var BackgroundWorkArgs = []string{"work", "--background"}
 // lock so every invocation that resolves the same node finds the same files.
 const (
 	SupervisorLockFileName = "citadel-supervisor.lock"
-	SupervisorStopFileName = "citadel-supervisor.stop"
+	// SupervisorStopFilePrefix plus a supervisor PID is a stop request for that
+	// supervisor only. Naming the target means a request can never be lost to,
+	// or misapplied by, a supervisor that started in between.
+	SupervisorStopFilePrefix = "citadel-supervisor.stop."
 )
 
 // SupervisorLockPath is the per-user supervisor's single-instance lock.
@@ -37,10 +42,77 @@ func SupervisorLockPath(nodeConfigDir string) string {
 	return filepath.Join(nodeConfigDir, SupervisorLockFileName)
 }
 
-// SupervisorStopPath is the stop request `citadel worker stop` writes and the
-// supervisor polls for.
-func SupervisorStopPath(nodeConfigDir string) string {
-	return filepath.Join(nodeConfigDir, SupervisorStopFileName)
+// SupervisorStopPath is the stop request for the supervisor with PID pid, which
+// `citadel worker stop` writes and that supervisor polls for.
+func SupervisorStopPath(nodeConfigDir string, pid int) string {
+	return filepath.Join(nodeConfigDir, SupervisorStopFilePrefix+strconv.Itoa(pid))
+}
+
+// RemoveStaleStopRequests deletes stop requests addressed to any PID other than
+// self. The caller must hold the supervisor lock: then no other PID is a live
+// supervisor, so every such request is stale.
+func RemoveStaleStopRequests(nodeConfigDir string, self int) {
+	matches, _ := filepath.Glob(filepath.Join(nodeConfigDir, SupervisorStopFilePrefix+"*"))
+	keep := SupervisorStopPath(nodeConfigDir, self)
+	for _, m := range matches {
+		if m != keep {
+			_ = os.Remove(m)
+		}
+	}
+}
+
+// ErrUserWorkerDirUntrusted: the supervisor lock and stop requests must live in
+// a directory inside this user's own profile.
+var ErrUserWorkerDirUntrusted = errors.New("the node config dir is not inside your user profile, so the background worker will not use it")
+
+// CheckUserWorkerDir accepts dir only when it lies strictly inside one of homes
+// (the user's profile dirs), after resolving symlinks on the existing part of
+// each path. A machine-wide or shared node dir is refused, so another account
+// cannot plant or remove the supervisor's lock and stop requests.
+func CheckUserWorkerDir(dir string, homes []string) error {
+	if dir == "" || !filepath.IsAbs(dir) {
+		return ErrUserWorkerDirUntrusted
+	}
+	target := resolveExisting(dir)
+	for _, h := range homes {
+		if h == "" || !filepath.IsAbs(h) {
+			continue
+		}
+		rel, err := filepath.Rel(resolveExisting(h), target)
+		if err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel) {
+			return nil
+		}
+	}
+	return ErrUserWorkerDirUntrusted
+}
+
+// UserProfileDirs are the current user's own profile roots.
+func UserProfileDirs() []string {
+	var dirs []string
+	if h, err := os.UserHomeDir(); err == nil {
+		dirs = append(dirs, h)
+	}
+	if v := os.Getenv("LOCALAPPDATA"); v != "" {
+		dirs = append(dirs, v)
+	}
+	return dirs
+}
+
+// resolveExisting resolves symlinks on the longest existing prefix of p.
+func resolveExisting(p string) string {
+	p = filepath.Clean(p)
+	rest := ""
+	for cur := p; ; {
+		if real, err := filepath.EvalSymlinks(cur); err == nil {
+			return filepath.Join(real, rest)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return p
+		}
+		rest = filepath.Join(filepath.Base(cur), rest)
+		cur = parent
+	}
 }
 
 // ErrUserAutostartUnsupported is returned off Windows, where the worker runs
@@ -64,9 +136,11 @@ type UserAutostartStatus struct {
 }
 
 // BuildRunValue renders the Run value for exe: the quoted absolute path followed
-// by `work --background`. It refuses a relative path (the Run key is evaluated
-// from an unrelated working directory) and a path containing a double quote,
-// which Windows command-line quoting cannot represent.
+// by `work --background`. It accepts only a local drive path (C:\...). It
+// refuses a relative path (the Run key is evaluated from an unrelated working
+// directory), a UNC or device path (a network share could change under the
+// user at every sign-in), and a path containing a double quote, which Windows
+// command-line quoting cannot represent.
 func BuildRunValue(exe string) (string, error) {
 	exe = strings.TrimSpace(exe)
 	if exe == "" {
@@ -75,8 +149,8 @@ func BuildRunValue(exe string) (string, error) {
 	if strings.ContainsAny(exe, "\"\r\n\x00") {
 		return "", fmt.Errorf("autostart: executable path %q contains a quote or control character", exe)
 	}
-	if !isAbsExePath(exe) {
-		return "", fmt.Errorf("autostart: executable path %q is not absolute", exe)
+	if !isLocalDrivePath(exe) {
+		return "", fmt.Errorf("autostart: executable path %q is not an absolute local drive path", exe)
 	}
 	return `"` + exe + `" ` + strings.Join(BackgroundWorkArgs, " "), nil
 }
@@ -127,16 +201,11 @@ func autostartStatusFor(set bool, value, thisExe string) UserAutostartStatus {
 	return st
 }
 
-// isAbsExePath accepts a Windows drive or UNC path on any host, so the builder
-// is testable off Windows, plus a host-absolute path.
-func isAbsExePath(p string) bool {
-	if len(p) >= 3 && isLetter(p[0]) && p[1] == ':' && (p[2] == '\\' || p[2] == '/') {
-		return true
-	}
-	if strings.HasPrefix(p, `\\`) {
-		return true
-	}
-	return filepath.IsAbs(p)
+// isLocalDrivePath accepts only "X:\..." (or "X:/..."), checked by hand so the
+// builder is testable off Windows. UNC, device (\\?\, \\.\) and
+// drive-relative paths are refused.
+func isLocalDrivePath(p string) bool {
+	return len(p) >= 4 && isLetter(p[0]) && p[1] == ':' && (p[2] == '\\' || p[2] == '/')
 }
 
 func isLetter(c byte) bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') }

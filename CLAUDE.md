@@ -5308,17 +5308,27 @@ owns the three roles: the launcher (what the HKCU Run value starts) spawns
 `service.SupervisorLockPath` (a `worklock.AcquireFile` lock beside the worker
 lock) and runs `service.RunSupervisor`, which owns restart policy (backoff,
 reset after stable uptime, immediate relaunch on
-`update.SupervisorRestartExitCode`, stop on exit 0); the worker carries
-`--supervisor-pid`. `cmd.supervisedByUserSupervisor` is the only way that worker
-counts as service-managed (`managedByServiceManager`, AGENT_UPDATE's
-`IsService`, the Windows update restart via `update.SetSupervisorRestart`):
-the named PID must be the live parent and still hold the supervisor lock. Never
-set `INVOCATION_ID` for it. `cmd/work_background_windows.go` owns the process
+`update.SupervisorRestartExitCode`, stop on exit 0). On that restart code
+`service.SupervisorHandover` moves supervision to a fresh supervisor started
+from the updated path (spawn, then release, then confirm; retake on failure),
+because a supervisor left on the renamed `.old` image makes the next update's
+`os.Remove(.old)` fail. The worker carries `--supervisor-pid` and
+`--supervisor-lock`. `cmd.supervisedByUserSupervisor` is the only way that
+worker counts as service-managed (`managedByServiceManager`, AGENT_UPDATE's
+`IsService`): the named PID must be the live parent and still hold the
+supervisor lock. The Windows update restart instead keys on the flag alone
+(`update.SetSupervisedRestart`), so a failed probe never spawns a copy. Never
+set `INVOCATION_ID` for it. `service.CheckUserWorkerDir` refuses a node dir
+outside the user's profile; stop requests are per-PID files
+(`service.SupervisorStopPath`) so none is lost to a supervisor that started in
+between. `cmd/work_background_windows.go` owns the process
 flags (the supervisor gets a hidden console, not `DETACHED_PROCESS`, so console
 children never open a window) and puts the worker in a kill-on-close job;
 graceful stop is CTRL_BREAK, and `citadel worker stop` asks through
 `service.SupervisorStopPath`. `service.BuildRunValue` and `service.UserAutostart`
-own the Run value; only `citadel worker autostart enable` writes it.
+own the Run value (local drive paths only, no UNC); only `citadel worker
+autostart enable` writes it, and `cmd.enableUserAutostart` refuses an exe this
+user does not own (`update.ExecutableOwnership`).
 
 ### Known Limitations on Windows
 

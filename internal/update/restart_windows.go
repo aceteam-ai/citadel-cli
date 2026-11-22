@@ -11,7 +11,7 @@
 // foreground without a supervisor, the operator must restart it manually; we
 // log that expectation at the call site. Under the per-user supervisor
 // (`citadel work --background`) the restart exits with SupervisorRestartExitCode
-// and the supervisor relaunches the installed binary (SetSupervisorRestart).
+// and the supervisor relaunches the installed binary (SetSupervisedRestart).
 package update
 
 import (
