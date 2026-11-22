@@ -262,6 +262,7 @@ func registerPrivilegedNodeJobHandlers(runner *worker.Runner, opts nodeJobHandle
 		Version:    Version,
 		Drain:      func() { runner.Drain() },
 		ActiveJobs: runner.ActiveJobs,
+		IsService:  agentUpdateIsService,
 		Log:        opts.HandlerLog,
 	}))
 
