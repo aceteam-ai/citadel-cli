@@ -239,7 +239,48 @@ func registerAndLinkGrantWith(result *DeviceAuthResult, nodeName string, prechec
 // (aceteam_api_key, login_node_uid, nexus_url, node_config_dir, ...) and the
 // legacy config location are never touched. Values the save itself overwrote
 // cannot be restored; that is the save-before-link order #1350 tracks.
+// rollbackEnrollmentCredentialsRestoring restores them when the caller
+// snapshotted them before the save.
 func rollbackEnrollmentCredentials(configFile string, token *nexus.TokenResponse) error {
+	return rollbackEnrollmentCredentialsRestoring(configFile, token, nil)
+}
+
+// enrollmentSavedKeys are every config key saveDeviceConfigToDir or
+// saveRedisURLToDir may set or delete.
+var enrollmentSavedKeys = []string{
+	"device_api_token", "api_base_url", "org_id", "org_name",
+	"user_email", "user_name", "fabric_node_id", "redis_url",
+}
+
+// snapshotEnrollmentFields reads the values of enrollmentSavedKeys from
+// configFile before a save overwrites them. A missing or unparseable file
+// snapshots nothing.
+func snapshotEnrollmentFields(configFile string) (map[string]interface{}, error) {
+	data, err := os.ReadFile(configFile)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var config map[string]interface{}
+	if err := yaml.Unmarshal(data, &config); err != nil || config == nil {
+		return nil, nil
+	}
+	prior := make(map[string]interface{})
+	for _, key := range enrollmentSavedKeys {
+		if v, ok := config[key]; ok {
+			prior[key] = v
+		}
+	}
+	return prior, nil
+}
+
+// rollbackEnrollmentCredentialsRestoring is rollbackEnrollmentCredentials that,
+// when it acts, also puts back each prior value (from snapshotEnrollmentFields)
+// whose key is now absent. When the file no longer holds this enrollment's own
+// credential it changes nothing, so a newer save is never overwritten.
+func rollbackEnrollmentCredentialsRestoring(configFile string, token *nexus.TokenResponse, prior map[string]interface{}) error {
 	if token == nil {
 		return nil
 	}
@@ -282,6 +323,11 @@ func rollbackEnrollmentCredentials(configFile string, token *nexus.TokenResponse
 		}
 		for _, key := range remove {
 			delete(config, key)
+		}
+		for key, value := range prior {
+			if _, present := config[key]; !present {
+				config[key] = value
+			}
 		}
 		if len(config) == 0 {
 			return os.Remove(configFile)

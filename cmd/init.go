@@ -1912,17 +1912,18 @@ func connectToNetworkOpts(nodeName, authKey string, forceLogin bool) error {
 	return nil
 }
 
-// connectToNetworkQuiet is connectToNetwork without terminal output, for the
-// non-interactive enrollment core (citadel-cli#1867).
-func connectToNetworkQuiet(nodeName, authKey string) error {
-	_, err := registerOnNetwork(nodeName, authKey, false)
-	return err
+// registerOnNetwork registers this host with authKey against the package-level
+// control and auth URLs. See registerOnNetworkWith.
+func registerOnNetwork(nodeName, authKey string, forceLogin bool) (string, error) {
+	return registerOnNetworkWith(nodeName, authKey, forceLogin, nexusURL, authServiceURL)
 }
 
-// registerOnNetwork registers this host with authKey, records the registered
-// node ID for the device link and disconnects so tsnet flushes its state. It
-// returns the network IP it was assigned, and prints nothing.
-func registerOnNetwork(nodeName, authKey string, forceLogin bool) (string, error) {
+// registerOnNetworkWith registers this host with authKey on controlURL,
+// records the registered node ID for the device link and disconnects so tsnet
+// flushes its state. authURL is the API whose private CA, if any, is
+// persisted. It returns the network IP it was assigned, and prints nothing.
+// Every failure after the connection was established disconnects.
+func registerOnNetworkWith(nodeName, authKey string, forceLogin bool, controlURL, authURL string) (string, error) {
 	// Record the pre-registration OS hostname (once) so it can be restored
 	// later via 'citadel rename'. saveOriginalHostnameToConfig is a no-op if an
 	// original hostname has already been recorded.
@@ -1954,7 +1955,7 @@ func registerOnNetwork(nodeName, authKey string, forceLogin bool) (string, error
 
 	config := network.ServerConfig{
 		Hostname:   nodeName,
-		ControlURL: nexusURL, // From root.go
+		ControlURL: controlURL,
 		AuthKey:    authKey,
 		ForceLogin: forceLogin,
 	}
@@ -1966,7 +1967,7 @@ func registerOnNetwork(nodeName, authKey string, forceLogin bool) (string, error
 	if err != nil {
 		return "", fmt.Errorf("failed to connect: %w", err)
 	}
-	if err := persistPrivateCATrust(authServiceURL, nexusURL); err != nil {
+	if err := persistPrivateCATrust(authURL, controlURL); err != nil {
 		_ = network.Disconnect()
 		return "", err
 	}
@@ -1974,12 +1975,12 @@ func registerOnNetwork(nodeName, authKey string, forceLogin bool) (string, error
 	// Persist the control URL we just enrolled against so every later reconnect
 	// (citadel work, control center, recoverStaleVPN) targets the SAME control
 	// plane instead of the compiled-in default (citadel-cli#1110). We persist
-	// the URL actually used to connect (nexusURL), guaranteeing persisted ==
-	// connected.
-	persistNexusURLBestEffort(nexusURL)
+	// the URL actually used to connect, guaranteeing persisted == connected.
+	persistNexusURLBestEffort(controlURL)
 	// The first successful enroll fixes the durable session mode. Authkey-only
 	// nodes are presence-only; device-authorized nodes default to workers.
 	if _, err := nodesession.LoadOrInitialize(network.GetNodeConfigDir(), hasDeviceConfigured()); err != nil {
+		_ = network.Disconnect()
 		return "", fmt.Errorf("persist node session mode: %w", err)
 	}
 

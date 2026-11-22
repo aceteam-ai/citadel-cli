@@ -76,7 +76,12 @@ just run 'citadel enroll' and scan.`,
 			},
 			OnWarn: func(msg string) { fmt.Fprintln(os.Stderr, msg) },
 		}
-		result, err := enrollDevice(ctx, opts, terminalEnrollDeps(opts))
+		deps, err := terminalEnrollDeps(opts)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+			os.Exit(1)
+		}
+		result, err := enrollDevice(ctx, opts, deps)
 		if err != nil {
 			if kind, _ := enrollFailureKind(err); kind == enrollAlreadyConnected {
 				// Tell the user instead of re-enrolling silently.
@@ -109,8 +114,11 @@ just run 'citadel enroll' and scan.`,
 // terminal: the QR/bubbletea device flow, the interactive friendlier-name
 // offer, and the printed reclaim and IP lines, exactly as before the core was
 // extracted.
-func terminalEnrollDeps(opts enrollOptions) enrollDeps {
-	deps := defaultEnrollDeps(opts)
+func terminalEnrollDeps(opts enrollOptions) (enrollDeps, error) {
+	deps, err := defaultEnrollDeps(opts)
+	if err != nil {
+		return deps, err
+	}
 	deps.authorize = func(context.Context) (*DeviceAuthResult, error) {
 		fmt.Println("Scan the QR code below with the AceTeam app to add this node to your Fabric.")
 
@@ -128,8 +136,14 @@ func terminalEnrollDeps(opts enrollOptions) enrollDeps {
 		return getNodeName()
 	}
 	deps.reclaim = reclaimStaleNodeByHostname
-	deps.connect = connectToNetwork
-	return deps
+	deps.connect = func(r enrollConnectRequest) error {
+		ip, err := registerOnNetworkWith(r.NodeName, r.AuthKey, r.ForceLogin, r.ControlURL, r.AuthURL)
+		if err == nil && ip != "" {
+			fmt.Printf("   IP: %s\n", ip)
+		}
+		return err
+	}
+	return deps, nil
 }
 
 // reportEnrollFailure prints an enrollDevice failure the way `citadel enroll`
@@ -154,6 +168,10 @@ func reportEnrollFailure(err error) {
 			fmt.Fprintf(os.Stderr, "\nAlternative: generate an authkey at %s/fabric\n", authServiceURL)
 			fmt.Fprintln(os.Stderr, "Then run: citadel login --authkey <your-key>")
 		}
+	case ee.Kind == enrollAlreadyEnrolled:
+		fmt.Fprintln(os.Stderr, "❌ This machine is already enrolled in the Fabric.")
+		fmt.Fprintln(os.Stderr, "   To re-enroll: citadel logout && citadel enroll")
+		fmt.Fprintln(os.Stderr, "   To replace this registration with a new one: citadel enroll --new-device")
 	case ee.Kind == enrollNodeNameFailed:
 		fmt.Fprintf(os.Stderr, "❌ Error getting node name: %v\n", err)
 	case ee.Kind == enrollConnectFailed:

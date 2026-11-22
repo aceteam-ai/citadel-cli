@@ -2223,13 +2223,17 @@ completed device binding; the link response must confirm it.
 
 `cmd.enrollDevice` (`cmd/enroll_core.go`, #1867) owns the non-interactive
 enrollment sequence: it never prints, prompts or exits, saves to the explicit
-`enrollOptions.ConfigDir`, and keeps the device code out of its result,
-callbacks and errors. A failure after the save and before the link is sent
-(save, node name, cancel, connect) rolls back this grant's credentials; link
-outcomes keep `linkDeviceEnrollmentGatedWith`'s rules. Cancellation is honored
-until the stale-registration reclaim. `citadel enroll` is a terminal wrapper
-over it (`terminalEnrollDeps` keeps the QR UI and the name offer); `init` does
-not use it yet.
+`enrollOptions.ConfigDir`, and keeps grant secrets out of its result,
+callbacks and errors (`redactEnrollError`). It is single-flight per process,
+refuses a machine with saved mesh state unless `ForceNew` (which then forces the
+new key past the saved state), and passes its resolved control URL to connect
+instead of setting `nexusURL`. A failure after the save and before the link is
+sent disconnects and rolls back this grant, restoring the values the save
+overwrote (`rollbackEnrollmentCredentialsRestoring`); link outcomes keep
+`linkDeviceEnrollmentGatedWith`'s rules. Cancellation is honored until the link
+starts; a started link completes. `citadel enroll` is a terminal wrapper over it
+(`terminalEnrollDeps` keeps the QR UI and the name offer); `init` does not use
+it yet.
 
 ### Two ActualState reporters, two different module sets (#733)
 
