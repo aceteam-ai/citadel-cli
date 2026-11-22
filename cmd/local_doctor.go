@@ -21,6 +21,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/cobrowseprofile"
 	"github.com/aceteam-ai/citadel-cli/internal/localaudit"
 	"github.com/aceteam-ai/citadel-cli/internal/localcobrowse"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/spf13/cobra"
@@ -42,6 +43,9 @@ type localDoctorDeps struct {
 	// it. Nil means not checked (non-Windows).
 	binaryOwner func() (update.OwnerInfo, string, error)
 	harnesses   []harnessConfigStatus
+	// userWorker reports the per-user background worker (citadel-cli#1867 C3).
+	// Nil means not checked (non-Windows). It must only read state.
+	userWorker func() userWorkerState
 	// exe is how fix lines refer to citadel (the full path, quoted if needed).
 	exe string
 }
@@ -87,6 +91,7 @@ func realLocalDoctorDeps(skipLaunch bool) localDoctorDeps {
 				info, err := update.ExecutableOwnership(exe)
 				return info, exe, err
 			}
+			d.userWorker = func() userWorkerState { return readUserWorkerState(exe, network.GetNodeConfigDir()) }
 		}
 	}
 	if !skipLaunch {
@@ -257,6 +262,23 @@ func collectLocalDoctor(d localDoctorDeps) (checks []localDoctorCheck, failed bo
 	}
 	if pointed == 0 {
 		warn("Harness", fmt.Sprintf("no agent app is configured yet. Fix: %s local config copilot (or claude-code, claude-desktop, codex, opencode)", d.exe))
+	}
+
+	if d.userWorker != nil {
+		uw := d.userWorker()
+		switch {
+		case uw.AutostartErr != nil:
+			warn("Autostart", fmt.Sprintf("could not read the sign-in entry: %v", uw.AutostartErr))
+		case uw.Autostart.Set && (uw.Autostart.DisabledByUser || !uw.Autostart.PointsAtThis):
+			warn("Autostart", describeUserAutostart(uw.Autostart))
+		default:
+			ok("Autostart", describeUserAutostart(uw.Autostart))
+		}
+		if uw.Running {
+			ok("Worker", fmt.Sprintf("a background worker is running (supervisor PID %d) and connects to AceTeam on its own, separately from local mode. Stop it: %s worker stop", uw.SupervisorPID, d.exe))
+		} else {
+			ok("Worker", "no background worker is running (it is only needed to use this computer from AceTeam)")
+		}
 	}
 
 	ok("Network", "Citadel makes no calls of its own (no account, no update check, no telemetry). The co-browse browser connects only to public addresses, through Citadel's local guard, with background updates off")

@@ -43,3 +43,33 @@ func runBeforeRestart(reason string) {
 	}
 	h(reason, detail)
 }
+
+// SupervisorRestartExitCode is the exit code a worker run by the per-user
+// supervisor (`citadel work --background`, Windows) uses to ask it for an
+// immediate relaunch onto the installed binary. The supervisor reads the same
+// constant, so the two cannot drift.
+const SupervisorRestartExitCode = 75
+
+var (
+	supervisorRestartMu sync.Mutex
+	supervisorRestart   func() bool
+)
+
+// SetSupervisorRestart registers a check that reports, at restart time, whether a
+// live per-user supervisor owns this process. When it returns true the Windows
+// restart exits with SupervisorRestartExitCode instead of spawning a copy of
+// itself: a spawned copy would race the supervisor's relaunch for the worker
+// lock and would run unsupervised. Unix keeps execve, which preserves the PID
+// and so the supervisor's view of its child.
+func SetSupervisorRestart(owned func() bool) {
+	supervisorRestartMu.Lock()
+	supervisorRestart = owned
+	supervisorRestartMu.Unlock()
+}
+
+func restartBySupervisor() bool {
+	supervisorRestartMu.Lock()
+	f := supervisorRestart
+	supervisorRestartMu.Unlock()
+	return f != nil && f()
+}

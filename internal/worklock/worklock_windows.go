@@ -22,7 +22,13 @@ type Lock struct {
 // locks are released by the OS when the owning handle is closed or the process
 // exits, so a crashed worker never leaves a blocking lock.
 func Acquire(stateDir, version string, logf func(format string, args ...any)) (*Lock, error) {
-	path := LockPathForStateDir(stateDir)
+	return AcquireFile(LockPathForStateDir(stateDir), version, logf)
+}
+
+// AcquireFile is Acquire for an explicit lock file path, for a single-instance
+// guard other than the worker lock (the per-user supervisor's lock). Same
+// semantics: exclusive, non-blocking, released by the OS on process death.
+func AcquireFile(path, version string, logf func(format string, args ...any)) (*Lock, error) {
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("worklock: create lock dir: %w", err)
@@ -73,7 +79,11 @@ func Acquire(stateDir, version string, logf func(format string, args ...any)) (*
 // detects contention, the probe is unlocked immediately, and only a live citadel
 // holder PID is reported as held. A missing/stale/reused lock reports not held.
 func IsHeld(stateDir string) (held bool, holderPID int) {
-	path := LockPathForStateDir(stateDir)
+	return IsHeldFile(LockPathForStateDir(stateDir))
+}
+
+// IsHeldFile is IsHeld for an explicit lock file path (see AcquireFile).
+func IsHeldFile(path string) (held bool, holderPID int) {
 
 	f, err := os.OpenFile(path, os.O_RDONLY, 0o600)
 	if err != nil {

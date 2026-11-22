@@ -5299,6 +5299,27 @@ Docker Desktop on Windows requires WSL2:
 2. `nvidia-smi` in PATH
 3. WMI query: `wmic path win32_VideoController get name` (checks for "nvidia")
 
+### Per-user worker for a standard user (citadel-cli#1867 C3)
+
+A standard user cannot install the LocalSystem service, so `citadel work
+--background` keeps the worker running instead. `cmd.handleBackgroundModes`
+owns the three roles: the launcher (what the HKCU Run value starts) spawns
+`work --supervise` hidden and returns; the supervisor holds
+`service.SupervisorLockPath` (a `worklock.AcquireFile` lock beside the worker
+lock) and runs `service.RunSupervisor`, which owns restart policy (backoff,
+reset after stable uptime, immediate relaunch on
+`update.SupervisorRestartExitCode`, stop on exit 0); the worker carries
+`--supervisor-pid`. `cmd.supervisedByUserSupervisor` is the only way that worker
+counts as service-managed (`managedByServiceManager`, AGENT_UPDATE's
+`IsService`, the Windows update restart via `update.SetSupervisorRestart`):
+the named PID must be the live parent and still hold the supervisor lock. Never
+set `INVOCATION_ID` for it. `cmd/work_background_windows.go` owns the process
+flags (the supervisor gets a hidden console, not `DETACHED_PROCESS`, so console
+children never open a window) and puts the worker in a kill-on-close job;
+graceful stop is CTRL_BREAK, and `citadel worker stop` asks through
+`service.SupervisorStopPath`. `service.BuildRunValue` and `service.UserAutostart`
+own the Run value; only `citadel worker autostart enable` writes it.
+
 ### Known Limitations on Windows
 
 - WSL2 is required (not available on older Windows versions)

@@ -393,6 +393,12 @@ func runWork(cmd *cobra.Command, args []string) {
 		fmt.Fprintln(os.Stderr, "  IS supported by 'citadel module stop|start|restart', 'citadel run', and 'citadel stop'.")
 		os.Exit(1)
 	}
+	// Per-user Windows worker (citadel-cli#1867 C3): the launcher and the
+	// supervisor exit here, before any node state is touched or the worker lock
+	// is taken; the supervised worker continues as a normal worker.
+	if handleBackgroundModes() {
+		return
+	}
 	// `citadel work` ALWAYS runs as a worker regardless of the persisted session
 	// mode: it never reads or initializes session.yaml here, and never branches
 	// to runPresence. Presence is only the bare-`citadel` dispatch default
