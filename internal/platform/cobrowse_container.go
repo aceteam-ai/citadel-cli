@@ -1022,7 +1022,8 @@ func ConfigureBrowserRuntime(cfg BrowserRuntimeConfig) {
 }
 
 // recoverContainer re-adopts one live container record or expires it. It returns
-// the expired record (for retention accounting) or nil on success.
+// the committed expired snapshot (for retention accounting), or nil when no
+// expiration was committed, including when a newer record won the race.
 func (m *CobrowseSessionManager) recoverContainer(rec sessionRecord, dir, regDir string, now time.Time) *sessionRecord {
 	ad, _ := activeBrowserRunner.(containerAdopter)
 	var proc *cobrowseProc
@@ -1044,6 +1045,7 @@ func (m *CobrowseSessionManager) recoverContainer(rec sessionRecord, dir, regDir
 		if ad != nil {
 			ad.discardContainer(rec, dir)
 		}
+		expected := rec
 		rec.State = RecordExpired
 		rec.EndedReason, rec.EndedDetail = endedReasonLost, ""
 		if rec.PendingEnd != nil {
@@ -1051,12 +1053,15 @@ func (m *CobrowseSessionManager) recoverContainer(rec sessionRecord, dir, regDir
 		}
 		rec.PendingEnd = nil
 		rec.EndedAt = now.UTC().Format(time.RFC3339)
-		_ = saveRecord(regDir, rec)
-		return &rec
+		if saved, err := mutateRecordIfCurrent(regDir, expected, &rec); err == nil {
+			return &saved
+		}
+		return nil
 	}
 	s := &cobrowseSession{
 		id: rec.ID, profile: dir, regDir: regDir, state: SessionRunning, proc: proc,
 		explicitHandoff: rec.Handoff, generation: rec.Generation + 1, tracking: rec.Tracking, policy: m.targetPolicy,
+		ownerUserID: rec.OwnerUserID, profileName: rec.ProfileName,
 		workDir: filepath.Join(dir, containerProfileSubdir),
 	}
 	if t, perr := time.Parse(time.RFC3339, rec.StartedAt); perr == nil {

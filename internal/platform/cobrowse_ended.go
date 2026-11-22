@@ -49,7 +49,11 @@ func (m *CobrowseSessionManager) EndedSession(id string) (EndedSession, bool) {
 	if err != nil || rec.State != RecordExpired || rec.EndedReason == "" {
 		return EndedSession{}, false
 	}
-	if t, err := time.Parse(time.RFC3339, rec.EndedAt); err != nil || time.Since(t) >= expiredRetention {
+	retention := expiredRetention
+	if rec.EndedReason == "suspend_expired" {
+		retention = suspendTombstoneTTL
+	}
+	if t, err := time.Parse(time.RFC3339, rec.EndedAt); err != nil || time.Since(t) >= retention {
 		return EndedSession{}, false
 	}
 	return EndedSession{ID: id, Reason: rec.EndedReason, Detail: rec.EndedDetail, At: rec.EndedAt}, true

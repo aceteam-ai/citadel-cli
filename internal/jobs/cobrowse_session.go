@@ -513,8 +513,19 @@ func parseAttrNames(raw string) []string {
 // "profile" field it launches a throwaway session exactly as before.
 func startSession(mgr *platform.CobrowseSessionManager, job *nexus.Job) ([]byte, error) {
 	name := job.Payload["profile"]
+	// This is a server-owned assertion on the authenticated per-node job path.
+	// The paired platform must overwrite it from its session, never forward an
+	// agent/client value. An absent assertion preserves legacy start behavior,
+	// but leaves the session ineligible for suspend/reopen.
+	owner := job.Payload["owner_user_id"]
 	if name == "" {
-		st, err := mgr.StartSession(job.Payload["url"])
+		var st platform.CobrowseSessionStatus
+		var err error
+		if owner != "" {
+			st, err = mgr.StartSessionForOwner(job.Payload["url"], owner, "", nil)
+		} else {
+			st, err = mgr.StartSession(job.Payload["url"])
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -541,7 +552,12 @@ func startSession(mgr *platform.CobrowseSessionManager, job *nexus.Job) ([]byte,
 	}
 	// Ownership of handle transfers to the manager, which guarantees Close on every
 	// path (including a failed start), so there is no Close to do here.
-	st, err := mgr.StartSessionWithProfile(job.Payload["url"], handle)
+	var st platform.CobrowseSessionStatus
+	if owner != "" {
+		st, err = mgr.StartSessionForOwner(job.Payload["url"], owner, name, handle)
+	} else {
+		st, err = mgr.StartSessionWithProfile(job.Payload["url"], handle)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -589,6 +605,11 @@ func sessionScreenshotResult(img string, st platform.CobrowseSessionStatus, page
 // sessionStatusResult marshals one session's status (plus stream endpoint) to
 // JSON output bytes.
 func sessionStatusResult(st platform.CobrowseSessionStatus) ([]byte, error) {
+	switch st.State {
+	case platform.SessionSuspending, platform.SessionSuspended, platform.SessionResuming, platform.SessionExpired:
+		// A retained lifecycle record is not a usable viewer endpoint.
+		return json.Marshal(st)
+	}
 	out, err := json.Marshal(sessionResult{
 		CobrowseSessionStatus: st,
 		Stream: sessionStreamInfo{

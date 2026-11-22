@@ -61,6 +61,50 @@ func newAdoptEnv(t *testing.T) *adoptEnv {
 	return e
 }
 
+// joinObserver keeps a re-adopted fake process's poller within the lifetime of
+// its fake process table. Ordinary fake stop callbacks do not close exited.
+// Register immediately after adoption, before Stop can retire the proc pointer.
+func (e *adoptEnv) joinObserver(t *testing.T, m *CobrowseSessionManager, id string) {
+	t.Helper()
+	m.mu.Lock()
+	s := m.sessions[id]
+	m.mu.Unlock()
+	if s == nil || s.proc == nil {
+		t.Fatal("adopted fixture has no process observer")
+	}
+	exited, pid := s.proc.exited, s.proc.browserPID
+	t.Cleanup(func() {
+		s.stopChooserWatch()
+		e.mu.Lock()
+		p := e.procs[pid]
+		p.alive = false
+		e.procs[pid] = p
+		e.mu.Unlock()
+		select {
+		case <-exited:
+		case <-time.After(5 * time.Second):
+			t.Error("adopted process observer outlived its fake process table")
+		}
+	})
+}
+
+func TestRestartFixtureJoinsObserverBeforeReset(t *testing.T) {
+	var exited <-chan struct{}
+	t.Run("owned fake observer", func(t *testing.T) {
+		env := newAdoptEnv(t)
+		m := adoptMgr(trustedBaseDir(t))
+		proc := adoptedProc(sessionRecord{BrowserPID: 100001, BrowserStart: 11})
+		exited = proc.exited
+		m.sessions["fixture"] = &cobrowseSession{proc: proc}
+		env.joinObserver(t, m, "fixture")
+	})
+	select {
+	case <-exited:
+	default:
+		t.Fatal("fixture restored global process seams before joining its observer")
+	}
+}
+
 // adoptMgr is a node-wide-style manager: the only kind that keeps records or adopts.
 func adoptMgr(base string) *CobrowseSessionManager {
 	m := newCobrowseSessionManager(base, 4)
@@ -93,6 +137,7 @@ func TestRestartReadoptsSameSessionID(t *testing.T) {
 	if !ok {
 		t.Fatal("session was not re-adopted")
 	}
+	env.joinObserver(t, m2, id)
 	if st.ID != id || st.State != SessionRunning || st.DebugPort != 9001 {
 		t.Fatalf("unexpected status: %+v", st)
 	}
@@ -174,11 +219,14 @@ func TestUnadoptableLiveRecordBecomesExpiredWithReason(t *testing.T) {
 
 	m1 := adoptMgr(base)
 	m1.Recover() // pre-restart view, adopts the live record
+	env.joinObserver(t, m1, id)
 	if err := func() error { m1.prepareSelfRestart(EndedReasonNodeUpdate, "to v9.9.9"); return nil }(); err != nil {
 		t.Fatal(err)
 	}
 	// The restart killed the browser.
+	env.mu.Lock()
 	env.procs[100001] = fakeProc{11, false}
+	env.mu.Unlock()
 	m2 := adoptMgr(base)
 	if _, ok := m2.SessionStatus(id); ok {
 		t.Fatal("dead session must not be adopted")
@@ -314,11 +362,12 @@ func TestNoSessionsNoRecordsNoBusy(t *testing.T) {
 }
 
 func TestBusyOnHandoff(t *testing.T) {
-	newAdoptEnv(t)
+	env := newAdoptEnv(t)
 	base := trustedBaseDir(t)
 	id := startOne(t, base)
 	m := adoptMgr(base)
 	m.Recover()
+	env.joinObserver(t, m, id)
 	if len(m.BusySessions()) != 0 {
 		t.Fatal("plain running session must not be busy")
 	}
@@ -334,6 +383,7 @@ func TestBusyOnHandoff(t *testing.T) {
 		t.Fatal("not recovered until first use")
 	}
 	m3.Recover()
+	env.joinObserver(t, m3, id)
 	if b := m3.BusySessions(); len(b) != 1 {
 		t.Fatalf("handoff lost across restart: %+v", b)
 	}
@@ -520,7 +570,7 @@ func TestStaleTmpFilesCleaned(t *testing.T) {
 func TestRecoveryRetainsPerSessionTargetMode(t *testing.T) {
 	for _, tracking := range []bool{false, true} {
 		t.Run(fmt.Sprint(tracking), func(t *testing.T) {
-			_ = newAdoptEnv(t)
+			env := newAdoptEnv(t)
 			(&fakeLauncher{}).install(t)
 			base := trustedBaseDir(t)
 			before := adoptMgr(base)
@@ -545,6 +595,7 @@ func TestRecoveryRetainsPerSessionTargetMode(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			env.joinObserver(t, after, st.ID)
 			s.persistRecord()
 			rec, err = loadRecord(after.registryDir(), st.ID)
 			if err != nil || rec.Tracking != tracking {

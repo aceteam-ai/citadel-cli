@@ -49,6 +49,13 @@ func List(ctx context.Context, debugPort int, client *http.Client) ([]Target, er
 	return targets, err
 }
 
+// ListComplete refuses a page whose debugger endpoint is absent or invalid,
+// rather than silently omitting it. Capture callers must not lose a page.
+func ListComplete(ctx context.Context, debugPort int, client *http.Client) ([]Target, error) {
+	targets, _, err := list(ctx, debugPort, client, false, true)
+	return targets, err
+}
+
 // ListBounded is List for a caller that must keep working when a page floods
 // the browser with popups: past MaxPageTargets pages it returns the first
 // MaxPageTargets and reports overflow instead of failing. Every other bound and
@@ -57,7 +64,7 @@ func ListBounded(ctx context.Context, debugPort int, client *http.Client) (targe
 	return list(ctx, debugPort, client, true)
 }
 
-func list(ctx context.Context, debugPort int, client *http.Client, truncate bool) ([]Target, bool, error) {
+func list(ctx context.Context, debugPort int, client *http.Client, truncate bool, complete ...bool) ([]Target, bool, error) {
 	if debugPort < 1 || debugPort > 65535 || client == nil {
 		return nil, false, fmt.Errorf("CDP target discovery requires a valid local port and client")
 	}
@@ -91,7 +98,7 @@ func list(ctx context.Context, debugPort int, client *http.Client, truncate bool
 	if len(raw) > MaxResponseBytes {
 		return nil, false, fmt.Errorf("CDP target discovery exceeds 512 KiB")
 	}
-	targets, overflow, err := decode(raw, debugPort, truncate)
+	targets, overflow, err := decode(raw, debugPort, truncate, complete...)
 	if ctx.Err() != nil {
 		return nil, false, safeFailure(ctx, "CDP target discovery cancelled", ctx.Err())
 	}
@@ -113,7 +120,8 @@ func safeFailure(ctx context.Context, label string, cause error) error {
 	return errors.New(label)
 }
 
-func decode(raw []byte, debugPort int, truncate bool) ([]Target, bool, error) {
+func decode(raw []byte, debugPort int, truncate bool, complete ...bool) ([]Target, bool, error) {
+	strict := len(complete) > 0 && complete[0]
 	overflow := false
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	opening, err := decoder.Token()
@@ -140,6 +148,8 @@ func decode(raw []byte, debugPort int, truncate bool) ([]Target, bool, error) {
 		}
 		if target.WebSocketDebuggerURL != "" {
 			targets = append(targets, target)
+		} else if strict {
+			return nil, false, fmt.Errorf("CDP capture requires every page debugger endpoint")
 		}
 	}
 	if closing, err := decoder.Token(); err != nil || closing != json.Delim(']') {
@@ -157,7 +167,7 @@ func decode(raw []byte, debugPort int, truncate bool) ([]Target, bool, error) {
 	for i, t := range targets {
 		endpoint, err := url.Parse(t.WebSocketDebuggerURL)
 		if err != nil || endpoint == nil || (endpoint.Scheme != "ws" && endpoint.Scheme != "wss") || endpoint.Hostname() == "" || endpoint.User != nil || endpoint.Fragment != "" {
-			if i == 0 {
+			if i == 0 || strict {
 				return nil, false, fmt.Errorf("CDP target discovery returned an invalid debugger URL")
 			}
 			continue
