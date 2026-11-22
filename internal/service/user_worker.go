@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 // Per-user worker (citadel-cli#1867 C3): a standard Windows user cannot install
@@ -89,7 +91,7 @@ func CheckUserWorkerDir(dir string, homes []string) error {
 // UserProfileDirs are the current user's own profile roots.
 func UserProfileDirs() []string {
 	var dirs []string
-	if h, err := os.UserHomeDir(); err == nil {
+	if h, err := platform.UserHomeDir(); err == nil {
 		dirs = append(dirs, h)
 	}
 	if v := os.Getenv("LOCALAPPDATA"); v != "" {
