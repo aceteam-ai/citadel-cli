@@ -29,7 +29,7 @@ func (s *RedisSource) ackDelivery(ctx context.Context, kind string, payload map[
 func (job Job) MarshalJSON() ([]byte, error) {
 	type plain Job
 	safe := plain(job)
-	if job.Type == jobprivacy.FileFetch {
+	if jobprivacy.OmitPayload(job.Type) {
 		safe.Payload, safe.RawPayload = nil, nil
 	} else if jobprivacy.HasPasscode(job.Payload) {
 		// The raw stream bytes carry the passcode too, so drop them.
@@ -40,8 +40,8 @@ func (job Job) MarshalJSON() ([]byte, error) {
 }
 
 func (job Job) Format(state fmt.State, verb rune) {
-	if job.Type == jobprivacy.FileFetch {
-		_, _ = io.WriteString(state, "<FILE_FETCH job; payload omitted>")
+	if jobprivacy.OmitPayload(job.Type) {
+		_, _ = io.WriteString(state, "<credential-bearing job; payload omitted>")
 		return
 	}
 	type plain Job

@@ -62,6 +62,8 @@ func loadDeviceCredsFromDirs(dirs []string) DeviceCreds {
 // DeviceCreds carries the minimal device-auth material needed to call the
 // AceTeam backend as this node: the bearer token and the API base URL.
 type DeviceCreds struct {
+	// OrgID is the enrolled organization from this same converged config file.
+	OrgID string `yaml:"org_id"`
 	// Token is the device_api_token minted at device authorization.
 	Token string `yaml:"device_api_token"`
 	// APIBaseURL is the AceTeam API base (e.g. "https://aceteam.ai"). May be

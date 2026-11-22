@@ -1,0 +1,29 @@
+{
+  "manifest": {
+    "version": 1,
+    "org_id": "00000000-0000-4000-8000-000000000001",
+    "transfer_id": "00000000-0000-4000-8000-000000000003",
+    "chunks": [
+      {
+        "index": 0,
+        "plaintext_bytes": 1024,
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    ]
+  },
+  "canonical_manifest_json": "{\"version\":1,\"org_id\":\"00000000-0000-4000-8000-000000000001\",\"transfer_id\":\"00000000-0000-4000-8000-000000000003\",\"chunks\":[{\"index\":0,\"plaintext_bytes\":1024,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]}",
+  "manifest_sha256": "08113770e7b60e59d176b21dcc70b6556ec23cc5a928d2ce72a84570eaab837a",
+  "job_types": [
+    "CONTAINER_CREATE",
+    "CONTAINER_START",
+    "CONTAINER_STOP",
+    "CONTAINER_EXEC",
+    "CONTAINER_FILE_LIST",
+    "CONTAINER_FILE_READ",
+    "CONTAINER_FILE_WRITE",
+    "CONTAINER_USAGE",
+    "CONTAINER_EXPORT_CHUNK",
+    "CONTAINER_IMPORT_CHUNK",
+    "CONTAINER_DESTROY"
+  ]
+}
