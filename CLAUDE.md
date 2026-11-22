@@ -376,6 +376,14 @@ the entry (a different existing `citadel` entry is declined and left to
 Sessions come from the owner through the token-authenticated `/api/summary`.
 `TestSetupRoutesAreGuarded` pins the boundary. Muse has no confirmed local
 config file, so it is not a harness; the page offers the generic entry.
+"Connect this PC to AceTeam" (#1867 C2) is `cmd.setupEnroller` over
+`enrollDevice`: one enrollment at a time, options resolved at click time (the
+node config dir, not the page's private dir), and only display fields plus
+fixed copy per `enrollFailure` (`setupEnrollCopy`) reach the page; it is the
+page's only outbound call. `setupVerificationURL` refuses an approval link off
+the auth service's host before it is opened or shown. The setup process skips
+private CA trust (local-mode pre-run), so a private-CA control plane cannot be
+enrolled from the page.
 
 `nodevault.Vault.UnlockAtRest` owns #820: every consumer that encrypts data
 at rest unlocks through it, and it refuses a secret below

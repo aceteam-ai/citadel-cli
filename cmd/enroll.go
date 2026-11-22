@@ -169,7 +169,8 @@ func reportEnrollFailure(err error) {
 			fmt.Fprintln(os.Stderr, "Then run: citadel login --authkey <your-key>")
 		}
 	case ee.Kind == enrollAlreadyEnrolled:
-		fmt.Fprintln(os.Stderr, "❌ This machine is already enrolled in the Fabric.")
+		fmt.Fprintln(os.Stderr, "❌ This machine already has a Fabric registration.")
+		fmt.Fprintln(os.Stderr, "   It may come from 'citadel init', an earlier enroll, or an enroll whose connect or link step failed.")
 		fmt.Fprintln(os.Stderr, "   To re-enroll: citadel logout && citadel enroll")
 		fmt.Fprintln(os.Stderr, "   To replace this registration with a new one: citadel enroll --new-device")
 	case ee.Kind == enrollNodeNameFailed:
@@ -186,5 +187,8 @@ func reportEnrollFailure(err error) {
 func init() {
 	rootCmd.AddCommand(enrollCmd)
 	enrollCmd.Flags().StringVar(&enrollNodeName, "node-name", "", "Set the node name (defaults to hostname)")
-	enrollCmd.Flags().BoolVar(&enrollNewDevice, "new-device", false, "Force fresh registration, ignoring any existing machine mapping")
+	enrollCmd.Flags().BoolVar(&enrollNewDevice, "new-device", false, "Request a new device registration that replaces this machine's existing one. "+
+		"A plain 'citadel enroll' is refused on a machine that already has a registration, "+
+		"including one set up with 'citadel init' or left by an enroll whose connect or link step failed; "+
+		"use --new-device, or run 'citadel logout' and then 'citadel enroll'")
 }
