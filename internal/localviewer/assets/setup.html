@@ -11,7 +11,7 @@
   <strong>Citadel</strong> <span class="muted">setup for local mode on this computer</span>
 </header>
 <main class="setup">
-  <p class="muted">Everything here stays on this computer. Citadel makes no network calls of its own and needs no account.</p>
+  <p class="muted">Everything here stays on this computer, and local mode needs no account. Citadel connects to AceTeam only when you click Connect in step 4.</p>
 
   <section class="card">
     <h2>1. Is this computer ready?</h2>
@@ -38,6 +38,22 @@
     <p id="sessions-note" class="muted"></p>
     <button id="open-viewer">Open the viewer</button>
     <p id="viewer-result" class="muted"></p>
+  </section>
+
+  <section class="card" id="enroll" hidden>
+    <h2>4. Connect this PC to AceTeam (optional)</h2>
+    <p class="muted">You do not need this for local mode. Connecting registers this PC with the AceTeam account you approve it in, adds it to that account's private network, and saves a device key in your user folder. AceTeam agents can use it only while Citadel's worker runs, which is a separate step. Your cookies and saved logins stay on this PC.</p>
+    <p class="muted">Clicking Connect opens an AceTeam page in your browser. Enter the code shown here on that page, then approve. The PC joins the account and organization that page is signed in to. Connecting saves the device key only inside your own user folder; if this PC's Citadel was set up for all users, use <code>citadel enroll</code> in a terminal instead.</p>
+    <button id="enroll-start" class="primary">Connect</button>
+    <button id="enroll-cancel" hidden>Cancel</button>
+    <p id="enroll-message" role="status"></p>
+    <div id="enroll-code" hidden>
+      <p>Code: <strong id="enroll-user-code"></strong></p>
+      <p><a id="enroll-link" target="_blank" rel="noopener noreferrer">Open the AceTeam approval page</a></p>
+      <p class="muted">Or scan this with your phone to open the same page, then enter the code:</p>
+      <img id="enroll-qr" alt="QR code of the AceTeam approval page" width="180" height="180" hidden>
+    </div>
+    <p id="enroll-done" hidden></p>
   </section>
 </main>
 <script src="/assets/setup.js"></script>

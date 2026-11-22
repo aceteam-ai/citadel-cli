@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"rsc.io/qr"
 )
 
 // SetupDirName is the private subdir used by the setup server, kept apart from
@@ -74,6 +76,36 @@ type SetupConfig struct {
 	MaxSessions int
 	// GenericEntry is a copyable MCP entry for apps Citadel does not know.
 	GenericEntry string
+
+	// EnrollStart begins connecting this PC to AceTeam (citadel-cli#1867 C2).
+	// It must return at once; the enrollment runs in the background. Its
+	// error is shown to the user as is, so it must be fixed copy, never error
+	// text from the enrollment. The three Enroll hooks are set together; nil
+	// hides the Connect to AceTeam section and its routes answer 404.
+	EnrollStart func() (SetupEnrollState, error)
+	// EnrollState reports the current enrollment.
+	EnrollState func() SetupEnrollState
+	// EnrollCancel asks a running enrollment to stop.
+	EnrollCancel func() SetupEnrollState
+}
+
+// SetupEnrollState is what the page shows of a "Connect to AceTeam"
+// enrollment: display fields and fixed copy only. The type has no field for
+// the device code or any credential, so no response can carry one.
+type SetupEnrollState struct {
+	// Stage is idle, starting, waiting (the code is shown), connecting,
+	// connected, already (this PC already has a registration), canceling,
+	// canceled or failed.
+	Stage string `json:"stage"`
+	// UserCode and VerificationURL are what the user approves with.
+	UserCode        string `json:"user_code,omitempty"`
+	VerificationURL string `json:"verification_url,omitempty"`
+	OrgName         string `json:"org_name,omitempty"`
+	NodeName        string `json:"node_name,omitempty"`
+	// Failure is the failure class (for example "denied"); Message is the
+	// fixed copy shown for the stage or failure.
+	Failure string `json:"failure,omitempty"`
+	Message string `json:"message,omitempty"`
 }
 
 type setupState struct {
@@ -83,6 +115,8 @@ type setupState struct {
 	SessionsNote string         `json:"sessions_note,omitempty"`
 	MaxSessions  int            `json:"max_sessions"`
 	GenericEntry string         `json:"generic_entry"`
+	// EnrollAvailable shows the Connect to AceTeam section.
+	EnrollAvailable bool `json:"enroll_available"`
 }
 
 func (s *Server) setupRoutes(mux *http.ServeMux) {
@@ -90,11 +124,15 @@ func (s *Server) setupRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/setup/doctor", s.withCookie(s.withCSRF(s.handleSetupDoctor)))
 	mux.HandleFunc("POST /api/setup/connect/{app}", s.withCookie(s.withCSRF(s.handleSetupConnect)))
 	mux.HandleFunc("POST /api/setup/open-viewer", s.withCookie(s.withCSRF(s.handleSetupOpenViewer)))
+	mux.HandleFunc("POST /api/setup/enroll/start", s.withCookie(s.withCSRF(s.handleSetupEnrollStart)))
+	mux.HandleFunc("GET /api/setup/enroll/state", s.withCookie(s.withCSRF(s.handleSetupEnrollState)))
+	mux.HandleFunc("POST /api/setup/enroll/cancel", s.withCookie(s.withCSRF(s.handleSetupEnrollCancel)))
+	mux.HandleFunc("GET /api/setup/enroll/qr", s.withCookie(s.withCSRF(s.handleSetupEnrollQR)))
 }
 
 func (s *Server) handleSetupState(w http.ResponseWriter, r *http.Request) {
 	c := s.cfg.Setup
-	st := setupState{MaxSessions: c.MaxSessions, GenericEntry: c.GenericEntry, Sessions: []SetupSession{}}
+	st := setupState{MaxSessions: c.MaxSessions, GenericEntry: c.GenericEntry, Sessions: []SetupSession{}, EnrollAvailable: c.enrollAvailable()}
 	if c.Doctor != nil {
 		st.Checks = c.Doctor(false)
 	}
@@ -144,6 +182,84 @@ func (s *Server) handleSetupConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
+}
+
+func (c *SetupConfig) enrollAvailable() bool {
+	return c.EnrollStart != nil && c.EnrollState != nil && c.EnrollCancel != nil
+}
+
+// readConfirm requires a JSON body with "confirm": true, like the Connect
+// click, so only the page's own buttons start or stop an enrollment.
+func readConfirm(w http.ResponseWriter, r *http.Request) bool {
+	if !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+		writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "expected JSON"})
+		return false
+	}
+	var body struct {
+		Confirm bool `json:"confirm"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil || !body.Confirm {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "the click must confirm the action"})
+		return false
+	}
+	return true
+}
+
+func (s *Server) enrollUnavailable(w http.ResponseWriter) bool {
+	if s.cfg.Setup.enrollAvailable() {
+		return false
+	}
+	writeJSON(w, http.StatusNotFound, map[string]string{"error": "connecting to AceTeam is not available here"})
+	return true
+}
+
+// handleSetupEnrollStart begins one enrollment. A start while one runs gets
+// 409 with the running enrollment's state, which it leaves unchanged.
+func (s *Server) handleSetupEnrollStart(w http.ResponseWriter, r *http.Request) {
+	if s.enrollUnavailable(w) || !readConfirm(w, r) {
+		return
+	}
+	st, err := s.cfg.Setup.EnrollStart()
+	if err != nil {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "enroll": st})
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+func (s *Server) handleSetupEnrollState(w http.ResponseWriter, r *http.Request) {
+	if s.enrollUnavailable(w) {
+		return
+	}
+	writeJSON(w, http.StatusOK, s.cfg.Setup.EnrollState())
+}
+
+func (s *Server) handleSetupEnrollCancel(w http.ResponseWriter, r *http.Request) {
+	if s.enrollUnavailable(w) || !readConfirm(w, r) {
+		return
+	}
+	writeJSON(w, http.StatusOK, s.cfg.Setup.EnrollCancel())
+}
+
+// handleSetupEnrollQR serves the waiting enrollment's verification URL as a
+// PNG QR code, for approving from a phone. The page fetches it with the bearer
+// header and shows it through a blob: URL, which the CSP allows.
+func (s *Server) handleSetupEnrollQR(w http.ResponseWriter, r *http.Request) {
+	if s.enrollUnavailable(w) {
+		return
+	}
+	st := s.cfg.Setup.EnrollState()
+	if st.Stage != "waiting" || st.VerificationURL == "" {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no code is waiting for approval"})
+		return
+	}
+	code, err := qr.Encode(st.VerificationURL, qr.M)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not draw the QR code"})
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	_, _ = w.Write(code.PNG())
 }
 
 func (s *Server) handleSetupOpenViewer(w http.ResponseWriter, r *http.Request) {

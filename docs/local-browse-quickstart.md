@@ -14,7 +14,8 @@ the same computer, with you in charge:
   `citadel.exe local audit` shows it.
 - **It stays on your computer.** There is no AceTeam account. Docker and admin
   rights are not needed. Citadel makes no calls of its own: no update check
-  and no telemetry. The co-browse browser's connections go through a guard
+  and no telemetry. (The setup page can optionally connect this PC to AceTeam;
+  it does so only when you click that button.) The co-browse browser's connections go through a guard
   inside Citadel that only connects to public internet addresses, and the
   browser's own background updates and syncing are turned off.
 
@@ -120,6 +121,19 @@ computer, behind a one-time link:
    bottom of the page into that app's MCP settings.
 3. It lists your live browser sessions and the session limit (read-only), and
    **Open the viewer** opens the hand-off viewer.
+4. Optional: **Connect this PC to AceTeam**. You do not need it for local
+   mode. Press **Connect**, and an AceTeam page opens in your browser (or scan
+   the QR code with your phone). Enter the code the setup page shows, then
+   approve. The PC joins the account and organization you approve it in, and
+   the setup page then shows the PC's name and that organization. **Cancel**
+   stops it, unless the last step has already started. Connecting saves a
+   device key only inside your own user folder; if Citadel on this PC was set
+   up for all users, the page refuses and you use `citadel enroll` instead.
+   The PC stays registered after you close the window, but AceTeam agents can
+   use it only while Citadel's worker runs. Your cookies and saved logins stay
+   on the PC. If the page says the PC already has a registration (for example
+   after a try that did not finish), run `citadel logout` in a terminal and
+   press **Connect** again.
 
 The page also opens for any launch that gives `citadel.exe` a console of its
 own, such as `start citadel` or `Start-Process citadel`, not only a double-click.
@@ -358,7 +372,7 @@ older location and `local audit` no longer shows them.
 
 ## Later: connect to AceTeam
 
-Local mode does not need AceTeam. If you later run `citadel init` to connect
-this computer to AceTeam, cloud agents still cannot reach the sessions your
+Local mode does not need AceTeam. If you later connect this computer to
+AceTeam (with the setup page's Connect button, or `citadel init`), cloud agents still cannot reach the sessions your
 local agent app starts. Your local approvals apply only to local agents, never
 to cloud agents.
