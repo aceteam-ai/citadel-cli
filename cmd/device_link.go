@@ -92,6 +92,18 @@ func enrollmentNodeID(ctx context.Context) string {
 // expires within the hour. That says nothing about the server, so it is fatal
 // on every version, is not retried, and removes this enrollment's credentials.
 func linkDeviceEnrollmentGated(result *DeviceAuthResult, nodeID func(context.Context) string, client deviceLinker) error {
+	return linkDeviceEnrollmentGatedWith(result, nodeID, client, enrollmentRollbackFn, deviceLinkWarnFn)
+}
+
+// linkDeviceEnrollmentGatedWith is linkDeviceEnrollmentGated with the
+// credential rollback and the unverified-link warning supplied by the caller,
+// so the non-interactive enrollment core (citadel-cli#1867) rolls back its own
+// config dir and reports warnings without writing to a terminal. The gating
+// rules are the same for every caller.
+func linkDeviceEnrollmentGatedWith(result *DeviceAuthResult, nodeID func(context.Context) string, client deviceLinker, rollback func(*nexus.TokenResponse) error, warn func(string)) error {
+	if warn == nil {
+		warn = func(string) {}
+	}
 	attempt := func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
@@ -101,7 +113,7 @@ func linkDeviceEnrollmentGated(result *DeviceAuthResult, nodeID func(context.Con
 	if isDeviceLinkUnsent(linkErr) {
 		fatal := deviceEnrollmentRecoveryError(linkErr)
 		if result != nil {
-			if err := enrollmentRollbackFn(result.Token); err != nil {
+			if err := rollback(result.Token); err != nil {
 				return fmt.Errorf("%w (removing this enrollment's saved credentials also failed)", fatal)
 			}
 		}
@@ -124,18 +136,18 @@ func linkDeviceEnrollmentGated(result *DeviceAuthResult, nodeID func(context.Con
 		if ok && enforced {
 			fatal := deviceEnrollmentRecoveryError(linkErr)
 			if !uncertainAttempt && isDeviceLinkRefusal(linkErr) && result != nil {
-				if err := enrollmentRollbackFn(result.Token); err != nil {
+				if err := rollback(result.Token); err != nil {
 					return fmt.Errorf("%w (removing this enrollment's saved credentials also failed)", fatal)
 				}
 			}
 			return fatal
 		}
 		if ok {
-			deviceLinkWarnFn("⚠️  Device link is unverified on this older server (" + nexus.DeviceLinkDiagnostic(linkErr) + "); continuing for compatibility. Saved credentials do not prove completed device binding. Run 'citadel logout && citadel init' with fresh browser approval to register again.")
+			warn("⚠️  Device link is unverified on this older server (" + nexus.DeviceLinkDiagnostic(linkErr) + "); continuing for compatibility. Saved credentials do not prove completed device binding. Run 'citadel logout && citadel init' with fresh browser approval to register again.")
 			return nil
 		}
 	}
-	deviceLinkWarnFn("⚠️  Device link is unverified and the server version could not be verified (" + nexus.DeviceLinkDiagnostic(linkErr) + "); continuing for compatibility. Saved credentials do not prove completed device binding. Run 'citadel logout && citadel init' with fresh browser approval to register again.")
+	warn("⚠️  Device link is unverified and the server version could not be verified (" + nexus.DeviceLinkDiagnostic(linkErr) + "); continuing for compatibility. Saved credentials do not prove completed device binding. Run 'citadel logout && citadel init' with fresh browser approval to register again.")
 	return nil
 }
 
@@ -227,7 +239,48 @@ func registerAndLinkGrantWith(result *DeviceAuthResult, nodeName string, prechec
 // (aceteam_api_key, login_node_uid, nexus_url, node_config_dir, ...) and the
 // legacy config location are never touched. Values the save itself overwrote
 // cannot be restored; that is the save-before-link order #1350 tracks.
+// rollbackEnrollmentCredentialsRestoring restores them when the caller
+// snapshotted them before the save.
 func rollbackEnrollmentCredentials(configFile string, token *nexus.TokenResponse) error {
+	return rollbackEnrollmentCredentialsRestoring(configFile, token, nil)
+}
+
+// enrollmentSavedKeys are every config key saveDeviceConfigToDir or
+// saveRedisURLToDir may set or delete.
+var enrollmentSavedKeys = []string{
+	"device_api_token", "api_base_url", "org_id", "org_name",
+	"user_email", "user_name", "fabric_node_id", "redis_url",
+}
+
+// snapshotEnrollmentFields reads the values of enrollmentSavedKeys from
+// configFile before a save overwrites them. A missing or unparseable file
+// snapshots nothing.
+func snapshotEnrollmentFields(configFile string) (map[string]interface{}, error) {
+	data, err := os.ReadFile(configFile)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var config map[string]interface{}
+	if err := yaml.Unmarshal(data, &config); err != nil || config == nil {
+		return nil, nil
+	}
+	prior := make(map[string]interface{})
+	for _, key := range enrollmentSavedKeys {
+		if v, ok := config[key]; ok {
+			prior[key] = v
+		}
+	}
+	return prior, nil
+}
+
+// rollbackEnrollmentCredentialsRestoring is rollbackEnrollmentCredentials that,
+// when it acts, also puts back each prior value (from snapshotEnrollmentFields)
+// whose key is now absent. When the file no longer holds this enrollment's own
+// credential it changes nothing, so a newer save is never overwritten.
+func rollbackEnrollmentCredentialsRestoring(configFile string, token *nexus.TokenResponse, prior map[string]interface{}) error {
 	if token == nil {
 		return nil
 	}
@@ -270,6 +323,11 @@ func rollbackEnrollmentCredentials(configFile string, token *nexus.TokenResponse
 		}
 		for _, key := range remove {
 			delete(config, key)
+		}
+		for key, value := range prior {
+			if _, present := config[key]; !present {
+				config[key] = value
+			}
 		}
 		if len(config) == 0 {
 			return os.Remove(configFile)

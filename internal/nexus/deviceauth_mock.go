@@ -42,6 +42,13 @@ type MockDeviceAuthServer struct {
 	// identity reuse so a test can prove a second login keeps the same uid.
 	enrollByMachineID bool
 	machineNodeUIDs   map[string]string
+	// Optional terminal RFC 8628 outcome (citadel-cli#1867): when set, every
+	// /token poll at or past pollsUntilSuccess answers 400 {"error": code}
+	// (for example "access_denied" or "expired_token") instead of success.
+	terminalTokenError string
+	// Success payload overrides (citadel-cli#1867), so a test can assert which
+	// grant fields reach the saved config and the enrollment result.
+	successToken *TokenResponse
 }
 
 // StartMockDeviceAuthServer creates and starts a mock device authorization server
@@ -110,6 +117,12 @@ func (m *MockDeviceAuthServer) handleToken(w http.ResponseWriter, r *http.Reques
 	m.tokenCSRs = append(m.tokenCSRs, parsed.CSRPem)
 	bundleLeaf, bundleChain, bundleUID := m.bundleLeaf, m.bundleChain, m.bundleNodeUID
 	csrFailStatus, csrFailCode := m.csrFailStatus, m.csrFailCode
+	terminalTokenError := m.terminalTokenError
+	var successToken *TokenResponse
+	if m.successToken != nil {
+		copied := *m.successToken
+		successToken = &copied
+	}
 	// Resolve a machine_id-keyed node_uid for the success response when enabled.
 	if m.enrollByMachineID && parsed.CSRPem != "" {
 		if m.machineNodeUIDs == nil {
@@ -140,6 +153,11 @@ func (m *MockDeviceAuthServer) handleToken(w http.ResponseWriter, r *http.Reques
 			ErrorCode:        "authorization_pending",
 			ErrorDescription: "User has not yet authorized the device",
 		})
+	} else if terminalTokenError != "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(TokenError{ErrorCode: terminalTokenError})
+	} else if successToken != nil {
+		json.NewEncoder(w).Encode(successToken)
 	} else {
 		// Return success with authkey (plus a CSR-enrollment bundle when the
 		// test configured one via SetEnrollmentBundle).
@@ -152,6 +170,28 @@ func (m *MockDeviceAuthServer) handleToken(w http.ResponseWriter, r *http.Reques
 			NodeUID:   bundleUID,
 		})
 	}
+}
+
+// SetTerminalTokenError makes every /token poll at or past pollsUntilSuccess
+// answer 400 {"error": code} instead of success (citadel-cli#1867), for
+// example "access_denied" or "expired_token". Empty restores success.
+func (m *MockDeviceAuthServer) SetTerminalTokenError(code string) {
+	m.pollMutex.Lock()
+	defer m.pollMutex.Unlock()
+	m.terminalTokenError = code
+}
+
+// SetSuccessToken replaces the default success response body (citadel-cli
+// #1867). Nil restores the default.
+func (m *MockDeviceAuthServer) SetSuccessToken(token *TokenResponse) {
+	m.pollMutex.Lock()
+	defer m.pollMutex.Unlock()
+	if token == nil {
+		m.successToken = nil
+		return
+	}
+	copied := *token
+	m.successToken = &copied
 }
 
 // SetEnrollmentBundle configures the leaf/chain/node_uid the mock echoes on the

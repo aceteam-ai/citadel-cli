@@ -299,6 +299,11 @@ func NewDeviceAuthClient(baseURL string) *DeviceAuthClient {
 // StartFlow initiates the device authorization flow by requesting device and user codes.
 // If opts is nil, default options are used.
 func (c *DeviceAuthClient) StartFlow(opts *StartFlowOptions) (*DeviceCodeResponse, error) {
+	return c.StartFlowContext(context.Background(), opts)
+}
+
+// StartFlowContext is StartFlow with caller cancellation of the request.
+func (c *DeviceAuthClient) StartFlowContext(ctx context.Context, opts *StartFlowOptions) (*DeviceCodeResponse, error) {
 	url := c.baseURL + "/api/fabric/device-auth/start"
 
 	// Get hostname for device identification
@@ -327,7 +332,7 @@ func (c *DeviceAuthClient) StartFlow(opts *StartFlowOptions) (*DeviceCodeRespons
 	}
 
 	// Create HTTP request
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -336,6 +341,9 @@ func (c *DeviceAuthClient) StartFlow(opts *StartFlowOptions) (*DeviceCodeRespons
 	// Execute request
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, classifyNetworkError(err, c.baseURL)
 	}
 	defer resp.Body.Close()
@@ -381,9 +389,46 @@ func (c *DeviceAuthClient) PollForToken(deviceCode string, interval int) (*Token
 // already committed to. An empty csrPEM reproduces the legacy no-CSR request
 // exactly. RFC 8628 pending/slow_down/expired/denied semantics are unchanged.
 func (c *DeviceAuthClient) PollForTokenWithCSR(deviceCode string, interval int, csrPEM string) (*TokenResponse, error) {
+	return c.PollForTokenWithCSRContext(context.Background(), deviceCode, interval, csrPEM)
+}
+
+// ErrDeviceAuthDenied, ErrDeviceAuthExpired and ErrDeviceAuthTimeout are the
+// terminal outcomes of a device-grant poll that are not transport failures.
+// Their text is the text the poll has always returned.
+var (
+	ErrDeviceAuthDenied  = errors.New("authorization denied by user")
+	ErrDeviceAuthExpired = errors.New("device code expired after 10 minutes, please run the command again")
+	ErrDeviceAuthTimeout = errors.New("authentication timeout after 10 minutes")
+)
+
+// deviceTokenPollTimeout matches the backend's device-code lifetime.
+const deviceTokenPollTimeout = 10 * time.Minute
+
+// PollForTokenContext is PollForToken with caller cancellation (citadel-cli
+// #1867): cancelling ctx stops both the wait between polls and an in-flight
+// token request, and the poll returns ctx.Err().
+func (c *DeviceAuthClient) PollForTokenContext(ctx context.Context, deviceCode string, interval int) (*TokenResponse, error) {
+	return c.PollForTokenWithCSRContext(ctx, deviceCode, interval, "")
+}
+
+// PollForTokenWithCSRContext is PollForTokenWithCSR with caller cancellation.
+// A cancelled ctx is reported as ctx.Err() (context.Canceled or
+// context.DeadlineExceeded), never as a network error or a timeout.
+func (c *DeviceAuthClient) PollForTokenWithCSRContext(ctx context.Context, deviceCode string, interval int, csrPEM string) (*TokenResponse, error) {
 	pollingInterval := time.Duration(interval) * time.Second
-	timeout := 10 * time.Minute // Match backend expiration
+	timeout := deviceTokenPollTimeout
 	startTime := time.Now()
+
+	wait := func() error {
+		timer := time.NewTimer(pollingInterval)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return nil
+		}
+	}
 
 	// csr may be dropped mid-flight. A certificate-enrollment failure on a
 	// CSR-bearing poll (citadel-cli#1062) must NOT abort login: the device grant
@@ -394,8 +439,16 @@ func (c *DeviceAuthClient) PollForTokenWithCSR(deviceCode string, interval int, 
 	serverErrors := 0
 
 	for time.Since(startTime) < timeout {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		// Make token request (same CSR on every retry, until it is dropped).
-		token, err := c.CheckTokenWithCSR(deviceCode, csr)
+		token, err := c.checkTokenWithCSRContext(ctx, deviceCode, csr)
+		// classifyNetworkError does not keep the request error in its chain,
+		// so a cancelled request is recognized through ctx itself.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 
 		// Success case
 		if token != nil && token.Authkey != "" {
@@ -408,7 +461,9 @@ func (c *DeviceAuthClient) PollForTokenWithCSR(deviceCode string, interval int, 
 			if serverErrors > MaxConsecutiveTokenServerErrors {
 				return nil, fmt.Errorf("token request failed: %w", err)
 			}
-			time.Sleep(pollingInterval)
+			if err := wait(); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		serverErrors = 0
@@ -429,9 +484,9 @@ func (c *DeviceAuthClient) PollForTokenWithCSR(deviceCode string, interval int, 
 				// Increase interval by 5 seconds
 				pollingInterval += 5 * time.Second
 			case "expired_token":
-				return nil, fmt.Errorf("device code expired after 10 minutes, please run the command again")
+				return nil, ErrDeviceAuthExpired
 			case "access_denied":
-				return nil, fmt.Errorf("authorization denied by user")
+				return nil, ErrDeviceAuthDenied
 			default:
 				// Not a standard RFC 8628 code. If it is a certificate
 				// enrollment failure and we still carry a CSR, drop the CSR and
@@ -445,10 +500,12 @@ func (c *DeviceAuthClient) PollForTokenWithCSR(deviceCode string, interval int, 
 		}
 
 		// Wait before next poll
-		time.Sleep(pollingInterval)
+		if err := wait(); err != nil {
+			return nil, err
+		}
 	}
 
-	return nil, fmt.Errorf("authentication timeout after 10 minutes")
+	return nil, ErrDeviceAuthTimeout
 }
 
 // certificateEnrollmentErrorCodes are the error codes the device-auth
@@ -490,6 +547,10 @@ func (c *DeviceAuthClient) CheckToken(deviceCode string) (*TokenResponse, error)
 // An empty csrPEM omits the csr_pem field entirely, so the request body is
 // byte-identical to the legacy CheckToken request.
 func (c *DeviceAuthClient) CheckTokenWithCSR(deviceCode, csrPEM string) (*TokenResponse, error) {
+	return c.checkTokenWithCSRContext(context.Background(), deviceCode, csrPEM)
+}
+
+func (c *DeviceAuthClient) checkTokenWithCSRContext(ctx context.Context, deviceCode, csrPEM string) (*TokenResponse, error) {
 	url := c.baseURL + "/api/fabric/device-auth/token"
 
 	// Create request body
@@ -505,7 +566,7 @@ func (c *DeviceAuthClient) CheckTokenWithCSR(deviceCode, csrPEM string) (*TokenR
 	}
 
 	// Create HTTP request
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}

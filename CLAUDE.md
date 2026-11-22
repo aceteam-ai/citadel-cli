@@ -2221,6 +2221,20 @@ can refuse the old registration: run `citadel logout && citadel init` to
 register through a fresh reservation. Saved credentials alone never establish
 completed device binding; the link response must confirm it.
 
+`cmd.enrollDevice` (`cmd/enroll_core.go`, #1867) owns the non-interactive
+enrollment sequence: it never prints, prompts or exits, saves to the explicit
+`enrollOptions.ConfigDir`, and keeps grant secrets out of its result,
+callbacks and errors (`redactEnrollError`). It is single-flight per process,
+refuses a machine with saved mesh state unless `ForceNew` (which then forces the
+new key past the saved state), and passes its resolved control URL to connect
+instead of setting `nexusURL`. A failure after the save and before the link is
+sent disconnects and rolls back this grant, restoring the values the save
+overwrote (`rollbackEnrollmentCredentialsRestoring`); link outcomes keep
+`linkDeviceEnrollmentGatedWith`'s rules. Cancellation is honored until the link
+starts; a started link completes. `citadel enroll` is a terminal wrapper over it
+(`terminalEnrollDeps` keeps the QR UI and the name offer); `init` does not use
+it yet.
+
 ### Two ActualState reporters, two different module sets (#733)
 
 A node ships `ActualState` to the control plane from TWO independent paths.

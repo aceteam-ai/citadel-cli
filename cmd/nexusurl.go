@@ -151,6 +151,13 @@ func normalizeControlURL(url string) string {
 // network.ResolveControlURL() (persisted-or-default) otherwise, so nexusURL is
 // the correct "preRun" input to the resolver.
 func applyDeviceAuthNexusURL(nexusFlagChanged bool, tokenNexusURL string) {
+	nexusURL = deviceAuthControlURL(nexusFlagChanged, tokenNexusURL)
+}
+
+// deviceAuthControlURL is the control URL applyDeviceAuthNexusURL would adopt,
+// returned instead of stored, so a long-lived caller (the enrollment core,
+// citadel-cli#1867) never mutates the package-level nexusURL.
+func deviceAuthControlURL(nexusFlagChanged bool, tokenNexusURL string) string {
 	hasState := network.HasState()
 	persisted := network.PersistedControlURL()
 	// Trace the one case the resolver deliberately ignores the token: an
@@ -164,7 +171,7 @@ func applyDeviceAuthNexusURL(nexusFlagChanged bool, tokenNexusURL string) {
 		Debug("device-auth token nexus %q differs from persisted %q; keeping persisted (citadel-cli#1110 D7)",
 			tokenNexusURL, persisted)
 	}
-	nexusURL = resolveDeviceAuthNexusURL(nexusFlagChanged, hasState, nexusURL, persisted, tokenNexusURL)
+	return resolveDeviceAuthNexusURL(nexusFlagChanged, hasState, nexusURL, persisted, tokenNexusURL)
 }
 
 // resolveDeviceAuthNexusURL is the pure decision for the effective device-auth
