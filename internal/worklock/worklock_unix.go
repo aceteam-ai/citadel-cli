@@ -40,7 +40,9 @@ func Acquire(stateDir, version string, logf func(format string, args ...any)) (*
 
 // AcquireFile is Acquire for an explicit lock file path, for a single-instance
 // guard other than the worker lock (the per-user supervisor's lock). Same
-// semantics: exclusive, non-blocking, released by the OS on process death.
+// semantics: exclusive, non-blocking, released by the OS on process death. On
+// Windows it locks a different byte than Acquire, so never use it for the
+// worker lock (citadel-work.lock).
 func AcquireFile(path, version string, logf func(format string, args ...any)) (*Lock, error) {
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
