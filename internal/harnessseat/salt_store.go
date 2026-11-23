@@ -79,41 +79,62 @@ func (s *SaltStore) InitializeSalt(ctx context.Context) ([32]byte, error) {
 }
 
 func (s *SaltStore) salt(ctx context.Context, create bool) ([32]byte, error) {
-	var empty [32]byte
+	var value [32]byte
+	err := s.withPrivateLock(ctx, func() error {
+		var err error
+		value, err = s.readSalt()
+		if !create || !errors.Is(err, ErrSaltMissing) {
+			return err
+		}
+		// Generic salt initialization cannot establish whether an existing
+		// registry already uses this identity. Only InitializeRegistry may
+		// initialize alongside a validated empty registry.
+		if _, err := s.root.Lstat(registryFileName); !os.IsNotExist(err) {
+			return ErrSaltMissing
+		}
+		value, err = s.createSalt()
+		return err
+	})
+	if err != nil {
+		return [32]byte{}, err
+	}
+	return value, nil
+}
+
+func (s *SaltStore) withPrivateLock(ctx context.Context, action func() error) error {
 	if ctx == nil {
-		return empty, ErrPrivateStore
+		return ErrPrivateStore
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.root == nil {
-		return empty, ErrPrivateStore
+		return ErrPrivateStore
 	}
 	if err := ctx.Err(); err != nil {
-		return empty, err
+		return err
 	}
 	// The sidecar is persistent: deleting it would let concurrent callers lock
 	// different inodes. Each store opens its own description, so separate stores
 	// in this process and separate processes use the same kernel lock.
 	f, err := s.root.OpenFile(saltLockName, os.O_CREATE|os.O_RDWR|privateNoFollowFlags(), 0o600)
 	if err != nil {
-		return empty, ErrPrivateStore
+		return ErrPrivateStore
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil || !privateStoreInfo(info, false) {
-		return empty, ErrPrivateStore
+		return ErrPrivateStore
 	}
 	lockCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	if err := privateStoreLock(lockCtx, f); err != nil {
-		return empty, err
+		return err
 	}
 	defer privateStoreUnlock(f)
-	value, err := s.readSalt()
-	if !create || !errors.Is(err, ErrSaltMissing) {
-		return value, err
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	return s.createSalt()
+	return action()
 }
 
 func (s *SaltStore) readSalt() ([32]byte, error) {

@@ -8,8 +8,9 @@ The child-environment plan retains a small locale/platform allowlist and sets
 only the chosen harness's configuration home from a validated local identity.
 Provider credentials, shared configuration homes and executable-loader or shell
 startup overrides are not inherited. Local identities are excluded from JSON;
-the reporting projection has only a domain-separated opaque reference and the
-harness name. Salted account digests support local duplicate-account refusal.
+the reporting projection has a domain-separated opaque reference and bounded
+seat metadata, never local owner/configuration/work paths or account digests.
+Salted account digests support local duplicate-account refusal.
 
 These are structural, fake-only proofs, not proof of native login isolation or
 permission to launch. A caller must still establish the actual owner, private
@@ -17,10 +18,9 @@ directory modes, registry integrity, entitlement/scope/data-class policy,
 enabled state, and a trusted vendor probe result. Unknown account identity is
 not uniqueness or authentication evidence.
 
-Remaining P1 work: private atomic harness.yaml storage and salt integration;
-safe default-home adoption; owner-bound seat add/list/probe/enable/disable/remove;
-vendor status adapters that never open credential files; full metadata and
-sanitized projections; duplicate-account reconciliation; two-seat native
+Remaining P1 work: safe default-home adoption; owner-bound seat
+add/list/probe/enable/disable/remove; vendor status adapters that never open
+credential files; observed metadata and duplicate-account reconciliation; two-seat native
 isolation proof including keychain/secret-store/daemon behavior. The later
 driver/permission slices must bind this identity at start and every turn. No
 HARNESS job, remote enable path, allowance multiplier or routing policy is added
@@ -39,6 +39,15 @@ The owning user/root are trusted, not sandboxed by this store.
 
 Private salt storage currently supports Linux and macOS; other platforms refuse
 until native privacy and locking checks exist. Linux temporary-file tests are
-not native macOS/Windows acceptance. Registry creation must separately ensure a
-missing salt is never regenerated for existing account digests. No production
-caller invokes initialization, and no harness.yaml writer exists yet.
+not native macOS/Windows acceptance. No production caller invokes initialization.
+
+The offline harness.yaml codec preserves other root sections, rejects ambiguous
+YAML and unknown seat fields, and re-resolves owner homes through an injected
+trusted resolver. A bounded, private atomic writer shares the salt lock and uses
+snapshot compare-and-swap to refuse stale updates. Removing a seat removes only
+its declaration, never its vendor directory. Registry initialization refuses a
+missing salt whenever any existing seat is present; generic salt initialization
+also refuses an existing registry. Neither reads nor updates create identity.
+The data-ceiling field is only a bounded policy selector here, not an invented
+classification ordering or permission decision. Local status fields are
+declarations, not trusted evidence of login, scopes or native isolation.
