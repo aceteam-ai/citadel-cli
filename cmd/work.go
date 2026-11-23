@@ -1928,7 +1928,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		// control listener behind a coordinator cert (citadel-cli#1318, the
 		// #5028 rule); the plaintext listener serves fail-closed stubs.
 		if provisionHandler := initProvisionHandler(); provisionHandler != nil {
-			registerControlOnlyAPI(statusServer, provisionHandler, requireProvisionPermission)
+			registerProvisionControlAPI(statusServer, provisionHandler, nodePermissionsDir)
 		}
 
 		// Register workflow API routes (#259). The whole API lives only on the
@@ -1941,7 +1941,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		// /rag/status. Served only on the mTLS control listener behind a
 		// coordinator cert (citadel-cli#1318) and the operator's live Files
 		// permission; the plaintext listener serves fail-closed stubs.
-		registerControlOnlyAPI(statusServer, rag.NewServer(rag.New(wsDir, "")), requireFilesPermission)
+		registerRAGControlAPI(statusServer, rag.NewServer(rag.New(wsDir, "")), nodePermissionsDir)
 
 		// Local semantic-search file watcher (citadel-cli#617-619): if the
 		// operator has authorized any search roots, watch them and keep the

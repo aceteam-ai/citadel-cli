@@ -2260,7 +2260,8 @@ as well as in this repo's own CLI commands. Wire both sides with
 `cmd.registerControlOnlyAPI`, whose test pins which listener each side lands on.
 A coordinator cert does not override the operator's permission toggles: a
 control route for a toggled surface also takes that permission, read strictly
-per request, as its extra gate (`requireFilesPermission` for `/rag`), and
+per request, as its extra gate (`registerRAGControlAPI` and
+`registerProvisionControlAPI` own this for `/rag` and provisioning), and
 `/ssh/authorized-keys` takes it through `status.ServerConfig.SSHDeployAllowed`,
 where nil refuses.
 
