@@ -12,5 +12,6 @@ import (
 func privateStoreSupported() bool                      { return false }
 func privateNoFollowFlags() int                        { return 0 }
 func privateStoreInfo(os.FileInfo, bool) bool          { return false }
+func ownedSeatParentInfo(os.FileInfo) bool             { return false }
 func privateStoreLock(context.Context, *os.File) error { return ErrStoreUnsupported }
 func privateStoreUnlock(*os.File)                      {}

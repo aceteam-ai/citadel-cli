@@ -20,8 +20,8 @@ not uniqueness or authentication evidence.
 
 Remaining P1 work: safe default-home adoption; owner-bound seat
 add/list/probe/enable/disable/remove; vendor status adapters that never open
-credential files; observed metadata and duplicate-account reconciliation; two-seat native
-isolation proof including keychain/secret-store/daemon behavior. The later
+credential files; observed metadata and duplicate-account reconciliation;
+two-seat native isolation proof including keychain/secret-store/daemon behavior. The later
 driver/permission slices must bind this identity at start and every turn. No
 HARNESS job, remote enable path, allowance multiplier or routing policy is added
 by this foundation.
@@ -51,3 +51,25 @@ also refuses an existing registry. Neither reads nor updates create identity.
 The data-ceiling field is only a bounded policy selector here, not an invented
 classification ordering or permission decision. Local status fields are
 declarations, not trusted evidence of login, scopes or native isolation.
+
+Local configuration-directory preparation is also offline/unwired and limited
+to the process owner. Its identity/home must come from the trusted owner
+resolver, not remote input. It opens directories only, refuses symlinked or
+foreign/writable ancestors, requires a 0700 leaf and creates missing components
+0700 only on an explicit create. An existing leaf is never silently adopted
+by create. Read-only validation creates nothing. Neither operation repairs
+permissions or deletes anything; a failed create may leave private parents for
+the owner to inspect. Revalidation checks the pinned inode and the current
+no-symlink path, refusing a replacement or lost privacy. This is not custody for
+a later path-based subprocess or proof of native vendor isolation. Unsupported
+platforms refuse without creating state. The owner/root remain trusted.
+
+Offline local-edit helpers use the same snapshot fence before any add creates
+directories and again before publishing metadata. Add accepts only declared
+fields and starts disabled with unknown auth; it never invents observed plan,
+model or account data. Enable rechecks directory privacy but changes only the
+local flag, not authentication evidence or permission. Disable and remove remain
+available with an unsafe vendor directory, which neither operation opens,
+repairs or deletes. A concurrent add losing publication may leave its new
+private directory for the owner to inspect; retries do not silently adopt it.
+These helpers do not create a CLI, remote route, login command or launch path.

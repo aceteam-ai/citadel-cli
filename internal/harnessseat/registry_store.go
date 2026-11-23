@@ -102,19 +102,9 @@ func (s *SaltStore) UpdateRegistry(ctx context.Context, previous RegistrySnapsho
 	}
 	var result RegistrySnapshot
 	err := s.withPrivateLock(ctx, func() error {
-		raw, err := s.readRegistry()
+		current, err := s.expectedRegistry(previous)
 		if err != nil {
 			return err
-		}
-		if registryRevision(raw) != previous.revision {
-			return ErrRegistryConflict
-		}
-		current, err := s.snapshot(raw, previous.document.resolve)
-		if err != nil {
-			return err
-		}
-		if current.salt != previous.salt {
-			return ErrRegistryConflict
 		}
 		next, err := current.document.WithSeats(seats).Encode()
 		if err != nil {
@@ -135,6 +125,29 @@ func (s *SaltStore) UpdateRegistry(ctx context.Context, previous RegistrySnapsho
 		return RegistrySnapshot{}, err
 	}
 	return result, nil
+}
+
+// expectedRegistry must run under withPrivateLock. Keep the same fencing for
+// direct updates and for local-edit preflight before any directory creation.
+func (s *SaltStore) expectedRegistry(previous RegistrySnapshot) (RegistrySnapshot, error) {
+	if previous.owner != s {
+		return RegistrySnapshot{}, ErrRegistryConflict
+	}
+	raw, err := s.readRegistry()
+	if err != nil {
+		return RegistrySnapshot{}, err
+	}
+	if registryRevision(raw) != previous.revision {
+		return RegistrySnapshot{}, ErrRegistryConflict
+	}
+	current, err := s.snapshot(raw, previous.document.resolve)
+	if err != nil {
+		return RegistrySnapshot{}, err
+	}
+	if current.salt != previous.salt {
+		return RegistrySnapshot{}, ErrRegistryConflict
+	}
+	return current, nil
 }
 
 func (s *SaltStore) readRegistry() ([]byte, error) {

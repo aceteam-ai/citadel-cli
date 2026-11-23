@@ -14,6 +14,16 @@ import (
 
 func privateStoreSupported() bool { return true }
 
+// Ancestors may be searchable/readable by others, but not writable by them.
+// The final login directory still requires the stricter privateStoreInfo.
+func ownedSeatParentInfo(info os.FileInfo) bool {
+	if info == nil || !info.IsDir() || info.Mode().Perm()&0o022 != 0 || info.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != 0 {
+		return false
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	return ok && st.Uid == uint32(os.Geteuid())
+}
+
 func privateNoFollowFlags() int { return unix.O_NOFOLLOW | unix.O_NONBLOCK }
 
 func privateStoreInfo(info os.FileInfo, dir bool) bool {
