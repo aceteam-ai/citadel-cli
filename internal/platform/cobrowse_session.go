@@ -743,12 +743,6 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	// the session still runs and graceful stop still reaps it in-process.
 	writeSessionPidfile(s.profile, os.Getpid(), proc.browserPID, proc.xvfbPID, currentProcessStartToken())
 
-	// Configure the page policy before the session is visible to status or
-	// actions, so no page is ever accepted without it.
-	if s.tracking {
-		dropTargetSet(proc.debugPort)
-		targetSetFor(proc.debugPort).configure(s.id, tpolicy, tevent)
-	}
 	// Learn the browser's CDP id before the session is visible and before the
 	// chooser watcher exists, on every OS, so the watcher can always verify it.
 	if proc.browserID == "" && proc.debugPort > 0 {
@@ -758,13 +752,21 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	}
 	// Public-only: prove the browser really sends traffic through its guard
 	// before the session becomes usable (a managed proxy policy could route
-	// it elsewhere). Stopping the proc also closes the guard.
+	// it elsewhere). Stopping the proc also closes the guard. This runs
+	// before the page set below exists, so the canary's short-lived tab is
+	// never tracked (or picked as the active page).
 	if guard != nil {
 		if err := egressRouteCheck(proc, guard); err != nil {
 			dropTargetSet(proc.debugPort)
 			_ = proc.stop()
 			return nil, err
 		}
+	}
+	// Configure the page policy before the session is visible to status or
+	// actions, so no page is ever accepted without it.
+	if s.tracking {
+		dropTargetSet(proc.debugPort)
+		targetSetFor(proc.debugPort).configure(s.id, tpolicy, tevent)
 	}
 	s.mu.Lock()
 	s.proc = proc

@@ -3,7 +3,10 @@ package platform
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,10 +14,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/browserurl"
+	"github.com/gorilla/websocket"
 )
 
 // egressEnv records the launch options every launch received and the guards
@@ -817,4 +822,79 @@ func TestEgressSweepStopsWithManager(t *testing.T) {
 		t.Fatal("an unguarded launch did not restart the sweep")
 	}
 	_ = m.StopAll()
+}
+
+// TestFirstNavigateRetriesDialFailures: a page whose debugger endpoint does
+// not accept the handshake yet (a cold browser on a slow runner) is retried
+// until it does, and Page.navigate is sent exactly once.
+func TestFirstNavigateRetriesDialFailures(t *testing.T) {
+	f := startFakeCDPServer(t)
+	notReady := httptest.NewServer(http.NotFoundHandler()) // bad handshake
+	defer notReady.Close()
+	var pins int
+	pinFn := func() (pin, error) {
+		pins++
+		switch {
+		case pins == 1:
+			return pin{}, errors.New("no page target yet")
+		case pins < 4:
+			return pin{port: f.port, ws: "ws" + strings.TrimPrefix(notReady.URL, "http") + "/devtools/page/1"}, nil
+		}
+		return pin{port: f.port, ws: fmt.Sprintf("ws://127.0.0.1:%d/devtools/page/1", f.port)}, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := firstNavigateWithRetry(ctx, pinFn, "https://a.example/once"); err != nil {
+		t.Fatalf("navigate: %v", err)
+	}
+	calls := f.callsFor("Page.navigate")
+	if len(calls) != 1 || calls[0].Params["url"] != "https://a.example/once" {
+		t.Fatalf("Page.navigate calls = %+v", calls)
+	}
+	if pins != 4 {
+		t.Fatalf("pins = %d, want 4", pins)
+	}
+}
+
+// TestFirstNavigateFailsClosedAndNeverResends: a dial that never succeeds
+// gives up at the deadline; an error after the command may have been sent is
+// not retried (a start URL may be single use).
+func TestFirstNavigateFailsClosedAndNeverResends(t *testing.T) {
+	notReady := httptest.NewServer(http.NotFoundHandler())
+	defer notReady.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer cancel()
+	bad := func() (pin, error) {
+		return pin{port: 1, ws: "ws" + strings.TrimPrefix(notReady.URL, "http") + "/x"}, nil
+	}
+	if err := firstNavigateWithRetry(ctx, bad, "https://a.example/"); err == nil || !strings.Contains(err.Error(), "CDP dial") {
+		t.Fatalf("want a dial failure at the deadline, got %v", err)
+	}
+
+	// The connection is accepted and then dropped without a reply: the
+	// command may have reached the browser, so it is not sent again.
+	var sends atomic.Int64
+	up := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	drop := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		var msg map[string]any
+		_ = c.ReadJSON(&msg)
+		sends.Add(1)
+		c.Close()
+	}))
+	defer drop.Close()
+	dropPin := func() (pin, error) {
+		return pin{port: 1, ws: "ws" + strings.TrimPrefix(drop.URL, "http") + "/devtools/page/1"}, nil
+	}
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	if err := firstNavigateWithRetry(ctx2, dropPin, "https://a.example/"); err == nil {
+		t.Fatal("a dropped reply should fail the navigation")
+	}
+	if sends.Load() != 1 {
+		t.Fatalf("Page.navigate sent %d times, want 1", sends.Load())
+	}
 }
