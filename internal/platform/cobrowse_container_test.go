@@ -64,8 +64,11 @@ func (f *fakeEngine) exec(_ context.Context, args ...string) (string, error) {
 	}
 	switch key {
 	case "info":
-		return "id\n", nil
+		return `{"OSType":"linux","Architecture":"amd64","host":{"os":"linux","arch":"amd64"}}`, nil
 	case "image inspect":
+		if args[3] == "{{json .}}" {
+			return `{"Os":"linux","Architecture":"amd64"}`, nil
+		}
 		if f.imageLabels != "" {
 			return f.imageLabels + "\n", nil
 		}
@@ -328,8 +331,8 @@ func TestContainerHealthFailsClosed(t *testing.T) {
 	f4 := &fakeEngine{failOn: "image inspect"}
 	r4 := newTestRunner(f4, false)
 	f4.failOn = "image inspect"
-	if r4.healthy(false) != nil {
-		t.Fatal("absent but pullable image counts as available for discovery")
+	if r4.healthy(false) == nil || f4.has("pull") != 0 {
+		t.Fatal("absent image must be unknown without pulling during discovery")
 	}
 }
 

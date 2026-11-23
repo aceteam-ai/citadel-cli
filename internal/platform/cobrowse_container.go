@@ -126,11 +126,12 @@ type containerRunner struct {
 	limits   ContainerLimits
 	uid, gid int
 
-	mu         sync.Mutex
-	healthAt   time.Time
-	healthErr  error
-	imageReady bool
-	now        func() time.Time
+	mu            sync.Mutex
+	healthAt      time.Time
+	healthErr     error
+	imageReady    bool
+	selectedImage string // resolved index child, protected by mu
+	now           func() time.Time
 
 	// Seams for tests; defaults talk to the published loopback ports.
 	startBrowser  func(ctx context.Context, ctrlPort int, id string) error
@@ -222,8 +223,11 @@ func (r *containerRunner) healthy(allowPull bool) error {
 		return r.healthErr
 	}
 	err := r.checkLocked(allowPull)
-	if !(err == nil && !r.imageReady) { // an unpulled-but-reachable probe is not cached as final
+	if !errors.Is(err, errContainerImageUnknown) {
 		r.healthAt = r.now()
+	}
+	if err != nil {
+		r.imageReady = false
 	}
 	r.healthErr = err
 	return err
@@ -231,20 +235,37 @@ func (r *containerRunner) healthy(allowPull bool) error {
 
 func (r *containerRunner) checkLocked(allowPull bool) error {
 	ctx := context.Background()
-	if _, err := r.call(ctx, "info"); err != nil {
+	info, err := r.call(ctx, "info", "--format", "{{json .}}")
+	if err != nil {
 		return fmt.Errorf("container engine unreachable: %w", err)
 	}
-	out, err := r.call(ctx, "image", "inspect", "--format", imageLabelFormat, r.image)
+	target, err := engineImagePlatform(info, r.podman)
+	if err != nil {
+		return err
+	}
+	image := r.image
+	if r.selectedImage != "" {
+		image = r.selectedImage
+	}
+	out, err := r.call(ctx, "image", "inspect", "--format", imageLabelFormat, image)
 	if err != nil {
 		if !allowPull {
-			return nil // present-or-pullable: Launch pulls it
+			return errContainerImageUnknown
+		}
+		manifest, merr := r.call(ctx, "manifest", "inspect", r.image)
+		if merr != nil {
+			return fmt.Errorf("browser-runtime image platform is unknown: %w", merr)
+		}
+		image, err = resolveImagePlatform(r.image, manifest, target)
+		if err != nil {
+			return err
 		}
 		pctx, cancel := context.WithTimeout(ctx, containerPullLimit)
 		defer cancel()
-		if _, perr := r.eng(pctx, "pull", r.image); perr != nil {
+		if _, perr := r.eng(pctx, "pull", "--platform", target.String(), image); perr != nil {
 			return fmt.Errorf("browser-runtime image is not present and could not be pulled: %w", perr)
 		}
-		out, err = r.call(ctx, "image", "inspect", "--format", imageLabelFormat, r.image)
+		out, err = r.call(ctx, "image", "inspect", "--format", imageLabelFormat, image)
 		if err != nil {
 			return fmt.Errorf("inspect browser-runtime image: %w", err)
 		}
@@ -258,8 +279,25 @@ func (r *containerRunner) checkLocked(allowPull bool) error {
 	if sandbox != browserruntime.SandboxMarker {
 		return errors.New("browser-runtime image has no renderer sandbox marker (" + browserruntime.ImageLabelSandbox + ")")
 	}
+	metadata, err := r.call(ctx, "image", "inspect", "--format", "{{json .}}", image)
+	if err != nil {
+		return fmt.Errorf("inspect browser-runtime image platform: %w", err)
+	}
+	if err := checkImagePlatform(metadata, target); err != nil {
+		return err
+	}
+	r.selectedImage = image
 	r.imageReady = true
 	return nil
+}
+
+func (r *containerRunner) imageForRun() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.selectedImage != "" {
+		return r.selectedImage
+	}
+	return r.image
 }
 
 func (r *containerRunner) Name() string { return "container" }
@@ -268,7 +306,7 @@ func (r *containerRunner) Discover() (BrowserInfo, error) {
 	if err := r.healthy(false); err != nil {
 		return BrowserInfo{}, fmt.Errorf("%w: %v", ErrNoBrowser, err)
 	}
-	return BrowserInfo{Path: r.image, Kind: "chromium"}, nil
+	return BrowserInfo{Path: r.imageForRun(), Kind: "chromium"}, nil
 }
 
 func (r *containerRunner) PrepareBaseDir(string) error { return nil }
@@ -341,7 +379,7 @@ func (r *containerRunner) Launch(sessionDir, startURL string, lo LaunchOptions) 
 	owner := r.ownerFor(filepath.Dir(sessionDir))
 	spec := browserruntime.RunSpec{
 		SeccompProfile: seccompPath, Browser: browserruntime.DefaultBrowser,
-		Image: r.image, Network: browserruntime.NetworkName(id), SessionID: id,
+		Image: r.imageForRun(), Network: browserruntime.NetworkName(id), SessionID: id,
 		Purpose: "cobrowse", UID: r.uid, GID: r.gid, ProfileDir: mountDir,
 		StageDir: stageDir, Name: containerName(id), Owner: owner,
 		DiskCacheMB: r.limits.DiskCacheMB, UserNSKeepID: r.podman,
@@ -956,6 +994,9 @@ func (s *selectingRunner) Launch(profileDir, startURL string, lo LaunchOptions) 
 // useContainer is the per-launch decision, made once by the manager before it
 // lays out the session dir: the node-wide manager uses the container runner
 // while it is healthy, otherwise the host runner (logged once per reason).
+// Unlike informational discovery, this admission path may resolve and pull an
+// absent pinned image before selecting it. The resolved platform and local
+// config still have to pass; Launch cannot be the only path that makes it ready.
 func (s *selectingRunner) useContainer(nodeWide bool) bool {
 	c := s.cr()
 	if c == nil || !nodeWide {
