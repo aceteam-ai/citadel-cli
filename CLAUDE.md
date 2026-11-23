@@ -464,7 +464,10 @@ their own human-granted permission); every other type, including one added
 later, is refused terminally (`ReasonSetupPosture`) through the source cmd
 installs with `worker.SetSetupPostureSource` (`setupPostureCache` stats the file
 per job). `TestSetupPostureClassifiesEveryJobType` fails until a new job type is
-classified. A failed posture save runs `setupPostureQuarantine` (autostart off,
+classified. `cmd.sshDeployAllowedIn` also refuses SSH key deployment (the
+control listener's `/ssh/authorized-keys` and every
+`syncAuthorizedKeysIfAllowed` sync) while the marker is set, even with SSH on.
+A failed posture save runs `setupPostureQuarantine` (autostart off,
 worker stopped) and offers Retry. The marker stays after Disconnect;
 `citadel permission setup-posture disable` (`clearSetupPosture`) removes it.
 The Control Center's `savePermissionsChecked` and `toggleNodePermission` keep
