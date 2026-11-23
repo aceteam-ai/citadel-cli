@@ -105,3 +105,41 @@ func TestLocalPermissionWritersRefuseDamagedFile(t *testing.T) {
 		})
 	}
 }
+
+// TestControlCenterSaveKeepsPublicOnlyChangedOnDisk: the Built-in Services
+// modal loads the policy, the file changes on disk while it is open (here
+// public-only and Shell turn on), then a toggle is saved. The toggle writes
+// only its own field, and a whole-struct save still keeps public-only.
+func TestControlCenterSaveKeepsPublicOnlyChangedOnDisk(t *testing.T) {
+	dir := t.TempDir()
+	if err := config.SavePermissions(dir, config.DefaultPermissions()); err != nil {
+		t.Fatal(err)
+	}
+	modal := config.LoadPermissions(dir) // what the modal holds
+
+	onDisk := config.LoadPermissions(dir)
+	onDisk.CobrowsePublicOnly = true
+	onDisk.Shell = true
+	if err := config.SavePermissions(dir, onDisk); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := toggleNodePermission(dir, "Files", true); err != nil {
+		t.Fatal(err)
+	}
+	got := config.LoadPermissions(dir)
+	if !got.CobrowsePublicOnly || !got.Shell || !got.Files {
+		t.Fatalf("toggle save: %+v", got)
+	}
+
+	modal.Console = true
+	if err := savePermissionsChecked(dir, modal); err != nil {
+		t.Fatal(err)
+	}
+	if got := config.LoadPermissions(dir); !got.CobrowsePublicOnly || !got.Console {
+		t.Fatalf("whole-struct save turned public-only off: %+v", got)
+	}
+	if err := toggleNodePermission(dir, "Nope", true); err == nil {
+		t.Fatal("unknown toggle accepted")
+	}
+}

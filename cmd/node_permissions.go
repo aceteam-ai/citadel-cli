@@ -27,9 +27,44 @@ func saveNodePermissions(p *config.Permissions) error {
 	return savePermissionsChecked(nodePermissionsDir(), p)
 }
 
+// savePermissionsChecked also keeps, from the file as it is now, every field
+// the Control Center never edits, so a struct loaded earlier cannot turn them
+// back. CobrowsePublicOnly is such a field: only APPLY_DEVICE_CONFIG (on only)
+// and 'citadel permission cobrowse-public-only' change it.
 func savePermissionsChecked(dir string, p *config.Permissions) error {
-	if _, err := config.LoadPermissionsStrict(dir); err != nil {
+	cur, err := config.LoadPermissionsStrict(dir)
+	if err != nil {
 		return fmt.Errorf("the node permissions file must be readable before it can be changed: %w", err)
+	}
+	next := *p
+	next.CobrowsePublicOnly = cur.CobrowsePublicOnly
+	return config.SavePermissions(dir, &next)
+}
+
+// toggleNodePermission sets one Built-in Services toggle against the file as
+// it is now: a strict load, one field, a save. Nothing else is written back.
+func toggleNodePermission(dir, name string, enabled bool) error {
+	p, err := config.LoadPermissionsStrict(dir)
+	if err != nil {
+		return fmt.Errorf("the node permissions file must be readable before it can be changed: %w", err)
+	}
+	switch name {
+	case "Console":
+		p.Console = enabled
+	case "Desktop":
+		p.Desktop = enabled
+	case "Files":
+		p.Files = enabled
+	case "Services":
+		p.Services = enabled
+	case "SSH":
+		p.SSH = enabled
+	case "Provision":
+		p.Provision = enabled
+	case "Shell":
+		p.Shell = enabled
+	default:
+		return fmt.Errorf("unknown permission %q", name)
 	}
 	return config.SavePermissions(dir, p)
 }

@@ -266,8 +266,9 @@ type CobrowseSessionManager struct {
 	// useResolver is set on the process-wide manager only, so its registry
 	// follows registryDirResolver; other managers keep a sibling of baseDir.
 	useResolver bool
-	// egressSweepOnce starts the unguarded-session sweep (startEgressSweep).
-	egressSweepOnce sync.Once
+	// egressSweepStop ends the running unguarded-session sweep
+	// (startEgressSweep); nil when none runs. Guarded by mu.
+	egressSweepStop chan struct{}
 }
 
 // SessionProfile is an encrypted, PIN-unlocked persistent profile bound to one
@@ -855,6 +856,7 @@ func (m *CobrowseSessionManager) Stop(id string) error {
 // display orphans across a worker restart. Best-effort: a failure on one session does
 // not skip the rest; the last error is returned.
 func (m *CobrowseSessionManager) StopAll() error {
+	m.stopEgressSweep()
 	m.mu.Lock()
 	all := m.sessions
 	m.sessions = make(map[string]*cobrowseSession)

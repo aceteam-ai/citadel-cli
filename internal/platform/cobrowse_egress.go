@@ -43,6 +43,7 @@ func (m *CobrowseSessionManager) SetEgressRequired(f func() bool) {
 	m.mu.Lock()
 	m.egressRequired = f
 	m.mu.Unlock()
+	m.startEgressSweep()
 }
 
 // egressRequiredNow reports whether the next session must run behind the
@@ -256,16 +257,33 @@ func (m *CobrowseSessionManager) stopIfUnguarded(s *cobrowseSession) error {
 	if s.egressGuarded() || !m.egressSwitchable() || !m.egressRequiredNow() {
 		return nil
 	}
-	m.stopUnguarded(s.id)
-	return &SessionEndedError{ID: s.id, Reason: EndedReasonPublicOnly, Detail: publicOnlyEndedDetail}
+	if m.stopUnguarded(s.id) {
+		return &SessionEndedError{ID: s.id, Reason: EndedReasonPublicOnly, Detail: publicOnlyEndedDetail}
+	}
+	// Someone else ended it first; report their reason, not ours.
+	if e, ok := m.EndedSession(s.id); ok {
+		return &SessionEndedError{ID: s.id, Reason: e.Reason, Detail: e.Detail}
+	}
+	return fmt.Errorf("no such browser session: %q", s.id)
 }
 
 const publicOnlyEndedDetail = "this node switched to public-only browsing; start a new session"
 
-func (m *CobrowseSessionManager) stopUnguarded(id string) {
+// stopUnguarded ends id with the public-only reason. It reports false, and
+// records nothing, when the session was already gone: whatever stopped it
+// keeps its own end reason.
+func (m *CobrowseSessionManager) stopUnguarded(id string) bool {
+	m.mu.Lock()
+	s, ok := m.sessions[id]
+	delete(m.sessions, id)
+	m.mu.Unlock()
+	if !ok {
+		return false
+	}
 	log.Printf("[cobrowse] stopping session %s: it has no egress guard and this node is now public-only", id)
-	_ = m.Stop(id)
+	_ = s.teardown()
 	m.recordEnded(id, EndedReasonPublicOnly, publicOnlyEndedDetail)
+	return true
 }
 
 // sweepUnguarded stops every unguarded session when public-only is on.
@@ -289,22 +307,45 @@ func (m *CobrowseSessionManager) sweepUnguarded() {
 	}
 }
 
-// startEgressSweep runs sweepUnguarded periodically, once per manager, after
-// its first unguarded launch, so an idle page does not keep its network
-// access until the next action.
+// startEgressSweep runs sweepUnguarded periodically so an idle page does not
+// keep its network access until the next action. It starts at most once per
+// manager at a time: after an unguarded launch, after a re-adoption (adopted
+// sessions are never guarded) and when SetEgressRequired installs a source.
+// stopEgressSweep (StopAll, ShutdownSessions) ends it.
 func (m *CobrowseSessionManager) startEgressSweep() {
 	if !m.egressSwitchable() {
 		return
 	}
-	m.egressSweepOnce.Do(func() {
-		go func() {
-			t := time.NewTicker(egressSweepInterval)
-			defer t.Stop()
-			for range t.C {
+	interval := egressSweepInterval
+	m.mu.Lock()
+	if m.egressSweepStop != nil {
+		m.mu.Unlock()
+		return
+	}
+	stop := make(chan struct{})
+	m.egressSweepStop = stop
+	m.mu.Unlock()
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
 				m.sweepUnguarded()
 			}
-		}()
-	})
+		}
+	}()
+}
+
+func (m *CobrowseSessionManager) stopEgressSweep() {
+	m.mu.Lock()
+	if m.egressSweepStop != nil {
+		close(m.egressSweepStop)
+		m.egressSweepStop = nil
+	}
+	m.mu.Unlock()
 }
 
 func (s *cobrowseSession) egressGuarded() bool {

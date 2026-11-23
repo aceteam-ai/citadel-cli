@@ -716,3 +716,105 @@ type atomicBool struct {
 
 func (b *atomicBool) get() bool  { b.mu.Lock(); defer b.mu.Unlock(); return b.v }
 func (b *atomicBool) set(v bool) { b.mu.Lock(); b.v = v; b.mu.Unlock() }
+
+// TestAdoptedUnguardedSessionIsSwept: a session re-adopted after a restart
+// (never guarded) starts the sweep, so it ends once public-only turns on,
+// with no launch and no action in the new process.
+func TestAdoptedUnguardedSessionIsSwept(t *testing.T) {
+	newAdoptEnv(t)
+	prevInterval := egressSweepInterval
+	egressSweepInterval = 20 * time.Millisecond
+	t.Cleanup(func() { egressSweepInterval = prevInterval })
+	var on atomicBool
+	setNodeEgress(t, on.get)
+	base := trustedBaseDir(t)
+	id := startOne(t, base)
+
+	m2 := adoptMgr(base)
+	defer m2.StopAll()
+	m2.Recover()
+	m2.mu.Lock()
+	_, adopted := m2.sessions[id]
+	running := m2.egressSweepStop != nil
+	m2.mu.Unlock()
+	if !adopted || !running {
+		t.Fatalf("adopted=%v sweep running=%v", adopted, running)
+	}
+	on.set(true)
+	// Wait for the recorded end, which is written after the teardown, so no
+	// sweep work is still running when the test's fakes are restored.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if e, ok := m2.EndedSession(id); ok {
+			if e.Reason != EndedReasonPublicOnly {
+				t.Fatalf("ended = %+v", e)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the adopted unguarded session was never swept")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	m2.mu.Lock()
+	_, still := m2.sessions[id]
+	m2.mu.Unlock()
+	if still {
+		t.Fatal("swept session still tracked")
+	}
+}
+
+// TestStopUnguardedKeepsEarlierEndReason: a session that something else
+// already ended keeps that reason; the public-only stop records nothing.
+func TestStopUnguardedKeepsEarlierEndReason(t *testing.T) {
+	newEgressEnv(t)
+	m := adoptMgr(trustedBaseDir(t))
+	defer m.StopAll()
+	on := false
+	m.SetEgressRequired(func() bool { return on })
+	st, err := m.StartSession("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	s := m.sessions[st.ID]
+	m.mu.Unlock()
+	_ = m.Stop(st.ID)
+	m.recordEnded(st.ID, EndedReasonNodeUpdate, "to v9")
+
+	if m.stopUnguarded(st.ID) {
+		t.Fatal("stopUnguarded claimed a session that was already gone")
+	}
+	on = true
+	err = m.stopIfUnguarded(s)
+	var se *SessionEndedError
+	if !errors.As(err, &se) || se.Reason != EndedReasonNodeUpdate {
+		t.Fatalf("want the earlier node_update reason, got %v", err)
+	}
+	if e, ok := m.EndedSession(st.ID); !ok || e.Reason != EndedReasonNodeUpdate {
+		t.Fatalf("end reason overwritten: %+v %v", e, ok)
+	}
+}
+
+// TestEgressSweepStopsWithManager: StopAll ends the sweep goroutine, and a
+// later unguarded launch can start it again.
+func TestEgressSweepStopsWithManager(t *testing.T) {
+	newEgressEnv(t)
+	m := adoptMgr(trustedBaseDir(t))
+	m.SetEgressRequired(func() bool { return false })
+	running := func() bool { m.mu.Lock(); defer m.mu.Unlock(); return m.egressSweepStop != nil }
+	if !running() {
+		t.Fatal("SetEgressRequired did not start the sweep")
+	}
+	_ = m.StopAll()
+	if running() {
+		t.Fatal("StopAll left the sweep running")
+	}
+	if _, err := m.StartSession(""); err != nil {
+		t.Fatal(err)
+	}
+	if !running() {
+		t.Fatal("an unguarded launch did not restart the sweep")
+	}
+	_ = m.StopAll()
+}

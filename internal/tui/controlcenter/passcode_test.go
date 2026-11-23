@@ -2,6 +2,7 @@ package controlcenter
 
 import (
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -241,5 +242,27 @@ func TestSaveBuiltinPermissionsRefreshesActionsSummary(t *testing.T) {
 	}
 	if got := cc.actionsView.GetCell(0, 2).Text; !strings.Contains(got, "3/5 enabled") {
 		t.Fatalf("refreshed summary = %q, want 3/5 enabled", got)
+	}
+}
+
+// TestSaveBuiltinPermissionsPrefersSaveToggle: with SaveToggle wired, a
+// toggle is saved by name and the modal's whole struct is not written.
+func TestSaveBuiltinPermissionsPrefersSaveToggle(t *testing.T) {
+	var toggled []string
+	saved := false
+	cc := New(Config{Permissions: PermissionsCallbacks{
+		Load: func() *config.Permissions { return config.DefaultPermissions() },
+		Save: func(p *config.Permissions) error { saved = true; return nil },
+		SaveToggle: func(name string, enabled bool) error {
+			toggled = append(toggled, name+"="+strconv.FormatBool(enabled))
+			return nil
+		},
+	}})
+	cc.actionsView = tview.NewTable()
+	if err := cc.saveBuiltinPermissions(config.DefaultPermissions(), "Files", true); err != nil {
+		t.Fatal(err)
+	}
+	if saved || len(toggled) != 1 || toggled[0] != "Files=true" {
+		t.Fatalf("saved=%v toggled=%v", saved, toggled)
 	}
 }

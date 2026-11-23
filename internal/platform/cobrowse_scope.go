@@ -316,6 +316,7 @@ func startManagedCobrowse(m *CobrowseSessionManager) {
 // service_restart in case it does not survive) for the next worker to re-adopt;
 // everything else is stopped as StopAll does.
 func (m *CobrowseSessionManager) ShutdownSessions() error {
+	m.stopEgressSweep()
 	if !detachedWorker.Load() || !m.useResolver || !adoptionSupported {
 		return m.StopAll()
 	}

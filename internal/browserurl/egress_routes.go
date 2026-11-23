@@ -31,12 +31,30 @@ func combineOwnNet(ifaces InterfacePrefixes, routes OnLinkRoutes) ([]netip.Prefi
 	if err != nil {
 		return nil, err
 	}
+	out = append(out, ipv6Slash64s(out)...)
 	if routes != nil {
 		if r, rerr := routes(); rerr == nil {
 			out = append(out, r...)
 		}
 	}
 	return out, nil
+}
+
+// ipv6Slash64s returns the /64 around each global IPv6 interface address
+// reported with a longer prefix. A stateful DHCPv6 address is often /128 and,
+// when the router advertises its prefix as off-link (L=0), no connected route
+// names the LAN either. A /64 is the standard IPv6 subnet, so it is treated as
+// on-link (the usual ownNet floor still applies).
+func ipv6Slash64s(list []netip.Prefix) []netip.Prefix {
+	var out []netip.Prefix
+	for _, p := range list {
+		a := p.Addr()
+		if !a.Is6() || a.Is4In6() || !a.IsGlobalUnicast() || p.Bits() <= 64 {
+			continue
+		}
+		out = append(out, netip.PrefixFrom(a.WithZone(""), 64).Masked())
+	}
+	return out
 }
 
 // Linux route flags (include/uapi/linux/route.h, ipv6_route.h).

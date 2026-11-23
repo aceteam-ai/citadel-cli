@@ -1078,6 +1078,7 @@ func (m *CobrowseSessionManager) recoverContainer(rec sessionRecord, dir, regDir
 		s.startChooserWatch(proc.debugPort)
 	}
 	log.Printf("[cobrowse] re-adopted container session %s (generation %d)", rec.ID, s.generation)
+	m.startEgressSweep()
 	return nil
 }
 

@@ -682,6 +682,9 @@ func (m *CobrowseSessionManager) recoverSessions() {
 			s.startChooserWatch(s.proc.debugPort)
 		}
 		log.Printf("[cobrowse] re-adopted session %s (generation %d)", rec.ID, s.generation)
+		// Adopted sessions never have a guard; sweep them if public-only
+		// turns on.
+		m.startEgressSweep()
 	}
 	if len(expired) > expiredMaxRecords {
 		sort.Slice(expired, func(i, j int) bool { return expired[i].EndedAt > expired[j].EndedAt })

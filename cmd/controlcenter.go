@@ -274,6 +274,9 @@ func runControlCenter() {
 			Save: func(p *config.Permissions) error {
 				return saveNodePermissions(p)
 			},
+			SaveToggle: func(name string, enabled bool) error {
+				return toggleNodePermission(nodePermissionsDir(), name, enabled)
+			},
 		},
 		OnConnect:       ccOnNetworkConnect,
 		ConnectToPeerFn: ccConnectToPeer,

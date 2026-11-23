@@ -154,10 +154,11 @@ func TestOnLinkRoutesCoverHostMaskAddress(t *testing.T) {
 		t.Error("an off-link address was refused")
 	}
 
-	// A failed route read falls back to the interface masks.
+	// A failed route read falls back to the interface masks, plus the /64
+	// around the global IPv6 address.
 	broken := func() ([]netip.Prefix, error) { return nil, errors.New("no route table") }
 	got, err := combineOwnNet(ifaces, broken)
-	if err != nil || !reflect.DeepEqual(got, prefixes("2001:db8:a:1::5/128", "198.51.100.7/32")) {
+	if err != nil || !reflect.DeepEqual(got, prefixes("2001:db8:a:1::5/128", "198.51.100.7/32", "2001:db8:a:1::/64")) {
 		t.Fatalf("fallback: %v %v", got, err)
 	}
 	// An interface read failure is still an error (the guard then fails closed).
@@ -183,4 +184,30 @@ func TestOSOnLinkRoutesReadable(t *testing.T) {
 		t.Skipf("route table not readable here: %v", err)
 	}
 	t.Logf("%d connected route(s)", len(r))
+}
+
+// TestIPv6Slash64AroundHostAddress: a /128 global IPv6 address with no
+// connected route (DHCPv6 with an off-link prefix) still covers its /64.
+// Link-local, IPv4-mapped and already-short prefixes add nothing.
+func TestIPv6Slash64AroundHostAddress(t *testing.T) {
+	ifaces := fakeIfaces("2001:db8:a:1::5/128", "2001:db8:b::7/48", "fe80::9/128", "::ffff:198.51.100.7/128", "198.51.100.7/32")
+	none := func() ([]netip.Prefix, error) { return nil, nil }
+	o := newOwnNet(func() ([]netip.Prefix, error) { return combineOwnNet(ifaces, none) })
+	for _, tc := range []struct {
+		addr string
+		want bool
+	}{
+		{"2001:db8:a:1::1", true},      // the router in the same /64
+		{"2001:db8:a:1:ffff::1", true}, // another host in it
+		{"2001:db8:a:2::1", false},     // the next /64
+		{"2001:db8:b:ffff::1", true},   // the /48 interface prefix as before
+		{"198.51.100.1", false},        // no IPv4 widening
+	} {
+		if got := o.contains(netip.MustParseAddr(tc.addr)); got != tc.want {
+			t.Errorf("contains(%s) = %v, want %v", tc.addr, got, tc.want)
+		}
+	}
+	if got := ipv6Slash64s(prefixes("fe80::9/128", "2001:db8:b::7/48")); len(got) != 0 {
+		t.Fatalf("unexpected /64s: %v", got)
+	}
 }
