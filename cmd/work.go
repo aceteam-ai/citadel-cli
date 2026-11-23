@@ -1793,6 +1793,9 @@ func runWork(cmd *cobra.Command, args []string) {
 			Version:     Version,
 			Agent:       agentProviders,
 			SelfMeshIPs: selfMeshIPs,
+			// The control listener's SSH-key deployment honors the operator's
+			// live SSH permission, read strictly per request.
+			SSHDeployAllowed: nodeSSHDeployAllowed,
 		}
 
 		// Publish the gateway's self-signed leaf cert at GET /gateway-cert.pem so
@@ -1936,9 +1939,9 @@ func runWork(cmd *cobra.Command, args []string) {
 
 		// Register node-local RAG API routes (#589): /rag/index, /rag/query,
 		// /rag/status. Served only on the mTLS control listener behind a
-		// coordinator cert (citadel-cli#1318); the plaintext listener serves
-		// fail-closed stubs.
-		registerControlOnlyAPI(statusServer, rag.NewServer(rag.New(wsDir, "")), nil)
+		// coordinator cert (citadel-cli#1318) and the operator's live Files
+		// permission; the plaintext listener serves fail-closed stubs.
+		registerControlOnlyAPI(statusServer, rag.NewServer(rag.New(wsDir, "")), requireFilesPermission)
 
 		// Local semantic-search file watcher (citadel-cli#617-619): if the
 		// operator has authorized any search roots, watch them and keep the

@@ -3,6 +3,7 @@ package cmd
 import (
 	"net/http"
 
+	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 )
 
@@ -41,6 +42,37 @@ func registerControlOnlyAPI(sink routeRegistrarSink, api controlOnlyAPI, extraGa
 // listener. It is read per request, so toggling it needs no restart.
 func requireProvisionPermission(next http.HandlerFunc) http.HandlerFunc {
 	return permissionGate("provisioning", func() bool { return loadNodePermissions().Provision })(next)
+}
+
+// requireFilesPermission gates a control-listener API that reads node content
+// (the /rag routes) on the operator's live Files permission, read strictly per
+// request so an unreadable or damaged permissions file refuses.
+func requireFilesPermission(next http.HandlerFunc) http.HandlerFunc {
+	return permissionGate("files", func() bool { return filesEnabledIn(nodePermissionsDir()) })(next)
+}
+
+// filesEnabledIn is requireFilesPermission's pure core. Any load error refuses.
+func filesEnabledIn(permissionsDir string) bool {
+	p, err := config.LoadPermissionsStrict(permissionsDir)
+	return err == nil && p.Files
+}
+
+// nodeSSHDeployAllowed backs status.ServerConfig.SSHDeployAllowed: the
+// control listener's SSH-key deployment honors the operator's live SSH
+// permission.
+func nodeSSHDeployAllowed() bool {
+	return sshDeployAllowedIn(nodePermissionsDir())
+}
+
+// sshDeployAllowedIn is nodeSSHDeployAllowed's pure core. A missing file keeps
+// the default (SSH on); any other read error or a file that does not parse
+// refuses.
+//
+// TODO(#1882): also refuse while the setup posture is active
+// (config.SetupPostureActive) once that lands on main.
+func sshDeployAllowedIn(permissionsDir string) bool {
+	p, err := config.LoadPermissionsStrict(permissionsDir)
+	return err == nil && p.SSH
 }
 
 // permissionGate refuses with 403 while enabled() reports false. The pure core

@@ -2258,6 +2258,11 @@ the intended fail-closed direction. (Constructing it also needs the verifier
 and the control server cert.) Check callers before moving a route, in aceteam
 as well as in this repo's own CLI commands. Wire both sides with
 `cmd.registerControlOnlyAPI`, whose test pins which listener each side lands on.
+A coordinator cert does not override the operator's permission toggles: a
+control route for a toggled surface also takes that permission, read strictly
+per request, as its extra gate (`requireFilesPermission` for `/rag`), and
+`/ssh/authorized-keys` takes it through `status.ServerConfig.SSHDeployAllowed`,
+where nil refuses.
 
 `status.Server.ControlTLS` reports the public certificate held by the active
 control listener, using the same immutable DER snapshot as its TLS config.
