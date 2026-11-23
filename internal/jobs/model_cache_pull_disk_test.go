@@ -30,9 +30,9 @@ func TestHFDownloadArgsFilteredThreadsPatterns(t *testing.T) {
 	)
 	want := []string{
 		"download", "Lightricks/LTX-Video",
-		"--include", "transformer/*",
-		"--include", "vae/*",
-		"--exclude", "*.bin",
+		"--include=transformer/*",
+		"--include=vae/*",
+		"--exclude=*.bin",
 	}
 	if !equalStrs(got, want) {
 		t.Errorf("hfDownloadArgsFiltered(patterns) = %v, want %v", got, want)
@@ -44,7 +44,7 @@ func TestBuildHuggingFaceDownloadCommandFiltered(t *testing.T) {
 		[]string{"transformer/*", "vae/*", "text_encoder/*", "tokenizer/*", "scheduler/*"}, nil)
 	args := cmd.Args
 	joined := strings.Join(args, " ")
-	for _, want := range []string{"--include transformer/*", "--include vae/*"} {
+	for _, want := range []string{"--include=transformer/*", "--include=vae/*"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("argv %v missing %q", args, want)
 		}

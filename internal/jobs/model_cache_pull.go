@@ -29,6 +29,9 @@ const ollamaPullTimeout = 2 * time.Hour
 // Shared by MODEL_CACHE_PULL (pullOllama) and the SERVICE_START native-ollama
 // path (ensureOllamaModel, #543) so both pull with the same bounds.
 func runOllamaPull(modelName string) ([]byte, error) {
+	if !validModelArgument(modelName) {
+		return nil, ErrUnsafeModelArgument
+	}
 	cctx, cancel := context.WithTimeout(context.Background(), ollamaPullTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, "ollama", "pull", modelName)
@@ -45,6 +48,9 @@ func runOllamaPull(modelName string) ([]byte, error) {
 // path is; never invents or starts a container just to pull into it (the
 // caller confirms the container is running first).
 func runOllamaPullViaDocker(containerName, modelName string) ([]byte, error) {
+	if !validModelArgument(modelName) {
+		return nil, ErrUnsafeModelArgument
+	}
 	cctx, cancel := context.WithTimeout(context.Background(), ollamaPullTimeout)
 	defer cancel()
 	cmd := catalog.SelectContainerRuntime().EngineCommandContext(cctx, "exec", containerName, "ollama", "pull", modelName)
@@ -161,8 +167,16 @@ func (h *ModelCachePullHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte,
 
 	// HuggingFace-backed pulls use model_name as a repo id and derive cache
 	// paths from it, so it must be a plain "org/name" (or "name").
-	if (engine == "vllm" || engine == "llamacpp") && !validHFRepoID(modelName) {
-		return nil, ErrUnsafeModelPath
+	if engine == "vllm" || engine == "llamacpp" {
+		if !validHFRepoID(modelName) {
+			return nil, ErrUnsafeModelPath
+		}
+		if !validModelCachePullPatterns(job.Payload) {
+			return nil, ErrUnsafeModelArgument
+		}
+	}
+	if engine == "ollama" && !validModelArgument(modelName) {
+		return nil, ErrUnsafeModelArgument
 	}
 
 	switch engine {
@@ -646,10 +660,10 @@ func hfDownloadArgsFiltered(repo, file, localDir string, allowPatterns, ignorePa
 		args = append(args, "--local-dir", localDir)
 	}
 	for _, p := range allowPatterns {
-		args = append(args, "--include", p)
+		args = append(args, "--include="+p)
 	}
 	for _, p := range ignorePatterns {
-		args = append(args, "--exclude", p)
+		args = append(args, "--exclude="+p)
 	}
 	return args
 }

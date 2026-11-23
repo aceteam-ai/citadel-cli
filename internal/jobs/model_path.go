@@ -145,3 +145,36 @@ func resolveModelCacheDest(root, subdir, name string) (destDir, destPath string,
 		return "", "", false, ErrUnsafeModelPath
 	}
 }
+
+// ErrUnsafeModelArgument is returned when a model job's payload value would
+// reach a model tool's command line in a form it could read as an option
+// (a leading '-') or contains control characters. The message is fixed and
+// never echoes the payload value.
+var ErrUnsafeModelArgument = errors.New("refusing model job: model names and patterns must not start with '-' or contain control characters")
+
+// validModelArgument reports whether s may be passed as a positional or
+// option value to a model tool (ollama, the HuggingFace CLI).
+func validModelArgument(s string) bool {
+	if s == "" || s[0] == '-' {
+		return false
+	}
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// validModelCachePullPatterns reports whether every allow/ignore pattern in a
+// MODEL_CACHE_PULL payload is a safe CLI value. A bad pattern refuses the
+// whole job: dropping it would silently widen or unfilter the pull.
+func validModelCachePullPatterns(payload map[string]string) bool {
+	allow, ignore := parseModelCachePullPatterns(payload)
+	for _, p := range append(allow, ignore...) {
+		if !validModelArgument(p) {
+			return false
+		}
+	}
+	return true
+}

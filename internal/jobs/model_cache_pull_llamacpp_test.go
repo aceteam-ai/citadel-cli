@@ -67,7 +67,7 @@ func TestBuildLlamaCppGGUFDownloadCommandThreadsPatterns(t *testing.T) {
 	cmd := BuildLlamaCppGGUFDownloadCommand("hf", "TheBloke/Llama-2-7B-GGUF", "/tmp/llamacpp",
 		[]string{"*Q4_K_M.gguf"}, []string{"*.md"})
 	joined := strings.Join(cmd.Args, " ")
-	for _, want := range []string{"--include *Q4_K_M.gguf", "--exclude *.md"} {
+	for _, want := range []string{"--include=*Q4_K_M.gguf", "--exclude=*.md"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("argv %v missing %q", cmd.Args, want)
 		}
