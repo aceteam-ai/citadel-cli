@@ -61,6 +61,9 @@ func (h *ModelCacheEvictHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 	case "ollama":
 		return h.evictOllama(ctx, job.ID, modelName)
 	case "vllm":
+		if !validHFRepoID(modelName) {
+			return nil, ErrUnsafeModelPath
+		}
 		return h.evictHuggingFace(ctx, job.ID, modelName, engine)
 	case "llamacpp":
 		// Routed separately from vllm (citadel #906 / #682 P1): llamacpp's

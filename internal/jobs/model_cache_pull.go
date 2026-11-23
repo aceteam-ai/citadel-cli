@@ -159,6 +159,12 @@ func (h *ModelCachePullHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte,
 
 	engine = normalizeEngineToken(strings.ToLower(engine))
 
+	// HuggingFace-backed pulls use model_name as a repo id and derive cache
+	// paths from it, so it must be a plain "org/name" (or "name").
+	if (engine == "vllm" || engine == "llamacpp") && !validHFRepoID(modelName) {
+		return nil, ErrUnsafeModelPath
+	}
+
 	switch engine {
 	case "ollama":
 		return h.pullOllama(ctx, job.ID, modelName)
@@ -1201,7 +1207,17 @@ func hfCacheModelSize(modelName string) int64 {
 func hfCacheDir(modelName string) string {
 	// HuggingFace cache layout: <hfCacheBaseDir()>/models--{org}--{model}/
 	sanitized := "models--" + strings.ReplaceAll(modelName, "/", "--")
-	dir := filepath.Join(hfCacheBaseDir(), sanitized)
+	// The result must be ONE plain directory directly under the hub cache on
+	// every OS (MODEL_CACHE_EVICT and cache GC remove it). Anything else is
+	// treated as not cached.
+	if !validModelPathComponent(sanitized) {
+		return ""
+	}
+	base := filepath.Clean(hfCacheBaseDir())
+	dir := filepath.Join(base, sanitized)
+	if filepath.Dir(dir) != base {
+		return ""
+	}
 	if _, err := os.Stat(dir); err != nil {
 		return ""
 	}
