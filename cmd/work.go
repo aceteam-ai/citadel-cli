@@ -1793,6 +1793,9 @@ func runWork(cmd *cobra.Command, args []string) {
 			Version:     Version,
 			Agent:       agentProviders,
 			SelfMeshIPs: selfMeshIPs,
+			// The control listener's SSH-key deployment honors the operator's
+			// live SSH permission, read strictly per request.
+			SSHDeployAllowed: nodeSSHDeployAllowed,
 		}
 
 		// Publish the gateway's self-signed leaf cert at GET /gateway-cert.pem so
@@ -1925,7 +1928,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		// control listener behind a coordinator cert (citadel-cli#1318, the
 		// #5028 rule); the plaintext listener serves fail-closed stubs.
 		if provisionHandler := initProvisionHandler(); provisionHandler != nil {
-			registerControlOnlyAPI(statusServer, provisionHandler, requireProvisionPermission)
+			registerProvisionControlAPI(statusServer, provisionHandler, nodePermissionsDir)
 		}
 
 		// Register workflow API routes (#259). The whole API lives only on the
@@ -1936,9 +1939,9 @@ func runWork(cmd *cobra.Command, args []string) {
 
 		// Register node-local RAG API routes (#589): /rag/index, /rag/query,
 		// /rag/status. Served only on the mTLS control listener behind a
-		// coordinator cert (citadel-cli#1318); the plaintext listener serves
-		// fail-closed stubs.
-		registerControlOnlyAPI(statusServer, rag.NewServer(rag.New(wsDir, "")), nil)
+		// coordinator cert (citadel-cli#1318) and the operator's live Files
+		// permission; the plaintext listener serves fail-closed stubs.
+		registerRAGControlAPI(statusServer, rag.NewServer(rag.New(wsDir, "")), nodePermissionsDir)
 
 		// Local semantic-search file watcher (citadel-cli#617-619): if the
 		// operator has authorized any search roots, watch them and keep the
@@ -2030,9 +2033,11 @@ func runWork(cmd *cobra.Command, args []string) {
 			fmt.Printf("   - SSH key sync: enabled (every %dm)\n", workSSHSyncMins)
 
 			// Initial sync
-			if err := nexus.SyncAuthorizedKeys(sshConfig); err != nil {
+			// Each sync re-reads the operator's SSH permission and is skipped
+			// while it is off or the permissions file is unreadable.
+			if ran, err := syncAuthorizedKeysIfAllowed(nodePermissionsDir(), sshConfig, nexus.SyncAuthorizedKeys); err != nil {
 				fmt.Fprintf(os.Stderr, "   - ⚠️ Initial SSH sync failed: %v\n", err)
-			} else {
+			} else if ran {
 				fmt.Println("   - ✅ SSH keys synchronized")
 			}
 
@@ -2045,7 +2050,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					if err := nexus.SyncAuthorizedKeys(sshConfig); err != nil {
+					if _, err := syncAuthorizedKeysIfAllowed(nodePermissionsDir(), sshConfig, nexus.SyncAuthorizedKeys); err != nil {
 						fmt.Fprintf(os.Stderr, "   - ⚠️ SSH sync failed: %v\n", err)
 					}
 				}

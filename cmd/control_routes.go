@@ -1,8 +1,12 @@
 package cmd
 
 import (
+	"fmt"
 	"net/http"
+	"os"
 
+	"github.com/aceteam-ai/citadel-cli/internal/config"
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 )
 
@@ -36,16 +40,62 @@ func registerControlOnlyAPI(sink routeRegistrarSink, api controlOnlyAPI, extraGa
 	})
 }
 
-// requireProvisionPermission keeps the operator's `provision` opt-out
-// (config.Permissions.Provision, default on) effective on the control
-// listener. It is read per request, so toggling it needs no restart.
-func requireProvisionPermission(next http.HandlerFunc) http.HandlerFunc {
-	return permissionGate("provisioning", func() bool { return loadNodePermissions().Provision })(next)
+// registerProvisionControlAPI wires the provisioning API onto the control
+// listener behind the operator's `provision` opt-out
+// (config.Permissions.Provision, default on), read strictly per request from
+// permissionsDir(), so toggling it needs no restart and a damaged file refuses.
+// runWork passes nodePermissionsDir; tests pass a temp dir.
+func registerProvisionControlAPI(sink routeRegistrarSink, api controlOnlyAPI, permissionsDir func() string) {
+	registerControlOnlyAPI(sink, api, permissionGate("provisioning", func() bool { return provisionEnabledIn(permissionsDir()) }))
 }
 
-// permissionGate refuses with 403 while enabled() reports false. The pure core
-// of requireProvisionPermission, so tests never read the live node's
-// permissions file.
+// registerRAGControlAPI wires the /rag API, which reads node content, onto the
+// control listener behind the operator's live Files permission, read strictly
+// per request from permissionsDir(). runWork passes nodePermissionsDir.
+func registerRAGControlAPI(sink routeRegistrarSink, api controlOnlyAPI, permissionsDir func() string) {
+	registerControlOnlyAPI(sink, api, permissionGate("files", func() bool { return filesEnabledIn(permissionsDir()) }))
+}
+
+// provisionEnabledIn reports the Provision permission. Any load error refuses.
+func provisionEnabledIn(permissionsDir string) bool {
+	p, err := config.LoadPermissionsStrict(permissionsDir)
+	return err == nil && p.Provision
+}
+
+// filesEnabledIn reports the Files permission. Any load error refuses.
+func filesEnabledIn(permissionsDir string) bool {
+	p, err := config.LoadPermissionsStrict(permissionsDir)
+	return err == nil && p.Files
+}
+
+// nodeSSHDeployAllowed backs status.ServerConfig.SSHDeployAllowed: the
+// control listener's SSH-key deployment honors the operator's live SSH
+// permission.
+func nodeSSHDeployAllowed() bool {
+	return sshDeployAllowedIn(nodePermissionsDir())
+}
+
+// sshDeployAllowedIn is nodeSSHDeployAllowed's pure core. A missing file keeps
+// the default (SSH on); any other read error or a file that does not parse
+// refuses. The setup posture refusal is added by #1882.
+func sshDeployAllowedIn(permissionsDir string) bool {
+	p, err := config.LoadPermissionsStrict(permissionsDir)
+	return err == nil && p.SSH
+}
+
+// syncAuthorizedKeysIfAllowed runs one authorized_keys sync only while the SSH
+// permission in permissionsDir allows it (sshDeployAllowedIn), read on every
+// call. Otherwise it logs a skip and returns ran=false without calling sync.
+// Both sync paths (`work --ssh-sync` and `citadel run`) go through it.
+func syncAuthorizedKeysIfAllowed(permissionsDir string, cfg nexus.SSHSyncConfig, sync func(nexus.SSHSyncConfig) error) (ran bool, err error) {
+	if !sshDeployAllowedIn(permissionsDir) {
+		fmt.Fprintln(os.Stderr, "   - SSH key sync skipped: SSH is disabled on this node, or its permissions file is unreadable")
+		return false, nil
+	}
+	return true, sync(cfg)
+}
+
+// permissionGate refuses with a fixed 403 while enabled() reports false.
 func permissionGate(surface string, enabled func() bool) func(http.HandlerFunc) http.HandlerFunc {
 	msg := `{"error":"the ` + surface + ` API is disabled on this node by its permission toggle"}`
 	return func(next http.HandlerFunc) http.HandlerFunc {

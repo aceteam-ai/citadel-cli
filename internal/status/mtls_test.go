@@ -209,7 +209,7 @@ func TestRequireCoordinatorFailClosed(t *testing.T) {
 func startControlTLSServer(t *testing.T, v *FabricCAVerifier, serverCert tls.Certificate) *httptest.Server {
 	t.Helper()
 	collector := NewCollector(CollectorConfig{NodeName: "test-node"})
-	srv := NewServer(ServerConfig{CAVerifier: v, ControlServerCert: &serverCert}, collector)
+	srv := NewServer(ServerConfig{CAVerifier: v, ControlServerCert: &serverCert, SSHDeployAllowed: func() bool { return true }}, collector)
 	ts := httptest.NewUnstartedServer(srv.buildControlMux())
 	ts.TLS = v.ServerTLSConfig(serverCert)
 	ts.StartTLS()
