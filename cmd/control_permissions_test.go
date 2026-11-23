@@ -46,6 +46,8 @@ func TestSSHDeployAllowedIn(t *testing.T) {
 		{"ssh off", writePerms(t, "ssh: false\n"), false},
 		{"damaged file refuses", writePerms(t, "ssh: [true\n"), false},
 		{"unreadable file refuses", unreadablePerms(t), false},
+		{"setup posture refuses even with ssh on", writePerms(t, "ssh: true\nsetup_posture: cobrowse_only\n"), false},
+		{"damaged setup posture file refuses", writePerms(t, "ssh: true\nsetup_posture: [cobrowse_only\n"), false},
 	}
 	for _, tc := range cases {
 		if got := sshDeployAllowedIn(tc.dir); got != tc.want {
@@ -85,6 +87,7 @@ func TestSyncAuthorizedKeysIfAllowed(t *testing.T) {
 		{"ssh off", writePerms(t, "ssh: false\n"), false},
 		{"damaged file skips", writePerms(t, "ssh: [true\n"), false},
 		{"unreadable file skips", unreadablePerms(t), false},
+		{"setup posture skips even with ssh on", writePerms(t, "ssh: true\nsetup_posture: cobrowse_only\n"), false},
 	}
 	for _, tc := range cases {
 		calls := 0

@@ -77,19 +77,21 @@ func nodeSSHDeployAllowed() bool {
 
 // sshDeployAllowedIn is nodeSSHDeployAllowed's pure core. A missing file keeps
 // the default (SSH on); any other read error or a file that does not parse
-// refuses. The setup posture refusal is added by #1882.
+// refuses. A PC connected from its setup page (the setup posture marker,
+// citadel-cli#1867 C5) refuses even when its SSH permission is on: no one
+// adds a login key to a co-browse-only PC.
 func sshDeployAllowedIn(permissionsDir string) bool {
 	p, err := config.LoadPermissionsStrict(permissionsDir)
-	return err == nil && p.SSH
+	return err == nil && p.SSH && p.SetupPosture == ""
 }
 
 // syncAuthorizedKeysIfAllowed runs one authorized_keys sync only while the SSH
-// permission in permissionsDir allows it (sshDeployAllowedIn), read on every
-// call. Otherwise it logs a skip and returns ran=false without calling sync.
+// permission in permissionsDir allows it and no setup posture is set
+// (sshDeployAllowedIn), read on every call. Otherwise it logs a skip and returns ran=false without calling sync.
 // Both sync paths (`work --ssh-sync` and `citadel run`) go through it.
 func syncAuthorizedKeysIfAllowed(permissionsDir string, cfg nexus.SSHSyncConfig, sync func(nexus.SSHSyncConfig) error) (ran bool, err error) {
 	if !sshDeployAllowedIn(permissionsDir) {
-		fmt.Fprintln(os.Stderr, "   - SSH key sync skipped: SSH is disabled on this node, or its permissions file is unreadable")
+		fmt.Fprintln(os.Stderr, "   - SSH key sync skipped: SSH is disabled on this node, this PC was connected from its setup page (co-browse only), or its permissions file is unreadable")
 		return false, nil
 	}
 	return true, sync(cfg)
