@@ -20,7 +20,8 @@ const maxSeatDirectoryDepth = 64
 // opens directories only, never a vendor credential or configuration file.
 // The owner/home must already come from the trusted local owner resolver.
 // This is not a native isolation proof, a cross-user privilege drop, or launch
-// admission. No production caller uses it yet.
+// admission. The local CLI reuses read-only checks for its registry path;
+// vendor-directory creation remains unwired.
 type LocalSeatDirectory struct {
 	mu       sync.Mutex
 	root     *os.Root

@@ -26,7 +26,8 @@ var (
 // resolver. It never resolves a vendor home, opens a vendor credential, repairs
 // permissions, or creates parent directories. The owning user and root remain
 // trusted; this is not a sandbox against that user modifying their own files.
-// No production path calls this store yet.
+// Only explicit local metadata commands use this store; no vendor process or
+// dispatched job is wired to it.
 type SaltStore struct {
 	mu   sync.Mutex
 	root *os.Root

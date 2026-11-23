@@ -31,6 +31,12 @@ So, when adding to this file:
 
 ## Project Overview
 
+`newHarnessSeatRoot` owns explicit local registry metadata commands; the owner
+resolver refuses privileged or mismatched callers. These commands do not probe
+or launch a harness. `isHarnessSeatCLI` scopes the startup exemption after run
+profile admission. See `internal/harnessseat/README.md` for the incomplete
+seat-registry boundary and focused tests.
+
 `status.collectCapacityMetrics` owns additive optional heartbeat placement
 signals and per-source unknown handling. `nativeCapacityProbes` owns the
 build-tagged OS readers; `TestCapacity*` exercises bounded procfs parsing and

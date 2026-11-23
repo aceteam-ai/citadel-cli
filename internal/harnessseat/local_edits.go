@@ -9,8 +9,8 @@ var ErrSeatNotFound = errors.New("seat_not_found")
 
 // LocalSeatDeclaration contains only human-declared metadata. Observed plan,
 // model, account and auth fields cannot be supplied through add. These helpers
-// are reserved for a future owner-bound local CLI, not a remote enable route or
-// launch admission. They have no production caller yet.
+// are not a remote enable route or launch admission. Only disable/remove are
+// exposed by the local CLI; add/enable remain unwired.
 type LocalSeatDeclaration struct {
 	ID          string   `json:"-"`
 	Harness     Harness  `json:"-"`
