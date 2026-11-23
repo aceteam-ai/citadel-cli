@@ -89,6 +89,18 @@
     <ol id="activity"></ol>
   </section>
 </main>
+<main class="setup">
+  <section class="card" id="node-perms" hidden>
+    <h2>What AceTeam agents may do on this PC</h2>
+    <p id="node-perms-posture" class="muted"></p>
+    <p><label><input type="checkbox" id="perm-files"> Allow agents to read and upload files in <code id="perm-workspace"></code></label>
+      <span class="muted">(the worker's default folder; a <code>--workspace</code> setting changes it)</span></p>
+    <p><label><input type="checkbox" id="perm-shell"> Allow agents to run commands</label>
+      <span class="muted">(asks again before turning on; also needs a passcode set with <code>citadel passcode set</code>)</span></p>
+    <p id="node-perms-message" role="status"></p>
+  </section>
+</main>
 <script src="/assets/app.js"></script>
+<script src="/assets/permissions.js"></script>
 </body>
 </html>

@@ -45,11 +45,22 @@ type setupFixture struct {
 	optsFn   func() enrollOptions
 	already  func(string) (string, string)
 	check    func(string) error
+
+	// C5 seams; see local_setup_posture_test.go. nodeDir is the fixture's
+	// node config dir; connected is what the toggles see.
+	nodeDir     string
+	meetingDir  string
+	connected   bool
+	quarantined int
+	disconnect  disconnectDeps
+	worker      setupWorkerDeps
 }
 
 func newSetupFixture(t *testing.T) *setupFixture {
 	t.Helper()
 	f := &setupFixture{t: t, home: t.TempDir(), exe: `C:\Users\demo\AppData\Local\Citadel\citadel.exe`}
+	f.nodeDir = filepath.Join(f.home, "node")
+	f.meetingDir = filepath.Join(f.home, "meeting")
 	env := harnessEnv{goos: "linux", home: f.home}
 	d := localSetupDeps{
 		stateDir: func() string { return filepath.Join(f.home, "state") },
@@ -98,13 +109,65 @@ func newSetupFixture(t *testing.T) *setupFixture {
 			}
 			return check(dir)
 		},
+		posture: func(dir string) error { return writeSetupPosture(dir, f.meetingDir) },
+		quarantine: func() {
+			f.mu.Lock()
+			f.quarantined++
+			f.mu.Unlock()
+		},
+		nodePerms: func(busy func() bool) *localviewer.NodePermissionHooks {
+			return newNodePermissionHooks(nodePermissionDeps{
+				dir: func() string { return f.nodeDir },
+				connected: func() bool {
+					f.mu.Lock()
+					defer f.mu.Unlock()
+					return f.connected
+				},
+				workspace: func() string { return filepath.Join(f.home, "citadel-node", "workspace") },
+				busy:      busy,
+				via:       "setup_page",
+			})
+		},
+		disconnect: func() localviewer.SetupActionResult {
+			f.mu.Lock()
+			d := f.disconnect
+			f.mu.Unlock()
+			return disconnectThisPC(d)
+		},
+		worker: func(offered func() bool) setupWorkerDeps {
+			f.mu.Lock()
+			w := f.worker
+			f.mu.Unlock()
+			w.offered = offered
+			return w
+		},
+	}
+	// Nothing reaches this machine: every C5 side effect is a refusing fake
+	// unless a test replaces it.
+	nothing := errors.New("fixture: not set up")
+	f.disconnect = disconnectDeps{
+		stopWorker:        func() (bool, error) { return false, nothing },
+		disableAutostart:  func() (bool, error) { return false, nothing },
+		logout:            func() (logoutOutcome, error) { return logoutOutcome{}, nothing },
+		removeCredentials: func() (bool, error) { return false, nothing },
+	}
+	f.worker = setupWorkerDeps{
+		goos: "windows",
+		registered: func() bool {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			return f.connected
+		},
+		postureHolds:    func() bool { return setupPostureHolds(f.nodeDir) },
+		releaseNetwork:  func() error { return nothing },
+		enableAutostart: func() error { return nothing },
+		start:           func(context.Context) error { return nothing },
 	}
 	// The default enrollment never touches the network: it reports a code
 	// and waits to be canceled.
 	f.enrollFn = waitingFakeEnroll
-	nodeDir := filepath.Join(f.home, "node")
 	f.optsFn = func() enrollOptions {
-		return enrollOptions{AuthServiceURL: "https://auth.example.test", ConfigDir: nodeDir}
+		return enrollOptions{AuthServiceURL: "https://auth.example.test", ConfigDir: f.nodeDir}
 	}
 	f.already = func(string) (string, string) { return "", "" }
 	f.srv, f.enroller = newLocalSetupServer(d)
@@ -199,6 +262,17 @@ func TestSetupRoutesAreGuarded(t *testing.T) {
 		{"enroll state without bearer", "GET", "/api/setup/enroll/state", "", with("X-Citadel-CSRF", ""), true},
 		{"enroll cancel with foreign origin", "POST", "/api/setup/enroll/cancel", `{"confirm":true}`, with("Origin", "http://attacker.test"), true},
 		{"enroll qr without cookie", "GET", "/api/setup/enroll/qr", "", f.good(), false},
+		// Posture, grant, worker and Disconnect (#1867 C5).
+		{"node permissions without bearer", "GET", "/api/node-permissions", "", with("X-Citadel-CSRF", ""), true},
+		{"grant without cookie", "POST", "/api/node-permissions", `{"confirm":true,"surface":"files","enabled":true}`, f.good(), false},
+		{"grant with foreign origin", "POST", "/api/node-permissions", `{"confirm":true,"surface":"files","enabled":true}`, with("Origin", "http://attacker.test"), true},
+		{"grant cross-site", "POST", "/api/node-permissions", `{"confirm":true,"surface":"shell","enabled":true,"confirm_shell":true}`, with("Sec-Fetch-Site", "cross-site"), true},
+		{"grant without bearer", "POST", "/api/node-permissions", `{"confirm":true,"surface":"files","enabled":true}`, with("X-Citadel-CSRF", ""), true},
+		{"worker start with foreign origin", "POST", "/api/setup/worker/start", `{"confirm":true}`, with("Origin", "http://attacker.test"), true},
+		{"worker start without bearer", "POST", "/api/setup/worker/start", `{"confirm":true}`, with("X-Citadel-CSRF", ""), true},
+		{"disconnect without cookie", "POST", "/api/setup/disconnect", `{"confirm":true}`, f.good(), false},
+		{"disconnect cross-site", "POST", "/api/setup/disconnect", `{"confirm":true}`, with("Sec-Fetch-Site", "cross-site"), true},
+		{"disconnect without origin", "POST", "/api/setup/disconnect", `{"confirm":true}`, with("Origin", ""), true},
 	}
 	for _, c := range cases {
 		req, _ := http.NewRequest(c.method, f.base+c.path, strings.NewReader(c.body))
@@ -329,6 +403,8 @@ func (f *setupFixture) state() (st struct {
 	SessionsNote string                     `json:"sessions_note"`
 	MaxSessions  int                        `json:"max_sessions"`
 	GenericEntry string                     `json:"generic_entry"`
+	// DisconnectAvailable shows Disconnect this PC (#1867 C5).
+	DisconnectAvailable bool `json:"disconnect_available"`
 }) {
 	f.t.Helper()
 	r := f.do("GET", "/api/setup/state", "", f.good(), true)

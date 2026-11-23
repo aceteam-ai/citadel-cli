@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
+	"github.com/aceteam-ai/citadel-cli/internal/localviewer"
 	"github.com/spf13/cobra"
 )
 
@@ -27,6 +28,30 @@ var permissionShellCmd = &cobra.Command{
 	RunE:  runPermissionShell,
 }
 
+var permissionFilesCmd = &cobra.Command{
+	Use:   "files <enable|disable>",
+	Short: "Allow or refuse AceTeam agents reading and uploading files in the workspace",
+	Long: `Allow or refuse the Files permission: AceTeam agents may read files in this
+node's workspace folder and upload files through co-browse. Takes effect on the
+next job; no worker restart is needed. Remote configuration can also change it.`,
+	Args: cobra.ExactArgs(1),
+	RunE: runPermissionFiles,
+}
+
+var permissionSetupPostureCmd = &cobra.Command{
+	Use:   "setup-posture disable",
+	Short: "Remove the co-browse-only setting a setup-page connect wrote",
+	Long: `A PC connected to AceTeam from its setup page keeps a co-browse-only
+setting: remote configuration cannot turn anything on, and the worker runs only
+co-browse sessions (plus Files or Shell when you allow them here). The setting
+stays after Disconnect, so connecting again keeps the PC co-browse only.
+
+'disable' removes that setting. It turns nothing on by itself; the other
+permissions keep their current values.`,
+	Args: cobra.ExactArgs(1),
+	RunE: runPermissionSetupPosture,
+}
+
 var permissionCobrowsePublicOnlyCmd = &cobra.Command{
 	Use:   "cobrowse-public-only <enable|disable>",
 	Short: "Limit remote co-browse sessions to public internet addresses",
@@ -44,12 +69,16 @@ Leave it off on a server node that must browse an intranet.`,
 func init() {
 	rootCmd.AddCommand(permissionCmd)
 	permissionCmd.AddCommand(permissionShellCmd)
+	permissionCmd.AddCommand(permissionFilesCmd)
+	permissionCmd.AddCommand(permissionSetupPostureCmd)
 	permissionCmd.AddCommand(permissionCobrowsePublicOnlyCmd)
 }
 
 func runPermissionStatus(cmd *cobra.Command, args []string) error {
 	perms := loadNodePermissions()
 	fmt.Fprintf(cmd.OutOrStdout(), "Shell: %s\n", enabledLabel(perms.Shell))
+	fmt.Fprintf(cmd.OutOrStdout(), "Files: %s\n", enabledLabel(perms.Files))
+	fmt.Fprintf(cmd.OutOrStdout(), "Co-browse-only setup posture: %s\n", enabledLabel(config.SetupPostureActive(nodePermissionsDir())))
 	fmt.Fprintf(cmd.OutOrStdout(), "Passcode: %s\n", enabledLabel(perms.HasPasscode()))
 	fmt.Fprintf(cmd.OutOrStdout(), "Co-browse public-only: %s\n", enabledLabel(cobrowsePublicOnlyIn(nodePermissionsDir())))
 	return nil
@@ -98,14 +127,41 @@ func runPermissionShell(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// setShellPermission refuses a permissions file it cannot parse rather than
+// rewrite it from the defaults (setNodeSurface).
 func setShellPermission(configDir string, enabled bool) (*config.Permissions, error) {
-	perms, err := config.LoadPermissionsStrict(configDir)
+	return setNodeSurface(configDir, localviewer.SurfaceShell, enabled, "cli")
+}
+
+func runPermissionFiles(cmd *cobra.Command, args []string) error {
+	enabled, err := parseEnableDisable("files", args[0])
 	if err != nil {
-		return nil, fmt.Errorf("the node permissions file must be readable before this setting can change: %w", err)
+		return err
 	}
-	perms.Shell = enabled
-	if err := config.SavePermissions(configDir, perms); err != nil {
-		return nil, fmt.Errorf("save shell permission: %w", err)
+	if _, err := setNodeSurface(nodePermissionsDir(), localviewer.SurfaceFiles, enabled, "cli"); err != nil {
+		return err
 	}
-	return perms, nil
+	fmt.Fprintf(cmd.OutOrStdout(), "Files access %s. Takes effect on the next job; no worker restart is needed.\n", enabledLabel(enabled))
+	return nil
+}
+
+func runPermissionSetupPosture(cmd *cobra.Command, args []string) error {
+	if strings.ToLower(strings.TrimSpace(args[0])) != "disable" {
+		return fmt.Errorf("setup-posture only supports 'disable'; the setup page sets it when it connects this PC")
+	}
+	if err := clearSetupPosture(nodePermissionsDir()); err != nil {
+		return err
+	}
+	fmt.Fprintln(cmd.OutOrStdout(), "The co-browse-only setting is removed. Nothing else changed; remote configuration can now change this PC's permissions again.")
+	return nil
+}
+
+func parseEnableDisable(what, arg string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(arg)) {
+	case "enable", "enabled":
+		return true, nil
+	case "disable", "disabled":
+		return false, nil
+	}
+	return false, fmt.Errorf("%s permission must be 'enable' or 'disable'", what)
 }

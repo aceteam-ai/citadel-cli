@@ -11,7 +11,7 @@
   <strong>Citadel</strong> <span class="muted">setup for local mode on this computer</span>
 </header>
 <main class="setup">
-  <p class="muted">Everything here stays on this computer, and local mode needs no account. Citadel connects to AceTeam only when you click Connect in step 4.</p>
+  <p class="muted">Everything here stays on this computer, and local mode needs no account. Citadel connects to AceTeam only when you click Connect in step 4 (or Disconnect this PC).</p>
 
   <section class="card">
     <h2>1. Is this computer ready?</h2>
@@ -54,8 +54,36 @@
       <img id="enroll-qr" alt="QR code of the AceTeam approval page" width="180" height="180" hidden>
     </div>
     <p id="enroll-done" hidden></p>
+    <p id="enroll-posture" hidden></p>
+    <p id="posture-retry-row" hidden><button id="posture-retry" class="primary">Retry</button> <span id="posture-retry-message" role="status"></span></p>
+    <div id="worker" hidden>
+      <h3>Keep this PC available to AceTeam</h3>
+      <p class="muted">AceTeam agents can use this PC only while Citadel's worker runs. This starts it now in the background and again each time you sign in.</p>
+      <button id="worker-start" class="primary">Keep this PC available to AceTeam</button>
+      <ul id="worker-steps"></ul>
+      <p id="worker-message" role="status"></p>
+    </div>
+  </section>
+
+  <section class="card" id="node-perms" hidden>
+    <h2>What AceTeam agents may do on this PC</h2>
+    <p id="node-perms-posture" class="muted"></p>
+    <p><label><input type="checkbox" id="perm-files"> Allow agents to read and upload files in <code id="perm-workspace"></code></label>
+      <span class="muted">(the worker's default folder; a <code>--workspace</code> setting changes it)</span></p>
+    <p><label><input type="checkbox" id="perm-shell"> Allow agents to run commands</label>
+      <span class="muted">(asks again before turning on; also needs a passcode set with <code>citadel passcode set</code>)</span></p>
+    <p id="node-perms-message" role="status"></p>
+  </section>
+
+  <section class="card" id="disconnect" hidden>
+    <h2>Disconnect this PC</h2>
+    <p class="muted">Stops the background worker, stops Citadel from starting when you sign in, logs this PC out of AceTeam and removes the device key AceTeam gave it. Local mode keeps working, and your saved logins are not touched. The co-browse-only setting stays, so connecting again keeps this PC co-browse only; <code>citadel permission setup-posture disable</code> removes it.</p>
+    <button id="disconnect-start" class="danger">Disconnect this PC</button>
+    <ul id="disconnect-steps"></ul>
+    <p id="disconnect-message" role="status"></p>
   </section>
 </main>
 <script src="/assets/setup.js"></script>
+<script src="/assets/permissions.js"></script>
 </body>
 </html>

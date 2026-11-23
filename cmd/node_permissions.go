@@ -30,7 +30,10 @@ func saveNodePermissions(p *config.Permissions) error {
 // savePermissionsChecked also keeps, from the file as it is now, every field
 // the Control Center never edits, so a struct loaded earlier cannot turn them
 // back. CobrowsePublicOnly is such a field: only APPLY_DEVICE_CONFIG (on only)
-// and 'citadel permission cobrowse-public-only' change it.
+// and 'citadel permission cobrowse-public-only' change it. SetupPosture is
+// another: the setup page writes it and only 'citadel permission
+// setup-posture disable' clears it (citadel-cli#1867 C5), so a struct loaded
+// before a setup-page connect cannot drop it.
 func savePermissionsChecked(dir string, p *config.Permissions) error {
 	cur, err := config.LoadPermissionsStrict(dir)
 	if err != nil {
@@ -38,11 +41,13 @@ func savePermissionsChecked(dir string, p *config.Permissions) error {
 	}
 	next := *p
 	next.CobrowsePublicOnly = cur.CobrowsePublicOnly
+	next.SetupPosture = cur.SetupPosture
 	return config.SavePermissions(dir, &next)
 }
 
 // toggleNodePermission sets one Built-in Services toggle against the file as
-// it is now: a strict load, one field, a save. Nothing else is written back.
+// it is now: a strict load, one field, a save. Nothing else is written back,
+// so the co-browse public-only guard and the setup posture marker stay.
 func toggleNodePermission(dir, name string, enabled bool) error {
 	p, err := config.LoadPermissionsStrict(dir)
 	if err != nil {

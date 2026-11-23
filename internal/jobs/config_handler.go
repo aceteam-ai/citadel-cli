@@ -261,12 +261,21 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 		configDir = filepath.Join(homeDir, "citadel-node")
 	}
 
+	// A PC connected from its setup page keeps its own permissions
+	// (citadel-cli#1867 C5): drop every request that would turn something on
+	// before anything below applies it. A no-op on every other node.
+	posturePermissionsDir := h.PermissionsDir
+	if posturePermissionsDir == "" {
+		posturePermissionsDir = platform.ConfigDir()
+	}
+	postureRefusals := applySetupPostureFilter(posturePermissionsDir, &config)
+
 	// Update manifest with new configuration
 	if err := h.updateManifest(configDir, &config); err != nil {
 		return nil, fmt.Errorf("failed to update manifest: %w", err)
 	}
 
-	result := fmt.Sprintf("Manifest updated successfully for device '%s'", config.DeviceName)
+	result := fmt.Sprintf("Manifest updated successfully for device '%s'", config.DeviceName) + postureRefusals
 
 	// Apply the meeting-capability opt-out (aceteam#5098) when the platform pushed
 	// an explicit value. This writes the same persisted meeting.yaml the Control

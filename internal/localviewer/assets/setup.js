@@ -181,6 +181,10 @@
         "This PC is now " + node + org + "." :
         node + " is already connected" + org + ".";
     }
+    $("enroll-posture").hidden = !(st.stage === "connected" && st.posture);
+    $("enroll-posture").textContent = st.posture || "";
+    $("worker").hidden = !(st.stage === "connected" && st.worker_offer);
+    $("posture-retry-row").hidden = !(st.stage === "connected" && st.posture_retry);
     if (active && !enrollTimer) enrollTimer = setInterval(pollEnroll, 1500);
     if (!active && enrollTimer) { clearInterval(enrollTimer); enrollTimer = null; }
   }
@@ -198,9 +202,54 @@
     try { renderEnroll(await api("POST", "/api/setup/enroll/cancel", { confirm: true })); } catch (e) { /* next poll */ }
   };
 
+  const STEP = { ok: "Done", failed: "Failed", skipped: "Skipped", not_applicable: "Not needed" };
+
+  function renderSteps(listId, msgId, res) {
+    const ul = $(listId);
+    ul.replaceChildren();
+    for (const s of res.steps || []) {
+      li(ul, s.name + ": " + (STEP[s.status] || s.status) + ". " + s.message, s.status === "failed" ? "danger" : "");
+    }
+    $(msgId).textContent = res.message || "";
+    $(msgId).className = res.ok ? "" : "refused";
+  }
+
+  async function runAction(path, button, listId, msgId) {
+    button.disabled = true;
+    $(msgId).textContent = "Working...";
+    $(msgId).className = "";
+    try {
+      renderSteps(listId, msgId, await api("POST", path, { confirm: true }));
+    } catch (e) {
+      $(listId).replaceChildren();
+      $(msgId).textContent = e.message;
+      $(msgId).className = "refused";
+    }
+    button.disabled = false;
+  }
+
+  $("posture-retry").onclick = async () => {
+    $("posture-retry").disabled = true;
+    try {
+      const res = await api("POST", "/api/setup/posture/retry", { confirm: true });
+      $("posture-retry-message").textContent = res.message || "";
+    } catch (e) { $("posture-retry-message").textContent = e.message; }
+    $("posture-retry").disabled = false;
+    await pollEnroll();
+  };
+  $("worker-start").onclick = () => runAction("/api/setup/worker/start", $("worker-start"), "worker-steps", "worker-message");
+  $("disconnect-start").onclick = async () => {
+    const ok = window.confirm("Disconnect this PC from AceTeam?\n\nThe background worker stops, Citadel no longer starts when you sign in, " +
+      "this PC is logged out of AceTeam and its AceTeam device key is removed. Local mode keeps working, and your saved logins are not touched.");
+    if (!ok) return;
+    await runAction("/api/setup/disconnect", $("disconnect-start"), "disconnect-steps", "disconnect-message");
+    await pollEnroll();
+  };
+
   async function loadEnroll() {
     try {
       const st = await api("GET", "/api/setup/state");
+      $("disconnect").hidden = !st.disconnect_available;
       if (!st.enroll_available) return;
       $("enroll").hidden = false;
       await pollEnroll();

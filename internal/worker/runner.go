@@ -1122,6 +1122,11 @@ func (r *Runner) executeJob(ctx context.Context, job *Job, stream StreamWriter, 
 		return false
 	}
 	caps := capabilitiesOf(handler, job.Type)
+	// A setup-page PC refuses the job types that start software on it
+	// (citadel-cli#1867 C5); the refusal takes the terminal gate path below.
+	if err := setupPostureRefusal(job.Type); err != nil {
+		handler, caps = refusingHandler{err: err}, jobs.JobCapabilities{}
+	}
 
 	// Preflight RUNNER-signed dispatched work BEFORE executing: a keyless node
 	// fails in milliseconds rather than after a full inference (citadel-cli#1287,
