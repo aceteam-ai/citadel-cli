@@ -5350,6 +5350,37 @@ Docker Desktop on Windows requires WSL2:
 2. `nvidia-smi` in PATH
 3. WMI query: `wmic path win32_VideoController get name` (checks for "nvidia")
 
+### Per-user worker for a standard user (citadel-cli#1867 C3)
+
+A standard user cannot install the LocalSystem service, so `citadel work
+--background` keeps the worker running instead. `cmd.handleBackgroundModes`
+owns the three roles: the launcher (what the HKCU Run value starts) spawns
+`work --supervise` hidden and returns; the supervisor holds
+`service.SupervisorLockPath` (a `worklock.AcquireFile` lock beside the worker
+lock) and runs `service.RunSupervisor`, which owns restart policy (backoff,
+reset after stable uptime, immediate relaunch on
+`update.SupervisorRestartExitCode`, stop on exit 0). On that restart code
+`service.SupervisorHandover` moves supervision to a fresh supervisor started
+from the updated path (spawn, then release, then confirm; retake on failure),
+because a supervisor left on the renamed `.old` image makes the next update's
+`os.Remove(.old)` fail. The worker carries `--supervisor-pid` and
+`--supervisor-lock`. `cmd.supervisedByUserSupervisor` is the only way that
+worker counts as service-managed (`managedByServiceManager`, AGENT_UPDATE's
+`IsService`): the named PID must be the live parent and still hold the
+supervisor lock. The Windows update restart instead keys on the flag alone
+(`update.SetSupervisedRestart`), so a failed probe never spawns a copy. Never
+set `INVOCATION_ID` for it. `service.CheckUserWorkerDir` refuses a node dir
+outside the user's profile; stop requests are per-PID files
+(`service.SupervisorStopPath`) so none is lost to a supervisor that started in
+between. `cmd/work_background_windows.go` owns the process
+flags (the supervisor gets a hidden console, not `DETACHED_PROCESS`, so console
+children never open a window) and puts the worker in a kill-on-close job;
+graceful stop is CTRL_BREAK, and `citadel worker stop` asks through
+`service.SupervisorStopPath`. `service.BuildRunValue` and `service.UserAutostart`
+own the Run value (local drive paths only, no UNC); only `citadel worker
+autostart enable` writes it, and `cmd.enableUserAutostart` refuses an exe this
+user does not own (`update.ExecutableOwnership`).
+
 ### Known Limitations on Windows
 
 - WSL2 is required (not available on older Windows versions)

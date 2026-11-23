@@ -9,7 +9,9 @@
 // installed as a Windows service (sc.exe) configured to restart, and the
 // service manager will start the new binary. If Citadel is run in the
 // foreground without a supervisor, the operator must restart it manually; we
-// log that expectation at the call site.
+// log that expectation at the call site. Under the per-user supervisor
+// (`citadel work --background`) the restart exits with SupervisorRestartExitCode
+// and the supervisor relaunches the installed binary (SetSupervisedRestart).
 package update
 
 import (
@@ -24,6 +26,11 @@ import (
 // foreground case. On success this call does not return.
 func restartProcess(reason string) error {
 	runBeforeRestart(reason)
+	if restartBySupervisor() {
+		// The per-user supervisor relaunches the installed binary itself.
+		os.Exit(SupervisorRestartExitCode)
+		return nil
+	}
 	path, err := GetCurrentBinaryPath()
 	if err != nil {
 		// Fall back to a clean exit so a supervisor can relaunch us.

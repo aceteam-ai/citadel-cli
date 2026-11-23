@@ -393,6 +393,12 @@ func runWork(cmd *cobra.Command, args []string) {
 		fmt.Fprintln(os.Stderr, "  IS supported by 'citadel module stop|start|restart', 'citadel run', and 'citadel stop'.")
 		os.Exit(1)
 	}
+	// Per-user Windows worker (citadel-cli#1867 C3): the launcher and the
+	// supervisor exit here, before any node state is touched or the worker lock
+	// is taken; the supervised worker continues as a normal worker.
+	if handleBackgroundModes() {
+		return
+	}
 	// `citadel work` ALWAYS runs as a worker regardless of the persisted session
 	// mode: it never reads or initializes session.yaml here, and never branches
 	// to runPresence. Presence is only the bare-`citadel` dispatch default
@@ -440,6 +446,14 @@ func runWork(cmd *cobra.Command, args []string) {
 		lock, lockErr := worklock.Acquire(network.GetStateDir(), Version, Log)
 		if lockErr != nil {
 			var running *worklock.ErrAlreadyRunning
+			if errors.As(lockErr, &running) && workSupervisorPID > 0 {
+				// Under the per-user supervisor (citadel-cli#1867), another worker
+				// already serving this node is the intended outcome, so exit 0 and
+				// let the supervisor stop, whatever the holder probe says (on
+				// Windows it cannot always read the holder, #1875).
+				fmt.Fprintf(os.Stderr, "Another citadel worker already serves this node (lock %s, PID %d); the background supervisor will stop.\n", running.Path, running.PID)
+				os.Exit(0)
+			}
 			if errors.As(lockErr, &running) {
 				// An ErrAlreadyRunning means the OS advisory lock is CONTENDED — a
 				// live process genuinely holds it (the kernel frees flock on death).
