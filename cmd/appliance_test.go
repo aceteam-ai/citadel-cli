@@ -151,3 +151,67 @@ func TestApplianceConfigRefusesSymlink(t *testing.T) {
 		t.Fatal("symlink configuration must be refused")
 	}
 }
+
+func TestApplianceCommandRefusesNodeDirOverride(t *testing.T) {
+	for _, kind := range []string{"environment", "flag"} {
+		t.Run(kind, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "unused")
+			t.Setenv("CITADEL_NODE_DIR", "")
+			setNodeDirOverrideForTest(t, "")
+			if kind == "environment" {
+				t.Setenv("CITADEL_NODE_DIR", dir)
+			} else {
+				setNodeDirOverrideForTest(t, dir)
+			}
+			cmd := newApplianceCommand()
+			cmd.SetOut(&bytes.Buffer{})
+			cmd.SetErr(&bytes.Buffer{})
+			cmd.SetArgs([]string{"apply"})
+			if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "does not support --node-dir") {
+				t.Fatalf("override not refused: %v", err)
+			}
+			if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("override refusal must not create configuration")
+			}
+		})
+	}
+}
+
+func TestApplianceProfileRefusesUnsafeOwnerPathsBeforeLockOrUpdates(t *testing.T) {
+	for _, name := range []string{"node", "meeting", "config.yaml.pointer-safety"} {
+		t.Run(name, func(t *testing.T) {
+			node, meeting := t.TempDir(), t.TempDir()
+			target := t.TempDir()
+			path := filepath.Join(node, "config.yaml.pointer-safety")
+			if name == "node" {
+				node = filepath.Join(t.TempDir(), "node")
+				path = node
+			} else if name == "meeting" {
+				meeting = filepath.Join(t.TempDir(), "meeting")
+				path = meeting
+			}
+			if err := os.Symlink(target, path); err != nil {
+				t.Skip("symlinks unavailable")
+			}
+			called := false
+			err := applyApplianceProfile(node, meeting, applianceOptions{slots: 1}, func() error { called = true; return nil }, &bytes.Buffer{})
+			if err == nil || called {
+				t.Fatalf("unsafe path accepted: %v", err)
+			}
+			entries, err := os.ReadDir(target)
+			if err != nil || len(entries) != 0 {
+				t.Fatalf("refused target changed: %v", err)
+			}
+		})
+	}
+}
+
+func TestApplianceInvokerRejectsPOSIXElevation(t *testing.T) {
+	for _, tc := range []struct {
+		windows, elevated, refused bool
+	}{{false, true, true}, {false, false, false}, {true, true, false}, {true, false, false}} {
+		if got := applianceInvokerCheck(tc.windows, tc.elevated); (got != nil) != tc.refused {
+			t.Fatalf("invoker check %+v: %v", tc, got)
+		}
+	}
+}

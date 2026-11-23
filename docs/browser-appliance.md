@@ -3,6 +3,12 @@
 To dedicate a machine to public-web co-browse, run as the account that owns its
 Citadel configuration:
 
+On POSIX systems, run without sudo or root; existing configuration and lock
+paths must be owned by the current user. Windows retains its file ACL checks.
+The command refuses `--node-dir`/`CITADEL_NODE_DIR` overrides before resolving or
+modifying the real node. It does not change file ownership or write a different
+user's automatic-update preference.
+
 ```sh
 citadel appliance apply
 ```
@@ -48,8 +54,13 @@ their existing defaults.
 
 The new missing-browser and missing-Xvfb checks affect the exit code only when
 the appliance profile is applied. A known namespace prohibition or broken
-appliance egress posture also fails that profile's readiness. Missing font
-coverage, an unavailable fontconfig tool or an unknown namespace policy warn.
+appliance egress posture also fails that profile's readiness.
+
+An unreadable or damaged device configuration fails readiness instead of being
+treated as an unapplied profile. The existing co-browse-only posture marker also
+requires browser readiness when the device profile marker is missing.
+Missing font coverage, an unavailable fontconfig tool or an unknown namespace
+policy warn.
 Existing engine, service and resource checks retain their own exit-code rules.
 
 These are read-only preflights, not proof that a browser can successfully create

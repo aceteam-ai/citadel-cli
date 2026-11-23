@@ -82,6 +82,43 @@ func TestApplianceDoctorReadinessRequiredOnlyWhenApplied(t *testing.T) {
 	}
 }
 
+func TestApplianceDoctorRefusesUnknownConfigAndRetainsPostureEvidence(t *testing.T) {
+	for _, kind := range []string{"malformed", "unreadable", "missing-with-posture"} {
+		t.Run(kind, func(t *testing.T) {
+			dir := applianceDoctorDir(t, true)
+			path := filepath.Join(dir, "config.yaml")
+			switch kind {
+			case "malformed":
+				if err := os.WriteFile(path, []byte("[damaged:"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			case "unreadable":
+				if err := os.Chmod(path, 0); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+				if _, err := os.ReadFile(path); err == nil {
+					t.Skip("platform does not enforce POSIX read permissions")
+				}
+			case "missing-with-posture":
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			p := fakeBrowserReadinessProbes()
+			p.chromium = func() (string, error) { return "", os.ErrNotExist }
+			checks := cobrowseReadiness(dir, p)
+			r := doctorReport{dockerHealth: platform.DockerHealth{OK: true}, doctor: healthyDoctorPayload(), browserReadiness: checks}
+			if r.ok() {
+				t.Fatal("unknown configuration or known posture cannot hide missing browser")
+			}
+			if kind != "missing-with-posture" && (!checks[0].fatal || checks[0].status != "FAIL") {
+				t.Fatalf("config read failure must be fatal: %+v", checks[0])
+			}
+		})
+	}
+}
+
 func TestApplianceDoctorFontsAndUnknownNamespacesWarn(t *testing.T) {
 	dir := applianceDoctorDir(t, true)
 	p := fakeBrowserReadinessProbes()

@@ -37,13 +37,13 @@ func productionBrowserReadinessProbes() browserReadinessProbes {
 // display server, container, namespace, updater or service to test readiness.
 func cobrowseReadiness(dir string, p browserReadinessProbes) []browserReadinessCheck {
 	values, err := readApplianceConfig(dir)
-	active := err == nil && values["browser_appliance"] == true
+	permissions, perr := config.LoadPermissionsStrict(dir)
+	active := values["browser_appliance"] == true || (perr == nil && permissions.SetupPosture == config.SetupPostureCobrowseOnly)
 	profile := browserReadinessCheck{name: "appliance profile", status: "INFO", detail: "not applied; browser checks are informational"}
 	if err != nil {
-		profile.status = "WARN"
+		profile.status, profile.fatal = "FAIL", true
 		profile.detail = err.Error()
-	}
-	if active {
+	} else if active {
 		profile.status = "OK"
 		profile.detail = "applied"
 	}
@@ -80,11 +80,10 @@ func cobrowseReadiness(dir string, p browserReadinessProbes) []browserReadinessC
 		checks = append(checks, browserReadinessCheck{name: "Xvfb / user namespaces", status: "INFO", detail: "Linux-only readiness checks"})
 	}
 	checks = append(checks, browserFontReadiness(p)...)
-	permissions, perr := config.LoadPermissionsStrict(dir)
 	guardOK := perr == nil && permissions.CobrowsePublicOnly && (!active || permissions.SetupPosture == config.SetupPostureCobrowseOnly)
 	guard := browserReadinessCheck{name: "public-only egress", status: "OK", detail: "on; private-address destinations refused"}
 	if !guardOK {
-		guard.status, guard.detail = "WARN", "off or unreadable; private-address protection is not verified"
+		guard.status, guard.detail = "INFO", "off or unreadable; private-address protection is not verified"
 		if active {
 			guard.status, guard.fatal = "FAIL", true
 			guard.detail = "appliance posture marker or public-only guard is missing; reapply the profile"

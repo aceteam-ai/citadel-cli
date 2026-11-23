@@ -71,6 +71,9 @@ func applyApplianceProfile(nodeDir, meetingDir string, o applianceOptions, enabl
 	if err := validateApplianceOptions(o); err != nil {
 		return err
 	}
+	if err := checkApplianceWriteOwnership(nodeDir, meetingDir); err != nil {
+		return err
+	}
 	return withNodePointerLock(filepath.Join(nodeDir, "config.yaml"), func() error {
 		values, err := readApplianceConfig(nodeDir)
 		if err != nil {
@@ -126,10 +129,38 @@ func applyApplianceProfile(nodeDir, meetingDir string, o applianceOptions, enabl
 	})
 }
 
+// Refuse elevation instead of rewriting a user's token/config, lock directory
+// or updater preference as another user. This runs before lock creation.
+func checkApplianceWriteOwnership(nodeDir, meetingDir string) error {
+	if err := applianceInvokerCheck(platform.IsWindows(), platform.IsRoot()); err != nil {
+		return err
+	}
+	for _, path := range []string{nodeDir, meetingDir, filepath.Join(nodeDir, "config.yaml"), filepath.Join(nodeDir, "config.yaml.pointer-safety"), filepath.Join(nodeDir, "permissions.yaml"), filepath.Join(meetingDir, "meeting.yaml")} {
+		info, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil || info.Mode()&os.ModeSymlink != 0 || !appliancePathOwnedByCaller(info) {
+			return errors.New("appliance configuration and lock paths must be owned by the current user and not symlinks")
+		}
+	}
+	return nil
+}
+
+func applianceInvokerCheck(windows, elevated bool) error {
+	if !windows && elevated {
+		return errors.New("appliance apply must run as the configuration owner without sudo or root")
+	}
+	return nil
+}
+
 func newApplianceCommand() *cobra.Command {
 	var o applianceOptions
 	root := &cobra.Command{Use: "appliance", Short: "Configure a co-browse-only appliance"}
 	apply := &cobra.Command{Use: "apply", Args: cobra.NoArgs, Short: "Apply the co-browse-only posture and enable automatic updates", RunE: func(cmd *cobra.Command, _ []string) error {
+		if resolveNodeDirOverride() != "" {
+			return errors.New("appliance apply does not support --node-dir/CITADEL_NODE_DIR; unset the override before applying a profile")
+		}
 		return applyApplianceProfile(network.GetNodeConfigDir(), platform.ConfigDir(), o, func() error { return update.SetAutoUpdate(true) }, cmd.OutOrStdout())
 	}}
 	apply.Flags().IntVar(&o.slots, "browser-slots", 1, "Concurrent browser slots (1 to 64)")
