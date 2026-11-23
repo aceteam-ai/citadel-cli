@@ -3974,7 +3974,9 @@ type DeviceConfig struct {
 	// BrowserSlots is the shared concurrent browser-session count for this node
 	// (citadel-cli#1760). 0 keeps the default; CITADEL_COBROWSE_MAX_SESSIONS
 	// still overrides it.
-	BrowserSlots int `yaml:"browser_slots"`
+	BrowserSlots      int    `yaml:"browser_slots"`
+	BrowserAppliance  bool   `yaml:"browser_appliance"`
+	BrowserWindowSize string `yaml:"browser_window_size"`
 }
 
 // getDeviceConfigFromFile reads device authentication config from the

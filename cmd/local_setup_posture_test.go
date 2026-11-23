@@ -321,7 +321,7 @@ func TestNodePermissionGrantHasNoMCPPath(t *testing.T) {
 		"viewerNodePermissions(":       {"local.go", "local_setup_posture.go", "mcp.go"},
 		"disconnectThisPC(":            {"local_disconnect.go", "local_setup.go"},
 		"startSetupWorker(":            {"local_setup.go", "local_setup_worker.go"},
-		"writeSetupPosture":            {"local_setup.go", "local_setup_posture.go"},
+		"writeSetupPosture":            {"appliance.go", "local_setup.go", "local_setup_posture.go"},
 	}
 	files, err := filepath.Glob("*.go")
 	if err != nil {
