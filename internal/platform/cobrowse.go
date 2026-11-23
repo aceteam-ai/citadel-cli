@@ -231,7 +231,11 @@ func buildChromeArgs(opts cobrowseLaunchOptions) []string {
 			"--webrtc-ip-handling-policy=disable_non_proxied_udp",
 			// An extension can set its own proxy (chrome.proxy) and route
 			// around the guard; a guarded browser runs none.
-			"--disable-extensions")
+			"--disable-extensions",
+			// QUIC is UDP and never goes through an HTTP proxy. Chrome does
+			// not use it for proxied requests, and this keeps any QUIC-based
+			// API (HTTP/3, WebTransport) from opening its own UDP path.
+			"--disable-quic")
 	}
 	if opts.quiet {
 		args = append(args, "--disable-background-networking", "--disable-component-update")

@@ -99,7 +99,10 @@ func runPermissionShell(cmd *cobra.Command, args []string) error {
 }
 
 func setShellPermission(configDir string, enabled bool) (*config.Permissions, error) {
-	perms := config.LoadPermissions(configDir)
+	perms, err := config.LoadPermissionsStrict(configDir)
+	if err != nil {
+		return nil, fmt.Errorf("the node permissions file must be readable before this setting can change: %w", err)
+	}
 	perms.Shell = enabled
 	if err := config.SavePermissions(configDir, perms); err != nil {
 		return nil, fmt.Errorf("save shell permission: %w", err)

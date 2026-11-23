@@ -5,11 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/browserurl"
+	"github.com/aceteam-ai/citadel-cli/internal/cdpdiscovery"
 )
 
 // EgressPublicOnly is the status "egress" value of a session whose browser
@@ -41,6 +44,7 @@ func (m *CobrowseSessionManager) SetEgressRequired(f func() bool) {
 	m.mu.Lock()
 	m.egressRequired = f
 	m.mu.Unlock()
+	m.startEgressSweep()
 }
 
 // egressRequiredNow reports whether the next session must run behind the
@@ -198,11 +202,7 @@ func verifyEgressRoute(proc *cobrowseProc, g *browserurl.EgressGuard) error {
 		return fmt.Errorf("public-only route check: %w", err)
 	}
 	if tid, _ := res["targetId"].(string); tid != "" {
-		defer func() {
-			cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer ccancel()
-			_, _ = cdpDialAndSendContext(cctx, ws, "Target.closeTarget", map[string]any{"targetId": tid})
-		}()
+		defer closeCanaryTarget(proc.debugPort, ws, tid)
 	}
 	for !g.CanarySeen() {
 		select {
@@ -231,3 +231,224 @@ func startEgressForLaunch(id string, lo *LaunchOptions) (*browserurl.EgressGuard
 	lo.UseContainer = false
 	return g, nil
 }
+
+// EndedReasonPublicOnly ends an unguarded session that was running when the
+// node switched to public-only browsing.
+const EndedReasonPublicOnly = "public_only_enabled"
+
+// egressSweepInterval is how often a manager that can be switched to
+// public-only checks for unguarded sessions to stop.
+var egressSweepInterval = 30 * time.Second
+
+// egressSwitchable reports whether this manager reads a public-only source
+// (the node-wide manager, or one given SetEgressRequired). Local mode is not.
+func (m *CobrowseSessionManager) egressSwitchable() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.useResolver || m.egressRequired != nil
+}
+
+// stopIfUnguarded stops s, and refuses the action, when public-only is now on
+// and s runs without a guard: its pages still reach the local network.
+func (m *CobrowseSessionManager) stopIfUnguarded(s *cobrowseSession) error {
+	if s.egressGuarded() || !m.egressSwitchable() || !m.egressRequiredNow() {
+		return nil
+	}
+	if m.stopUnguarded(s.id) {
+		return &SessionEndedError{ID: s.id, Reason: EndedReasonPublicOnly, Detail: publicOnlyEndedDetail}
+	}
+	// Someone else ended it first; report their reason, not ours.
+	if e, ok := m.EndedSession(s.id); ok {
+		return &SessionEndedError{ID: s.id, Reason: e.Reason, Detail: e.Detail}
+	}
+	return fmt.Errorf("no such browser session: %q", s.id)
+}
+
+const publicOnlyEndedDetail = "this node switched to public-only browsing; start a new session"
+
+// stopUnguarded ends id with the public-only reason. It reports false, and
+// records nothing, when the session was already gone: whatever stopped it
+// keeps its own end reason.
+func (m *CobrowseSessionManager) stopUnguarded(id string) bool {
+	m.mu.Lock()
+	s, ok := m.sessions[id]
+	delete(m.sessions, id)
+	m.mu.Unlock()
+	if !ok {
+		return false
+	}
+	log.Printf("[cobrowse] stopping session %s: it has no egress guard and this node is now public-only", id)
+	_ = s.teardown()
+	m.recordEnded(id, EndedReasonPublicOnly, publicOnlyEndedDetail)
+	return true
+}
+
+// sweepUnguarded stops every unguarded session when public-only is on.
+func (m *CobrowseSessionManager) sweepUnguarded() {
+	if !m.egressSwitchable() || !m.egressRequiredNow() {
+		return
+	}
+	m.mu.Lock()
+	var ids []string
+	for id, s := range m.sessions {
+		s.mu.Lock()
+		unguarded := s.egress == "" && s.proc != nil
+		s.mu.Unlock()
+		if unguarded {
+			ids = append(ids, id)
+		}
+	}
+	m.mu.Unlock()
+	for _, id := range ids {
+		m.stopUnguarded(id)
+	}
+}
+
+// startEgressSweep runs sweepUnguarded periodically so an idle page does not
+// keep its network access until the next action. It starts at most once per
+// manager at a time: after an unguarded launch, after a re-adoption (adopted
+// sessions are never guarded) and when SetEgressRequired installs a source.
+// stopEgressSweep (StopAll, ShutdownSessions) ends it.
+func (m *CobrowseSessionManager) startEgressSweep() {
+	if !m.egressSwitchable() {
+		return
+	}
+	interval := egressSweepInterval
+	m.mu.Lock()
+	if m.egressSweepStop != nil {
+		m.mu.Unlock()
+		return
+	}
+	stop := make(chan struct{})
+	m.egressSweepStop = stop
+	m.mu.Unlock()
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				m.sweepUnguarded()
+			}
+		}
+	}()
+}
+
+func (m *CobrowseSessionManager) stopEgressSweep() {
+	m.mu.Lock()
+	if m.egressSweepStop != nil {
+		close(m.egressSweepStop)
+		m.egressSweepStop = nil
+	}
+	m.mu.Unlock()
+}
+
+func (s *cobrowseSession) egressGuarded() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.egress != ""
+}
+
+// closeCanaryTarget closes the canary tab and waits (bounded) until the
+// browser no longer lists it, so nothing later can pick or dial it.
+func closeCanaryTarget(port int, browserWS, targetID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _ = cdpDialAndSendContext(ctx, browserWS, "Target.closeTarget", map[string]any{"targetId": targetID})
+	for {
+		list, _, err := cdpdiscovery.ListBounded(ctx, port, cdpHTTPClient)
+		gone := err == nil
+		for _, t := range list {
+			if t.ID == targetID {
+				gone = false
+			}
+		}
+		if gone {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+// egressFirstNavigateWait bounds pinning the page and sending the deferred
+// start-URL navigation (not the page load; startSession settles that).
+const egressFirstNavigateWait = 10 * time.Second
+
+// egressFirstNavigate sends a guarded session's start URL once, after the
+// route check. A package var so unit tests without a browser record it.
+var egressFirstNavigate = func(ctx context.Context, s *cobrowseSession, url string) error {
+	return firstNavigateWithRetry(ctx, func() (pin, error) { return s.pinActionCtx(ctx) }, url)
+}
+
+// firstNavigateWithRetry pins the page and sends Page.navigate through the
+// same pin helper every action uses. A cold browser can list its first page
+// before that page's debugger endpoint accepts a connection, so a failure to
+// pin or to dial is retried with a short backoff until ctx ends. Once the
+// command may have been sent nothing is retried: a start URL may be single
+// use and must be requested at most once.
+func firstNavigateWithRetry(ctx context.Context, pinFn func() (pin, error), url string) error {
+	backoff := 100 * time.Millisecond
+	var last error
+	for {
+		p, err := pinFn()
+		if err == nil {
+			_, err = p.cdp("Page.navigate", map[string]any{"url": url})
+			if err == nil {
+				return nil
+			}
+			if !isCDPDialError(err) {
+				return err
+			}
+		}
+		last = err
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%w (gave up after retries: %v)", last, ctx.Err())
+		case <-time.After(backoff):
+		}
+		if backoff < time.Second {
+			backoff *= 2
+		}
+	}
+}
+
+// isCDPDialError reports a failure before any command reached the browser.
+func isCDPDialError(err error) bool {
+	return err != nil && strings.HasPrefix(err.Error(), "CDP dial:")
+}
+
+// clearSessionRestore removes a profile's saved session state (open tabs and
+// windows), so a restored profile cannot reopen its last pages at startup.
+// Cookies and saved logins are untouched. Every profile directory under the
+// user-data dir is covered; a removal error refuses the launch.
+func clearSessionRestore(userDataDir string) error {
+	entries, err := os.ReadDir(userDataDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("public-only: read profile: %w", err)
+	}
+	for _, e := range entries {
+		if !e.IsDir() || e.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		dir := filepath.Join(userDataDir, e.Name())
+		for _, name := range sessionRestoreEntries {
+			if err := os.RemoveAll(filepath.Join(dir, name)); err != nil {
+				return fmt.Errorf("public-only: clear saved tabs in the profile: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+// sessionRestoreEntries are Chromium's saved-session files: the Sessions
+// directory (current releases) and the older top-level files.
+var sessionRestoreEntries = []string{"Sessions", "Current Session", "Current Tabs", "Last Session", "Last Tabs"}
