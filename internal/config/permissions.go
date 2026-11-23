@@ -45,6 +45,15 @@ type Permissions struct {
 	Provision bool `yaml:"provision" json:"provision"` // Container provisioning API (default-on, opt-out)
 	Shell     bool `yaml:"shell" json:"shell"`         // SHELL_COMMAND job execution (default-deny, opt-in)
 
+	// CobrowsePublicOnly runs every remote (node-wide) co-browse session behind
+	// an egress guard that refuses loopback, private, link-local and mesh
+	// addresses, so a remote agent cannot reach this machine's home network
+	// (citadel-cli#1867 C4b). Absent or false keeps the historical behavior,
+	// since server nodes may legitimately browse an intranet. Read live at
+	// every session start. Remote config may turn it on; only a local command
+	// turns it off.
+	CobrowsePublicOnly bool `yaml:"cobrowse_public_only,omitempty" json:"cobrowse_public_only,omitempty"`
+
 	// PasscodeHash is the bcrypt hash of the per-node passcode that gates the
 	// sensitive remote-access surfaces (console/desktop/files). It is never the
 	// plaintext PIN — bcrypt embeds its own salt, so no separate salt field is

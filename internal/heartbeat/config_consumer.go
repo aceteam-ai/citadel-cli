@@ -49,6 +49,12 @@ type ConfigConsumerConfig struct {
 	// ConfigDir is where citadel config is stored (optional, defaults to ~/citadel-node)
 	ConfigDir string
 
+	// PermissionsDir is the machine-convergent node directory holding
+	// permissions.yaml (the worker's nodePermissionsDir). Empty keeps the
+	// handler's legacy invoker-scoped location, which a worker must not use:
+	// a config push would then write a file the worker never reads.
+	PermissionsDir string
+
 	// BlockMs is how long to wait for a job before returning (default: 5000)
 	BlockMs int
 }
@@ -77,7 +83,7 @@ func NewConfigConsumer(cfg ConfigConsumerConfig) (*ConfigConsumer, error) {
 		queueName:     ConfigQueueName,
 		consumerGroup: ConfigConsumerGroup,
 		blockMs:       cfg.BlockMs,
-		configHandler: jobs.NewConfigHandler(cfg.ConfigDir),
+		configHandler: newConfigHandler(cfg.ConfigDir, cfg.PermissionsDir),
 	}, nil
 }
 
@@ -264,4 +270,12 @@ func (c *ConfigConsumer) Close() error {
 // QueueName returns the config queue name.
 func (c *ConfigConsumer) QueueName() string {
 	return c.queueName
+}
+
+// newConfigHandler builds the APPLY_DEVICE_CONFIG handler both config paths
+// share, with the worker's permissions directory.
+func newConfigHandler(configDir, permissionsDir string) *jobs.ConfigHandler {
+	h := jobs.NewConfigHandler(configDir)
+	h.PermissionsDir = permissionsDir
+	return h
 }

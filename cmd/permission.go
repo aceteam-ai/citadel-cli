@@ -27,15 +27,52 @@ var permissionShellCmd = &cobra.Command{
 	RunE:  runPermissionShell,
 }
 
+var permissionCobrowsePublicOnlyCmd = &cobra.Command{
+	Use:   "cobrowse-public-only <enable|disable>",
+	Short: "Limit remote co-browse sessions to public internet addresses",
+	Long: `When enabled, every remote co-browse session on this node runs its browser
+behind an egress guard: it can reach public websites, but not this computer,
+your home or office network (router, NAS, printers), link-local addresses or
+other AceTeam Network devices. Takes effect at the next session start.
+
+Remote configuration can turn this on, but only this command turns it off.
+Leave it off on a server node that must browse an intranet.`,
+	Args: cobra.ExactArgs(1),
+	RunE: runPermissionCobrowsePublicOnly,
+}
+
 func init() {
 	rootCmd.AddCommand(permissionCmd)
 	permissionCmd.AddCommand(permissionShellCmd)
+	permissionCmd.AddCommand(permissionCobrowsePublicOnlyCmd)
 }
 
 func runPermissionStatus(cmd *cobra.Command, args []string) error {
 	perms := loadNodePermissions()
 	fmt.Fprintf(cmd.OutOrStdout(), "Shell: %s\n", enabledLabel(perms.Shell))
 	fmt.Fprintf(cmd.OutOrStdout(), "Passcode: %s\n", enabledLabel(perms.HasPasscode()))
+	fmt.Fprintf(cmd.OutOrStdout(), "Co-browse public-only: %s\n", enabledLabel(cobrowsePublicOnlyIn(nodePermissionsDir())))
+	return nil
+}
+
+func runPermissionCobrowsePublicOnly(cmd *cobra.Command, args []string) error {
+	var enabled bool
+	switch strings.ToLower(strings.TrimSpace(args[0])) {
+	case "enable", "enabled":
+		enabled = true
+	case "disable", "disabled":
+		enabled = false
+	default:
+		return fmt.Errorf("cobrowse-public-only must be 'enable' or 'disable'")
+	}
+	if err := setCobrowsePublicOnly(nodePermissionsDir(), enabled); err != nil {
+		return err
+	}
+	if enabled {
+		fmt.Fprintln(cmd.OutOrStdout(), "Remote co-browse sessions will reach public internet addresses only. Takes effect at the next session start; running sessions keep their current setting.")
+	} else {
+		fmt.Fprintln(cmd.OutOrStdout(), "Remote co-browse sessions may reach any address this computer can, including your local network. Takes effect at the next session start.")
+	}
 	return nil
 }
 

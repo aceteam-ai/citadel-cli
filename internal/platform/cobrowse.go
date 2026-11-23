@@ -223,7 +223,15 @@ func buildChromeArgs(opts cobrowseLaunchOptions) []string {
 		args = append(args,
 			"--proxy-server="+opts.proxyServer,
 			"--proxy-bypass-list=<-loopback>",
-			"--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
+			"--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+			// Current Chrome ignores the force- spelling above and honors only
+			// this one (verified on Chrome 156: a page's STUN request reached a
+			// loopback UDP port with the force- form alone). Both are passed
+			// so older and newer builds each get one they read.
+			"--webrtc-ip-handling-policy=disable_non_proxied_udp",
+			// An extension can set its own proxy (chrome.proxy) and route
+			// around the guard; a guarded browser runs none.
+			"--disable-extensions")
 	}
 	if opts.quiet {
 		args = append(args, "--disable-background-networking", "--disable-component-update")
@@ -530,6 +538,9 @@ func (m *CobrowseManager) Start(profileDir, startURL string, debugPort int) (Cob
 	if err := ValidateCobrowseURL(startURL); err != nil {
 		return CobrowseStatus{}, err
 	}
+	if err := m.refuseWhenPublicOnly(); err != nil {
+		return CobrowseStatus{}, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -730,6 +741,9 @@ func (m *CobrowseManager) teardownXvfbLocked() {
 
 // Handoff transfers control to the human. Idempotent.
 func (m *CobrowseManager) Handoff() (CobrowseStatus, error) {
+	if err := m.refuseWhenPublicOnly(); err != nil {
+		return CobrowseStatus{}, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.isRunningLocked() {
@@ -741,6 +755,9 @@ func (m *CobrowseManager) Handoff() (CobrowseStatus, error) {
 
 // Resume returns control to the AI agent. Idempotent.
 func (m *CobrowseManager) Resume() (CobrowseStatus, error) {
+	if err := m.refuseWhenPublicOnly(); err != nil {
+		return CobrowseStatus{}, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.isRunningLocked() {
@@ -783,6 +800,9 @@ func (m *CobrowseManager) Navigate(url string) (CobrowseStatus, error) {
 	if err := ValidateCobrowseURL(url); err != nil {
 		return CobrowseStatus{}, err
 	}
+	if err := m.refuseWhenPublicOnly(); err != nil {
+		return CobrowseStatus{}, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.isRunningLocked() {
@@ -800,6 +820,9 @@ func (m *CobrowseManager) Navigate(url string) (CobrowseStatus, error) {
 // Screenshot captures the current viewport as base64 PNG. Refused while handed
 // off to the human (the live VNC stream is the human's view during handoff).
 func (m *CobrowseManager) Screenshot() (string, error) {
+	if err := m.refuseWhenPublicOnly(); err != nil {
+		return "", err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.isRunningLocked() {
