@@ -115,22 +115,32 @@ func browserFontReadiness(p browserReadinessProbes) []browserReadinessCheck {
 
 func browserNamespaceReadiness(read func(string) ([]byte, error)) (status, detail string, blocked bool) {
 	seen := false
+	unknown, blockedBy := "", ""
 	for _, path := range []string{"/proc/sys/user/max_user_namespaces", "/proc/sys/kernel/unprivileged_userns_clone"} {
 		data, err := read(path)
 		if err != nil {
 			if !os.IsNotExist(err) {
-				return "WARN", "namespace sysctl policy is unreadable; browser sandbox readiness is unknown", false
+				unknown = "namespace sysctl policy is unreadable; browser sandbox readiness is unknown"
 			}
 			continue
 		}
 		n, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
 		if err != nil {
-			return "WARN", "namespace sysctl policy is malformed; browser sandbox readiness is unknown", false
+			unknown = "namespace sysctl policy is malformed; browser sandbox readiness is unknown"
+			continue
 		}
 		seen = true
 		if n == 0 {
-			return "WARN", fmt.Sprintf("blocked by %s=0; Chromium's namespace sandbox cannot start", path), true
+			blockedBy = path
 		}
+	}
+	// An unknown gate must never hide an independently observed prohibition.
+	// Read both gates before choosing a result, irrespective of their order.
+	if blockedBy != "" {
+		return "WARN", fmt.Sprintf("blocked by %s=0; Chromium's namespace sandbox cannot start", blockedBy), true
+	}
+	if unknown != "" {
+		return "WARN", unknown, false
 	}
 	if data, err := read("/proc/sys/kernel/apparmor_restrict_unprivileged_userns"); err == nil {
 		switch strings.TrimSpace(string(data)) {

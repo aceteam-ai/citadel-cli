@@ -197,6 +197,51 @@ func TestApplianceDoctorNamespaceUnknownIsNotClaimedReady(t *testing.T) {
 	}
 }
 
+func TestApplianceDoctorNamespaceBlockOverridesUnknownOtherGate(t *testing.T) {
+	paths := []string{"/proc/sys/user/max_user_namespaces", "/proc/sys/kernel/unprivileged_userns_clone"}
+	for _, blockedPath := range paths {
+		for _, failure := range []string{"malformed", "unreadable", "missing"} {
+			t.Run(filepath.Base(blockedPath)+"/"+failure, func(t *testing.T) {
+				p := fakeBrowserReadinessProbes()
+				p.readFile = func(path string) ([]byte, error) {
+					if path == blockedPath {
+						return []byte("0"), nil
+					}
+					if strings.Contains(path, "apparmor") {
+						return []byte("0"), nil
+					}
+					if failure == "unreadable" {
+						return nil, os.ErrPermission
+					}
+					if failure == "missing" {
+						return nil, os.ErrNotExist
+					}
+					return []byte("invalid"), nil
+				}
+				status, detail, blocked := browserNamespaceReadiness(p.readFile)
+				if status != "WARN" || !blocked || !strings.Contains(detail, blockedPath+"=0") {
+					t.Fatalf("known block must take precedence: %s %q %v", status, detail, blocked)
+				}
+				for _, active := range []bool{false, true} {
+					checks := cobrowseReadiness(applianceDoctorDir(t, active), p)
+					found := false
+					for _, check := range checks {
+						if check.name == "unprivileged user namespaces" {
+							found = true
+							if check.fatal != active || (active && check.status != "FAIL") {
+								t.Fatalf("namespace readiness did not reflect appliance state: %+v", check)
+							}
+						}
+					}
+					if !found {
+						t.Fatal("namespace readiness check missing")
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestApplianceDoctorFontProbesAreBoundedAndWarnWhenMissing(t *testing.T) {
 	p := fakeBrowserReadinessProbes()
 	count := 0
