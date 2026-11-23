@@ -321,3 +321,14 @@ func TestHarnessSeatCLIPropagatesJSONAndTableWriteFailure(t *testing.T) {
 		}
 	}
 }
+
+func TestHarnessSeatCLIRefusesBareGroupBeforeSharedStartup(t *testing.T) {
+	root := &cobra.Command{Use: "citadel", PersistentPreRun: func(*cobra.Command, []string) { t.Fatal("bare metadata group entered shared startup") }}
+	root.AddCommand(newHarnessSeatRoot(func() (seatCLIOwner, error) { t.Fatal("bare group resolved owner"); return seatCLIOwner{}, nil }))
+	root.SetOut(&bytes.Buffer{})
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"harness", "seat"})
+	if err := root.Execute(); !errors.Is(err, errSeatCLICommand) {
+		t.Fatal("bare group did not require a subcommand")
+	}
+}

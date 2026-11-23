@@ -17,8 +17,9 @@ import (
 )
 
 var (
-	errSeatCLIOwner  = errors.New("seat_local_owner_unresolved")
-	errSeatCLIOutput = errors.New("seat_output_failed")
+	errSeatCLIOwner   = errors.New("seat_local_owner_unresolved")
+	errSeatCLIOutput  = errors.New("seat_output_failed")
+	errSeatCLICommand = errors.New("seat_subcommand_required")
 )
 
 type seatCLIOwner struct{ Name, Home string }
@@ -121,8 +122,13 @@ type seatCLIListRow struct {
 func newHarnessSeatRoot(resolveOwner seatCLIOwnerResolver) *cobra.Command {
 	harness := &cobra.Command{Use: "harness", Short: "Manage local harness metadata"}
 	seat := &cobra.Command{Use: "seat", Short: "Inspect or restrict an explicit private seat registry", Long: "Owner-only local registry metadata. No vendor credential files, login, status probe, job, remote enable or process launch is used. Incomplete seat-registry build: add/enable/probe and default-home adoption are not exposed yet."}
-	seat.Args = cobra.NoArgs
-	seat.RunE = func(cmd *cobra.Command, args []string) error { return cmd.Help() }
+	seat.Args = func(cmd *cobra.Command, args []string) error {
+		if len(args) == 0 {
+			return errSeatCLICommand
+		}
+		return cobra.NoArgs(cmd, args)
+	}
+	seat.RunE = func(cmd *cobra.Command, args []string) error { return errSeatCLICommand }
 	harness.AddCommand(seat)
 	var dir string
 	seat.PersistentFlags().StringVar(&dir, "registry-dir", "", "Required existing absolute 0700 registry directory under the caller's home; never defaults to node state")
