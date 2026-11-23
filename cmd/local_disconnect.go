@@ -2,11 +2,15 @@
 //
 // "Disconnect this PC" on the setup page and `citadel local disconnect`
 // (citadel-cli#1867 C5). disconnectThisPC runs, in order: stop the per-user
-// background worker, remove its sign-in autostart, and log this PC out of the
-// AceTeam Network, reporting each step in fixed copy. If the worker could not
-// be stopped, the logout is skipped: clearing the network state under a live
-// worker is unsafe. Local mode keeps working; local-mode saved logins, the
-// local audit log and the permissions file are never touched.
+// background worker, remove its sign-in autostart, log this PC out of the
+// AceTeam Network, and remove the device credentials the enrollment saved,
+// reporting each step in fixed copy. If the worker could not be stopped or its
+// autostart could not be removed, the logout and the credential removal are
+// skipped: clearing state under a live (or about to restart) worker is unsafe.
+// The credentials go because a later worker would otherwise keep taking jobs
+// over the AceTeam API with them, mesh or not. Local mode keeps working;
+// local-mode saved logins, the local audit log and the permissions file are
+// never touched.
 package cmd
 
 import (
@@ -17,15 +21,18 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/localviewer"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/nodesession"
 	"github.com/aceteam-ai/citadel-cli/internal/service"
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
 )
 
 // Step names, in the order they run.
@@ -33,6 +40,7 @@ const (
 	disconnectStepStop      = "Stop the background worker"
 	disconnectStepAutostart = "Remove sign-in autostart"
 	disconnectStepLogout    = "Log out of the AceTeam Network"
+	disconnectStepCreds     = "Remove this PC's AceTeam device key"
 )
 
 // Step statuses (localviewer.SetupStep.Status).
@@ -51,12 +59,16 @@ const (
 	disconnectAutoOKCopy      = "Citadel no longer starts when you sign in."
 	disconnectAutoNACopy      = "This system has no sign-in autostart entry for Citadel."
 	disconnectAutoFailedCopy  = "Citadel could not remove its sign-in autostart entry. Run \"citadel worker autostart disable\" in a terminal."
-	disconnectLogoutSkipCopy  = "Skipped, because the worker may still be running. Stop it, then press Disconnect again."
+	disconnectLogoutSkipCopy  = "Skipped, because the worker may still be running or start again at sign-in. Fix the step above, then press Disconnect again."
 	disconnectLogoutNoneCopy  = "This PC was not connected to the AceTeam Network."
 	disconnectLogoutOKCopy    = "Logged out. AceTeam removed this PC from your account."
 	disconnectLogoutLocalCopy = "Logged out on this PC. AceTeam was not asked to remove it from your account, so it may still be listed there; you can remove it in your AceTeam account."
 	disconnectLogoutHeldCopy  = "Another Citadel program on this PC still uses its AceTeam connection (a worker, a service or \"citadel up\"). Stop it, then press Disconnect again."
 	disconnectLogoutFailCopy  = "Citadel could not log out. Run \"citadel logout\" in a terminal."
+	disconnectCredsOKCopy     = "The device key AceTeam gave this PC is removed, so a later worker cannot take AceTeam jobs."
+	disconnectCredsNoneCopy   = "This PC had no saved AceTeam device key."
+	disconnectCredsFailCopy   = "Citadel could not remove this PC's AceTeam device key. Run \"citadel logout\" in a terminal, then remove this PC from your AceTeam account."
+	disconnectCredsSkipCopy   = "Skipped, because the logout did not finish."
 
 	disconnectDoneCopy    = "This PC is disconnected from AceTeam. Local mode keeps working, and your saved logins were not touched."
 	disconnectPartialCopy = "Disconnect did not finish. Check the steps below."
@@ -80,10 +92,14 @@ type disconnectDeps struct {
 	stopWorker       func() (applicable bool, err error)
 	disableAutostart func() (applicable bool, err error)
 	logout           func() (logoutOutcome, error)
+	// removeCredentials removes the device credentials saved by this node's
+	// enrollment; removed is false when there were none.
+	removeCredentials func() (removed bool, err error)
 }
 
 // disconnectThisPC runs every step in order and reports each. A failed worker
-// stop skips the logout; a failed autostart removal does not.
+// stop or autostart removal skips the logout, and a logout that did not
+// finish skips the credential removal.
 func disconnectThisPC(d disconnectDeps) localviewer.SetupActionResult {
 	res := localviewer.SetupActionResult{OK: true}
 	add := func(name, status, msg string) {
@@ -108,6 +124,7 @@ func disconnectThisPC(d disconnectDeps) localviewer.SetupActionResult {
 	switch applicable, err := d.disableAutostart(); {
 	case err != nil:
 		log.Printf("[setup] disconnect: remove autostart: %v", err)
+		stopped = false
 		add(disconnectStepAutostart, stepFailed, disconnectAutoFailedCopy)
 	case !applicable:
 		add(disconnectStepAutostart, stepNotApplicable, disconnectAutoNACopy)
@@ -115,10 +132,12 @@ func disconnectThisPC(d disconnectDeps) localviewer.SetupActionResult {
 		add(disconnectStepAutostart, stepOK, disconnectAutoOKCopy)
 	}
 
+	loggedOut := false
 	if !stopped {
 		add(disconnectStepLogout, stepSkipped, disconnectLogoutSkipCopy)
 	} else {
 		out, err := d.logout()
+		loggedOut = err == nil
 		switch {
 		case errors.Is(err, errLogoutHeld):
 			log.Printf("[setup] disconnect: logout refused: %v", err)
@@ -132,6 +151,20 @@ func disconnectThisPC(d disconnectDeps) localviewer.SetupActionResult {
 			add(disconnectStepLogout, stepOK, disconnectLogoutOKCopy)
 		default:
 			add(disconnectStepLogout, stepOK, disconnectLogoutLocalCopy)
+		}
+	}
+
+	if !loggedOut {
+		add(disconnectStepCreds, stepSkipped, disconnectCredsSkipCopy)
+	} else {
+		switch removed, err := d.removeCredentials(); {
+		case err != nil:
+			log.Printf("[setup] disconnect: remove device credentials: %v", err)
+			add(disconnectStepCreds, stepFailed, disconnectCredsFailCopy)
+		case !removed:
+			add(disconnectStepCreds, stepOK, disconnectCredsNoneCopy)
+		default:
+			add(disconnectStepCreds, stepOK, disconnectCredsOKCopy)
 		}
 	}
 
@@ -189,6 +222,44 @@ func logoutThisNode(ctx context.Context, d logoutDeps) (logoutOutcome, error) {
 	return logoutOutcome{Deregistered: derr == nil}, nil
 }
 
+// removeEnrollmentCredentials removes from configFile the device credentials
+// an enrollment saved (device_api_token and the fields saved beside it, or a
+// legacy redis_url), through the enrollment rollback helper: the token passed
+// is the one the file holds now, so the helper removes exactly those fields
+// and never touches operator or node keys (aceteam_api_key, nexus_url,
+// node_config_dir, ...). removed is false when there were none.
+func removeEnrollmentCredentials(configFile string) (bool, error) {
+	data, err := os.ReadFile(configFile)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var cur map[string]interface{}
+	if err := yaml.Unmarshal(data, &cur); err != nil {
+		return false, fmt.Errorf("parse %s: %w", configFile, err)
+	}
+	str := func(k string) string { v, _ := cur[k].(string); return v }
+	token := &nexus.TokenResponse{
+		DeviceAPIToken: str("device_api_token"),
+		APIBaseURL:     str("api_base_url"),
+		OrgID:          str("org_id"),
+		OrgName:        str("org_name"),
+		UserEmail:      str("user_email"),
+		UserName:       str("user_name"),
+		FabricNodeID:   str("fabric_node_id"),
+		RedisURL:       str("redis_url"),
+	}
+	if token.DeviceAPIToken == "" && token.RedisURL == "" {
+		return false, nil
+	}
+	if err := rollbackEnrollmentCredentials(configFile, token); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // hasNodeRegistration reports whether this PC holds an AceTeam Network
 // registration or connection.
 func hasNodeRegistration() bool {
@@ -214,6 +285,9 @@ func productionDisconnectDeps() disconnectDeps {
 				return false, nil
 			}
 			return true, err
+		},
+		removeCredentials: func() (bool, error) {
+			return removeEnrollmentCredentials(filepath.Join(network.GetNodeConfigDir(), "config.yaml"))
 		},
 		logout: func() (logoutOutcome, error) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -244,8 +318,8 @@ var localDisconnectCmd = &cobra.Command{
 	Use:   "disconnect",
 	Short: "Disconnect this PC from AceTeam (local mode keeps working)",
 	Long: `Disconnects this PC from AceTeam: stops the background worker, removes its
-sign-in autostart, and logs this PC out of the AceTeam Network. Each step is
-reported. Local mode keeps working, and local-mode saved logins are never
+sign-in autostart, logs this PC out of the AceTeam Network, and removes the
+device key AceTeam gave it. Each step is reported. Local mode keeps working, and local-mode saved logins are never
 touched. The setup page's Disconnect this PC button does the same.`,
 	Args:         cobra.NoArgs,
 	SilenceUsage: true,

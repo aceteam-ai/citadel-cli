@@ -20,7 +20,19 @@
     $("perm-workspace").textContent = st.workspace || "the Citadel workspace folder";
     const parts = [];
     if (st.public_only) parts.push("Co-browse reaches public websites only, not your home network.");
-    if (!st.files && !st.shell) parts.push("Agents can't open files or run commands on this PC.");
+    const off = [];
+    if (!st.files) off.push("open files");
+    if (!st.shell) off.push("run commands");
+    if (!st.console) off.push("use a terminal");
+    if (!st.desktop) off.push("see or control the screen");
+    if (off.length === 4) {
+      parts.push("Agents can't open files, run commands, use a terminal, or see or control the screen on this PC.");
+    } else {
+      const on = [];
+      if (st.console) on.push("terminal (console)");
+      if (st.desktop) on.push("screen (desktop)");
+      if (on.length) parts.push("Remote " + on.join(" and ") + " access is on for this PC.");
+    }
     $("node-perms-posture").textContent = parts.join(" ");
     $("node-perms-message").textContent = st.message || "";
   }

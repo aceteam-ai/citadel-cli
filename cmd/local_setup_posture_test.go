@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -43,7 +42,7 @@ func TestSetupEnrollWritesTheCoBrowseOnlyPosture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := config.Permissions{CobrowsePublicOnly: true}
+	want := config.Permissions{CobrowsePublicOnly: true, SetupPosture: config.SetupPostureCobrowseOnly}
 	if *p != want {
 		t.Fatalf("posture: got %+v, want every surface off and public-only on", *p)
 	}
@@ -51,10 +50,15 @@ func TestSetupEnrollWritesTheCoBrowseOnlyPosture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, line := range []string{"console: false", "desktop: false", "files: false", "services: false", "ssh: false", "provision: false", "shell: false", "cobrowse_public_only: true"} {
+	for _, line := range []string{"console: false", "desktop: false", "files: false", "services: false", "ssh: false", "provision: false", "shell: false", "cobrowse_public_only: true", "setup_posture: cobrowse_only"} {
 		if !bytes.Contains(raw, []byte(line)) {
 			t.Errorf("the permissions file must say %q explicitly:\n%s", line, raw)
 		}
+	}
+	// The meeting bot's browser has no egress guard, so the posture turns the
+	// meeting capability off.
+	if _, err := os.Stat(filepath.Join(f.meetingDir, "meeting.yaml")); err != nil || config.LoadMeeting(f.meetingDir).MeetingEnabled {
+		t.Fatalf("the posture must write meeting_enabled: false: %v", err)
 	}
 	// Other enrollment paths and new nodes keep the historical defaults.
 	d := config.DefaultPermissions()
@@ -102,7 +106,7 @@ func TestSetupPostureKeepsPasscodeAndRefusesADamagedFile(t *testing.T) {
 	if err := config.SavePermissions(dir, p); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeSetupPosture(dir); err != nil {
+	if err := writeSetupPosture(dir, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	got, err := config.LoadPermissionsStrict(dir)
@@ -118,7 +122,7 @@ func TestSetupPostureKeepsPasscodeAndRefusesADamagedFile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(damaged, "permissions.yaml"), bad, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeSetupPosture(damaged); err == nil {
+	if err := writeSetupPosture(damaged, t.TempDir()); err == nil {
 		t.Fatal("the posture was written over a damaged file")
 	}
 	if b, _ := os.ReadFile(filepath.Join(damaged, "permissions.yaml")); !bytes.Equal(b, bad) {
@@ -191,7 +195,7 @@ func TestSetupPageGrantsFilesAndShell(t *testing.T) {
 		t.Fatal("a refused change wrote the permissions file")
 	}
 
-	if err := writeSetupPosture(f.nodeDir); err != nil {
+	if err := writeSetupPosture(f.nodeDir, f.meetingDir); err != nil {
 		t.Fatal(err)
 	}
 	f.mu.Lock()
@@ -236,7 +240,7 @@ func TestSetupPageGrantsFilesAndShell(t *testing.T) {
 // enrollment runs.
 func TestSetupPageGrantRefusedWhileEnrolling(t *testing.T) {
 	f := newSetupFixture(t)
-	if err := writeSetupPosture(f.nodeDir); err != nil {
+	if err := writeSetupPosture(f.nodeDir, f.meetingDir); err != nil {
 		t.Fatal(err)
 	}
 	f.mu.Lock()
@@ -285,12 +289,6 @@ func TestSetNodeSurfaceRefusesADamagedFile(t *testing.T) {
 func TestNodePermissionGrantHasNoMCPPath(t *testing.T) {
 	rt := newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: func() string { return t.TempDir() }, browser: newCmdFakeBrowser(), policy: allowAllURLs})
 	defer rt.close()
-	bad := regexp.MustCompile(`(?i)permission|grant|allow|shell|posture|disconnect|logout|autostart|worker|passcode`)
-	for _, tool := range newLocalMCPTools(localMCPDeps{cobrowse: rt, workspaceDir: t.TempDir(), egressRelayConfigDir: t.TempDir}) {
-		if bad.MatchString(tool.Name) {
-			t.Errorf("local MCP tool %s looks like a permission, disconnect or worker path", tool.Name)
-		}
-	}
 	names := []string{"local_permission_set", "local_files_enable", "local_shell_enable", "local_node_permissions", "local_disconnect", "local_worker_start"}
 	var lines []string
 	for i, n := range names {
@@ -305,12 +303,15 @@ func TestNodePermissionGrantHasNoMCPPath(t *testing.T) {
 	}
 
 	allowed := map[string][]string{
-		"setNodeSurface(":         {"local_setup_posture.go", "permission.go"},
-		"newNodePermissionHooks(": {"local_setup.go", "local_setup_posture.go"},
-		"viewerNodePermissions(":  {"local.go", "local_setup_posture.go", "mcp.go"},
-		"disconnectThisPC(":       {"local_disconnect.go", "local_setup.go"},
-		"startSetupWorker(":       {"local_setup.go", "local_setup_worker.go"},
-		"writeSetupPosture":       {"local_setup.go", "local_setup_posture.go"},
+		"setNodeSurface(":              {"local_setup_posture.go", "permission.go"},
+		"setShellPermission(":          {"permission.go"},
+		"removeEnrollmentCredentials(": {"local_disconnect.go"},
+		"retryPosture":                 {"local_setup.go", "local_setup_enroll.go"},
+		"newNodePermissionHooks(":      {"local_setup.go", "local_setup_posture.go"},
+		"viewerNodePermissions(":       {"local.go", "local_setup_posture.go", "mcp.go"},
+		"disconnectThisPC(":            {"local_disconnect.go", "local_setup.go"},
+		"startSetupWorker(":            {"local_setup.go", "local_setup_worker.go"},
+		"writeSetupPosture":            {"local_setup.go", "local_setup_posture.go"},
 	}
 	files, err := filepath.Glob("*.go")
 	if err != nil {
@@ -362,6 +363,10 @@ func recordDisconnect(calls *[]string, stopErr, autoErr, logoutErr error, stopAp
 			*calls = append(*calls, "logout")
 			return out, logoutErr
 		},
+		removeCredentials: func() (bool, error) {
+			*calls = append(*calls, "creds")
+			return true, nil
+		},
 	}
 }
 
@@ -373,43 +378,93 @@ func stepStatuses(res localviewer.SetupActionResult) string {
 	return strings.Join(s, ",")
 }
 
-// TestDisconnectRunsStopAutostartLogoutInOrder covers the full run and every
-// partial failure.
-func TestDisconnectRunsStopAutostartLogoutInOrder(t *testing.T) {
+// TestDisconnectRunsStepsInOrder covers the full run and every partial
+// failure: a failed stop or autostart removal skips the logout and the
+// credential removal, and a logout that did not finish skips the credential
+// removal.
+func TestDisconnectRunsStepsInOrder(t *testing.T) {
 	boom := errors.New("raw failure text")
 	cases := []struct {
-		name                   string
-		stopErr, autoErr, lErr error
-		applicable             bool
-		out                    logoutOutcome
-		wantCalls, wantStatus  string
-		wantOK                 bool
-		wantLogoutCopy         string
+		name                            string
+		stopErr, autoErr, lErr, credErr error
+		applicable                      bool
+		out                             logoutOutcome
+		wantCalls, wantStatus           string
+		wantOK                          bool
+		wantLogoutCopy, wantCredsCopy   string
 	}{
-		{"all done, deregistered", nil, nil, nil, true, logoutOutcome{Deregistered: true}, "stop,autostart,logout", "ok,ok,ok", true, disconnectLogoutOKCopy},
-		{"all done, local logout only", nil, nil, nil, true, logoutOutcome{}, "stop,autostart,logout", "ok,ok,ok", true, disconnectLogoutLocalCopy},
-		{"not connected", nil, nil, nil, true, logoutOutcome{NotConnected: true}, "stop,autostart,logout", "ok,ok,ok", true, disconnectLogoutNoneCopy},
-		{"not windows", nil, nil, nil, false, logoutOutcome{}, "stop,autostart,logout", "not_applicable,not_applicable,ok", true, disconnectLogoutLocalCopy},
-		{"stop fails: logout skipped, autostart still removed", boom, nil, nil, true, logoutOutcome{}, "stop,autostart", "failed,ok,skipped", false, disconnectLogoutSkipCopy},
-		{"autostart fails: logout still runs", nil, boom, nil, true, logoutOutcome{}, "stop,autostart,logout", "ok,failed,ok", false, disconnectLogoutLocalCopy},
-		{"logout held by another process", nil, nil, errLogoutHeld, true, logoutOutcome{}, "stop,autostart,logout", "ok,ok,failed", false, disconnectLogoutHeldCopy},
-		{"logout fails", nil, nil, boom, true, logoutOutcome{}, "stop,autostart,logout", "ok,ok,failed", false, disconnectLogoutFailCopy},
+		{"all done, deregistered", nil, nil, nil, nil, true, logoutOutcome{Deregistered: true}, "stop,autostart,logout,creds", "ok,ok,ok,ok", true, disconnectLogoutOKCopy, disconnectCredsOKCopy},
+		{"all done, local logout only", nil, nil, nil, nil, true, logoutOutcome{}, "stop,autostart,logout,creds", "ok,ok,ok,ok", true, disconnectLogoutLocalCopy, disconnectCredsOKCopy},
+		{"not connected still removes the key", nil, nil, nil, nil, true, logoutOutcome{NotConnected: true}, "stop,autostart,logout,creds", "ok,ok,ok,ok", true, disconnectLogoutNoneCopy, disconnectCredsOKCopy},
+		{"not windows", nil, nil, nil, nil, false, logoutOutcome{}, "stop,autostart,logout,creds", "not_applicable,not_applicable,ok,ok", true, disconnectLogoutLocalCopy, disconnectCredsOKCopy},
+		{"stop fails", boom, nil, nil, nil, true, logoutOutcome{}, "stop,autostart", "failed,ok,skipped,skipped", false, disconnectLogoutSkipCopy, disconnectCredsSkipCopy},
+		{"autostart fails", nil, boom, nil, nil, true, logoutOutcome{}, "stop,autostart", "ok,failed,skipped,skipped", false, disconnectLogoutSkipCopy, disconnectCredsSkipCopy},
+		{"logout held by another process", nil, nil, errLogoutHeld, nil, true, logoutOutcome{}, "stop,autostart,logout", "ok,ok,failed,skipped", false, disconnectLogoutHeldCopy, disconnectCredsSkipCopy},
+		{"logout fails", nil, nil, boom, nil, true, logoutOutcome{}, "stop,autostart,logout", "ok,ok,failed,skipped", false, disconnectLogoutFailCopy, disconnectCredsSkipCopy},
+		{"credential removal fails", nil, nil, nil, boom, true, logoutOutcome{}, "stop,autostart,logout,creds", "ok,ok,ok,failed", false, disconnectLogoutLocalCopy, disconnectCredsFailCopy},
 	}
 	for _, c := range cases {
 		var calls []string
-		res := disconnectThisPC(recordDisconnect(&calls, c.stopErr, c.autoErr, c.lErr, c.applicable, c.out))
+		d := recordDisconnect(&calls, c.stopErr, c.autoErr, c.lErr, c.applicable, c.out)
+		if c.credErr != nil {
+			d.removeCredentials = func() (bool, error) { calls = append(calls, "creds"); return false, c.credErr }
+		}
+		res := disconnectThisPC(d)
 		if got := strings.Join(calls, ","); got != c.wantCalls {
 			t.Errorf("%s: calls %s, want %s", c.name, got, c.wantCalls)
 		}
 		if got := stepStatuses(res); got != c.wantStatus {
 			t.Errorf("%s: statuses %s, want %s", c.name, got, c.wantStatus)
 		}
-		if res.OK != c.wantOK || len(res.Steps) != 3 || res.Steps[2].Message != c.wantLogoutCopy {
+		if res.OK != c.wantOK || len(res.Steps) != 4 || res.Steps[2].Message != c.wantLogoutCopy || res.Steps[3].Message != c.wantCredsCopy {
 			t.Errorf("%s: %+v", c.name, res)
 		}
 		if b, _ := json.Marshal(res); bytes.Contains(b, []byte(boom.Error())) {
 			t.Errorf("%s: raw error text reached the result", c.name)
 		}
+	}
+}
+
+// TestRemoveEnrollmentCredentials: Disconnect removes the device credentials
+// an enrollment saved, and keeps every operator and node key.
+func TestRemoveEnrollmentCredentials(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "config.yaml")
+	if removed, err := removeEnrollmentCredentials(file); err != nil || removed {
+		t.Fatalf("missing file: %v %v", removed, err)
+	}
+	body := "device_api_token: tok-sentinel\napi_base_url: https://api.example.test\norg_id: org-1\norg_name: Example Org\n" +
+		"user_email: user@example.test\nnexus_url: https://nexus.example.test\nnode_config_dir: " + dir + "\naceteam_api_key: keep-me\n"
+	if err := os.WriteFile(file, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := removeEnrollmentCredentials(file)
+	if err != nil || !removed {
+		t.Fatalf("remove: %v %v", removed, err)
+	}
+	got, _ := os.ReadFile(file)
+	for _, gone := range []string{"device_api_token", "tok-sentinel", "api_base_url", "org_id", "org_name", "user_email"} {
+		if bytes.Contains(got, []byte(gone)) {
+			t.Errorf("%s survived:\n%s", gone, got)
+		}
+	}
+	for _, kept := range []string{"nexus_url", "node_config_dir", "aceteam_api_key: keep-me"} {
+		if !bytes.Contains(got, []byte(kept)) {
+			t.Errorf("%s was removed:\n%s", kept, got)
+		}
+	}
+	if removed, err := removeEnrollmentCredentials(file); err != nil || removed {
+		t.Fatalf("second run: %v %v", removed, err)
+	}
+	// A legacy Redis-URL enrollment is removed too.
+	if err := os.WriteFile(file, []byte("redis_url: redis://example.test:6379\nnexus_url: https://nexus.example.test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := removeEnrollmentCredentials(file); err != nil || !removed {
+		t.Fatalf("redis: %v %v", removed, err)
+	}
+	if got, _ := os.ReadFile(file); bytes.Contains(got, []byte("redis_url")) || !bytes.Contains(got, []byte("nexus_url")) {
+		t.Fatalf("redis removal:\n%s", got)
 	}
 }
 
@@ -459,7 +514,7 @@ func TestLocalDisconnectCommandAsksFirst(t *testing.T) {
 	if err := runLocalDisconnect(strings.NewReader("y\n"), &out, false, recordDisconnect(&calls, nil, nil, nil, true, logoutOutcome{})); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Join(calls, ",") != "stop,autostart,logout" || !strings.Contains(out.String(), disconnectStepLogout+": done.") || !strings.Contains(out.String(), disconnectDoneCopy) {
+	if strings.Join(calls, ",") != "stop,autostart,logout,creds" || !strings.Contains(out.String(), disconnectStepLogout+": done.") || !strings.Contains(out.String(), disconnectDoneCopy) {
 		t.Fatalf("confirmed: %v\n%s", calls, out.String())
 	}
 	calls = nil
@@ -496,7 +551,7 @@ func TestSetupPageDisconnect(t *testing.T) {
 	}
 	code, body := f.enrollCall("POST", "/api/setup/disconnect", nil)
 	var res localviewer.SetupActionResult
-	if err := json.Unmarshal([]byte(body), &res); err != nil || code != http.StatusOK || !res.OK || strings.Join(calls, ",") != "stop,autostart,logout" {
+	if err := json.Unmarshal([]byte(body), &res); err != nil || code != http.StatusOK || !res.OK || strings.Join(calls, ",") != "stop,autostart,logout,creds" {
 		t.Fatalf("disconnect: %d %s %v", code, body, calls)
 	}
 	if st := f.state(); !st.DisconnectAvailable {

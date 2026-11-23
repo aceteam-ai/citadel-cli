@@ -184,6 +184,7 @@
     $("enroll-posture").hidden = !(st.stage === "connected" && st.posture);
     $("enroll-posture").textContent = st.posture || "";
     $("worker").hidden = !(st.stage === "connected" && st.worker_offer);
+    $("posture-retry-row").hidden = !(st.stage === "connected" && st.posture_retry);
     if (active && !enrollTimer) enrollTimer = setInterval(pollEnroll, 1500);
     if (!active && enrollTimer) { clearInterval(enrollTimer); enrollTimer = null; }
   }
@@ -227,10 +228,19 @@
     button.disabled = false;
   }
 
+  $("posture-retry").onclick = async () => {
+    $("posture-retry").disabled = true;
+    try {
+      const res = await api("POST", "/api/setup/posture/retry", { confirm: true });
+      $("posture-retry-message").textContent = res.message || "";
+    } catch (e) { $("posture-retry-message").textContent = e.message; }
+    $("posture-retry").disabled = false;
+    await pollEnroll();
+  };
   $("worker-start").onclick = () => runAction("/api/setup/worker/start", $("worker-start"), "worker-steps", "worker-message");
   $("disconnect-start").onclick = async () => {
     const ok = window.confirm("Disconnect this PC from AceTeam?\n\nThe background worker stops, Citadel no longer starts when you sign in, " +
-      "and this PC is logged out of AceTeam. Local mode keeps working, and your saved logins are not touched.");
+      "this PC is logged out of AceTeam and its AceTeam device key is removed. Local mode keeps working, and your saved logins are not touched.");
     if (!ok) return;
     await runAction("/api/setup/disconnect", $("disconnect-start"), "disconnect-steps", "disconnect-message");
     await pollEnroll();

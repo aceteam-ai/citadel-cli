@@ -49,6 +49,7 @@ type setupFixture struct {
 	// C5 seams; see local_setup_posture_test.go. nodeDir is the fixture's
 	// node config dir; connected is what the toggles see.
 	nodeDir    string
+	meetingDir string
 	connected  bool
 	disconnect disconnectDeps
 	worker     setupWorkerDeps
@@ -58,6 +59,7 @@ func newSetupFixture(t *testing.T) *setupFixture {
 	t.Helper()
 	f := &setupFixture{t: t, home: t.TempDir(), exe: `C:\Users\demo\AppData\Local\Citadel\citadel.exe`}
 	f.nodeDir = filepath.Join(f.home, "node")
+	f.meetingDir = filepath.Join(f.home, "meeting")
 	env := harnessEnv{goos: "linux", home: f.home}
 	d := localSetupDeps{
 		stateDir: func() string { return filepath.Join(f.home, "state") },
@@ -106,7 +108,7 @@ func newSetupFixture(t *testing.T) *setupFixture {
 			}
 			return check(dir)
 		},
-		posture: writeSetupPosture,
+		posture: func(dir string) error { return writeSetupPosture(dir, f.meetingDir) },
 		nodePerms: func(busy func() bool) *localviewer.NodePermissionHooks {
 			return newNodePermissionHooks(nodePermissionDeps{
 				dir: func() string { return f.nodeDir },
@@ -138,9 +140,10 @@ func newSetupFixture(t *testing.T) *setupFixture {
 	// unless a test replaces it.
 	nothing := errors.New("fixture: not set up")
 	f.disconnect = disconnectDeps{
-		stopWorker:       func() (bool, error) { return false, nothing },
-		disableAutostart: func() (bool, error) { return false, nothing },
-		logout:           func() (logoutOutcome, error) { return logoutOutcome{}, nothing },
+		stopWorker:        func() (bool, error) { return false, nothing },
+		disableAutostart:  func() (bool, error) { return false, nothing },
+		logout:            func() (logoutOutcome, error) { return logoutOutcome{}, nothing },
+		removeCredentials: func() (bool, error) { return false, nothing },
 	}
 	f.worker = setupWorkerDeps{
 		goos: "windows",

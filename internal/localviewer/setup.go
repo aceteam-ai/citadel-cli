@@ -96,6 +96,9 @@ type SetupConfig struct {
 	// PC out of the AceTeam Network, reporting each step. Local mode keeps
 	// working and saved logins are never touched. Nil answers 404.
 	Disconnect func() (SetupActionResult, error)
+	// RetryPosture writes the full co-browse-only posture again after it
+	// failed following a connect. Nil answers 404.
+	RetryPosture func() (SetupActionResult, error)
 }
 
 // SetupStep is one step of a setup action and how it went. Status is "ok",
@@ -135,6 +138,8 @@ type SetupEnrollState struct {
 	// after a connect; WorkerOffer shows "Keep this PC available to AceTeam".
 	Posture     string `json:"posture,omitempty"`
 	WorkerOffer bool   `json:"worker_offer,omitempty"`
+	// PostureRetry shows Retry when saving the posture failed.
+	PostureRetry bool `json:"posture_retry,omitempty"`
 }
 
 type setupState struct {
@@ -160,6 +165,7 @@ func (s *Server) setupRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/setup/enroll/cancel", s.withCookie(s.withCSRF(s.handleSetupEnrollCancel)))
 	mux.HandleFunc("GET /api/setup/enroll/qr", s.withCookie(s.withCSRF(s.handleSetupEnrollQR)))
 	mux.HandleFunc("POST /api/setup/worker/start", s.withCookie(s.withCSRF(s.handleSetupAction(func(c *SetupConfig) func() (SetupActionResult, error) { return c.StartWorker }))))
+	mux.HandleFunc("POST /api/setup/posture/retry", s.withCookie(s.withCSRF(s.handleSetupAction(func(c *SetupConfig) func() (SetupActionResult, error) { return c.RetryPosture }))))
 	mux.HandleFunc("POST /api/setup/disconnect", s.withCookie(s.withCSRF(s.handleSetupAction(func(c *SetupConfig) func() (SetupActionResult, error) { return c.Disconnect }))))
 }
 

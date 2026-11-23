@@ -154,6 +154,9 @@ type setupEnroller struct {
 	// action is set while Disconnect or the worker start runs; an enrollment
 	// cannot start then, and neither can run during an enrollment.
 	action bool
+	// postureDir is the node config dir of this page's last successful
+	// enrollment, for a posture retry.
+	postureDir string
 }
 
 func newSetupEnroller(base func() enrollOptions, run func(context.Context, enrollOptions) (*enrollResult, error), open func(string) error, already func(string) (string, string)) *setupEnroller {
@@ -287,10 +290,11 @@ func (e *setupEnroller) runOnce(ctx context.Context, opts enrollOptions, done ch
 			st.Message = setupEnrollConnectedCopy
 		}
 		if e.posture != nil {
+			e.postureDir = opts.ConfigDir
 			if postureSaved {
 				st.Posture, st.WorkerOffer = setupPostureCopy, true
 			} else {
-				st.Posture = setupPostureFailedCopy
+				st.Posture, st.PostureRetry = setupPostureFailedCopy, true
 			}
 		}
 	case e.untrusted:
@@ -345,6 +349,31 @@ func (e *setupEnroller) resetAfterDisconnect() {
 	if !e.running {
 		e.state = localviewer.SetupEnrollState{Stage: setupEnrollIdle}
 	}
+}
+
+// retryPosture writes the full co-browse-only posture again after it failed
+// following this page's enrollment. On success the worker is offered. The
+// caller holds the action lock (beginAction).
+func (e *setupEnroller) retryPosture() (localviewer.SetupActionResult, error) {
+	e.mu.Lock()
+	retry := !e.running && e.state.Stage == setupEnrollConnected && e.state.PostureRetry
+	dir, write := e.postureDir, e.posture
+	e.mu.Unlock()
+	if !retry || write == nil || dir == "" {
+		return localviewer.SetupActionResult{}, errors.New(setupPostureNoRetryCopy)
+	}
+	step := localviewer.SetupStep{Name: setupPostureStep, Status: stepOK, Message: setupPostureCopy}
+	err := write(dir)
+	if err != nil {
+		log.Printf("[setup] co-browse-only posture not saved on retry: %v", err)
+		step.Status, step.Message = stepFailed, setupPostureFailedCopy
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err == nil && e.state.Stage == setupEnrollConnected {
+		e.state.Posture, e.state.PostureRetry, e.state.WorkerOffer = setupPostureCopy, false, true
+	}
+	return localviewer.SetupActionResult{OK: err == nil, Steps: []localviewer.SetupStep{step}, Message: step.Message}, nil
 }
 
 // workerOffered reports whether this page connected the PC and saved its

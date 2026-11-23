@@ -430,23 +430,35 @@ enrolled from the page.
 
 The co-browse-only posture of a setup-page PC (#1867 C5) is
 `cmd.writeSetupPosture`, run by `setupEnroller` only after a successful
-enrollment, into the node config dir it enrolled: every surface off,
-services/SSH/provision off, `cobrowse_public_only` on, passcode hash kept, a
-damaged file refused. Co-browse has no key of its own. `DefaultPermissions` and
-other enrollment paths are unchanged. `cmd.setNodeSurface` is the one writer for
+enrollment (and by the page's Retry): every surface off, services/SSH/provision
+off, `cobrowse_public_only` on, the `setup_posture` marker, a passcode hash kept,
+a damaged file refused, then `meeting_enabled: false` (the meeting browser has
+no egress guard). Co-browse has no key of its own. `DefaultPermissions` and
+other enrollment paths are unchanged. `config.SetupPostureActive` owns reading
+the marker (a damaged file counts when the key is in it). While it is set,
+`jobs.applySetupPostureFilter` drops every remote APPLY_DEVICE_CONFIG request
+that turns something on (Console/Desktop/Files/Shell, meeting, egress relay,
+default-serve, VNC, services) and every passcode push, reporting each in the
+job result; turning things off still applies. `worker.setupPostureRefusedJobTypes`
+is refused terminally (`ReasonSetupPosture`) through the source cmd installs
+with `worker.SetSetupPostureSource`. `cmd.setNodeSurface` is the one writer for
 the human Files/Shell grant (setup page, viewer, `citadel permission
 files|shell`): strict load, never a rewrite from defaults, one `[permission]
 audit` log line per change. Both pages serve it at `/api/node-permissions`
 (`localviewer.NodePermissionHooks`, behind the guard, cookie and bearer); Shell
 on needs `confirm_shell` and still fails closed without a passcode.
-`TestNodePermissionGrantHasNoMCPPath` pins that no MCP tool reaches it and which
-files may call it. `cmd.disconnectThisPC` (page and `citadel local disconnect`)
-stops the per-user worker, removes autostart, then `logoutThisNode`; a failed
-stop skips the logout, and local-mode state is never touched.
+`TestNodePermissionGrantHasNoMCPPath` pins which files may call the grant, and
+`TestEnrolledBridgeCannotGrantOnAPosturePC` drives the enrolled bridge's backend
+fallthrough into the refusal. `cmd.disconnectThisPC` (page and `citadel local
+disconnect`) stops the per-user worker, removes autostart, runs
+`logoutThisNode`, then `removeEnrollmentCredentials` (through the enrollment
+rollback helper, never `clearSavedConfig`), so a later worker has no device
+token to take API jobs with; a failed stop or autostart removal skips the logout
+and the credential removal. Local-mode state is never touched.
 `cmd.startSetupWorker` starts the worker only after this page connected the PC,
-the registration still exists and the public-only guard still holds, and drops
-the page's own network connection first so one node key has one endpoint; a
-Disconnect that logged out returns the page to idle.
+the registration still exists and the marker and public-only guard still hold,
+and drops the page's own network connection first so one node key has one
+endpoint; a Disconnect that logged out returns the page to idle.
 
 `nodevault.Vault.UnlockAtRest` owns #820: every consumer that encrypts data
 at rest unlocks through it, and it refuses a secret below

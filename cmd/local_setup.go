@@ -203,7 +203,9 @@ func realLocalSetupDeps() (localSetupDeps, error) {
 		enrollOptions: productionEnrollOptions,
 		enrollAlready: setupAlreadyInfo,
 		enrollCheck:   productionSetupNodeDirCheck,
-		posture:       writeSetupPosture,
+		posture: func(dir string) error {
+			return writeSetupPosture(dir, platform.ConfigDir())
+		},
 		nodePerms: func(busy func() bool) *localviewer.NodePermissionHooks {
 			return newNodePermissionHooks(productionNodePermissionDeps("setup_page", busy))
 		},
@@ -306,6 +308,9 @@ func newLocalSetupServer(d localSetupDeps) (*localviewer.Server, *setupEnroller)
 			}
 			return res, nil
 		})
+	}
+	if enroller != nil && d.posture != nil {
+		setup.RetryPosture = exclusive(enroller.retryPosture)
 	}
 	if d.worker != nil && enroller != nil {
 		setup.StartWorker = exclusive(func() (localviewer.SetupActionResult, error) {

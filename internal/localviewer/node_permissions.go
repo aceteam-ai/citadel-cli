@@ -26,6 +26,9 @@ type NodePermissionState struct {
 	Available bool `json:"available"`
 	Files     bool `json:"files"`
 	Shell     bool `json:"shell"`
+	// Console (terminal) and Desktop (screen) are shown, not changed here.
+	Console bool `json:"console"`
+	Desktop bool `json:"desktop"`
 	// Passcode reports a node passcode or master PIN, without which an enabled
 	// Shell still refuses every command.
 	Passcode bool `json:"passcode"`

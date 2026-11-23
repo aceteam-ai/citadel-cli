@@ -29,22 +29,26 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/localviewer"
+	"github.com/aceteam-ai/citadel-cli/internal/worker"
 )
 
 // setupPostureCopy is shown on the setup page after a connect.
-const setupPostureCopy = "AceTeam agents can browse public websites on this PC. They can't open files or run commands, " +
-	"and their browser sessions can't reach your home network. You can allow files or commands below when a task needs them."
+const setupPostureCopy = "AceTeam agents can browse public websites on this PC. They can't open files, run commands, " +
+	"use its terminal or screen, or start software on it, and their browser sessions can't reach your home network. " +
+	"You can allow files or commands below when a task needs them."
 
 // setupPostureFailedCopy is shown when the connect succeeded but the posture
 // could not be saved. The worker is then not offered.
 const setupPostureFailedCopy = "Connected, but Citadel could not save this PC's co-browse-only setting, so the worker was not started. " +
-	"Check that your user folder is not full or read-only, then run \"citadel permission cobrowse-public-only enable\" in a terminal, " +
-	"or press Disconnect this PC."
+	"Check that your user folder is not full or read-only, then press Retry. If it keeps failing, press Disconnect this PC."
 
-// writeSetupPosture writes the co-browse-only posture to permissionsDir. It
-// keeps a passcode hash already in the file, and refuses a file it cannot
-// read or parse.
-func writeSetupPosture(permissionsDir string) error {
+// writeSetupPosture writes the co-browse-only posture: the permissions file in
+// permissionsDir (with the SetupPosture marker that stops remote config from
+// turning anything back on), then meeting.yaml in meetingDir with the meeting
+// capability off, because the meeting bot's browser has no egress guard. It
+// keeps a passcode hash already in the file and refuses a file it cannot
+// read or parse. It is safe to run again: a retry writes the full posture.
+func writeSetupPosture(permissionsDir, meetingDir string) error {
 	p, err := config.LoadPermissionsStrict(permissionsDir)
 	if err != nil {
 		return fmt.Errorf("the node permissions file must be readable before the co-browse-only setting is saved: %w", err)
@@ -52,18 +56,37 @@ func writeSetupPosture(permissionsDir string) error {
 	p.Console, p.Desktop, p.Files, p.Shell = false, false, false, false
 	p.Services, p.SSH, p.Provision = false, false, false
 	p.CobrowsePublicOnly = true
+	p.SetupPosture = config.SetupPostureCobrowseOnly
 	if err := config.SavePermissions(permissionsDir, p); err != nil {
 		return fmt.Errorf("save the co-browse-only setting: %w", err)
+	}
+	m := config.LoadMeeting(meetingDir)
+	m.MeetingEnabled = false
+	if err := config.SaveMeeting(meetingDir, m); err != nil {
+		return fmt.Errorf("turn off the meeting capability: %w", err)
 	}
 	log.Printf("[permission] audit posture=cobrowse_only actor=human via=setup_page")
 	return nil
 }
 
-// setupPostureHolds reports whether permissionsDir still has the public-only
-// guard on, read strictly. The setup page starts the worker only then.
+// setupPostureStep names the posture retry's one step.
+const setupPostureStep = "Save the co-browse-only setting"
+
+// setupPostureNoRetryCopy refuses a retry that is not pending.
+const setupPostureNoRetryCopy = "There is no co-browse-only setting waiting to be saved again on this page."
+
+// setupPostureHolds reports whether permissionsDir still has the posture
+// marker and the public-only guard on, read strictly. The setup page starts
+// the worker only then.
 func setupPostureHolds(permissionsDir string) bool {
 	p, err := config.LoadPermissionsStrict(permissionsDir)
-	return err == nil && p.CobrowsePublicOnly
+	return err == nil && p.CobrowsePublicOnly && p.SetupPosture != ""
+}
+
+func init() {
+	// Every worker this binary runs (citadel work and the control center)
+	// refuses the software-starting job types on a setup-page PC, read live.
+	worker.SetSetupPostureSource(func() bool { return config.SetupPostureActive(nodePermissionsDir()) })
 }
 
 // errUnknownSurface is setNodeSurface's refusal of anything but files/shell.
@@ -134,6 +157,8 @@ func nodePermissionState(d nodePermissionDeps) (localviewer.NodePermissionState,
 		Available:  true,
 		Files:      p.Files,
 		Shell:      p.Shell,
+		Console:    p.Console,
+		Desktop:    p.Desktop,
 		Passcode:   p.HasPasscode(),
 		PublicOnly: p.CobrowsePublicOnly,
 	}
