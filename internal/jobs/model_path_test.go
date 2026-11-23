@@ -130,8 +130,18 @@ func TestDownloadModel_RefusesUnsafePathFields(t *testing.T) {
 				_, err := h.Execute(JobContext{}, makeJob(payload))
 				assertUnsafeRefusal(t, err, bad)
 				assertDirEmpty(t, outside)
-				if _, statErr := os.Stat(root); !errors.Is(statErr, os.ErrNotExist) {
-					t.Fatalf("cache root should not be created on refusal (stat err %v)", statErr)
+				// Nothing else may appear beside the cache root either: the
+				// cache root itself is not created, and no sibling exists.
+				entries, err := os.ReadDir(base)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(entries) != 1 || entries[0].Name() != "outside" {
+					names := make([]string, 0, len(entries))
+					for _, e := range entries {
+						names = append(names, e.Name())
+					}
+					t.Fatalf("unexpected entries beside the cache root: %v", names)
 				}
 			})
 		}
