@@ -111,9 +111,9 @@ The renderer sandbox in the browser-runtime container (citadel-cli#1788) has thr
 
 Container image platform checks (citadel-cli#1889) use the engine's JSON `info`
 platform, including Docker Desktop's VM platform, and local image OS/architecture/
-variant metadata. Discovery and `selectingRunner.useContainer` never pull: an
-absent image is unknown and selects the host runner. An explicit container launch
-may inspect the remote manifest and pull; an index must have a matching immutable
+variant metadata. Informational discovery never pulls: an absent image is unknown.
+The node-wide per-launch selection and explicit container launch may resolve and
+pull an absent digest-pinned image before selecting it; an index must have a matching immutable
 child, which is used for both inspection and the run contract. A single manifest
 must pass the local image-config check after pulling. Contract and sandbox labels
 remain mandatory. Tests in `cobrowse_container_platform_test.go` execute a fake
