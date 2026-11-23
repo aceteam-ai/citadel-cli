@@ -76,9 +76,10 @@ func TestClearSetupPosture(t *testing.T) {
 	}
 }
 
-// TestControlCenterSaveIsStrictAndKeepsThePosture: a Control Center save
-// from a stale copy keeps the marker and the public-only guard as they are
-// on disk, and never rewrites a damaged file.
+// TestControlCenterSaveIsStrictAndKeepsThePosture: a Control Center
+// whole-struct save (savePermissionsChecked) from a stale copy keeps the
+// marker and the public-only guard as they are on disk, and never rewrites a
+// damaged file. A by-name toggle keeps them too.
 func TestControlCenterSaveIsStrictAndKeepsThePosture(t *testing.T) {
 	dir := t.TempDir()
 	stale := config.DefaultPermissions() // loaded before the setup page connected
@@ -86,7 +87,7 @@ func TestControlCenterSaveIsStrictAndKeepsThePosture(t *testing.T) {
 		t.Fatal(err)
 	}
 	stale.Desktop = true
-	if err := saveControlCenterPermissions(dir, stale); err != nil {
+	if err := savePermissionsChecked(dir, stale); err != nil {
 		t.Fatal(err)
 	}
 	p, err := config.LoadPermissionsStrict(dir)
@@ -98,14 +99,20 @@ func TestControlCenterSaveIsStrictAndKeepsThePosture(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(bad, "permissions.yaml"), body, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := saveControlCenterPermissions(bad, config.DefaultPermissions()); err == nil {
+	if err := savePermissionsChecked(bad, config.DefaultPermissions()); err == nil {
 		t.Fatal("saved over a damaged file")
 	}
 	if got, _ := os.ReadFile(filepath.Join(bad, "permissions.yaml")); !bytes.Equal(got, body) {
 		t.Fatal("a damaged file was rewritten")
 	}
+	if err := toggleNodePermission(dir, "Console", true); err != nil {
+		t.Fatal(err)
+	}
+	if p, err := config.LoadPermissionsStrict(dir); err != nil || p.SetupPosture == "" || !p.CobrowsePublicOnly || !p.Console {
+		t.Fatalf("toggle: %+v %v", p, err)
+	}
 	// A missing file is fine (a fresh node).
-	if err := saveControlCenterPermissions(t.TempDir(), config.DefaultPermissions()); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := savePermissionsChecked(t.TempDir(), config.DefaultPermissions()); err != nil && !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("fresh node: %v", err)
 	}
 }

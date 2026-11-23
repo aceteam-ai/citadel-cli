@@ -7,12 +7,13 @@ import (
 	"time"
 )
 
-// InterfacePrefixes lists this machine's interface addresses, each with its
-// on-link prefix length (as net.InterfaceAddrs reports them).
+// InterfacePrefixes lists this machine's own addresses and on-link prefixes:
+// interface addresses with their masks, plus directly connected routes
+// (DefaultInterfacePrefixes).
 type InterfacePrefixes func() ([]netip.Prefix, error)
 
-// DefaultInterfacePrefixes reads the machine's interface addresses.
-func DefaultInterfacePrefixes() ([]netip.Prefix, error) {
+// interfaceAddrPrefixes reads the interface addresses with their masks.
+func interfaceAddrPrefixes() ([]netip.Prefix, error) {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
 		return nil, err

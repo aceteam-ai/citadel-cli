@@ -310,18 +310,18 @@ func TestNodePermissionGrantHasNoMCPPath(t *testing.T) {
 	}
 
 	allowed := map[string][]string{
-		"setNodeSurface(":               {"local_setup_posture.go", "permission.go"},
-		"setShellPermission(":           {"permission.go"},
-		"removeEnrollmentCredentials(":  {"local_disconnect.go"},
-		"retryPosture":                  {"local_setup.go", "local_setup_enroll.go"},
-		"clearSetupPosture(":            {"local_setup_posture.go", "permission.go"},
-		"setupPostureQuarantine":        {"local_setup.go", "local_setup_posture.go"},
-		"saveControlCenterPermissions(": {"controlcenter.go", "node_permissions.go"},
-		"newNodePermissionHooks(":       {"local_setup.go", "local_setup_posture.go"},
-		"viewerNodePermissions(":        {"local.go", "local_setup_posture.go", "mcp.go"},
-		"disconnectThisPC(":             {"local_disconnect.go", "local_setup.go"},
-		"startSetupWorker(":             {"local_setup.go", "local_setup_worker.go"},
-		"writeSetupPosture":             {"local_setup.go", "local_setup_posture.go"},
+		"setNodeSurface(":              {"local_setup_posture.go", "permission.go"},
+		"setShellPermission(":          {"permission.go"},
+		"removeEnrollmentCredentials(": {"local_disconnect.go"},
+		"retryPosture":                 {"local_setup.go", "local_setup_enroll.go"},
+		"clearSetupPosture(":           {"local_setup_posture.go", "permission.go"},
+		"setupPostureQuarantine":       {"local_setup.go", "local_setup_posture.go"},
+		"savePermissionsChecked(":      {"node_permissions.go"},
+		"newNodePermissionHooks(":      {"local_setup.go", "local_setup_posture.go"},
+		"viewerNodePermissions(":       {"local.go", "local_setup_posture.go", "mcp.go"},
+		"disconnectThisPC(":            {"local_disconnect.go", "local_setup.go"},
+		"startSetupWorker(":            {"local_setup.go", "local_setup_worker.go"},
+		"writeSetupPosture":            {"local_setup.go", "local_setup_posture.go"},
 	}
 	files, err := filepath.Glob("*.go")
 	if err != nil {

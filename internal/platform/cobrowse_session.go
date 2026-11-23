@@ -266,6 +266,9 @@ type CobrowseSessionManager struct {
 	// useResolver is set on the process-wide manager only, so its registry
 	// follows registryDirResolver; other managers keep a sibling of baseDir.
 	useResolver bool
+	// egressSweepStop ends the running unguarded-session sweep
+	// (startEgressSweep); nil when none runs. Guarded by mu.
+	egressSweepStop chan struct{}
 }
 
 // SessionProfile is an encrypted, PIN-unlocked persistent profile bound to one
@@ -583,6 +586,18 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 	}
 	m.mu.Unlock()
 
+	if s.egressGuarded() && startURL != "" && !strings.EqualFold(startURL, "about:blank") {
+		// The browser launched on about:blank and passed its route check; only
+		// now is the start URL requested (once).
+		nctx, ncancel := context.WithTimeout(context.Background(), egressFirstNavigateWait)
+		err := egressFirstNavigate(nctx, s, startURL)
+		ncancel()
+		if err != nil {
+			_ = m.Stop(id)
+			return CobrowseSessionStatus{}, fmt.Errorf("public-only session could not open its start page: %w", err)
+		}
+	}
+
 	st := s.status()
 	if startURL != "" && !strings.EqualFold(startURL, "about:blank") {
 		// Wait for the launch URL (including redirects) to settle, then report
@@ -697,7 +712,22 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 		}
 		guard = g
 	}
-	proc, err := launchCobrowseProc(s.profile, startURL, lo)
+	// A guarded browser opens on about:blank: nothing may load before the route
+	// check below proves its traffic goes through the guard. startSession
+	// navigates to the start URL afterwards, exactly once.
+	launchURL := startURL
+	if guard != nil {
+		launchURL = "about:blank"
+		if enc != nil {
+			// A restored profile could reopen its last tabs at startup,
+			// before the route check; drop the saved session state.
+			if err := clearSessionRestore(workDir); err != nil {
+				guard.Close()
+				return nil, err
+			}
+		}
+	}
+	proc, err := launchCobrowseProc(s.profile, launchURL, lo)
 	if err != nil {
 		if guard != nil {
 			guard.Close()
@@ -713,12 +743,6 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	// the session still runs and graceful stop still reaps it in-process.
 	writeSessionPidfile(s.profile, os.Getpid(), proc.browserPID, proc.xvfbPID, currentProcessStartToken())
 
-	// Configure the page policy before the session is visible to status or
-	// actions, so no page is ever accepted without it.
-	if s.tracking {
-		dropTargetSet(proc.debugPort)
-		targetSetFor(proc.debugPort).configure(s.id, tpolicy, tevent)
-	}
 	// Learn the browser's CDP id before the session is visible and before the
 	// chooser watcher exists, on every OS, so the watcher can always verify it.
 	if proc.browserID == "" && proc.debugPort > 0 {
@@ -728,13 +752,21 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	}
 	// Public-only: prove the browser really sends traffic through its guard
 	// before the session becomes usable (a managed proxy policy could route
-	// it elsewhere). Stopping the proc also closes the guard.
+	// it elsewhere). Stopping the proc also closes the guard. This runs
+	// before the page set below exists, so the canary's short-lived tab is
+	// never tracked (or picked as the active page).
 	if guard != nil {
 		if err := egressRouteCheck(proc, guard); err != nil {
 			dropTargetSet(proc.debugPort)
 			_ = proc.stop()
 			return nil, err
 		}
+	}
+	// Configure the page policy before the session is visible to status or
+	// actions, so no page is ever accepted without it.
+	if s.tracking {
+		dropTargetSet(proc.debugPort)
+		targetSetFor(proc.debugPort).configure(s.id, tpolicy, tevent)
 	}
 	s.mu.Lock()
 	s.proc = proc
@@ -749,6 +781,8 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	s.persistRecord()
 	if guard != nil {
 		go m.watchGuard(s.id, guard.Failed(), guardStopped)
+	} else {
+		m.startEgressSweep()
 	}
 	return proc, nil
 }
@@ -824,6 +858,7 @@ func (m *CobrowseSessionManager) Stop(id string) error {
 // display orphans across a worker restart. Best-effort: a failure on one session does
 // not skip the rest; the last error is returned.
 func (m *CobrowseSessionManager) StopAll() error {
+	m.stopEgressSweep()
 	m.mu.Lock()
 	all := m.sessions
 	m.sessions = make(map[string]*cobrowseSession)

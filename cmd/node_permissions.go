@@ -19,20 +19,57 @@ func loadNodePermissions() *config.Permissions {
 	return config.LoadPermissions(nodePermissionsDir())
 }
 
-// saveControlCenterPermissions is the Control Center's save. It loads the
-// file strictly first and refuses one it cannot parse, so a save never
-// rewrites a damaged file from the defaults. The Control Center holds a copy
-// it loaded earlier, which may predate a setup-page connect, so the settings
-// it has no toggle for, the setup posture marker and the co-browse
-// public-only guard, are taken from the file as it is now (citadel-cli#1867
-// C5).
-func saveControlCenterPermissions(dir string, p *config.Permissions) error {
+// saveNodePermissions writes p as the whole policy. It refuses when the file
+// on disk cannot be parsed: p was then loaded as the defaults, and saving it
+// would silently drop every setting the file holds (including co-browse
+// public-only).
+func saveNodePermissions(p *config.Permissions) error {
+	return savePermissionsChecked(nodePermissionsDir(), p)
+}
+
+// savePermissionsChecked also keeps, from the file as it is now, every field
+// the Control Center never edits, so a struct loaded earlier cannot turn them
+// back. CobrowsePublicOnly is such a field: only APPLY_DEVICE_CONFIG (on only)
+// and 'citadel permission cobrowse-public-only' change it. SetupPosture is
+// another: the setup page writes it and only 'citadel permission
+// setup-posture disable' clears it (citadel-cli#1867 C5), so a struct loaded
+// before a setup-page connect cannot drop it.
+func savePermissionsChecked(dir string, p *config.Permissions) error {
 	cur, err := config.LoadPermissionsStrict(dir)
 	if err != nil {
-		return fmt.Errorf("the node permissions file could not be read, so nothing was saved: %w", err)
+		return fmt.Errorf("the node permissions file must be readable before it can be changed: %w", err)
 	}
-	out := *p
-	out.SetupPosture = cur.SetupPosture
-	out.CobrowsePublicOnly = cur.CobrowsePublicOnly
-	return config.SavePermissions(dir, &out)
+	next := *p
+	next.CobrowsePublicOnly = cur.CobrowsePublicOnly
+	next.SetupPosture = cur.SetupPosture
+	return config.SavePermissions(dir, &next)
+}
+
+// toggleNodePermission sets one Built-in Services toggle against the file as
+// it is now: a strict load, one field, a save. Nothing else is written back,
+// so the co-browse public-only guard and the setup posture marker stay.
+func toggleNodePermission(dir, name string, enabled bool) error {
+	p, err := config.LoadPermissionsStrict(dir)
+	if err != nil {
+		return fmt.Errorf("the node permissions file must be readable before it can be changed: %w", err)
+	}
+	switch name {
+	case "Console":
+		p.Console = enabled
+	case "Desktop":
+		p.Desktop = enabled
+	case "Files":
+		p.Files = enabled
+	case "Services":
+		p.Services = enabled
+	case "SSH":
+		p.SSH = enabled
+	case "Provision":
+		p.Provision = enabled
+	case "Shell":
+		p.Shell = enabled
+	default:
+		return fmt.Errorf("unknown permission %q", name)
+	}
+	return config.SavePermissions(dir, p)
 }
