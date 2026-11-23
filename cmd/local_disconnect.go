@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/localviewer"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
@@ -70,9 +71,16 @@ const (
 	disconnectCredsFailCopy   = "Citadel could not remove this PC's AceTeam device key. Run \"citadel logout\" in a terminal, then remove this PC from your AceTeam account."
 	disconnectCredsSkipCopy   = "Skipped, because the logout did not finish."
 
-	disconnectDoneCopy    = "This PC is disconnected from AceTeam. Local mode keeps working, and your saved logins were not touched."
+	disconnectDoneCopy = "This PC is disconnected from AceTeam. Local mode keeps working, and your saved logins were not touched."
+	// disconnectPostureNote is added when the co-browse-only marker stays.
+	disconnectPostureNote = " This PC keeps its co-browse-only setting, so if you connect it again (here or with \"citadel enroll\") it stays co-browse only. " +
+		"To remove that setting, run \"citadel permission setup-posture disable\" in a terminal."
 	disconnectPartialCopy = "Disconnect did not finish. Check the steps below."
 )
+
+// disconnectPostureKept reports whether the co-browse-only marker is in
+// place (a test seam).
+var disconnectPostureKept = func() bool { return config.SetupPostureActive(nodePermissionsDir()) }
 
 // logoutOutcome is what logoutThisNode did.
 type logoutOutcome struct {
@@ -95,6 +103,9 @@ type disconnectDeps struct {
 	// removeCredentials removes the device credentials saved by this node's
 	// enrollment; removed is false when there were none.
 	removeCredentials func() (removed bool, err error)
+	// postureKept reports the co-browse-only marker, which Disconnect keeps
+	// (nil: not reported).
+	postureKept func() bool
 }
 
 // disconnectThisPC runs every step in order and reports each. A failed worker
@@ -172,6 +183,9 @@ func disconnectThisPC(d disconnectDeps) localviewer.SetupActionResult {
 		res.Message = disconnectDoneCopy
 	} else {
 		res.Message = disconnectPartialCopy
+	}
+	if d.postureKept != nil && d.postureKept() {
+		res.Message += disconnectPostureNote
 	}
 	return res
 }
@@ -260,6 +274,29 @@ func removeEnrollmentCredentials(configFile string) (bool, error) {
 	return true, nil
 }
 
+// removeDeviceCredentialsIn removes the enrollment's device credentials from
+// <dir>/config.yaml in every dir the worker reads them from
+// (deviceConfigDirs: the node config dir, then the legacy invoker config dir),
+// so no fallback is left for a later worker. Each dir is tried; the first
+// error is returned after all were tried.
+func removeDeviceCredentialsIn(dirs []string) (bool, error) {
+	removed := false
+	var firstErr error
+	seen := map[string]bool{}
+	for _, dir := range dirs {
+		if dir == "" || seen[filepath.Clean(dir)] {
+			continue
+		}
+		seen[filepath.Clean(dir)] = true
+		r, err := removeEnrollmentCredentials(filepath.Join(dir, "config.yaml"))
+		removed = removed || r
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return removed, firstErr
+}
+
 // hasNodeRegistration reports whether this PC holds an AceTeam Network
 // registration or connection.
 func hasNodeRegistration() bool {
@@ -286,9 +323,8 @@ func productionDisconnectDeps() disconnectDeps {
 			}
 			return true, err
 		},
-		removeCredentials: func() (bool, error) {
-			return removeEnrollmentCredentials(filepath.Join(network.GetNodeConfigDir(), "config.yaml"))
-		},
+		removeCredentials: func() (bool, error) { return removeDeviceCredentialsIn(deviceConfigDirs()) },
+		postureKept:       disconnectPostureKept,
 		logout: func() (logoutOutcome, error) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()

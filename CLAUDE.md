@@ -439,9 +439,18 @@ the marker (a damaged file counts when the key is in it). While it is set,
 `jobs.applySetupPostureFilter` drops every remote APPLY_DEVICE_CONFIG request
 that turns something on (Console/Desktop/Files/Shell, meeting, egress relay,
 default-serve, VNC, services) and every passcode push, reporting each in the
-job result; turning things off still applies. `worker.setupPostureRefusedJobTypes`
-is refused terminally (`ReasonSetupPosture`) through the source cmd installs
-with `worker.SetSetupPostureSource`. `cmd.setNodeSurface` is the one writer for
+job result; turning things off still applies. The worker runs only
+`worker.setupPostureAllowedJobTypes` there (co-browse sessions, the filtered
+config job, self-update, worker restart, and the Shell/Files jobs that recheck
+their own human-granted permission); every other type, including one added
+later, is refused terminally (`ReasonSetupPosture`) through the source cmd
+installs with `worker.SetSetupPostureSource` (`setupPostureCache` stats the file
+per job). `TestSetupPostureClassifiesEveryJobType` fails until a new job type is
+classified. A failed posture save runs `setupPostureQuarantine` (autostart off,
+worker stopped) and offers Retry. The marker stays after Disconnect;
+`citadel permission setup-posture disable` (`clearSetupPosture`) removes it.
+The Control Center saves through `saveControlCenterPermissions` (strict, keeps
+the marker and public-only guard from disk). `cmd.setNodeSurface` is the one writer for
 the human Files/Shell grant (setup page, viewer, `citadel permission
 files|shell`): strict load, never a rewrite from defaults, one `[permission]
 audit` log line per change. Both pages serve it at `/api/node-permissions`
@@ -451,9 +460,10 @@ on needs `confirm_shell` and still fails closed without a passcode.
 `TestEnrolledBridgeCannotGrantOnAPosturePC` drives the enrolled bridge's backend
 fallthrough into the refusal. `cmd.disconnectThisPC` (page and `citadel local
 disconnect`) stops the per-user worker, removes autostart, runs
-`logoutThisNode`, then `removeEnrollmentCredentials` (through the enrollment
-rollback helper, never `clearSavedConfig`), so a later worker has no device
-token to take API jobs with; a failed stop or autostart removal skips the logout
+`logoutThisNode`, then `removeDeviceCredentialsIn(deviceConfigDirs())` (through
+the enrollment rollback helper, never `clearSavedConfig`, in the node and the
+legacy invoker config dir), so a later worker has no device token to take API
+jobs with; a failed stop or autostart removal skips the logout
 and the credential removal. Local-mode state is never touched.
 `cmd.startSetupWorker` starts the worker only after this page connected the PC,
 the registration still exists and the marker and public-only guard still hold,

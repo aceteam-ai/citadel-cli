@@ -161,6 +161,13 @@ func TestSetupPostureFailureWithholdsTheWorker(t *testing.T) {
 	if len(calls) != 0 {
 		t.Fatalf("a refused worker start ran %v", calls)
 	}
+	// The PC has no marker, so any autostart entry and running worker must go.
+	f.mu.Lock()
+	q := f.quarantined
+	f.mu.Unlock()
+	if q != 1 {
+		t.Fatalf("a failed posture save must stop the worker and remove autostart once, got %d", q)
+	}
 }
 
 func setupPerms(t *testing.T, f *setupFixture) localviewer.NodePermissionState {
@@ -303,15 +310,18 @@ func TestNodePermissionGrantHasNoMCPPath(t *testing.T) {
 	}
 
 	allowed := map[string][]string{
-		"setNodeSurface(":              {"local_setup_posture.go", "permission.go"},
-		"setShellPermission(":          {"permission.go"},
-		"removeEnrollmentCredentials(": {"local_disconnect.go"},
-		"retryPosture":                 {"local_setup.go", "local_setup_enroll.go"},
-		"newNodePermissionHooks(":      {"local_setup.go", "local_setup_posture.go"},
-		"viewerNodePermissions(":       {"local.go", "local_setup_posture.go", "mcp.go"},
-		"disconnectThisPC(":            {"local_disconnect.go", "local_setup.go"},
-		"startSetupWorker(":            {"local_setup.go", "local_setup_worker.go"},
-		"writeSetupPosture":            {"local_setup.go", "local_setup_posture.go"},
+		"setNodeSurface(":               {"local_setup_posture.go", "permission.go"},
+		"setShellPermission(":           {"permission.go"},
+		"removeEnrollmentCredentials(":  {"local_disconnect.go"},
+		"retryPosture":                  {"local_setup.go", "local_setup_enroll.go"},
+		"clearSetupPosture(":            {"local_setup_posture.go", "permission.go"},
+		"setupPostureQuarantine":        {"local_setup.go", "local_setup_posture.go"},
+		"saveControlCenterPermissions(": {"controlcenter.go", "node_permissions.go"},
+		"newNodePermissionHooks(":       {"local_setup.go", "local_setup_posture.go"},
+		"viewerNodePermissions(":        {"local.go", "local_setup_posture.go", "mcp.go"},
+		"disconnectThisPC(":             {"local_disconnect.go", "local_setup.go"},
+		"startSetupWorker(":             {"local_setup.go", "local_setup_worker.go"},
+		"writeSetupPosture":             {"local_setup.go", "local_setup_posture.go"},
 	}
 	files, err := filepath.Glob("*.go")
 	if err != nil {

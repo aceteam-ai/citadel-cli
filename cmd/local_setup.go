@@ -176,6 +176,9 @@ type localSetupDeps struct {
 	// posture writes the co-browse-only permissions after a successful
 	// enrollment from this page (writeSetupPosture).
 	posture func(configDir string) error
+	// quarantine stops the worker and removes autostart after a failed
+	// posture save (setupPostureQuarantine).
+	quarantine func()
 	// nodePerms builds the Files and Shell toggles; busy refuses a change
 	// while an enrollment or action runs. Nil hides them.
 	nodePerms func(busy func() bool) *localviewer.NodePermissionHooks
@@ -203,6 +206,7 @@ func realLocalSetupDeps() (localSetupDeps, error) {
 		enrollOptions: productionEnrollOptions,
 		enrollAlready: setupAlreadyInfo,
 		enrollCheck:   productionSetupNodeDirCheck,
+		quarantine:    setupPostureQuarantine,
 		posture: func(dir string) error {
 			return writeSetupPosture(dir, platform.ConfigDir())
 		},
@@ -285,6 +289,7 @@ func newLocalSetupServer(d localSetupDeps) (*localviewer.Server, *setupEnroller)
 		enroller = newSetupEnroller(d.enrollOptions, d.enroll, d.openURL, d.enrollAlready)
 		enroller.check = d.enrollCheck
 		enroller.posture = d.posture
+		enroller.quarantine = d.quarantine
 		enroller.hooks(setup)
 	}
 	// exclusive runs a Disconnect or worker start alone: never during an

@@ -25,7 +25,11 @@ package cmd
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
+	"os"
+	"path/filepath"
+	"sync"
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/localviewer"
@@ -69,6 +73,20 @@ func writeSetupPosture(permissionsDir, meetingDir string) error {
 	return nil
 }
 
+// setupPostureQuarantine makes sure a PC whose posture could not be saved
+// runs no worker: it removes the sign-in autostart entry and stops the
+// per-user background worker, the first two Disconnect steps. Failures are
+// logged; the page still withholds the worker and offers Retry.
+func setupPostureQuarantine() {
+	d := productionDisconnectDeps()
+	if _, err := d.disableAutostart(); err != nil {
+		log.Printf("[setup] posture not saved: could not remove autostart: %v", err)
+	}
+	if _, err := d.stopWorker(); err != nil {
+		log.Printf("[setup] posture not saved: could not stop the background worker: %v", err)
+	}
+}
+
 // setupPostureStep names the posture retry's one step.
 const setupPostureStep = "Save the co-browse-only setting"
 
@@ -85,8 +103,54 @@ func setupPostureHolds(permissionsDir string) bool {
 
 func init() {
 	// Every worker this binary runs (citadel work and the control center)
-	// refuses the software-starting job types on a setup-page PC, read live.
-	worker.SetSetupPostureSource(func() bool { return config.SetupPostureActive(nodePermissionsDir()) })
+	// runs only the allowlisted job types on a setup-page PC, read live.
+	var cache setupPostureCache
+	worker.SetSetupPostureSource(func() bool { return cache.active(nodePermissionsDir()) })
+}
+
+// setupPostureCache answers the per-job posture check from the last parse
+// while the permissions file's size and modification time are unchanged, so
+// a busy fleet worker stats the file per job instead of parsing it.
+type setupPostureCache struct {
+	mu     sync.Mutex
+	dir    string
+	key    string
+	result bool
+}
+
+func (c *setupPostureCache) active(dir string) bool {
+	key := "missing"
+	if fi, err := os.Stat(filepath.Join(dir, "permissions.yaml")); err == nil {
+		key = fmt.Sprintf("%d/%d", fi.Size(), fi.ModTime().UnixNano())
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		key = ""
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if key != "" && key == c.key && dir == c.dir {
+		return c.result
+	}
+	c.result = config.SetupPostureActive(dir)
+	c.dir, c.key = dir, key
+	return c.result
+}
+
+// clearSetupPosture removes the SetupPosture marker, loading strictly so a
+// damaged file is never rewritten from the defaults. It changes nothing else.
+func clearSetupPosture(permissionsDir string) error {
+	p, err := config.LoadPermissionsStrict(permissionsDir)
+	if err != nil {
+		return fmt.Errorf("the node permissions file must be readable before this setting can change: %w", err)
+	}
+	if p.SetupPosture == "" {
+		return nil
+	}
+	p.SetupPosture = ""
+	if err := config.SavePermissions(permissionsDir, p); err != nil {
+		return fmt.Errorf("save permissions: %w", err)
+	}
+	log.Printf("[permission] audit posture=off actor=human via=cli")
+	return nil
 }
 
 // errUnknownSurface is setNodeSurface's refusal of anything but files/shell.

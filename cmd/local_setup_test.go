@@ -48,11 +48,12 @@ type setupFixture struct {
 
 	// C5 seams; see local_setup_posture_test.go. nodeDir is the fixture's
 	// node config dir; connected is what the toggles see.
-	nodeDir    string
-	meetingDir string
-	connected  bool
-	disconnect disconnectDeps
-	worker     setupWorkerDeps
+	nodeDir     string
+	meetingDir  string
+	connected   bool
+	quarantined int
+	disconnect  disconnectDeps
+	worker      setupWorkerDeps
 }
 
 func newSetupFixture(t *testing.T) *setupFixture {
@@ -109,6 +110,11 @@ func newSetupFixture(t *testing.T) *setupFixture {
 			return check(dir)
 		},
 		posture: func(dir string) error { return writeSetupPosture(dir, f.meetingDir) },
+		quarantine: func() {
+			f.mu.Lock()
+			f.quarantined++
+			f.mu.Unlock()
+		},
 		nodePerms: func(busy func() bool) *localviewer.NodePermissionHooks {
 			return newNodePermissionHooks(nodePermissionDeps{
 				dir: func() string { return f.nodeDir },

@@ -77,7 +77,7 @@
 
   <section class="card" id="disconnect" hidden>
     <h2>Disconnect this PC</h2>
-    <p class="muted">Stops the background worker, stops Citadel from starting when you sign in, logs this PC out of AceTeam and removes the device key AceTeam gave it. Local mode keeps working, and your saved logins are not touched.</p>
+    <p class="muted">Stops the background worker, stops Citadel from starting when you sign in, logs this PC out of AceTeam and removes the device key AceTeam gave it. Local mode keeps working, and your saved logins are not touched. The co-browse-only setting stays, so connecting again keeps this PC co-browse only; <code>citadel permission setup-posture disable</code> removes it.</p>
     <button id="disconnect-start" class="danger">Disconnect this PC</button>
     <ul id="disconnect-steps"></ul>
     <p id="disconnect-message" role="status"></p>

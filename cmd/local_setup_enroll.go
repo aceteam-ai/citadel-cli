@@ -142,6 +142,10 @@ type setupEnroller struct {
 	// enrollment (see local_setup_posture.go). Nil writes nothing and offers
 	// no worker.
 	posture func(configDir string) error
+	// quarantine runs when the posture could not be saved: it makes sure no
+	// sign-in autostart entry exists and no background worker runs, so a PC
+	// without the marker cannot take jobs while Retry is offered.
+	quarantine func()
 
 	mu              sync.Mutex
 	state           localviewer.SetupEnrollState
@@ -267,6 +271,9 @@ func (e *setupEnroller) runOnce(ctx context.Context, opts enrollOptions, done ch
 	if err == nil && res != nil && e.posture != nil {
 		if perr := e.posture(opts.ConfigDir); perr != nil {
 			log.Printf("[setup] co-browse-only posture not saved: %v", perr)
+			if e.quarantine != nil {
+				e.quarantine()
+			}
 		} else {
 			postureSaved = true
 		}
