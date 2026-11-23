@@ -125,7 +125,10 @@ atomic config/update owners. It saves `browser_appliance`, `browser_slots` and
 optional `browser_window_size` in device config, without changing default
 permissions or restarting a worker. `configureBrowserRuntime` reads those
 settings even before enrollment. `doctor_cobrowse.go` owns injected, read-only
-readiness checks; browser/Xvfb absence is fatal only for an applied appliance.
+readiness checks; browser/Xvfb absence is fatal for an applied appliance or
+retained co-browse-only posture. Damaged/unreadable device configuration fails
+readiness. Apply refuses node-directory overrides and POSIX elevation/foreign
+ownership before creating locks or writing configuration.
 Unknown namespace policy and missing fonts warn, not claim sandbox proof.
 See `docs/browser-appliance.md`; tests use temporary config and fake probes.
 
