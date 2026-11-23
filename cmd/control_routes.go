@@ -1,9 +1,12 @@
 package cmd
 
 import (
+	"fmt"
 	"net/http"
+	"os"
 
 	"github.com/aceteam-ai/citadel-cli/internal/config"
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
 )
 
@@ -74,13 +77,22 @@ func nodeSSHDeployAllowed() bool {
 
 // sshDeployAllowedIn is nodeSSHDeployAllowed's pure core. A missing file keeps
 // the default (SSH on); any other read error or a file that does not parse
-// refuses.
-//
-// TODO(#1882): also refuse while the setup posture is active
-// (config.SetupPostureActive) once that lands on main.
+// refuses. The setup posture refusal is added by #1882.
 func sshDeployAllowedIn(permissionsDir string) bool {
 	p, err := config.LoadPermissionsStrict(permissionsDir)
 	return err == nil && p.SSH
+}
+
+// syncAuthorizedKeysIfAllowed runs one authorized_keys sync only while the SSH
+// permission in permissionsDir allows it (sshDeployAllowedIn), read on every
+// call. Otherwise it logs a skip and returns ran=false without calling sync.
+// Both sync paths (`work --ssh-sync` and `citadel run`) go through it.
+func syncAuthorizedKeysIfAllowed(permissionsDir string, cfg nexus.SSHSyncConfig, sync func(nexus.SSHSyncConfig) error) (ran bool, err error) {
+	if !sshDeployAllowedIn(permissionsDir) {
+		fmt.Fprintln(os.Stderr, "   - SSH key sync skipped: SSH is disabled on this node, or its permissions file is unreadable")
+		return false, nil
+	}
+	return true, sync(cfg)
 }
 
 // permissionGate refuses with a fixed 403 while enabled() reports false.

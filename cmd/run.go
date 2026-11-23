@@ -311,9 +311,9 @@ func syncSSHKeysIfConfigured(configDir string) {
 	}
 
 	fmt.Println("   - Syncing SSH authorized keys...")
-	if err := nexus.SyncAuthorizedKeys(*config); err != nil {
+	if ran, err := syncAuthorizedKeysIfAllowed(nodePermissionsDir(), *config, nexus.SyncAuthorizedKeys); err != nil {
 		fmt.Fprintf(os.Stderr, "   ⚠️ SSH key sync failed: %v\n", err)
-	} else {
+	} else if ran {
 		fmt.Println("   ✅ SSH keys synchronized")
 	}
 }

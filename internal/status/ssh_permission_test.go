@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
 
 // The control listener's /ssh/authorized-keys runs the operator's SSH
@@ -31,6 +33,18 @@ func TestControlSSHDeployHonorsPermission(t *testing.T) {
 		t.Helper()
 		home := t.TempDir()
 		t.Setenv("HOME", home)
+		// deploySSHKeys resolves home through platform.UserHomeDir; the fixture
+		// pins it ahead of HOME, sudo and account lookup, so no case can reach
+		// a real authorized_keys.
+		restore, err := platform.OverrideHomeDirectoryForTesting(home)
+		if err != nil {
+			t.Fatalf("home fixture: %v", err)
+		}
+		defer func() {
+			if err := restore(); err != nil {
+				t.Errorf("restore home fixture: %v", err)
+			}
+		}()
 		srv := NewServer(ServerConfig{CAVerifier: v, ControlServerCert: &serverCert, SSHDeployAllowed: allowed}, NewCollector(CollectorConfig{NodeName: "test-node"}))
 		body, _ := json.Marshal(sshAuthorizedKeysRequest{Keys: []string{key}})
 		req := httptest.NewRequest(http.MethodPost, "/ssh/authorized-keys", bytes.NewReader(body))

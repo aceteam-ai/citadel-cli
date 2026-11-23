@@ -2033,9 +2033,11 @@ func runWork(cmd *cobra.Command, args []string) {
 			fmt.Printf("   - SSH key sync: enabled (every %dm)\n", workSSHSyncMins)
 
 			// Initial sync
-			if err := nexus.SyncAuthorizedKeys(sshConfig); err != nil {
+			// Each sync re-reads the operator's SSH permission and is skipped
+			// while it is off or the permissions file is unreadable.
+			if ran, err := syncAuthorizedKeysIfAllowed(nodePermissionsDir(), sshConfig, nexus.SyncAuthorizedKeys); err != nil {
 				fmt.Fprintf(os.Stderr, "   - ⚠️ Initial SSH sync failed: %v\n", err)
-			} else {
+			} else if ran {
 				fmt.Println("   - ✅ SSH keys synchronized")
 			}
 
@@ -2048,7 +2050,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					if err := nexus.SyncAuthorizedKeys(sshConfig); err != nil {
+					if _, err := syncAuthorizedKeysIfAllowed(nodePermissionsDir(), sshConfig, nexus.SyncAuthorizedKeys); err != nil {
 						fmt.Fprintf(os.Stderr, "   - ⚠️ SSH sync failed: %v\n", err)
 					}
 				}

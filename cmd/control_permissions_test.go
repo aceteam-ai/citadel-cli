@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
 
 // writePerms writes body as permissions.yaml in a fresh temp dir.
@@ -68,6 +70,55 @@ func TestFilesEnabledIn(t *testing.T) {
 		if got := filesEnabledIn(tc.dir); got != tc.want {
 			t.Errorf("%s: filesEnabledIn = %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+// The authorized_keys sync runs only while the SSH permission allows it.
+func TestSyncAuthorizedKeysIfAllowed(t *testing.T) {
+	cases := []struct {
+		name string
+		dir  string
+		want bool
+	}{
+		{"missing file keeps the SSH default", t.TempDir(), true},
+		{"ssh on", writePerms(t, "ssh: true\n"), true},
+		{"ssh off", writePerms(t, "ssh: false\n"), false},
+		{"damaged file skips", writePerms(t, "ssh: [true\n"), false},
+		{"unreadable file skips", unreadablePerms(t), false},
+	}
+	for _, tc := range cases {
+		calls := 0
+		ran, err := syncAuthorizedKeysIfAllowed(tc.dir, nexus.SSHSyncConfig{NodeID: "synthetic"}, func(nexus.SSHSyncConfig) error {
+			calls++
+			return nil
+		})
+		if err != nil || ran != tc.want || (calls == 1) != tc.want {
+			t.Errorf("%s: ran=%v calls=%d err=%v, want ran=%v", tc.name, ran, calls, err, tc.want)
+		}
+	}
+}
+
+// No command calls nexus.SyncAuthorizedKeys directly: every sync path goes
+// through syncAuthorizedKeysIfAllowed, so the SSH permission is always read.
+func TestAuthorizedKeysSyncOnlyThroughPermissionGate(t *testing.T) {
+	paths, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range paths {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok && types.ExprString(call.Fun) == "nexus.SyncAuthorizedKeys" {
+				t.Errorf("%s calls nexus.SyncAuthorizedKeys without syncAuthorizedKeysIfAllowed", path)
+			}
+			return true
+		})
 	}
 }
 
