@@ -26,6 +26,8 @@ func (p containerImagePlatform) normalized() containerImagePlatform {
 	case "aarch64":
 		p.Architecture = "arm64"
 	}
+	// Other spellings, including armv7, are not inferred: unknown variants
+	// refuse selection rather than guessing an image ISA.
 	// An omitted arm64 variant denotes the baseline v8 ISA.
 	if p.Architecture == "arm64" && p.Variant == "" {
 		p.Variant = "v8"
@@ -86,6 +88,10 @@ func checkImagePlatform(metadata string, target containerImagePlatform) error {
 // A single manifest has no platform in its wire representation: the local
 // image config must still pass checkImagePlatform after the explicit pull.
 func resolveImagePlatform(image, manifest string, target containerImagePlatform) (string, error) {
+	_, pin, pinned := strings.Cut(image, "@sha256:")
+	if _, err := hex.DecodeString(pin); !pinned || len(pin) != 64 || err != nil {
+		return "", errors.New("browser-runtime image must be pinned by sha256 digest")
+	}
 	var doc struct {
 		SchemaVersion int    `json:"schemaVersion"`
 		MediaType     string `json:"mediaType"`

@@ -994,12 +994,15 @@ func (s *selectingRunner) Launch(profileDir, startURL string, lo LaunchOptions) 
 // useContainer is the per-launch decision, made once by the manager before it
 // lays out the session dir: the node-wide manager uses the container runner
 // while it is healthy, otherwise the host runner (logged once per reason).
+// Unlike informational discovery, this admission path may resolve and pull an
+// absent pinned image before selecting it. The resolved platform and local
+// config still have to pass; Launch cannot be the only path that makes it ready.
 func (s *selectingRunner) useContainer(nodeWide bool) bool {
 	c := s.cr()
 	if c == nil || !nodeWide {
 		return false
 	}
-	if err := c.healthy(false); err != nil {
+	if err := c.healthy(true); err != nil {
 		s.logFallback(err)
 		return false
 	}

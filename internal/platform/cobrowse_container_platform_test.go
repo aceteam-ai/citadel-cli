@@ -190,6 +190,53 @@ func TestContainerPlatformUnknownDiscoveryCanBeExplicitlyRetried(t *testing.T) {
 	}
 }
 
+func TestContainerPlatformSelectionPullsAbsentCompatibleImage(t *testing.T) {
+	for _, compatible := range []bool{true, false} {
+		t.Run(fmt.Sprintf("compatible=%v", compatible), func(t *testing.T) {
+			calls := filepath.Join(t.TempDir(), "calls")
+			arch := "amd64"
+			if !compatible {
+				arch = "arm64"
+			}
+			child := "sha256:" + strings.Repeat("b", 64)
+			manifest := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"digest":%q,"platform":{"os":"linux","architecture":%q}}]}`, child, arch)
+			e := platformFixtureEngine{`{"OSType":"linux","Architecture":"amd64"}`, `{"os":"linux","architecture":"amd64"}`, manifest, calls, true, false}
+			r := newContainerRunner(BrowserRuntimeConfig{Engine: e, Image: testImage})
+			r.uid, r.gid = 1000, 1000
+			n := 0
+			s := &selectingRunner{host: markerRunner{"host", &n}, container: r}
+			if s.Name() != "host" {
+				t.Fatal("local discovery must not promise an absent image")
+			}
+			before, _ := os.ReadFile(calls)
+			if bytes.Contains(before, []byte(`["pull",`)) || bytes.Contains(before, []byte(`["manifest",`)) {
+				t.Fatal("discovery must stay local")
+			}
+			if s.useContainer(false) {
+				t.Fatal("local-mode selection must not use containers")
+			}
+			if got := s.useContainer(true); got != compatible {
+				t.Fatalf("per-launch selection=%v, want %v", got, compatible)
+			}
+			record, _ := os.ReadFile(calls)
+			pulled := bytes.Contains(record, []byte(`["pull",`))
+			if pulled != compatible {
+				t.Fatalf("unexpected pull: %s", record)
+			}
+			if compatible {
+				selected := strings.Split(testImage, "@")[0] + "@" + child
+				if r.imageForRun() != selected || !s.useContainer(true) || s.Name() != r.Name() {
+					t.Fatal("pulled child must become and remain selectable")
+				}
+				after, _ := os.ReadFile(calls)
+				if bytes.Count(after, []byte(`["pull",`)) != 1 {
+					t.Fatalf("healthy selection must not pull twice: %s", after)
+				}
+			}
+		})
+	}
+}
+
 func TestContainerPlatformResolvedChildUsedForLaunch(t *testing.T) {
 	f := &fakeEngine{}
 	r := newTestRunner(f, false)
@@ -236,6 +283,15 @@ func TestContainerPlatformIndexRejectsInvalidDigest(t *testing.T) {
 		manifest := fmt.Sprintf(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"digest":%q,"platform":{"os":"linux","architecture":"amd64"}}]}`, digest)
 		if _, err := resolveImagePlatform(testImage, manifest, target); err == nil {
 			t.Fatalf("accepted %q", digest)
+		}
+	}
+}
+
+func TestContainerPlatformResolveRefusesMutableReference(t *testing.T) {
+	target := containerImagePlatform{OS: "linux", Architecture: "amd64"}
+	for _, image := range []string{"example.invalid/runtime:latest", "example.invalid/runtime@sha256:bad"} {
+		if _, err := resolveImagePlatform(image, `{}`, target); err == nil || !strings.Contains(err.Error(), "pinned") {
+			t.Fatalf("accepted mutable or malformed reference %q: %v", image, err)
 		}
 	}
 }
