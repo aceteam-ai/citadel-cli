@@ -121,6 +121,8 @@ type seatCLIListRow struct {
 func newHarnessSeatRoot(resolveOwner seatCLIOwnerResolver) *cobra.Command {
 	harness := &cobra.Command{Use: "harness", Short: "Manage local harness metadata"}
 	seat := &cobra.Command{Use: "seat", Short: "Inspect or restrict an explicit private seat registry", Long: "Owner-only local registry metadata. No vendor credential files, login, status probe, job, remote enable or process launch is used. Incomplete seat-registry build: add/enable/probe and default-home adoption are not exposed yet."}
+	seat.Args = cobra.NoArgs
+	seat.RunE = func(cmd *cobra.Command, args []string) error { return cmd.Help() }
 	harness.AddCommand(seat)
 	var dir string
 	seat.PersistentFlags().StringVar(&dir, "registry-dir", "", "Required existing absolute 0700 registry directory under the caller's home; never defaults to node state")

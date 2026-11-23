@@ -289,14 +289,44 @@ func TestSessionAttachRootHookSkipsSharedStartup(t *testing.T) {
 			}
 		}
 		// This is a source boundary, not a live Control Center acceptance test:
-		// only the original offline leaf and explicit viewer return early. Bare
-		// interactive commands retain main's actual startup body below them.
-		for _, statement := range function.Body.List[2:] {
+		// The original two leaves stay first. The separately tested seat-only
+		// metadata predicate is allowed immediately AFTER profile admission,
+		// never ahead of it. Bare interactive commands still reach startup.
+		seatGuardSeen := false
+		for index, statement := range function.Body.List[2:] {
 			if guard, ok := statement.(*ast.IfStmt); ok && len(guard.Body.List) == 1 {
 				if _, returns := guard.Body.List[0].(*ast.ReturnStmt); returns {
-					t.Fatal("a third top-level startup bypass was introduced")
+					call, ok := guard.Cond.(*ast.CallExpr)
+					if !ok || index != 1 || guard.Init != nil || guard.Else != nil || len(call.Args) != 1 {
+						t.Fatal("an unaudited top-level startup bypass was introduced")
+					}
+					name, named := call.Fun.(*ast.Ident)
+					argument, correctArg := call.Args[0].(*ast.Ident)
+					if !named || name.Name != "isHarnessSeatCLI" || !correctArg || argument.Name != "cmd" {
+						t.Fatal("metadata startup scope changed")
+					}
+					profile, ok := function.Body.List[2].(*ast.IfStmt)
+					if !ok {
+						t.Fatal("metadata guard moved before profile admission")
+					}
+					assignment, ok := profile.Init.(*ast.AssignStmt)
+					if !ok || len(assignment.Rhs) != 1 {
+						t.Fatal("profile admission changed")
+					}
+					admission, ok := assignment.Rhs[0].(*ast.CallExpr)
+					if !ok {
+						t.Fatal("profile admission is not invoked")
+					}
+					admissionName, ok := admission.Fun.(*ast.Ident)
+					if !ok || admissionName.Name != "applyRunProfile" {
+						t.Fatal("metadata bypass no longer follows profile admission")
+					}
+					seatGuardSeen = true
 				}
 			}
+		}
+		if !seatGuardSeen {
+			t.Fatal("local metadata guard was not audited")
 		}
 		found = true
 		return false
