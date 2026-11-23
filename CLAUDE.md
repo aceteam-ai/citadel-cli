@@ -119,6 +119,16 @@ must pass the local image-config check after pulling. Contract and sandbox label
 remain mandatory. Tests in `cobrowse_container_platform_test.go` execute a fake
 `ContainerEngine` process, not a real engine or registry.
 
+The explicit `citadel appliance apply` command (citadel-cli#1890) reuses
+`writeSetupPosture`, with the closed `appliance` audit source, and the existing
+atomic config/update owners. It saves `browser_appliance`, `browser_slots` and
+optional `browser_window_size` in device config, without changing default
+permissions or restarting a worker. `configureBrowserRuntime` reads those
+settings even before enrollment. `doctor_cobrowse.go` owns injected, read-only
+readiness checks; browser/Xvfb absence is fatal only for an applied appliance.
+Unknown namespace policy and missing fonts warn, not claim sandbox proof.
+See `docs/browser-appliance.md`; tests use temporary config and fake probes.
+
 `platform.browserRunner` owns the per-OS half of a co-browse session:
 discovery, launch, owner-lifetime binding and the orphan sweep. The Linux
 `xvfbRunner` is the historical managed-Xvfb path, and its argument list is pinned

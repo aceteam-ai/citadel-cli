@@ -36,6 +36,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/cdpdiscovery"
@@ -126,7 +127,8 @@ type cobrowseLaunchOptions struct {
 	// the screencast viewer shows it instead. Left false on the Linux Xvfb path,
 	// whose argument list is unchanged.
 	headless bool
-	// windowSize is "W,H" for --window-size, applied only when headless.
+	// windowSize is "W,H" for --window-size. An explicit appliance size also
+	// applies to headed sessions instead of --start-maximized.
 	windowSize string
 	// proxyServer routes every browser connection through this HTTP proxy,
 	// including loopback ("<-loopback>" removes Chrome's implicit bypass), and
@@ -175,7 +177,16 @@ func stealthEnabled() bool {
 // plugins / languages, window.chrome.runtime, permissions.query, WebGL
 // vendor/renderer, canvas/audio noise), per-identity consistent fingerprints,
 // and proxy/TLS (JA3) alignment.
+// configuredBrowserWindow is set only by the explicit appliance profile.
+// An unset value preserves every existing runner's argument defaults.
+var configuredBrowserWindow atomic.Value
+
+func SetBrowserWindowSize(size string) { configuredBrowserWindow.Store(size) }
+
 func buildChromeArgs(opts cobrowseLaunchOptions) []string {
+	if size, ok := configuredBrowserWindow.Load().(string); ok && size != "" {
+		opts.windowSize = size
+	}
 	// disableFeatures is built as a single slice and emitted as ONE
 	// --disable-features flag. Chrome only honors the last --disable-features
 	// occurrence, so appending a second flag would silently drop earlier values
@@ -195,11 +206,13 @@ func buildChromeArgs(opts cobrowseLaunchOptions) []string {
 	}
 	if opts.headless {
 		args = append(args, "--headless=new")
-		if opts.windowSize != "" {
-			args = append(args, "--window-size="+opts.windowSize)
-		}
 	} else {
-		args = append(args, "--start-maximized")
+		if opts.windowSize == "" {
+			args = append(args, "--start-maximized")
+		}
+	}
+	if opts.windowSize != "" {
+		args = append(args, "--window-size="+opts.windowSize)
 	}
 
 	if opts.stealth {
@@ -422,6 +435,9 @@ func resolveCobrowseDisplay() (displayMode, string) {
 func xvfbResolution() string {
 	if r := strings.TrimSpace(os.Getenv(EnvCobrowseResolution)); r != "" {
 		return r
+	}
+	if size, ok := configuredBrowserWindow.Load().(string); ok && size != "" {
+		return strings.ReplaceAll(size, ",", "x") + "x24"
 	}
 	return defaultXvfbResolution
 }
