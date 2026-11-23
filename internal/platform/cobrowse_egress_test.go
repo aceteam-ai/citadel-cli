@@ -1,10 +1,12 @@
 package platform
 
 import (
+	"context"
 	"errors"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -27,6 +29,10 @@ type egressEnv struct {
 	routeErr error
 	routed   int
 	gate     chan struct{}
+	// events records launch, route-check and first-navigation order.
+	events  []string
+	navErr  error
+	workDir func(profileDir string)
 }
 
 func newEgressEnv(t *testing.T) *egressEnv {
@@ -37,16 +43,28 @@ func newEgressEnv(t *testing.T) *egressEnv {
 		e.mu.Lock()
 		defer e.mu.Unlock()
 		e.routed++
+		e.events = append(e.events, "route-check")
 		return e.routeErr
+	}
+	prevNav := egressFirstNavigate
+	egressFirstNavigate = func(ctx context.Context, s *cobrowseSession, url string) error {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		e.events = append(e.events, "navigate "+url)
+		return e.navErr
 	}
 	launchCobrowseProc = func(profileDir, startURL string, lo LaunchOptions) (*cobrowseProc, error) {
 		if e.gate != nil {
 			<-e.gate
 		}
+		if e.workDir != nil {
+			e.workDir(profileDir)
+		}
 		e.mu.Lock()
 		e.launches++
 		n := e.launches
 		e.opts = append(e.opts, lo)
+		e.events = append(e.events, "launch "+startURL)
 		e.mu.Unlock()
 		return &cobrowseProc{
 			debugPort: 9100 + n, display: ":" + strconv.Itoa(70+n),
@@ -74,6 +92,7 @@ func newEgressEnv(t *testing.T) *egressEnv {
 	}
 	t.Cleanup(func() {
 		launchCobrowseProc, startSessionEgressGuard, egressRouteCheck = prevLaunch, prevStart, prevRoute
+		egressFirstNavigate = prevNav
 		e.mu.Lock()
 		for _, g := range e.guards {
 			g.Close()
@@ -488,3 +507,212 @@ func TestLegacyCobrowseStoppedWhenPublicOnlyTurnsOn(t *testing.T) {
 		t.Fatal("the legacy browser kept running after public-only turned on")
 	}
 }
+
+func (e *egressEnv) eventList() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.events...)
+}
+
+// TestEgressStartURLOnlyAfterRouteCheck: a guarded browser launches on
+// about:blank, and the start URL is requested once, after the route check
+// passed. An unguarded session still launches straight at its URL.
+func TestEgressStartURLOnlyAfterRouteCheck(t *testing.T) {
+	e := newEgressEnv(t)
+	m := adoptMgr(trustedBaseDir(t))
+	defer m.StopAll()
+	on := true
+	m.SetEgressRequired(func() bool { return on })
+	if _, err := m.StartSession("https://a.example/login"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"launch about:blank", "route-check", "navigate https://a.example/login"}
+	if got := e.eventList(); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("order = %v, want %v", got, want)
+	}
+
+	on = false
+	e.mu.Lock()
+	e.events = nil
+	e.mu.Unlock()
+	if _, err := m.StartSession("https://b.example/"); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.eventList(); strings.Join(got, "|") != "launch https://b.example/" {
+		t.Fatalf("unguarded order = %v", got)
+	}
+}
+
+// TestEgressStartURLNotRequestedWhenRouteCheckFails: the canary failure
+// refuses the session before the start URL is ever requested.
+func TestEgressStartURLNotRequestedWhenRouteCheckFails(t *testing.T) {
+	e := newEgressEnv(t)
+	e.routeErr = errEgressNotRouted
+	m := adoptMgr(trustedBaseDir(t))
+	m.SetEgressRequired(func() bool { return true })
+	if _, err := m.StartSession("https://a.example/"); !errors.Is(err, errEgressNotRouted) {
+		t.Fatalf("want a route refusal, got %v", err)
+	}
+	for _, ev := range e.eventList() {
+		if strings.Contains(ev, "a.example") {
+			t.Fatalf("the start URL was requested before the session was refused: %v", e.eventList())
+		}
+	}
+}
+
+// TestEgressFirstNavigationFailureStopsSession: if the deferred navigation
+// cannot be sent, the session is stopped and the start refused.
+func TestEgressFirstNavigationFailureStopsSession(t *testing.T) {
+	e := newEgressEnv(t)
+	e.navErr = errors.New("no page target")
+	m := adoptMgr(trustedBaseDir(t))
+	m.SetEgressRequired(func() bool { return true })
+	if _, err := m.StartSession("https://a.example/"); err == nil {
+		t.Fatal("start should fail")
+	}
+	if n := len(m.List()); n != 0 || e.stops != 1 {
+		t.Fatalf("sessions left = %d, browser stops = %d", n, e.stops)
+	}
+}
+
+type restoreProfile struct{}
+
+func (restoreProfile) Materialize(dir string) error {
+	for _, p := range []string{"Default/Sessions/Tabs_1", "Default/Current Tabs", "Default/Last Session", "Profile 1/Sessions/Session_1", "Default/Cookies"} {
+		full := filepath.Join(dir, p)
+		if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+			return err
+		}
+		if err := os.WriteFile(full, []byte("x"), 0o600); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (restoreProfile) Persist(string) error { return nil }
+func (restoreProfile) Close() error         { return nil }
+
+// TestEgressPersistentProfileCannotRestoreTabs: a restored profile's saved
+// tabs are removed before a guarded launch (they would load before the route
+// check); cookies stay. An unguarded launch leaves the profile as it was.
+func TestEgressPersistentProfileCannotRestoreTabs(t *testing.T) {
+	for _, guarded := range []bool{true, false} {
+		e := newEgressEnv(t)
+		var seen map[string]bool
+		e.workDir = func(profileDir string) {
+			seen = map[string]bool{}
+			for _, p := range []string{"Default/Sessions", "Default/Current Tabs", "Default/Last Session", "Profile 1/Sessions", "Default/Cookies"} {
+				if _, err := os.Stat(filepath.Join(profileDir, p)); err == nil {
+					seen[p] = true
+				}
+			}
+		}
+		m := adoptMgr(trustedBaseDir(t))
+		m.SetEgressRequired(func() bool { return guarded })
+		if _, err := m.StartSessionWithProfile("", restoreProfile{}); err != nil {
+			t.Fatal(err)
+		}
+		_ = m.StopAll()
+		if !seen["Default/Cookies"] {
+			t.Fatalf("guarded=%v: cookies removed", guarded)
+		}
+		for _, p := range []string{"Default/Sessions", "Default/Current Tabs", "Default/Last Session", "Profile 1/Sessions"} {
+			if seen[p] == guarded {
+				t.Errorf("guarded=%v: %s present=%v at launch", guarded, p, seen[p])
+			}
+		}
+	}
+}
+
+// TestUnguardedSessionStoppedWhenPublicOnlyTurnsOn: a session launched
+// without a guard ends at its next action, or at the periodic sweep, once the
+// setting turns on.
+func TestUnguardedSessionStoppedWhenPublicOnlyTurnsOn(t *testing.T) {
+	newEgressEnv(t)
+	prevInterval := egressSweepInterval
+	t.Cleanup(func() { egressSweepInterval = prevInterval })
+	// The action path first, with the sweep too slow to interfere.
+	egressSweepInterval = time.Hour
+	m := adoptMgr(trustedBaseDir(t))
+	defer m.StopAll()
+	var on atomicBool
+	m.SetEgressRequired(on.get)
+
+	a, err := m.StartSession("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Handoff(a.ID); err != nil {
+		t.Fatalf("handoff with public-only off: %v", err)
+	}
+	on.set(true)
+	_, err = m.Handoff(a.ID)
+	var se *SessionEndedError
+	if !errors.As(err, &se) || se.Reason != EndedReasonPublicOnly {
+		t.Fatalf("want a public-only ended error, got %v", err)
+	}
+	if _, ok := m.SessionStatus(a.ID); ok {
+		t.Fatal("unguarded session still running")
+	}
+
+	// The sweep catches an idle one without any action (a fresh manager, so
+	// its sweep starts with the short interval).
+	egressSweepInterval = 20 * time.Millisecond
+	m = adoptMgr(trustedBaseDir(t))
+	defer m.StopAll()
+	on.set(false)
+	m.SetEgressRequired(on.get)
+	b, err := m.StartSession("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	on.set(true)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		m.mu.Lock()
+		_, still := m.sessions[b.ID]
+		m.mu.Unlock()
+		if !still {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the sweep did not stop the idle unguarded session")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// A guarded session is left alone.
+	g, err := m.StartSession("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if _, ok := m.SessionStatus(g.ID); !ok {
+		t.Fatal("a guarded session was stopped")
+	}
+}
+
+// TestLocalModeNeverSwept: a manager without a public-only source (local
+// mode) never stops its sessions on the node setting.
+func TestLocalModeNeverSwept(t *testing.T) {
+	newEgressEnv(t)
+	setNodeEgress(t, func() bool { return true })
+	m := newCobrowseSessionManager(trustedBaseDir(t), 2)
+	defer m.StopAll()
+	st, err := m.StartSession("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.sweepUnguarded()
+	if _, err := m.Handoff(st.ID); err != nil {
+		t.Fatalf("local session refused: %v", err)
+	}
+}
+
+type atomicBool struct {
+	mu sync.Mutex
+	v  bool
+}
+
+func (b *atomicBool) get() bool  { b.mu.Lock(); defer b.mu.Unlock(); return b.v }
+func (b *atomicBool) set(v bool) { b.mu.Lock(); b.v = v; b.mu.Unlock() }

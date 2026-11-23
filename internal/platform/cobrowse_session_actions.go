@@ -394,6 +394,9 @@ func (m *CobrowseSessionManager) sessionForAction(id string) (*cobrowseSession, 
 		}
 		return nil, fmt.Errorf("no such browser session: %q", id)
 	}
+	if err := m.stopIfUnguarded(s); err != nil {
+		return nil, err
+	}
 	return s, nil
 }
 

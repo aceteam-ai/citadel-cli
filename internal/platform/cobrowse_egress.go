@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -231,3 +233,127 @@ func startEgressForLaunch(id string, lo *LaunchOptions) (*browserurl.EgressGuard
 	lo.UseContainer = false
 	return g, nil
 }
+
+// EndedReasonPublicOnly ends an unguarded session that was running when the
+// node switched to public-only browsing.
+const EndedReasonPublicOnly = "public_only_enabled"
+
+// egressSweepInterval is how often a manager that can be switched to
+// public-only checks for unguarded sessions to stop.
+var egressSweepInterval = 30 * time.Second
+
+// egressSwitchable reports whether this manager reads a public-only source
+// (the node-wide manager, or one given SetEgressRequired). Local mode is not.
+func (m *CobrowseSessionManager) egressSwitchable() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.useResolver || m.egressRequired != nil
+}
+
+// stopIfUnguarded stops s, and refuses the action, when public-only is now on
+// and s runs without a guard: its pages still reach the local network.
+func (m *CobrowseSessionManager) stopIfUnguarded(s *cobrowseSession) error {
+	if s.egressGuarded() || !m.egressSwitchable() || !m.egressRequiredNow() {
+		return nil
+	}
+	m.stopUnguarded(s.id)
+	return &SessionEndedError{ID: s.id, Reason: EndedReasonPublicOnly, Detail: publicOnlyEndedDetail}
+}
+
+const publicOnlyEndedDetail = "this node switched to public-only browsing; start a new session"
+
+func (m *CobrowseSessionManager) stopUnguarded(id string) {
+	log.Printf("[cobrowse] stopping session %s: it has no egress guard and this node is now public-only", id)
+	_ = m.Stop(id)
+	m.recordEnded(id, EndedReasonPublicOnly, publicOnlyEndedDetail)
+}
+
+// sweepUnguarded stops every unguarded session when public-only is on.
+func (m *CobrowseSessionManager) sweepUnguarded() {
+	if !m.egressSwitchable() || !m.egressRequiredNow() {
+		return
+	}
+	m.mu.Lock()
+	var ids []string
+	for id, s := range m.sessions {
+		s.mu.Lock()
+		unguarded := s.egress == "" && s.proc != nil
+		s.mu.Unlock()
+		if unguarded {
+			ids = append(ids, id)
+		}
+	}
+	m.mu.Unlock()
+	for _, id := range ids {
+		m.stopUnguarded(id)
+	}
+}
+
+// startEgressSweep runs sweepUnguarded periodically, once per manager, after
+// its first unguarded launch, so an idle page does not keep its network
+// access until the next action.
+func (m *CobrowseSessionManager) startEgressSweep() {
+	if !m.egressSwitchable() {
+		return
+	}
+	m.egressSweepOnce.Do(func() {
+		go func() {
+			t := time.NewTicker(egressSweepInterval)
+			defer t.Stop()
+			for range t.C {
+				m.sweepUnguarded()
+			}
+		}()
+	})
+}
+
+func (s *cobrowseSession) egressGuarded() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.egress != ""
+}
+
+// egressFirstNavigateWait bounds pinning the page and sending the deferred
+// start-URL navigation (not the page load; startSession settles that).
+const egressFirstNavigateWait = 10 * time.Second
+
+// egressFirstNavigate sends a guarded session's start URL once, after the
+// route check. A package var so unit tests without a browser record it.
+var egressFirstNavigate = func(ctx context.Context, s *cobrowseSession, url string) error {
+	p, err := s.pinActionCtx(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = p.cdp("Page.navigate", map[string]any{"url": url})
+	return err
+}
+
+// clearSessionRestore removes a profile's saved session state (open tabs and
+// windows), so a restored profile cannot reopen its last pages at startup.
+// Cookies and saved logins are untouched. Every profile directory under the
+// user-data dir is covered; a removal error refuses the launch.
+func clearSessionRestore(userDataDir string) error {
+	entries, err := os.ReadDir(userDataDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("public-only: read profile: %w", err)
+	}
+	for _, e := range entries {
+		if !e.IsDir() || e.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		dir := filepath.Join(userDataDir, e.Name())
+		for _, name := range sessionRestoreEntries {
+			if err := os.RemoveAll(filepath.Join(dir, name)); err != nil {
+				return fmt.Errorf("public-only: clear saved tabs in the profile: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+// sessionRestoreEntries are Chromium's saved-session files: the Sessions
+// directory (current releases) and the older top-level files.
+var sessionRestoreEntries = []string{"Sessions", "Current Session", "Current Tabs", "Last Session", "Last Tabs"}

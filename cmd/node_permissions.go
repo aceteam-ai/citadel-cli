@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"fmt"
+
 	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 )
@@ -17,6 +19,17 @@ func loadNodePermissions() *config.Permissions {
 	return config.LoadPermissions(nodePermissionsDir())
 }
 
+// saveNodePermissions writes p as the whole policy. It refuses when the file
+// on disk cannot be parsed: p was then loaded as the defaults, and saving it
+// would silently drop every setting the file holds (including co-browse
+// public-only).
 func saveNodePermissions(p *config.Permissions) error {
-	return config.SavePermissions(nodePermissionsDir(), p)
+	return savePermissionsChecked(nodePermissionsDir(), p)
+}
+
+func savePermissionsChecked(dir string, p *config.Permissions) error {
+	if _, err := config.LoadPermissionsStrict(dir); err != nil {
+		return fmt.Errorf("the node permissions file must be readable before it can be changed: %w", err)
+	}
+	return config.SavePermissions(dir, p)
 }

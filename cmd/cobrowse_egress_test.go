@@ -76,3 +76,32 @@ func TestSetCobrowsePublicOnlyRefusesDamagedFile(t *testing.T) {
 		t.Fatalf("file changed: %q", data)
 	}
 }
+
+// TestLocalPermissionWritersRefuseDamagedFile: every local writer that loads
+// and saves the whole policy refuses a damaged file instead of rewriting it
+// from defaults (which would drop co-browse public-only and the rest).
+func TestLocalPermissionWritersRefuseDamagedFile(t *testing.T) {
+	const damaged = "cobrowse_public_only: true\nshell: [\n"
+	writers := map[string]func(dir string) error{
+		"shell":       func(dir string) error { _, err := setShellPermission(dir, true); return err },
+		"passcode":    func(dir string) error { _, err := setNodePasscode(dir, "2468"); return err },
+		"clear":       func(dir string) error { _, err := clearNodePasscode(dir); return err },
+		"legacyClear": func(dir string) error { return clearLegacyPasscodeAt([]string{dir}) },
+		"tui":         func(dir string) error { return savePermissionsChecked(dir, config.DefaultPermissions()) },
+	}
+	for name, write := range writers {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "permissions.yaml")
+			if err := os.WriteFile(path, []byte(damaged), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := write(dir); err == nil {
+				t.Fatal("a damaged permissions file must be refused")
+			}
+			if data, _ := os.ReadFile(path); string(data) != damaged {
+				t.Fatalf("file rewritten: %q", data)
+			}
+		})
+	}
+}

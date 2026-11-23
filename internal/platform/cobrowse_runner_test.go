@@ -309,6 +309,7 @@ func TestBuildChromeArgs_ProxyAndQuiet(t *testing.T) {
 		"--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
 		"--webrtc-ip-handling-policy=disable_non_proxied_udp",
 		"--disable-extensions",
+		"--disable-quic",
 		"--disable-background-networking",
 		"--disable-component-update",
 	} {

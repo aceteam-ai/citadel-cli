@@ -266,6 +266,8 @@ type CobrowseSessionManager struct {
 	// useResolver is set on the process-wide manager only, so its registry
 	// follows registryDirResolver; other managers keep a sibling of baseDir.
 	useResolver bool
+	// egressSweepOnce starts the unguarded-session sweep (startEgressSweep).
+	egressSweepOnce sync.Once
 }
 
 // SessionProfile is an encrypted, PIN-unlocked persistent profile bound to one
@@ -583,6 +585,18 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 	}
 	m.mu.Unlock()
 
+	if s.egressGuarded() && startURL != "" && !strings.EqualFold(startURL, "about:blank") {
+		// The browser launched on about:blank and passed its route check; only
+		// now is the start URL requested (once).
+		nctx, ncancel := context.WithTimeout(context.Background(), egressFirstNavigateWait)
+		err := egressFirstNavigate(nctx, s, startURL)
+		ncancel()
+		if err != nil {
+			_ = m.Stop(id)
+			return CobrowseSessionStatus{}, fmt.Errorf("public-only session could not open its start page: %w", err)
+		}
+	}
+
 	st := s.status()
 	if startURL != "" && !strings.EqualFold(startURL, "about:blank") {
 		// Wait for the launch URL (including redirects) to settle, then report
@@ -697,7 +711,22 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 		}
 		guard = g
 	}
-	proc, err := launchCobrowseProc(s.profile, startURL, lo)
+	// A guarded browser opens on about:blank: nothing may load before the route
+	// check below proves its traffic goes through the guard. startSession
+	// navigates to the start URL afterwards, exactly once.
+	launchURL := startURL
+	if guard != nil {
+		launchURL = "about:blank"
+		if enc != nil {
+			// A restored profile could reopen its last tabs at startup,
+			// before the route check; drop the saved session state.
+			if err := clearSessionRestore(workDir); err != nil {
+				guard.Close()
+				return nil, err
+			}
+		}
+	}
+	proc, err := launchCobrowseProc(s.profile, launchURL, lo)
 	if err != nil {
 		if guard != nil {
 			guard.Close()
@@ -749,6 +778,8 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	s.persistRecord()
 	if guard != nil {
 		go m.watchGuard(s.id, guard.Failed(), guardStopped)
+	} else {
+		m.startEgressSweep()
 	}
 	return proc, nil
 }
