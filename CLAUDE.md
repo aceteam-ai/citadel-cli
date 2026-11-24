@@ -148,21 +148,30 @@ fallback behind `selectingRunner`, whose container selection it does not touch.
 `discoverMacBrowser` (`cobrowse_macos_logic.go`) owns the search order (Chrome,
 Edge, Chromium, Canary under `/Applications` then `~/Applications`, then PATH,
 or `CITADEL_COBROWSE_BROWSER`) and lists what it searched on failure. macOS has
-no job object or parent-death signal, so `startHeadless` puts the browser in its
-own process group (`Setpgid`) and `killProcessGroup` ends the whole group on
-stop. A crashed owner's browser lives until the next sweep: `sweepMacSessions`
-removes only dirs whose owner PID plus start time (`processStartToken`, sysctl
-`kern.proc.pid`) no longer match, and `killVerifiedBrowserGroup` kills a group
-only when the recorded PID's command line (`ps`) names that session's exact
-`--user-data-dir` and the PID leads its own group; nothing is killed by bare PID.
+no job object or parent-death signal, so `startHeadless` starts a citadel-owned
+placeholder as the leader of a process group and joins the browser to it
+(`Pgid`). `groupGuard.teardown` is the only signaller: SIGTERM, a grace wait,
+SIGKILL of the group, then the placeholder is reaped last, under one mutex, and
+never signals again, so a group id is never signalled after it could be reused
+(Stop and the exit waiter both call it). The placeholder polls the owner and
+exits with it. A crashed owner's browser lives until the next sweep:
+`sweepMacSessions` removes only dirs whose owner PID plus start time
+(`processStartToken`, sysctl `kern.proc.pid`) no longer match, and
+`killVerifiedBrowserGroup` kills a group only when the recorded PID's command
+line (`ps`) names that session's exact `--user-data-dir` and the PID is in the
+recorded group (the pidfile's third slot holds the leader); nothing is killed
+by bare PID. A browser it cannot verify or kill keeps its dir and pidfile for a
+later retry, and `killOrphanSessionProcs` returns that error so the
+persistent-profile cleanup never reports "cleaned". On darwin the shared
+`reapProfileUsers` reads `ps` (`listMacReapProcs`) instead of /proc, so a
+surviving helper fails persistence and cleanup.
 `validatePrivateSessionDir` refuses a non-0700, foreign-owned or symlinked
 session dir before launch; the default base is `~/Library/Caches/Citadel`
 (`macDefaultBaseDir`), and with no home dir the launch is refused rather than
-falling back to a shared temp parent. The reaper kills the group as soon as the
-leader exits and `stopProcessGroup` never signals a group after that. `--use-mock-keychain` (`mockKeychain`) keeps a hidden
-browser off the Keychain prompt: during a session the decrypted working copy
-uses Chromium's mock key (the Linux basic-password-store posture), while the
-at-rest sealed profile is unchanged. The
+falling back to a shared temp parent. `--use-mock-keychain` (`mockKeychain`)
+keeps a hidden browser off the Keychain prompt: during a session the decrypted
+working copy uses Chromium's mock key (the Linux basic-password-store posture),
+while the at-rest sealed profile is unchanged. The
 decision logic is untagged and tested on Linux (`cobrowse_macos_logic_test.go`);
 the real-browser macOS acceptance is manual until CI has a macOS job.
 

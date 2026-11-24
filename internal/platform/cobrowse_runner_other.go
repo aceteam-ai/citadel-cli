@@ -39,7 +39,8 @@ func sessionOwnerAlive(pid int, _ int64) bool { return pid > 0 && pidAlive(pid) 
 
 // killOrphanSessionProcs kills an interrupted session's browser and Xvfb, each
 // only while its recorded identity still verifies.
-func killOrphanSessionProcs(_ string, browserPID, xvfbPID int) {
+func killOrphanSessionProcs(_ string, browserPID, xvfbPID int) error {
 	sweepKillIfVerified(browserPID, roleCobrowseBrowser, "browser")
 	sweepKillIfVerified(xvfbPID, roleCobrowseXvfb, "Xvfb")
+	return nil
 }

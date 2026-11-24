@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -116,18 +117,93 @@ func TestMacDefaultBaseDir(t *testing.T) {
 	}
 }
 
-func TestStopProcessGroupSkipsAfterExit(t *testing.T) {
-	var killed []int
-	kill := func(g int) error { killed = append(killed, g); return nil }
+func TestGroupGuardOrderAndNoSignalAfterTeardown(t *testing.T) {
+	var events []string
 	exited := make(chan struct{})
-	close(exited)
-	if err := stopProcessGroup(42, exited, kill); err != nil || len(killed) != 0 {
-		t.Errorf("exited leader: err %v, killed %v (must not signal a possibly reused group)", err, killed)
+	g := &groupGuard{
+		pgid:          42,
+		browserExited: exited,
+		termGrace:     time.Second,
+		signal: func(pg int, sig syscall.Signal) error {
+			events = append(events, fmt.Sprintf("%d:%v", pg, sig))
+			if sig == syscall.SIGTERM {
+				close(exited) // the browser exits on TERM
+			}
+			return nil
+		},
+		reapLeader: func() { events = append(events, "reap") },
 	}
-	running := make(chan struct{})
-	go func() { time.Sleep(20 * time.Millisecond); close(running) }()
-	if err := stopProcessGroup(43, running, kill); err != nil || len(killed) != 1 || killed[0] != 43 {
-		t.Errorf("running leader: err %v, killed %v", err, killed)
+	if err := g.teardown(); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"42:terminated", "42:killed", "reap"}
+	if strings.Join(events, ",") != strings.Join(want, ",") {
+		t.Errorf("order %v, want %v", events, want)
+	}
+	// Stop after the waiter's teardown (or the reverse): no further signal.
+	if err := g.teardown(); err != nil || len(events) != 3 {
+		t.Errorf("second teardown: %v, events %v", err, events)
+	}
+}
+
+func TestGroupGuardSerializesAndPropagatesErrors(t *testing.T) {
+	exited := make(chan struct{})
+	var mu sync.Mutex
+	inSignal, overlap, calls := 0, false, 0
+	g := &groupGuard{
+		pgid:          7,
+		browserExited: exited,
+		termGrace:     10 * time.Millisecond,
+		signal: func(int, syscall.Signal) error {
+			mu.Lock()
+			inSignal++
+			calls++
+			if inSignal > 1 {
+				overlap = true
+			}
+			mu.Unlock()
+			time.Sleep(5 * time.Millisecond)
+			mu.Lock()
+			inSignal--
+			mu.Unlock()
+			return syscall.EPERM
+		},
+		reapLeader: func() {},
+	}
+	var wg sync.WaitGroup
+	errs := make([]error, 4)
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) { defer wg.Done(); errs[i] = g.teardown() }(i)
+	}
+	wg.Wait()
+	if overlap || calls != 2 {
+		t.Errorf("concurrent teardown must signal exactly TERM+KILL once: overlap %v calls %d", overlap, calls)
+	}
+	for _, e := range errs {
+		if e == nil || !errors.Is(e, syscall.EPERM) {
+			t.Errorf("signal failure must be propagated to every caller, got %v", e)
+		}
+	}
+}
+
+func TestParseMacPS(t *testing.T) {
+	out := "  101   501 /Applications/Google Chrome.app/x --user-data-dir=/a b --headless=new\n 7 0 /sbin/launchd\nbogus\n  x 1 y\n"
+	rows := parseMacPS(out)
+	if len(rows) != 2 || rows[0].pid != 101 || rows[0].uid != 501 ||
+		rows[0].cmd != "/Applications/Google Chrome.app/x --user-data-dir=/a b --headless=new" || rows[1].cmd != "/sbin/launchd" {
+		t.Errorf("rows: %+v", rows)
+	}
+}
+
+func TestDiscoverMacBrowserNamedOverrideFromPath(t *testing.T) {
+	info, err := discoverMacBrowser(macProbe(nil, map[string]string{EnvCobrowseBrowser: "edge"}, map[string]string{"microsoft-edge": "/opt/bin/microsoft-edge"}))
+	if err != nil || info.Path != "/opt/bin/microsoft-edge" || info.Kind != "edge" {
+		t.Errorf("got %+v, %v", info, err)
+	}
+	// A named override never takes another browser from PATH.
+	if _, err := discoverMacBrowser(macProbe(nil, map[string]string{EnvCobrowseBrowser: "edge"}, map[string]string{"chromium": "/opt/bin/chromium"})); !errors.Is(err, ErrNoBrowser) {
+		t.Errorf("want ErrNoBrowser, got %v", err)
 	}
 }
 
@@ -180,26 +256,32 @@ func TestMacCmdlineHasProfile(t *testing.T) {
 }
 
 type fakeMacProcs struct {
-	cmdline map[int]string
-	pgid    map[int]int
-	killed  []int
-	removed []string
-	owners  map[int]int64 // alive owners: pid -> start
+	cmdline  map[int]string
+	pgid     map[int]int
+	killed   []int
+	removed  []string
+	owners   map[int]int64 // alive owners: pid -> start
+	killFail bool
+	unread   map[int]bool // pids whose command line cannot be read
 }
 
 func (f *fakeMacProcs) deps(self int, selfStart int64) macSweepDeps {
 	return macSweepDeps{
 		self:      self,
 		selfStart: selfStart,
+		ownPgrp:   5,
 		ownerAlive: func(pid int, start int64) bool {
 			s, ok := f.owners[pid]
 			return ok && (start == 0 || s == start)
 		},
 		cmdline: func(pid int) (string, error) {
+			if f.unread[pid] {
+				return "", errors.New("ps failed")
+			}
 			if c, ok := f.cmdline[pid]; ok {
 				return c, nil
 			}
-			return "", errors.New("gone")
+			return "", errMacProcGone
 		},
 		pgid: func(pid int) (int, error) {
 			if g, ok := f.pgid[pid]; ok {
@@ -207,7 +289,18 @@ func (f *fakeMacProcs) deps(self int, selfStart int64) macSweepDeps {
 			}
 			return 0, errors.New("gone")
 		},
-		killGroup: func(g int) error { f.killed = append(f.killed, g); return nil },
+		killGroup: func(g int) error {
+			f.killed = append(f.killed, g)
+			if f.killFail {
+				return syscall.EPERM
+			}
+			for pid, pg := range f.pgid {
+				if pg == g {
+					delete(f.cmdline, pid)
+				}
+			}
+			return nil
+		},
 		removeDir: func(d string) error { f.removed = append(f.removed, d); return os.RemoveAll(d) },
 	}
 }
@@ -268,20 +361,66 @@ func TestSweepMacSessions(t *testing.T) {
 func TestKillVerifiedBrowserGroupFailsClosed(t *testing.T) {
 	dir := "/tmp/sess"
 	f := &fakeMacProcs{
-		cmdline: map[int]string{10: "chrome --user-data-dir=" + dir, 11: "chrome --user-data-dir=" + dir, 12: "chrome --user-data-dir=/other"},
-		pgid:    map[int]int{10: 10, 11: 7, 12: 12},
+		cmdline: map[int]string{
+			10: "chrome --user-data-dir=" + dir, 11: "chrome --user-data-dir=" + dir, 12: "chrome --user-data-dir=/other",
+			14: "chrome --user-data-dir=" + dir, 15: "chrome --user-data-dir=" + dir,
+		},
+		pgid:   map[int]int{10: 9, 11: 7, 12: 12, 14: 5, 15: 15},
+		unread: map[int]bool{16: true},
 	}
 	d := f.deps(1, 0)
-	if !killVerifiedBrowserGroup(dir, 10, d) {
-		t.Error("verified leader should be killed")
+	// Verified member of the recorded group: killed and confirmed gone.
+	if err := killVerifiedBrowserGroup(dir, 10, 9, d); err != nil || len(f.killed) != 1 || f.killed[0] != 9 {
+		t.Errorf("verified member: %v, killed %v", err, f.killed)
 	}
-	for _, pid := range []int{11, 12, 13, 0, 1} {
-		if killVerifiedBrowserGroup(dir, pid, d) {
-			t.Errorf("pid %d must not be killed", pid)
+	// Wrong group, our own group, and a pre-placeholder record whose pid does
+	// not lead its group are refused with an error and nothing is signalled.
+	for _, c := range []struct{ pid, leader int }{{11, 9}, {14, 5}, {15, 0 + 3}} {
+		if err := killVerifiedBrowserGroup(dir, c.pid, c.leader, d); err == nil {
+			t.Errorf("pid %d leader %d must be refused", c.pid, c.leader)
+		}
+	}
+	// Unreadable command line: cannot verify, so an error (dir is kept).
+	if err := killVerifiedBrowserGroup(dir, 16, 0, d); err == nil {
+		t.Error("an unverifiable browser must be an error")
+	}
+	// Gone, other program, and pid 0 or 1: nothing of ours left, no error, no signal.
+	for _, pid := range []int{13, 12, 0, 1} {
+		if err := killVerifiedBrowserGroup(dir, pid, 0, d); err != nil {
+			t.Errorf("pid %d: %v", pid, err)
 		}
 	}
 	if len(f.killed) != 1 {
 		t.Errorf("killed %v", f.killed)
+	}
+	// A failing signal is propagated.
+	f2 := &fakeMacProcs{cmdline: map[int]string{20: "chrome --user-data-dir=" + dir}, pgid: map[int]int{20: 19}, killFail: true}
+	if err := killVerifiedBrowserGroup(dir, 20, 19, f2.deps(1, 0)); err == nil || !errors.Is(err, syscall.EPERM) {
+		t.Errorf("kill failure must propagate, got %v", err)
+	}
+}
+
+func TestSweepKeepsDirWhenBrowserCannotBeKilledOrVerified(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "sessions")
+	if err := os.Mkdir(base, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stuck := macSessionDir(t, base, "stuck", "400\n205\n9\n4000\n")
+	unread := macSessionDir(t, base, "unread", "401\n206\n0\n4000\n")
+	f := &fakeMacProcs{
+		cmdline:  map[int]string{205: "chrome --user-data-dir=" + stuck},
+		pgid:     map[int]int{205: 9},
+		unread:   map[int]bool{206: true},
+		killFail: true,
+	}
+	sweepMacSessions(base, f.deps(1, 0))
+	for _, dir := range []string{stuck, unread} {
+		if _, err := os.Stat(filepath.Join(dir, sessionPidfileName)); err != nil {
+			t.Errorf("%s and its pid record must be kept for a retry: %v", dir, err)
+		}
+	}
+	if len(f.removed) != 0 {
+		t.Errorf("removed %v", f.removed)
 	}
 }
 

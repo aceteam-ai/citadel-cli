@@ -118,7 +118,12 @@ func CleanOrphanedProfileSessions(baseDir string, owns func(identity string) boo
 			continue
 		}
 		if _, browserPID, xvfbPID := readSessionPidfile(dir); browserPID > 0 || xvfbPID > 0 {
-			killOrphanSessionProcs(dir, browserPID, xvfbPID)
+			if err := killOrphanSessionProcs(dir, browserPID, xvfbPID); err != nil {
+				// The browser may still be writing to the decrypted copy:
+				// keep the dir and report it, never "cleaned".
+				remain = append(remain, fmt.Sprintf("%s (%v)", dir, err))
+				continue
+			}
 		}
 		if err := removeAllRetry(dir, orphanRemoveAttempts, orphanRemoveDelay); err != nil {
 			remain = append(remain, fmt.Sprintf("%s (%v)", dir, err))

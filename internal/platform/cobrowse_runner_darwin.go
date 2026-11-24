@@ -13,11 +13,13 @@
 //     and sync off, the egress proxy arguments) come from buildChromeArgs.
 //     --use-mock-keychain keeps a hidden browser off the login Keychain prompt.
 //   - Lifetime: macOS has no job object and no parent-death signal. The
-//     browser leads its own process group (Setpgid); stop kills the whole
-//     group. If the owner dies without stopping, the browser keeps running
-//     until the next sweep, which kills the group only after verifying the
-//     recorded PID still is this session's browser (see killVerifiedBrowserGroup)
-//     and removes the dir.
+//     browser joins a process group led by a citadel-owned placeholder that
+//     is reaped last (groupGuard), so a signal never reaches a reused group id;
+//     stop and the exit waiter end the whole group. If the owner dies without
+//     stopping, the browser keeps running until the next sweep, which kills the
+//     group only after verifying the recorded PID still is this session's
+//     browser (see killVerifiedBrowserGroup) and removes the dir; a browser it
+//     cannot verify or kill keeps its dir for a later retry.
 //   - Identity: the owner is its PID plus its start time, read with
 //     sysctl(kern.proc.pid) through golang.org/x/sys/unix (microsecond
 //     resolution, no locale parsing as `ps -o lstart` would need). A browser's
@@ -35,7 +37,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -105,35 +106,60 @@ func startHeadless(info BrowserInfo, profileDir, startURL, userAgent string, lo 
 		quiet:        lo.Quiet,
 		mockKeychain: true,
 	})
+
+	// A citadel-owned placeholder leads the session's process group and is
+	// reaped only by groupGuard.teardown, last. While it is unreaped its pid, and
+	// so the group id, cannot be given to another process, so every signal sent
+	// to the group is sent to our own group. It polls the owner and exits with
+	// it, which keeps a crashed owner from leaking it; the browser then still
+	// holds the group.
+	leader := exec.Command("/bin/sh", "-c", `while kill -0 "$1" 2>/dev/null; do sleep 1; done`, "sh", strconv.Itoa(os.Getpid()))
+	leader.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := leader.Start(); err != nil {
+		return nil, fmt.Errorf("start browser process group: %w", err)
+	}
+	pgid := leader.Process.Pid
+
 	cmd := exec.Command(info.Path, args...)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: pgid}
+	exited := make(chan struct{})
+	guard := &groupGuard{
+		pgid:          pgid,
+		signal:        signalProcessGroup,
+		browserExited: exited,
+		termGrace:     2 * time.Second,
+		reapLeader: func() {
+			_ = leader.Process.Kill()
+			done := make(chan struct{})
+			go func() { _ = leader.Wait(); close(done) }()
+			waitBounded(done)
+		},
+	}
 	if err := cmd.Start(); err != nil {
+		_ = guard.teardown()
 		return nil, fmt.Errorf("launch %s: %w", info.Kind, err)
 	}
-	pgid := cmd.Process.Pid // Setpgid: the browser leads its own group
-	exited := make(chan struct{})
 	go func() {
 		_ = cmd.Wait()
-		// Reap helpers the moment the leader is gone, while the group id is
-		// still ours; stop never signals a group after this point.
-		_ = killProcessGroup(pgid)
 		close(exited)
+		// The leader still holds the group id, so this reaps the browser's
+		// helpers without ever signalling a reused id.
+		_ = guard.teardown()
 	}()
-	var once sync.Once
-	var stopErr error
+
 	proc := &cobrowseProc{
 		browser:    info.Kind,
-		browserPID: pgid,
-		exited:     exited,
+		browserPID: cmd.Process.Pid,
+		// xvfbPID records the group leader in the pidfile (there is no Xvfb
+		// on macOS); the sweep requires the browser to be in that group.
+		xvfbPID: pgid,
+		exited:  exited,
 		stop: func() error {
-			once.Do(func() {
-				// Whole group, so renderer, GPU and helper processes go with
-				// the main process; then wait (bounded) for it to be reaped.
-				stopErr = stopProcessGroup(pgid, exited, killProcessGroup)
-			})
-			return stopErr
+			err := guard.teardown()
+			waitBounded(exited)
+			return err
 		},
 	}
 
@@ -169,17 +195,22 @@ func startHeadless(info BrowserInfo, profileDir, startURL, userAgent string, lo 
 	return proc, nil
 }
 
-// killProcessGroup sends SIGKILL to a whole process group. A group that is
-// already gone is success.
-func killProcessGroup(pgid int) error {
+// signalProcessGroup sends sig to a whole process group. A group that is
+// already gone is success. Callers hold a groupGuard, which keeps the group id
+// reserved.
+func signalProcessGroup(pgid int, sig syscall.Signal) error {
 	if pgid <= 1 {
 		return fmt.Errorf("refusing to signal process group %d", pgid)
 	}
-	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
-		return fmt.Errorf("kill browser process group: %w", err)
+	if err := syscall.Kill(-pgid, sig); err != nil && err != syscall.ESRCH {
+		return err
 	}
 	return nil
 }
+
+// killProcessGroup sends SIGKILL to a group the caller has verified (the
+// orphan sweep).
+func killProcessGroup(pgid int) error { return signalProcessGroup(pgid, syscall.SIGKILL) }
 
 // processStartToken returns a process's start time in microseconds since the
 // epoch, from sysctl kern.proc.pid.
@@ -215,20 +246,23 @@ func processCommandLine(pid int) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "/bin/ps", "-ww", "-o", "command=", "-p", strconv.Itoa(pid)).Output()
-	if err != nil {
-		return "", err
-	}
 	s := strings.TrimSpace(string(out))
-	if s == "" {
-		return "", fmt.Errorf("no command line for pid %d", pid)
+	if s != "" {
+		return s, nil
 	}
-	return s, nil
+	// ps exits 1 with no output for a PID that does not exist.
+	var ee *exec.ExitError
+	if err == nil || (errors.As(err, &ee) && ee.ExitCode() == 1) {
+		return "", errMacProcGone
+	}
+	return "", err
 }
 
 func realMacSweepDeps() macSweepDeps {
 	return macSweepDeps{
 		self:       os.Getpid(),
 		selfStart:  currentProcessStartToken(),
+		ownPgrp:    syscall.Getpgrp(),
 		ownerAlive: sessionOwnerAlive,
 		cmdline:    processCommandLine,
 		pgid:       syscall.Getpgid,
@@ -239,9 +273,62 @@ func realMacSweepDeps() macSweepDeps {
 
 // killOrphanSessionProcs kills an interrupted persistent-profile session's
 // browser group, only while the recorded PID still verifies as that session's
-// browser. There is no Xvfb on macOS.
-func killOrphanSessionProcs(dir string, browserPID, _ int) {
-	killVerifiedBrowserGroup(dir, browserPID, realMacSweepDeps())
+// browser; leaderPID is the recorded group leader. A browser that could not be
+// verified and killed is an error, so the caller never reports it cleaned.
+func killOrphanSessionProcs(dir string, browserPID, leaderPID int) error {
+	return killVerifiedBrowserGroup(dir, browserPID, leaderPID, realMacSweepDeps())
+}
+
+// The shared profile-user reaper (reapProfileUsers) reads /proc, which macOS
+// lacks; here it reads `ps` instead, so a helper still using a session's
+// --user-data-dir fails persistence and cleanup rather than being missed.
+func init() {
+	listReapProcs = listMacReapProcs
+	lookupReapProc = lookupMacReapProc
+}
+
+func macReapProc(r macPSRow) (reapProc, bool) {
+	start, err := processStartToken(r.pid)
+	if err != nil {
+		return reapProc{}, false
+	}
+	return reapProc{pid: r.pid, start: uint64(start), uid: r.uid, args: strings.Fields(r.cmd)}, true
+}
+
+func listMacReapProcs() []reapProc {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "/bin/ps", "-ww", "-axo", "pid=,uid=,command=").Output()
+	if err != nil {
+		return nil
+	}
+	var res []reapProc
+	for _, r := range parseMacPS(string(out)) {
+		// Only the argv match needs the full list; the start time (a sysctl)
+		// is read just for processes naming a profile.
+		if !strings.Contains(r.cmd, "--user-data-dir=") && !strings.Contains(r.cmd, "--database=") {
+			continue
+		}
+		if p, ok := macReapProc(r); ok {
+			res = append(res, p)
+		}
+	}
+	return res
+}
+
+func lookupMacReapProc(pid int) (reapProc, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "/bin/ps", "-ww", "-o", "pid=,uid=,command=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return reapProc{}, false
+	}
+	for _, r := range parseMacPS(string(out)) {
+		if r.pid == pid {
+			return macReapProc(r)
+		}
+	}
+	return reapProc{}, false
 }
 
 func systemMacBrowserProbe() macBrowserProbe {

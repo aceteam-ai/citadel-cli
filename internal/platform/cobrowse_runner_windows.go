@@ -416,4 +416,4 @@ func sessionOwnerAlive(pid int, start int64) bool { return processAliveWithStart
 
 // killOrphanSessionProcs is a no-op on Windows: the owner's kill-on-close Job
 // Object already ended the session's browser tree when the owner exited.
-func killOrphanSessionProcs(string, int, int) {}
+func killOrphanSessionProcs(string, int, int) error { return nil }

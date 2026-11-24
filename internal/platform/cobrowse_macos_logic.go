@@ -18,7 +18,9 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -37,18 +39,20 @@ type macBrowserProbe struct {
 
 // macApp is one browser app bundle discovery knows.
 type macApp struct {
-	alias  string // value accepted from EnvCobrowseBrowser
-	kind   string // BrowserInfo.Kind
-	bundle string // "<bundle>.app" under an Applications dir
-	exe    string // executable name inside Contents/MacOS
+	alias string // value accepted from EnvCobrowseBrowser
+	// pathNames are plain executables that satisfy a named override from PATH.
+	pathNames []string
+	kind      string // BrowserInfo.Kind
+	bundle    string // "<bundle>.app" under an Applications dir
+	exe       string // executable name inside Contents/MacOS
 }
 
 // macApps is the search order: Chrome, Edge, Chromium, then Chrome Canary.
 var macApps = []macApp{
-	{"chrome", "chrome", "Google Chrome", "Google Chrome"},
-	{"edge", "edge", "Microsoft Edge", "Microsoft Edge"},
-	{"chromium", "chromium", "Chromium", "Chromium"},
-	{"canary", "chrome", "Google Chrome Canary", "Google Chrome Canary"},
+	{"chrome", []string{"google-chrome", "chrome"}, "chrome", "Google Chrome", "Google Chrome"},
+	{"edge", []string{"microsoft-edge"}, "edge", "Microsoft Edge", "Microsoft Edge"},
+	{"chromium", []string{"chromium"}, "chromium", "Chromium", "Chromium"},
+	{"canary", nil, "chrome", "Google Chrome Canary", "Google Chrome Canary"},
 }
 
 // macPathNames are the PATH fallbacks, tried last.
@@ -129,8 +133,17 @@ func discoverMacBrowser(p macBrowserProbe) (BrowserInfo, error) {
 			}
 		}
 	}
-	if only == "" && p.lookPath != nil {
-		for _, name := range macPathNames {
+	if p.lookPath != nil {
+		names := macPathNames
+		if only != "" {
+			names = nil
+			for _, a := range macApps {
+				if a.alias == only {
+					names = a.pathNames
+				}
+			}
+		}
+		for _, name := range names {
 			searched = append(searched, "PATH:"+name)
 			if path, err := p.lookPath(name); err == nil && path != "" {
 				return BrowserInfo{Path: path, Kind: macBrowserKind(path)}, nil
@@ -203,13 +216,19 @@ func macCmdlineHasProfile(cmdline, dir string) bool {
 // yet because a sibling process is still launching into it.
 const macSweepGrace = 10 * time.Minute
 
+// errMacProcGone is what a command-line lookup returns for a process that no
+// longer exists, as opposed to one that could not be read.
+var errMacProcGone = errors.New("process is gone")
+
 // macSweepDeps are the process seams of the sweep.
 type macSweepDeps struct {
 	self      int
 	selfStart int64
+	// ownPgrp is this process's own group, which is never signalled.
+	ownPgrp int
 	// ownerAlive is macOwnerAliveWithStart over the real syscalls.
 	ownerAlive func(pid int, start int64) bool
-	// cmdline returns a process's full command line.
+	// cmdline returns a process's full command line, or errMacProcGone.
 	cmdline func(pid int) (string, error)
 	// pgid returns a process's process group id.
 	pgid func(pid int) (int, error)
@@ -220,37 +239,61 @@ type macSweepDeps struct {
 }
 
 // killVerifiedBrowserGroup kills the process group of an orphaned session's
-// browser, and only when the recorded PID is still that browser: its command
-// line names this session's exact profile dir, and it leads its own process
-// group (the runner starts the browser with Setpgid). Anything else, including
-// an unreadable command line, is left alone: fail closed. It reports whether a
-// kill was sent.
-func killVerifiedBrowserGroup(dir string, browserPID int, d macSweepDeps) bool {
+// browser, only after proving the recorded PID is still that browser: its
+// command line names this session's exact profile dir, and it is a member of
+// the recorded group (leaderPID, the citadel-owned placeholder; browserPID
+// itself for a record that predates the placeholder). A member alive in a group
+// keeps its id from being reused, so this identity holds even after the
+// placeholder exited. It returns nil when nothing of this session is left
+// (the PID is gone or now belongs to another program) or after the group was
+// killed and the browser confirmed gone; any other outcome is an error and the
+// caller keeps the session dir for a later retry.
+func killVerifiedBrowserGroup(dir string, browserPID, leaderPID int, d macSweepDeps) error {
 	if browserPID <= 1 || browserPID == d.self {
-		return false
+		return nil
 	}
 	cmdline, err := d.cmdline(browserPID)
-	if err != nil || !macCmdlineHasProfile(cmdline, dir) {
-		log.Printf("[cobrowse] sweep: pid %d recorded as the browser of %s no longer matches (or is unverifiable); skipping kill", browserPID, dir)
-		return false
+	if errors.Is(err, errMacProcGone) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("cannot verify browser pid %d of %s: %w", browserPID, dir, err)
+	}
+	if !macCmdlineHasProfile(cmdline, dir) {
+		log.Printf("[cobrowse] sweep: pid %d recorded as the browser of %s now belongs to another program; not signalling it", browserPID, dir)
+		return nil
 	}
 	pg, err := d.pgid(browserPID)
-	if err != nil || pg != browserPID {
-		log.Printf("[cobrowse] sweep: pid %d is not the leader of its process group; skipping kill", browserPID)
-		return false
+	if err != nil {
+		return fmt.Errorf("cannot read the process group of browser pid %d: %w", browserPID, err)
+	}
+	want := browserPID
+	if leaderPID > 1 {
+		want = leaderPID
+	}
+	if pg != want || pg <= 1 || pg == d.ownPgrp {
+		return fmt.Errorf("browser pid %d is in process group %d, not the recorded group %d; not signalling it", browserPID, pg, want)
 	}
 	if err := d.killGroup(pg); err != nil {
-		log.Printf("[cobrowse] sweep: could not kill browser group %d: %v", pg, err)
-		return false
+		return fmt.Errorf("kill browser group %d: %w", pg, err)
 	}
-	return true
+	for i := 0; i < 40; i++ {
+		c, err := d.cmdline(browserPID)
+		if errors.Is(err, errMacProcGone) || (err == nil && !macCmdlineHasProfile(c, dir)) {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return fmt.Errorf("browser pid %d of %s survived the group kill", browserPID, dir)
 }
 
 // sweepMacSessions removes session dirs whose owner process is gone, and first
 // kills a verified orphan browser group (killVerifiedBrowserGroup). The owner is
 // identified by PID plus start time, so a reused PID is not mistaken for it.
 // A dir with no pidfile is left for macSweepGrace, then removed. Dirs this
-// process re-adopted are skipped. It refuses a base dir that is not owner-only.
+// process re-adopted are skipped. A dir whose browser could not be verified and
+// killed is KEPT, with its pidfile, and the failure logged, so a later sweep
+// retries. It refuses a base dir that is not owner-only.
 func sweepMacSessions(baseDir string, d macSweepDeps) {
 	if err := ensureCobrowseBaseDir(baseDir); err != nil {
 		log.Printf("[cobrowse] refusing session sweep of %s: %v", baseDir, err)
@@ -268,7 +311,7 @@ func sweepMacSessions(baseDir string, d macSweepDeps) {
 		if _, keep := sweepProtected.Load(dir); keep {
 			continue
 		}
-		owner, browserPID, _ := readSessionPidfile(dir)
+		owner, browserPID, leaderPID := readSessionPidfile(dir)
 		start := readSessionOwnerStart(dir)
 		switch {
 		case owner == 0:
@@ -280,23 +323,84 @@ func sweepMacSessions(baseDir string, d macSweepDeps) {
 		case owner != d.self && d.ownerAlive(owner, start):
 			continue
 		}
-		killVerifiedBrowserGroup(dir, browserPID, d)
+		if err := killVerifiedBrowserGroup(dir, browserPID, leaderPID, d); err != nil {
+			log.Printf("[cobrowse] sweep: keeping %s for a later retry: %v", dir, err)
+			continue
+		}
 		if err := d.removeDir(dir); err != nil {
 			log.Printf("[cobrowse] sweep: could not remove stale session dir %s: %v", dir, err)
 		}
 	}
 }
 
-// stopProcessGroup kills the group unless the leader already exited (its
-// reaper has then killed the group, and the id may be reused), then waits
-// (bounded) for the reaper.
-func stopProcessGroup(pgid int, exited <-chan struct{}, kill func(int) error) error {
-	select {
-	case <-exited:
-		return nil
-	default:
+// groupGuard owns teardown of one session's process group. The group's id is
+// reserved by a citadel-owned placeholder process that leads it and is reaped
+// only here, last, so while the guard may still signal, no other process can
+// have been given that id. After teardown it never signals again. One mutex
+// serializes Stop and the browser's exit waiter.
+type groupGuard struct {
+	mu   sync.Mutex
+	done bool
+	err  error
+	pgid int
+	// signal sends sig to the whole group; an already-gone group is nil.
+	signal func(pgid int, sig syscall.Signal) error
+	// reapLeader waits (bounded) for the placeholder after it was killed.
+	reapLeader func()
+	// browserExited is closed once the browser's own Wait returned.
+	browserExited <-chan struct{}
+	// termGrace is how long SIGTERM gets before SIGKILL.
+	termGrace time.Duration
+}
+
+// teardown ends the whole group (SIGTERM, a grace wait for the browser, then
+// SIGKILL, which also kills the placeholder) and reaps the placeholder last.
+// It runs once; later calls return the first result without signalling.
+func (g *groupGuard) teardown() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.done {
+		return g.err
 	}
-	err := kill(pgid)
-	waitBounded(exited)
-	return err
+	g.done = true
+	if err := g.signal(g.pgid, syscall.SIGTERM); err != nil {
+		g.err = fmt.Errorf("terminate browser group: %w", err)
+	}
+	select {
+	case <-g.browserExited:
+	case <-time.After(g.termGrace):
+	}
+	if err := g.signal(g.pgid, syscall.SIGKILL); err != nil && g.err == nil {
+		g.err = fmt.Errorf("kill browser group: %w", err)
+	}
+	g.reapLeader()
+	return g.err
+}
+
+// macPSRow is one line of `ps -axo pid=,uid=,command=`.
+type macPSRow struct {
+	pid, uid int
+	cmd      string
+}
+
+// parseMacPS parses `ps -ww -axo pid=,uid=,command=` output, skipping lines it
+// cannot read.
+func parseMacPS(out string) []macPSRow {
+	var rows []macPSRow
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 3 {
+			continue
+		}
+		pid, err1 := strconv.Atoi(f[0])
+		uid, err2 := strconv.Atoi(f[1])
+		if err1 != nil || err2 != nil || pid <= 0 {
+			continue
+		}
+		rest := strings.TrimLeft(line, " \t")
+		rest = strings.TrimLeft(rest[len(f[0]):], " \t")
+		rest = strings.TrimLeft(rest[len(f[1]):], " \t")
+		rows = append(rows, macPSRow{pid: pid, uid: uid, cmd: rest})
+	}
+	return rows
 }
