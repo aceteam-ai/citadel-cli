@@ -1,22 +1,35 @@
 package status
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
 // newAgentMux builds a mux with only the agent routes registered, for testing.
 func newAgentMux(p *AgentProviders) (*Server, *http.ServeMux) {
-	s := NewServer(ServerConfig{Port: 8080, Version: "test", Agent: p}, NewCollector(CollectorConfig{NodeName: "n"}))
+	s := NewServer(ServerConfig{Port: 8080, Version: "test", Agent: p, PeerVerifier: testPeerVerifier}, NewCollector(CollectorConfig{NodeName: "n"}))
 	mux := http.NewServeMux()
 	s.registerAgentRoutes(mux)
 	return s, mux
 }
 
-// vpnReq builds a request that appears to originate from the Headscale VPN
-// (100.64.0.0/10), which requireVPNOrAuth trusts without a token.
+// testPeerVerifier vouches only for the one mesh peer vpnReq uses.
+func testPeerVerifier(_ context.Context, remoteAddr string) bool {
+	return strings.HasPrefix(remoteAddr, "100.64.0.5:")
+}
+
+// loopbackReq builds a direct loopback request.
+func loopbackReq(method, target string) *http.Request {
+	r := httptest.NewRequest(method, target, nil)
+	r.RemoteAddr = "127.0.0.1:54321"
+	return r
+}
+
+// vpnReq builds a request from a mesh peer that testPeerVerifier vouches for.
 func vpnReq(method, target string) *http.Request {
 	r := httptest.NewRequest(method, target, nil)
 	r.RemoteAddr = "100.64.0.5:54321"
@@ -58,8 +71,8 @@ func TestAgentRequiresAuthFromLAN(t *testing.T) {
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, r)
 
-	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 from LAN without token, got %d", w.Code)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 from LAN without token, got %d", w.Code)
 	}
 }
 
@@ -79,13 +92,13 @@ func TestAgentControlRequiresPost(t *testing.T) {
 	})
 	// GET on a control endpoint must be 405.
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, vpnReq(http.MethodGet, "/agent/resubscribe"))
+	mux.ServeHTTP(w, loopbackReq(http.MethodGet, "/agent/resubscribe"))
 	if w.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("expected 405 for GET on control endpoint, got %d", w.Code)
 	}
 	// POST works.
 	w = httptest.NewRecorder()
-	mux.ServeHTTP(w, vpnReq(http.MethodPost, "/agent/resubscribe"))
+	mux.ServeHTTP(w, loopbackReq(http.MethodPost, "/agent/resubscribe"))
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 for POST resubscribe, got %d", w.Code)
 	}
@@ -97,7 +110,7 @@ func TestAgentLogsQueryParams(t *testing.T) {
 		Logs: func(q LogQuery) (string, error) { got = q; return "line1\nline2", nil },
 	})
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, vpnReq(http.MethodGet, "/agent/logs?lines=50&level=error&grep=consume&since=5m"))
+	mux.ServeHTTP(w, loopbackReq(http.MethodGet, "/agent/logs?lines=50&level=error&grep=consume&since=5m"))
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
@@ -144,8 +157,8 @@ func TestVendorAgentsRequiresAuthFromLAN(t *testing.T) {
 	r.RemoteAddr = "192.168.1.50:1234"
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, r)
-	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 from LAN without token, got %d", w.Code)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 from LAN without token, got %d", w.Code)
 	}
 }
 

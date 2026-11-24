@@ -46,17 +46,18 @@ func TestVPNRestartRouteIndependentOfBrokenOutboundPlatform(t *testing.T) {
 	validator := &offlineRestartValidator{}
 	s.tokenValidator = validator
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, vpnReq(http.MethodPost, "/agent/worker-restart"))
+	mux.ServeHTTP(w, loopbackReq(http.MethodPost, "/agent/worker-restart"))
 	if w.Code != http.StatusOK || called != 1 || validator.calls != 0 {
 		t.Fatal("mesh restart depended on outbound token validation")
 	}
-	// Existing authorization stays intact for a non-mesh caller.
+	// A non-loopback caller is pointed at the control listener; a bearer token
+	// no longer reaches this mutating route on the plaintext listener.
 	req := httptest.NewRequest(http.MethodPost, "/agent/worker-restart", nil)
 	req.RemoteAddr = "203.0.113.10:1234"
 	req.Header.Set("Authorization", "Bearer synthetic-token")
 	w = httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
-	if w.Code != http.StatusUnauthorized || called != 1 || validator.calls != 1 {
+	if w.Code != http.StatusForbidden || called != 1 || validator.calls != 0 {
 		t.Fatal("broken outbound weakened non-mesh authorization")
 	}
 }

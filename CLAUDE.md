@@ -2326,6 +2326,19 @@ the intended fail-closed direction. (Constructing it also needs the verifier
 and the control server cert.) Check callers before moving a route, in aceteam
 as well as in this repo's own CLI commands. Wire both sides with
 `cmd.registerControlOnlyAPI`, whose test pins which listener each side lands on.
+
+`status.Server.bindAddr` owns the plaintext listener's bind: loopback by default,
+all interfaces only on the explicit `cmd.statusBindLAN` opt-in (logged loudly at
+start); mesh reachability comes only from the `AddListener` VPN listener. The
+`/agent/*` table is `status.Server.agentRoutes`: its `sensitive` routes (logs,
+config, log level, resubscribe, worker restart) answer a fail-closed 403 stub
+on the plaintext listener (`agentMovedToControl`, loopback excepted) and are
+served for real by `registerAgentControlRoutes` behind `requireCoordinator`;
+the read-only routes use `requireAgentCaller`, which admits direct loopback, a
+mesh peer that `cmd.meshPeerVerifier` (WhoIs: same owner, stable device and
+owner id) vouches for, or a valid org token. A CGNAT source alone is never
+enough, and a forwarding header voids loopback and mesh. Change a route's
+class in that table, not at the registration sites.
 A coordinator cert does not override the operator's permission toggles: a
 control route for a toggled surface also takes that permission, read strictly
 per request, as its extra gate (`registerRAGControlAPI` and
