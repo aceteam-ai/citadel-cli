@@ -585,7 +585,7 @@ class GenerateVideoRequest(BaseModel):
     seed: int | None = None
 
 
-# Boot-time import self-test (found by GPU acceptance on node 1795: a missing C
+# Boot-time import self-test (found during GPU acceptance: a missing C
 # compiler made every pipeline import fail at request time, long after the image
 # built). Imports bitsandbytes and every pipeline class the catalog and the video
 # path use, in the background so /health still answers immediately, and reports
