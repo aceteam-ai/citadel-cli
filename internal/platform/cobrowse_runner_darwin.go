@@ -269,6 +269,7 @@ func realMacSweepDeps() macSweepDeps {
 		pgid:       syscall.Getpgid,
 		killGroup:  killProcessGroup,
 		removeDir:  removeSessionDir,
+		reapUsers:  func(dir string) error { return reapProfileUsers(dir, "") },
 	}
 }
 
@@ -277,7 +278,12 @@ func realMacSweepDeps() macSweepDeps {
 // browser; leaderPID is the recorded group leader. A browser that could not be
 // verified and killed is an error, so the caller never reports it cleaned.
 func killOrphanSessionProcs(dir string, browserPID, leaderPID int) error {
-	return killVerifiedBrowserGroup(dir, browserPID, leaderPID, realMacSweepDeps())
+	d := realMacSweepDeps()
+	if err := killVerifiedBrowserGroup(dir, browserPID, leaderPID, d); err != nil {
+		return err
+	}
+	// The browser may be gone while a helper still uses the profile.
+	return d.reapUsers(dir)
 }
 
 // The shared profile-user reaper (reapProfileUsers) reads /proc, which macOS
@@ -302,7 +308,7 @@ func listMacReapProcs() ([]reapProc, error) {
 		defer cancel()
 		out, err := exec.CommandContext(ctx, "/bin/ps", "-ww", "-axo", "pid=,uid=,command=").Output()
 		return string(out), err
-	}, processStartToken)
+	}, processStartToken, func(pid int) error { return syscall.Kill(pid, 0) })
 }
 
 func lookupMacReapProc(pid int) (reapProc, bool) {

@@ -5,6 +5,7 @@ package platform
 import (
 	"errors"
 	"fmt"
+	"syscall"
 	"testing"
 )
 
@@ -17,7 +18,7 @@ func TestListMacReapProcsSpacedProfilePath(t *testing.T) {
 			" 13 501 /Applications/Google Chrome.app/x --user-data-dir=%s --no-first-run\n"+
 			" 14 501 /usr/bin/vim notes\n", dir, dir, sibling), nil
 	}
-	procs, err := listMacReapProcsFrom(ps, func(pid int) (int64, error) { return int64(pid), nil })
+	procs, err := listMacReapProcsFrom(ps, func(pid int) (int64, error) { return int64(pid), nil }, func(int) error { return nil })
 	if err != nil || len(procs) != 3 {
 		t.Fatalf("listed %v, %v", procs, err)
 	}
@@ -65,7 +66,7 @@ func TestListMacReapProcsSpacedProfilePath(t *testing.T) {
 
 func TestListMacReapProcsFailsClosedOnPSError(t *testing.T) {
 	boom := errors.New("ps timed out")
-	if _, err := listMacReapProcsFrom(func() (string, error) { return "", boom }, nil); !errors.Is(err, boom) {
+	if _, err := listMacReapProcsFrom(func() (string, error) { return "", boom }, nil, nil); !errors.Is(err, boom) {
 		t.Fatalf("want the ps error, got %v", err)
 	}
 	prev := listReapProcs
@@ -73,5 +74,24 @@ func TestListMacReapProcsFailsClosedOnPSError(t *testing.T) {
 	listReapProcs = func() ([]reapProc, error) { return nil, boom }
 	if err := reapProfileUsers("/p/x", ""); err == nil || !errors.Is(err, boom) {
 		t.Errorf("an unreadable process list must fail the reap, got %v", err)
+	}
+}
+
+func TestListMacReapProcsUnreadableStartTime(t *testing.T) {
+	dir := "/p/sess"
+	ps := func() (string, error) {
+		return " 21 501 chrome --user-data-dir=" + dir + "\n 22 501 vim x\n", nil
+	}
+	noStart := func(int) (int64, error) { return 0, errors.New("sysctl") }
+	// Gone since the listing: omitted, scan succeeds.
+	procs, err := listMacReapProcsFrom(ps, noStart, func(int) error { return syscall.ESRCH })
+	if err != nil || len(procs) != 0 {
+		t.Errorf("gone: %v, %v", procs, err)
+	}
+	// Alive, or alive but not ours to signal: an error, never a silent drop.
+	for _, serr := range []error{nil, syscall.EPERM} {
+		if _, err := listMacReapProcsFrom(ps, noStart, func(int) error { return serr }); err == nil {
+			t.Errorf("sig0 %v: unreadable start time of a live profile user must be an error", serr)
+		}
 	}
 }

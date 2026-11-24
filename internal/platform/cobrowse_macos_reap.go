@@ -6,12 +6,17 @@
 // kept untagged by OS so its parsing runs on Linux CI.
 package platform
 
-import "strings"
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"syscall"
+)
 
 // listMacReapProcsFrom turns `ps -ww -axo pid=,uid=,command=` output into the
 // processes naming a profile (a start time is read only for those). A failed ps
-// is an error, never an empty list.
-func listMacReapProcsFrom(ps func() (string, error), start func(pid int) (int64, error)) ([]reapProc, error) {
+// is an error, never an empty list. sig0 is kill(pid, 0).
+func listMacReapProcsFrom(ps func() (string, error), start func(pid int) (int64, error), sig0 func(pid int) error) ([]reapProc, error) {
 	out, err := ps()
 	if err != nil {
 		return nil, err
@@ -23,7 +28,13 @@ func listMacReapProcsFrom(ps func() (string, error), start func(pid int) (int64,
 		}
 		st, err := start(r.pid)
 		if err != nil {
-			continue // exited since the listing
+			// A row naming the profile whose identity cannot be read: gone
+			// (ESRCH) is safe to omit; alive or unknowable is an error, so the
+			// caller never reports success past a live helper.
+			if serr := sig0(r.pid); errors.Is(serr, syscall.ESRCH) {
+				continue
+			}
+			return nil, fmt.Errorf("cannot read the start time of pid %d, which names the profile: %w", r.pid, err)
 		}
 		res = append(res, reapProc{pid: r.pid, start: uint64(st), uid: r.uid, args: strings.Fields(r.cmd), cmd: r.cmd})
 	}

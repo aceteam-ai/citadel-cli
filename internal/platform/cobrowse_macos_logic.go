@@ -248,6 +248,10 @@ type macSweepDeps struct {
 	killGroup func(pgid int) error
 	// removeDir removes a session dir.
 	removeDir func(dir string) error
+	// reapUsers signals verified processes still using the session dir (the
+	// profile-user scan, reapProfileUsers) and returns an error for any
+	// survivor or an unverifiable scan.
+	reapUsers func(dir string) error
 }
 
 // killVerifiedBrowserGroup kills the process group of an orphaned session's
@@ -336,6 +340,12 @@ func sweepMacSessions(baseDir string, d macSweepDeps) {
 			continue
 		}
 		if err := killVerifiedBrowserGroup(dir, browserPID, leaderPID, d); err != nil {
+			log.Printf("[cobrowse] sweep: keeping %s for a later retry: %v", dir, err)
+			continue
+		}
+		// The browser may be gone while a helper that left its group still
+		// writes the profile: scan by command line before removing anything.
+		if err := d.reapUsers(dir); err != nil {
 			log.Printf("[cobrowse] sweep: keeping %s for a later retry: %v", dir, err)
 			continue
 		}

@@ -262,7 +262,9 @@ type fakeMacProcs struct {
 	removed  []string
 	owners   map[int]int64 // alive owners: pid -> start
 	killFail bool
-	unread   map[int]bool // pids whose command line cannot be read
+	unread   map[int]bool     // pids whose command line cannot be read
+	reapErrs map[string]error // profile-user scan result by session dir name
+	reaped   []string
 }
 
 func (f *fakeMacProcs) deps(self int, selfStart int64) macSweepDeps {
@@ -302,6 +304,10 @@ func (f *fakeMacProcs) deps(self int, selfStart int64) macSweepDeps {
 			return nil
 		},
 		removeDir: func(d string) error { f.removed = append(f.removed, d); return os.RemoveAll(d) },
+		reapUsers: func(d string) error {
+			f.reaped = append(f.reaped, d)
+			return f.reapErrs[filepath.Base(d)]
+		},
 	}
 }
 
@@ -458,5 +464,32 @@ func TestBuildChromeArgsMacHeadless(t *testing.T) {
 	plain := " " + strings.Join(buildChromeArgs(cobrowseLaunchOptions{profileDir: "/p"}), " ") + " "
 	if strings.Contains(plain, "--use-mock-keychain") {
 		t.Error("mock keychain must be opt-in")
+	}
+}
+
+func TestSweepScansProfileUsersBeforeRemoving(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "sessions")
+	if err := os.Mkdir(base, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Browser pids are gone in all three; only the helper scan differs.
+	helper := macSessionDir(t, base, "helper", "400\n301\n9\n4000\n")
+	scanfail := macSessionDir(t, base, "scanfail", "401\n302\n9\n4000\n")
+	clean := macSessionDir(t, base, "clean", "402\n303\n9\n4000\n")
+	f := &fakeMacProcs{reapErrs: map[string]error{
+		"helper":   errors.New("browser helpers [77] still use the profile"),
+		"scanfail": errors.New("cannot list processes: ps timed out"),
+	}}
+	sweepMacSessions(base, f.deps(1, 0))
+	for _, dir := range []string{helper, scanfail} {
+		if _, err := os.Stat(filepath.Join(dir, sessionPidfileName)); err != nil {
+			t.Errorf("%s and its record must be kept: %v", dir, err)
+		}
+	}
+	if _, err := os.Lstat(clean); err == nil {
+		t.Error("a clean scan must let the dir be removed")
+	}
+	if len(f.reaped) != 3 {
+		t.Errorf("every orphan dir must be scanned, got %v", f.reaped)
 	}
 }
