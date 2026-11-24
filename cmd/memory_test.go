@@ -103,3 +103,81 @@ func TestUninstallMemory_RequiresRemoteRevocationConfirmation(t *testing.T) {
 		t.Fatalf("confirmed uninstall retained credential: %v", err)
 	}
 }
+
+func TestCheckCaptureScope(t *testing.T) {
+	for _, tc := range []struct {
+		scope string
+		allow bool
+		ok    bool
+	}{
+		{"", false, false}, {"  ", true, false},
+		{"global", false, false}, {"Global", false, false}, {"global", true, true},
+		{"agent:", false, false}, {"Agent:  ", false, false}, {"agent:", true, true},
+		{"agent:hermes", false, true}, {"my-project", false, true},
+	} {
+		err := checkCaptureScope(tc.scope, tc.allow)
+		if (err == nil) != tc.ok {
+			t.Errorf("checkCaptureScope(%q,%v) err=%v, want ok=%v", tc.scope, tc.allow, err, tc.ok)
+		}
+	}
+}
+
+func captureHookCommands(t *testing.T, home string) string {
+	t.Helper()
+	b, err := os.ReadFile(memory.ClaudeSettingsPath(home))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return ""
+		}
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+func TestWireClaudeCode_NoCaptureHookWithoutScope(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wireCaptureHook(memory.ClaudeSettingsPath(home), "/bin/citadel", "", false); err != nil {
+		t.Fatal(err)
+	}
+	if got := captureHookCommands(t, home); strings.Contains(got, memory.CaptureMarker) {
+		t.Fatalf("capture hook installed without a scope: %s", got)
+	}
+	if _, err := wireCaptureHook(memory.ClaudeSettingsPath(home), "/bin/citadel", "global", false); err == nil {
+		t.Fatal("global capture accepted without opt-in")
+	}
+	if got := captureHookCommands(t, home); strings.Contains(got, memory.CaptureMarker) {
+		t.Fatal("capture hook installed for refused global scope")
+	}
+}
+
+func TestWireClaudeCode_ScopedHookAndLegacyRemoval(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wireCaptureHook(memory.ClaudeSettingsPath(home), "/bin/citadel", "proj", false); err != nil {
+		t.Fatal(err)
+	}
+	got := captureHookCommands(t, home)
+	if !strings.Contains(got, memory.CaptureMarker) || !strings.Contains(got, "--scope") || strings.Contains(got, "allow-global") {
+		t.Fatalf("scoped hook wrong: %s", got)
+	}
+	// Reinstalling without a scope removes the hook (fail closed for old installs).
+	if _, err := wireCaptureHook(memory.ClaudeSettingsPath(home), "/bin/citadel", "", false); err != nil {
+		t.Fatal(err)
+	}
+	if got := captureHookCommands(t, home); strings.Contains(got, memory.CaptureMarker) {
+		t.Fatalf("capture hook survived scope-less reinstall: %s", got)
+	}
+}
+
+func TestCheckCaptureScope_RefusesOldUnscopedInstall(t *testing.T) {
+	// An old install runs the hook with no --scope. The network-level refusal
+	// is pinned by memory.CaptureNote's own empty-scope test.
+	if err := checkCaptureScope("", false); err == nil {
+		t.Fatal("empty scope must be refused before any write")
+	}
+}

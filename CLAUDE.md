@@ -76,6 +76,12 @@ typed refusal so a revocation after selection is terminal on its first attempt.
 The refusal inventory never advertises or executes a job. Focused coverage is
 in `internal/worker/job_refusal_test.go`.
 
+`cmd.checkCaptureScope` owns which memory scope the SessionEnd transcript-capture hook may write
+(#1916): an explicit one, with `global` needing `--allow-global-capture`; `cmd.wireCaptureHook` installs
+the hook only for `citadel memory install --capture-scope` (otherwise it removes an older unscoped hook),
+and `runMemoryCapture` and `memory.CaptureNote` both refuse an empty scope, since the server would
+default it to `global`. Tests: `cmd/memory_test.go`, `internal/memory/capture_test.go`.
+
 `workflow.LoadLLMPolicy` owns machine-local LLM endpoint grants and fail-closed
 loading; `LLMPolicy.resolveURL` owns exact endpoint and every-answer address
 validation separately from the HTTP node. Both worker entrypoints load once via
