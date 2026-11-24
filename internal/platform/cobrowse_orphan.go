@@ -2,7 +2,7 @@
 //
 // Orphan / stale-port handling for the co-browse manager (issue #396).
 //
-// Two failure modes this file addresses, both observed live on node 1054:
+// Two failure modes this file addresses, both observed on a live node:
 //
 // Stale :9222 owner: when a prior co-browse Chromium survives a worker restart
 // (see the teardown gap below) it keeps holding the CDP debug port. A fresh
