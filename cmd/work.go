@@ -2671,6 +2671,11 @@ func runWork(cmd *cobra.Command, args []string) {
 		// exposed service under /expose/<name>/ can be gated by mesh identity or a
 		// signed link token. Harmless when nothing is exposed.
 		gw.SetMeshResolver(gatewayMeshResolver{})
+		// /v1/* callers: same-host (loopback) or a verified same-owner mesh peer;
+		// the operator's platform-infra allowlist (platform-exposure.json) adds
+		// named platform logins. See internal/gateway/v1_auth.go.
+		gw.SetV1AllowedLogins(platformAllowedLogins)
+		warnGatewayLANBind("--gateway-bind", workGatewayBind)
 		if key, err := config.LoadOrCreateExposeSigningKey(platform.ConfigDir()); err != nil {
 			Log("warning: gateway link-token signing disabled: %v", err)
 		} else {
@@ -4363,7 +4368,7 @@ func init() {
 	workCmd.Flags().BoolVar(&workGateway, "gateway", true, "Start the HTTPS gateway in-process (enabled by default; use --no-gateway to disable)")
 	workCmd.Flags().BoolVar(&workNoGateway, "no-gateway", false, "Disable the HTTPS gateway")
 	workCmd.Flags().IntVar(&workGatewayPort, "gateway-port", 8443, "HTTPS gateway port (default: 8443)")
-	workCmd.Flags().StringVar(&workGatewayBind, "gateway-bind", "0.0.0.0", "Gateway bind address")
+	workCmd.Flags().StringVar(&workGatewayBind, "gateway-bind", defaultGatewayBind, "Gateway bind host. Default is loopback; the mesh listener is always added. A non-loopback value is an explicit LAN opt-in and is logged loudly")
 	workCmd.Flags().IntVar(&workGatewayVNC, "gateway-vnc-port", 6080, "VNC websockify port for gateway proxy")
 	workCmd.Flags().IntVar(&workGatewayEmbedding, "gateway-embedding-port", 8102, "Local TEI embedding service port (/v1/embeddings upstream)")
 	workCmd.Flags().BoolVar(&workGatewayNoTLS, "gateway-no-tls", false, "Disable TLS on the gateway (for testing only)")
