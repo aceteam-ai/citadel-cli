@@ -133,7 +133,12 @@ func (m *CobrowseSessionManager) prepareSelfRestart(reason, detail string) {
 			_ = m.MarkSessionEnding(s, reason, detail)
 			continue
 		}
-		_ = m.Stop(s.id) // seals a persistent profile, closes its lock, removes the dir
+		// Stop seals a persistent profile, closes its lock, removes the dir. A
+		// recovery session whose custody stop was not confirmed keeps its live
+		// registry record, so the next process can re-adopt it.
+		if err := m.Stop(s.id); err != nil && recoveryScopedID(s.id) {
+			continue
+		}
 		m.recordEnded(s.id, reason, detail)
 	}
 }
