@@ -638,3 +638,24 @@ func TestLocalFlowShippedArtifact(t *testing.T) {
 		t.Fatalf("output = %v, want answer 1", output)
 	}
 }
+
+func TestLocalFlowRefusesAStreamWithoutAnOrganization(t *testing.T) {
+	// Passes the worker's per-node gate and node suffix, but is not the
+	// organization's shell stream, so no organization can be bound.
+	f := newLFFixture(t)
+	res, _ := f.execute(lfJob(t, lfParams(t, nil), "jobs:v1:tag:org_"+lfTestOrg+":node:"+lfTestNode))
+	if res.Status != worker.JobStatusFailure || !strings.Contains(res.Error.Error(), "did not arrive on this node's organization stream") {
+		t.Fatalf("result = %s %v, want organization-stream refusal", res.Status, res.Error)
+	}
+	if f.engine.runCount() != 0 {
+		t.Fatal("engine started without a bound organization")
+	}
+}
+
+func TestHPCProfileRefusesLocalFlowRun(t *testing.T) {
+	// local-flow-run may use host networking, which a shared compute node must
+	// never grant.
+	if hpcTemplateBuiltinPolicy(localFlowBuiltinName) == "" {
+		t.Fatal("the hpc profile allows local-flow-run")
+	}
+}
