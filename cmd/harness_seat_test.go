@@ -20,7 +20,7 @@ import (
 
 func seatCLIForTest(t *testing.T, owner seatCLIOwner, args ...string) (string, error) {
 	t.Helper()
-	command := newHarnessSeatRoot(func() (seatCLIOwner, error) { return owner, nil })
+	command := newHarnessSeatRootWithTerminal(func() (seatCLIOwner, error) { return owner, nil }, func(*cobra.Command) bool { return true })
 	var output bytes.Buffer
 	command.SetOut(&output)
 	command.SetErr(&output)
@@ -207,7 +207,7 @@ func TestHarnessSeatCLIRejectsAnotherOwnersDeclarationsAndUnsafeStore(t *testing
 }
 
 func TestHarnessSeatCLILeavesSkipUnimplementedAndRetainsHPCPositiveList(t *testing.T) {
-	for _, leaf := range []string{"init", "list", "disable", "remove"} {
+	for _, leaf := range []string{"init", "list", "add", "enable", "disable", "remove"} {
 		path := "citadel harness seat " + leaf
 		root := &cobra.Command{Use: "citadel"}
 		harness := &cobra.Command{Use: "harness"}
@@ -220,7 +220,7 @@ func TestHarnessSeatCLILeavesSkipUnimplementedAndRetainsHPCPositiveList(t *testi
 			t.Fatal("startup scope or HPC gate changed")
 		}
 	}
-	for _, path := range []string{"citadel harness", "citadel harness seat", "citadel harness seat probe", "citadel harness seat add", "citadel other seat list"} {
+	for _, path := range []string{"citadel harness", "citadel harness seat", "citadel harness seat probe", "citadel harness seat adopt", "citadel other seat list"} {
 		root := &cobra.Command{Use: "citadel"}
 		parent := root
 		for _, name := range strings.Fields(path)[1:] {
@@ -249,7 +249,7 @@ func TestHarnessSeatCLIRootStartupDoesNotReadDeviceCredentialsOrRunUpdater(t *te
 		return seatCLIOwner{}, nil
 	})
 	root.AddCommand(harness)
-	for _, leaf := range []string{"init", "list", "disable", "remove"} {
+	for _, leaf := range []string{"init", "list", "add", "enable", "disable", "remove"} {
 		command, _, err := root.Find([]string{"harness", "seat", leaf})
 		if err != nil {
 			t.Fatal(err)
@@ -330,5 +330,174 @@ func TestHarnessSeatCLIRefusesBareGroupBeforeSharedStartup(t *testing.T) {
 	root.SetArgs([]string{"harness", "seat"})
 	if err := root.Execute(); !errors.Is(err, errSeatCLICommand) {
 		t.Fatal("bare group did not require a subcommand")
+	}
+}
+
+func TestHarnessSeatCLIAddThenEnableIsLocalDeclarationOnly(t *testing.T) {
+	for _, harness := range []string{"claude", "codex", "copilot", "muse"} {
+		t.Run(harness, func(t *testing.T) {
+			registry, owner := seatCLIState(t)
+			config := filepath.Join(owner.Home, "seats", "quoted ' fixture")
+			t.Setenv("GH_TOKEN", "fixture-must-not-appear")
+			t.Setenv("OPENAI_API_KEY", "fixture-must-not-appear")
+			if _, err := seatCLIForTest(t, owner, "seat", "init", "--registry-dir", registry); err != nil {
+				t.Fatal(err)
+			}
+			out, err := seatCLIForTest(t, owner, "seat", "add", "fixture-seat", "--harness", harness, "--label", "Fixture", "--config-dir", config, "--registry-dir", registry)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(out, "env -i ") || !strings.Contains(out, "not executed") || strings.Contains(out, "fixture-must-not-appear") || strings.Contains(out, "GH_TOKEN=") || strings.Contains(out, "OPENAI_API_KEY=") {
+				t.Fatal("login instruction inherited credentials or implied execution")
+			}
+			if !strings.Contains(out, "'\"'\"'") {
+				t.Fatal("instruction did not quote apostrophe in path")
+			}
+			entries, err := os.ReadDir(config)
+			if err != nil || len(entries) != 0 {
+				t.Fatal("add populated vendor state")
+			}
+			info, err := os.Stat(config)
+			if err != nil || info.Mode().Perm() != 0o700 {
+				t.Fatal("configuration directory is not private")
+			}
+			listed, err := seatCLIForTest(t, owner, "seat", "list", "--json", "--registry-dir", registry)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var result struct {
+				Seats []seatCLIListRow `json:"seats"`
+			}
+			if json.Unmarshal([]byte(listed), &result) != nil || len(result.Seats) != 1 {
+				t.Fatal("added declaration missing")
+			}
+			seat := result.Seats[0]
+			if seat.Enabled || seat.Auth != harnessseat.AuthUnknown || seat.PlanType != "" || len(seat.Models) != 0 || seat.DataCeiling != "public" {
+				t.Fatal("add invented observed metadata or authority")
+			}
+			if _, err := seatCLIForTest(t, owner, "seat", "enable", "fixture-seat", "--registry-dir", registry); err != nil {
+				t.Fatal(err)
+			}
+			listed, err = seatCLIForTest(t, owner, "seat", "list", "--json", "--registry-dir", registry)
+			if err != nil || json.Unmarshal([]byte(listed), &result) != nil || !result.Seats[0].Enabled || result.Seats[0].Auth != harnessseat.AuthUnknown {
+				t.Fatal("enable did not remain a local flag")
+			}
+			if entries, err := os.ReadDir(config); err != nil || len(entries) != 0 {
+				t.Fatal("enable populated vendor state")
+			}
+			if err := os.Chmod(config, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := seatCLIForTest(t, owner, "seat", "enable", "fixture-seat", "--registry-dir", registry); err == nil {
+				t.Fatal("unsafe directory enabled")
+			}
+		})
+	}
+}
+
+func TestHarnessSeatCLIAddRefusalsDoNotCreateVendorDirectory(t *testing.T) {
+	for _, extra := range [][]string{{"--plan-type", "invented"}, {"--os-user", "other-user"}, {"--account-digest", strings.Repeat("a", 64)}, {"--auth", "signed_in"}, {"--models", "invented"}, {"--harness", "unknown"}, {"--label", ""}, {"--root", "relative"}, {"--harness", "muse", "--data-ceiling", "private"}, {"--entitlement", "invalid"}} {
+		registry, owner := seatCLIState(t)
+		if _, err := seatCLIForTest(t, owner, "seat", "init", "--registry-dir", registry); err != nil {
+			t.Fatal(err)
+		}
+		config := filepath.Join(owner.Home, "seats", "refused")
+		args := []string{"seat", "add", "fixture-seat", "--harness", "codex", "--label", "Fixture", "--config-dir", config, "--registry-dir", registry}
+		if _, err := seatCLIForTest(t, owner, append(args, extra...)...); err == nil {
+			t.Fatal("invalid declaration accepted")
+		}
+		if _, err := os.Stat(config); !os.IsNotExist(err) {
+			t.Fatal("refused add created vendor directory")
+		}
+	}
+}
+
+func TestHarnessSeatCLIAddAndEnableRequireTerminalBeforeState(t *testing.T) {
+	for _, args := range [][]string{{"seat", "add", "fixture-seat"}, {"seat", "enable", "fixture-seat"}} {
+		command := newHarnessSeatRoot(func() (seatCLIOwner, error) {
+			t.Fatal("nonterminal mutation reached owner resolution")
+			return seatCLIOwner{}, nil
+		})
+		command.SetIn(strings.NewReader("not a human terminal"))
+		command.SetOut(&bytes.Buffer{})
+		command.SetErr(&bytes.Buffer{})
+		command.SetArgs(args)
+		if err := command.Execute(); !errors.Is(err, errSeatCLITerminal) {
+			t.Fatal("nonterminal mutation accepted")
+		}
+	}
+}
+
+func TestHarnessSeatCLIAddRefusesExistingDirectoryAndDuplicateDeclaration(t *testing.T) {
+	registry, owner := seatCLIState(t)
+	if _, err := seatCLIForTest(t, owner, "seat", "init", "--registry-dir", registry); err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(owner.Home, "existing")
+	if err := os.Mkdir(config, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(config, "untouched.fixture")
+	if err := os.WriteFile(marker, []byte("unchanged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"seat", "add", "fixture-seat", "--harness", "codex", "--label", "Fixture", "--registry-dir", registry, "--config-dir", config}
+	if _, err := seatCLIForTest(t, owner, args...); !errors.Is(err, harnessseat.ErrSeatDirectoryExists) {
+		t.Fatal("existing vendor state adopted")
+	}
+	if got, err := os.ReadFile(marker); err != nil || string(got) != "unchanged" {
+		t.Fatal("existing state changed")
+	}
+	fresh := filepath.Join(owner.Home, "fresh")
+	args[len(args)-1] = fresh
+	if _, err := seatCLIForTest(t, owner, args...); err != nil {
+		t.Fatal(err)
+	}
+	second := filepath.Join(owner.Home, "second")
+	args[len(args)-1] = second
+	if _, err := seatCLIForTest(t, owner, args...); err == nil {
+		t.Fatal("duplicate seat id accepted")
+	}
+	if _, err := os.Stat(second); !os.IsNotExist(err) {
+		t.Fatal("duplicate declaration created a directory")
+	}
+}
+
+func TestHarnessSeatCLIHumanLoginInstructionsRespectDeclaredMethod(t *testing.T) {
+	_, owner := seatCLIState(t)
+	for _, tc := range []struct {
+		harness harnessseat.Harness
+		suffix  string
+	}{{harnessseat.Codex, "codex login --with-api-key"}, {harnessseat.Copilot, "copilot login --with-token"}, {harnessseat.Claude, "; no value is accepted or read by Citadel."}} {
+		i := harnessseat.Identity{ID: "fixture-seat", Harness: tc.harness, Owner: owner.Name, HomeDir: owner.Home, ConfigDir: filepath.Join(owner.Home, "private")}
+		got, err := seatHumanLoginInstruction(i, "api_key", "/usr/bin:/bin")
+		if err != nil || !strings.HasSuffix(got, tc.suffix) {
+			t.Fatal("wrong vendor human login method")
+		}
+		if tc.harness == harnessseat.Claude && (!strings.Contains(got, "apiKeyHelper") || strings.Contains(got, "claude auth login")) {
+			t.Fatal("API-key helper replaced by subscription login")
+		}
+	}
+}
+
+func TestHarnessSeatCLIAddOutputFailurePreservesPublishedDeclaration(t *testing.T) {
+	registry, owner := seatCLIState(t)
+	if _, err := seatCLIForTest(t, owner, "seat", "init", "--registry-dir", registry); err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(owner.Home, "fresh")
+	command := newHarnessSeatRootWithTerminal(func() (seatCLIOwner, error) { return owner, nil }, func(*cobra.Command) bool { return true })
+	command.SetOut(seatCLIRefusingWriter{})
+	command.SetErr(&bytes.Buffer{})
+	command.SetArgs([]string{"seat", "add", "fixture-seat", "--harness", "codex", "--label", "Fixture", "--config-dir", config, "--registry-dir", registry})
+	if err := command.Execute(); !errors.Is(err, errSeatCLIOutput) {
+		t.Fatal("add output error swallowed")
+	}
+	out, err := seatCLIForTest(t, owner, "seat", "list", "--json", "--registry-dir", registry)
+	if err != nil || !strings.Contains(out, "fixture-seat") || !strings.Contains(out, `"enabled":false`) {
+		t.Fatal("output failure erased saved disabled declaration")
+	}
+	if entries, err := os.ReadDir(config); err != nil || len(entries) != 0 {
+		t.Fatal("output failure changed fresh vendor directory")
 	}
 }

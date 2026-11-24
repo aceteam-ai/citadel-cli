@@ -9,17 +9,20 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/aceteam-ai/citadel-cli/internal/agentsprobe"
 	"github.com/aceteam-ai/citadel-cli/internal/harnessseat"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 var (
-	errSeatCLIOwner   = errors.New("seat_local_owner_unresolved")
-	errSeatCLIOutput  = errors.New("seat_output_failed")
-	errSeatCLICommand = errors.New("seat_subcommand_required")
+	errSeatCLIOwner    = errors.New("seat_local_owner_unresolved")
+	errSeatCLIOutput   = errors.New("seat_output_failed")
+	errSeatCLICommand  = errors.New("seat_subcommand_required")
+	errSeatCLITerminal = errors.New("seat_human_terminal_required")
 )
 
 type seatCLIOwner struct{ Name, Home string }
@@ -53,7 +56,7 @@ func resolveSeatCLIProcessOwner(uid, euid int, lookup func(string) (*user.User, 
 // admission before this exception; the HPC positive list is unchanged.
 func isHarnessSeatCLI(cmd *cobra.Command) bool {
 	switch cmd.CommandPath() {
-	case "citadel harness seat init", "citadel harness seat list", "citadel harness seat disable", "citadel harness seat remove":
+	case "citadel harness seat init", "citadel harness seat list", "citadel harness seat add", "citadel harness seat enable", "citadel harness seat disable", "citadel harness seat remove":
 		return true
 	}
 	return false
@@ -120,8 +123,17 @@ type seatCLIListRow struct {
 }
 
 func newHarnessSeatRoot(resolveOwner seatCLIOwnerResolver) *cobra.Command {
+	return newHarnessSeatRootWithTerminal(resolveOwner, func(cmd *cobra.Command) bool {
+		input, ok := cmd.InOrStdin().(*os.File)
+		return ok && term.IsTerminal(int(input.Fd()))
+	})
+}
+
+// Terminal presence is a local interaction guard, not remote authorization or
+// proof of native credential isolation. No vendor process is ever executed.
+func newHarnessSeatRootWithTerminal(resolveOwner seatCLIOwnerResolver, terminal func(*cobra.Command) bool) *cobra.Command {
 	harness := &cobra.Command{Use: "harness", Short: "Manage local harness metadata"}
-	seat := &cobra.Command{Use: "seat", Short: "Inspect or restrict an explicit private seat registry", Long: "Owner-only local registry metadata. No vendor credential files, login, status probe, job, remote enable or process launch is used. Incomplete seat-registry build: add/enable/probe and default-home adoption are not exposed yet."}
+	seat := &cobra.Command{Use: "seat", Short: "Manage an explicit private local seat registry", Long: "Owner-only local registry metadata. Add and enable require a human terminal. Login instructions are printed only, never executed. No credential-file reader, status probe, job, remote enable or process launch is used. Probe and default-home adoption remain incomplete."}
 	seat.Args = func(cmd *cobra.Command, args []string) error {
 		if len(args) == 0 {
 			return errSeatCLICommand
@@ -180,16 +192,59 @@ func newHarnessSeatRoot(resolveOwner seatCLIOwnerResolver) *cobra.Command {
 	}}
 	list.Flags().BoolVar(&asJSON, "json", false, "Output local metadata without paths or account digests")
 	seat.AddCommand(initialize, list)
-	for _, verb := range []string{"disable", "remove"} {
+	var harnessName, label, configDir, entitlement, ceiling string
+	var roots []string
+	add := &cobra.Command{Use: "add <id>", Short: "Create a disabled local declaration and print human login instructions", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		if !terminal(cmd) {
+			return errSeatCLITerminal
+		}
+		var owner seatCLIOwner
+		boundOwner := func() (seatCLIOwner, error) {
+			var err error
+			owner, err = resolveOwner()
+			return owner, err
+		}
+		return withSeatCLIRegistry(cmd, dir, boundOwner, func(store *harnessseat.SaltStore, resolve func(string) (string, error)) error {
+			identity := harnessseat.Identity{ID: args[0], Harness: harnessseat.Harness(harnessName), Owner: owner.Name, HomeDir: owner.Home, ConfigDir: configDir}
+			instruction, err := seatHumanLoginInstruction(identity, entitlement, os.Getenv("PATH"))
+			if err != nil {
+				return err
+			}
+			snapshot, err := store.LoadRegistry(cmd.Context(), resolve)
+			if err != nil {
+				return err
+			}
+			_, err = store.AddLocalSeat(cmd.Context(), snapshot, harnessseat.LocalSeatDeclaration{ID: identity.ID, Harness: identity.Harness, Owner: identity.Owner, ConfigDir: identity.ConfigDir, Label: label, Entitlement: entitlement, Roots: roots, DataCeiling: ceiling})
+			if err != nil {
+				return err
+			}
+			// Paths appear only on this local human terminal, never a server projection.
+			if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Seat saved disabled with unknown auth. Native isolation is NOT verified.\nPrinted only, not executed; choose the declared login method in the vendor tool:\n%s\nNo credential or login output is collected. Local enable does not authorize launch.\n", instruction); err != nil {
+				return errSeatCLIOutput
+			}
+			return nil
+		})
+	}}
+	add.Flags().StringVar(&harnessName, "harness", "", "Required: claude, codex, copilot or muse")
+	add.Flags().StringVar(&label, "label", "", "Required human-readable label")
+	add.Flags().StringVar(&configDir, "config-dir", "", "Required fresh absolute configuration directory under the resolved owner's home")
+	add.Flags().StringVar(&entitlement, "entitlement", "consumer", "Declared entitlement, not observed authentication or permission")
+	add.Flags().StringVar(&ceiling, "data-ceiling", "public", "Declared policy selector; Muse permits public only")
+	add.Flags().StringArrayVar(&roots, "root", nil, "Declared absolute workspace root; repeat for multiple roots")
+	seat.AddCommand(add)
+	for _, verb := range []string{"enable", "disable", "remove"} {
 		verb := verb
 		command := &cobra.Command{Use: verb + " <id>", Short: verb + " a declaration without opening or deleting vendor files", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+			if verb == "enable" && !terminal(cmd) {
+				return errSeatCLITerminal
+			}
 			return withSeatCLIRegistry(cmd, dir, resolveOwner, func(store *harnessseat.SaltStore, resolve func(string) (string, error)) error {
 				snapshot, err := store.LoadRegistry(cmd.Context(), resolve)
 				if err != nil {
 					return err
 				}
-				if verb == "disable" {
-					_, err = store.SetLocalSeatEnabled(cmd.Context(), snapshot, args[0], false)
+				if verb == "disable" || verb == "enable" {
+					_, err = store.SetLocalSeatEnabled(cmd.Context(), snapshot, args[0], verb == "enable")
 				} else {
 					_, err = store.RemoveLocalSeat(cmd.Context(), snapshot, args[0])
 				}
@@ -205,6 +260,53 @@ func newHarnessSeatRoot(resolveOwner seatCLIOwnerResolver) *cobra.Command {
 		seat.AddCommand(command)
 	}
 	return harness
+}
+
+// A printable POSIX command, not an execution API. Build from an allowlist so
+// inherited API keys, provider overrides and shell startup hooks cannot appear.
+// It is not a promise that a vendor's keychain/daemon honors this home.
+func seatHumanLoginInstruction(identity harnessseat.Identity, entitlement, ownerPath string) (string, error) {
+	environment, err := harnessseat.ChildEnvironment(identity, ownerPath, nil)
+	if err != nil {
+		return "", err
+	}
+	var command string
+	switch identity.Harness {
+	case harnessseat.Claude:
+		if entitlement == "api_key" {
+			// API-key helpers are configured by the human in the vendor's own
+			// settings. Never accept a key/helper command as registry metadata.
+			path, err := quoteHookArgForOS("linux", filepath.Join(identity.ConfigDir, "settings.json"))
+			if err != nil {
+				return "", err
+			}
+			return "Configure apiKeyHelper manually in " + path + "; no value is accepted or read by Citadel.", nil
+		}
+		command = "claude auth login"
+	case harnessseat.Codex:
+		command = "codex login"
+		if entitlement == "api_key" {
+			command += " --with-api-key"
+		}
+	case harnessseat.Copilot:
+		command = "copilot login"
+		if entitlement == "api_key" {
+			command += " --with-token"
+		}
+	case harnessseat.Muse:
+		command = "muse auth"
+	default:
+		return "", harnessseat.ErrInvalidIdentity
+	}
+	parts := []string{"env", "-i"}
+	for _, entry := range environment {
+		quoted, err := quoteHookArgForOS("linux", entry)
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, quoted)
+	}
+	return strings.Join(parts, " ") + " " + command, nil
 }
 
 func init() { rootCmd.AddCommand(newHarnessSeatRoot(resolveSeatCLIOwner)) }

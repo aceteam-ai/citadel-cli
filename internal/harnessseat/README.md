@@ -1,7 +1,7 @@
 # Seat registry foundations (incomplete)
 
 This package holds identity/environment and local registry work for #1748.
-The CLI exposes only explicit init/list/disable/remove metadata commands. It
+The CLI exposes explicit init/list/add/enable/disable/remove metadata commands. It
 neither reads vendor credentials nor executes a vendor
 command, logs in, selects an account, changes a live process, or rotates quota.
 
@@ -19,7 +19,7 @@ directory modes, registry integrity, entitlement/scope/data-class policy,
 enabled state, and a trusted vendor probe result. Unknown account identity is
 not uniqueness or authentication evidence.
 
-Remaining P1 work: safe default-home adoption; owner-bound seat add/enable/probe;
+Remaining P1 work: safe default-home adoption; owner-bound seat probes;
 vendor status adapters that never open
 credential files; observed metadata and duplicate-account reconciliation;
 two-seat native isolation proof including keychain/secret-store/daemon behavior. The later
@@ -55,9 +55,9 @@ classification ordering or permission decision. Local status fields are
 declarations, not trusted evidence of login, scopes or native isolation.
 
 Local configuration-directory preparation is limited to the process owner.
-The CLI reuses read-only checks for its registry path; vendor-directory creation
-remains unwired. Its identity/home must come from the trusted owner
-resolver, not remote input. It opens directories only, refuses symlinked or
+The CLI reuses read-only checks for its registry path and creates a fresh vendor
+directory only on explicit terminal-only add. Its identity/home must come from
+the trusted owner resolver, not remote input. It opens directories only, refuses symlinked or
 foreign/writable ancestors, requires a 0700 leaf and creates missing components
 0700 only on an explicit create. An existing leaf is never silently adopted
 by create. Read-only validation creates nothing. Neither operation repairs
@@ -75,8 +75,9 @@ local flag, not authentication evidence or permission. Disable and remove remain
 available with an unsafe vendor directory, which neither operation opens,
 repairs or deletes. A concurrent add losing publication may leave its new
 private directory for the owner to inspect; retries do not silently adopt it.
-The CLI exposes disable/remove only; add/enable helpers are still unwired. No
-remote route, login command or launch path is registered.
+Add and enable require terminal input. This is an interaction guard, not remote
+authorization or proof of isolation. No remote route, executed login command or
+launch path is registered.
 
 ## Local metadata commands (partial implementation)
 
@@ -86,6 +87,8 @@ unprivileged caller's resolved home; there is no implicit node-state fallback:
 ```
 citadel harness seat init --registry-dir /absolute/private/registry
 citadel harness seat list --registry-dir /absolute/private/registry --json
+citadel harness seat add example-seat --harness codex --label Example --config-dir /absolute/home/seats/example --registry-dir /absolute/private/registry
+citadel harness seat enable example-seat --registry-dir /absolute/private/registry
 citadel harness seat disable example-seat --registry-dir /absolute/private/registry
 citadel harness seat remove example-seat --registry-dir /absolute/private/registry
 ```
@@ -100,5 +103,26 @@ admission; the HPC positive list stays closed. Listing may establish the private
 persistent coordination lock but never initializes registry identity. Saved
 auth is explicitly labelled a registry declaration, not a fresh vendor probe.
 JSON output omits OS usernames, paths and account digests. Disable/remove change
-only the saved declaration, not any live process or vendor login. The build and
+only the saved declaration, not any live process or vendor login. Add starts
+disabled with unknown auth; only declared entitlement, roots and ceiling are
+accepted. The owner is resolved, never supplied by a flag; observed plan, models,
+account and auth cannot be set by add. An existing directory is refused rather
+than adopted. Enable rechecks directory privacy but proves neither login nor
+launch permission.
+
+Add prints POSIX-shell human login instructions, never runs them or captures
+their output. Environment assignments are single-quoted and generated from the
+same allowlist as the environment plan, using the local caller's PATH; inherited
+provider credentials and shell startup hooks are excluded. Codex API-key and
+Copilot token instructions use vendor stdin, never registry flags; Claude API-key
+helper configuration stays a human vendor-settings action. Printed instructions
+do not prove that a vendor's keychain, secret store or daemon honors the selected
+directory. Native isolation remains an explicit acceptance blocker. An output
+error after publication does not roll back metadata or delete the new directory;
+the owner should inspect list before retrying. The build and
 tests do not authorize running these commands against an actual node.
+
+Printed command references: [Codex authentication](https://developers.openai.com/codex/auth),
+[Claude CLI reference](https://code.claude.com/docs/en/cli-reference), and
+[Copilot CLI reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference).
+The Muse entry point follows the dispatched design and remains subject to native proof.

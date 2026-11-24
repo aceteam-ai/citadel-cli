@@ -33,8 +33,10 @@ So, when adding to this file:
 
 `newHarnessSeatRoot` owns explicit local registry metadata commands; the owner
 resolver refuses privileged or mismatched callers. These commands do not probe
-or launch a harness. `isHarnessSeatCLI` scopes the startup exemption after run
-profile admission. See `internal/harnessseat/README.md` for the incomplete
+or launch a harness. Add/enable require terminal input; add creates a disabled
+declaration and prints, never executes, login instructions. `isHarnessSeatCLI`
+scopes the startup exemption after run-profile admission. See
+`internal/harnessseat/README.md` for the incomplete
 seat-registry boundary and focused tests.
 
 `status.collectCapacityMetrics` owns additive optional heartbeat placement
