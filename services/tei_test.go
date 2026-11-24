@@ -7,7 +7,7 @@ import (
 
 // TestTEICUDATagForComputeCap pins the compute-cap -> CUDA tag mapping against
 // the TEI v1.6 README Docker table (see tei.go header). The sm86 case is the
-// node-1795 / RTX 3090 verified data point (aceteam-ai/citadel-cli#1269).
+// dev-node RTX 3090 verified data point (aceteam-ai/citadel-cli#1269).
 func TestTEICUDATagForComputeCap(t *testing.T) {
 	cases := map[string]string{
 		"7.5": "turing-1.6", // Turing

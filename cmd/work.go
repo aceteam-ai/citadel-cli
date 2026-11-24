@@ -2201,7 +2201,7 @@ func runWork(cmd *cobra.Command, args []string) {
 							// logf (see newReconcileLoop) -- printing it again here on
 							// every single pass would reproduce the exact noise
 							// citadel-cli#742 exists to fix (4574 identical WARNs over
-							// 5 days on node 1297). Any OTHER pass-level error (fetch
+							// 5 days on a dev node). Any OTHER pass-level error (fetch
 							// failure, list failure, ...) still prints every time, same
 							// as before.
 							if passErr != nil && !errors.Is(passErr, reconcile.ErrFullWipeRefused) {

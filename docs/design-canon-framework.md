@@ -567,7 +567,7 @@ nil→`f6`, bytes→`43010203`, `"é😀"`→`66c3a9f09f9880`, and both receipt 
 fxamacker `CanonicalEncOptions()` `a2617a0219012c01`. `{-1:1,"a":2}`,
 `{"a"*24:1,"zz":2}`, `{1000000:1,"abcd":2}`: all agree.
 
-COSE_Sign1, ES256, protected `{1:-7, 4:"node-1297"}`, payload `hello receipt`:
+COSE_Sign1, ES256, protected `{1:-7, 4:"node-4321"}`, payload `hello receipt`:
 go-cose sign → pycose verify **OK** (with `cbor2` 5.9.0); pycose sign →
 go-cose verify **OK**; one payload byte tampered → go-cose `verification
 error`. go-cose signature length 64 (raw `r||s`). With `cbor2` 6.1.4, pycose

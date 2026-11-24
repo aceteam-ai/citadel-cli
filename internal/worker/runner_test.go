@@ -2877,7 +2877,7 @@ func TestRunnerLongSessionJobDoesNotBlockOtherJobs(t *testing.T) {
 
 // TestRunnerGPUBoundJobDoesNotBlockOtherJobs is the regression test for
 // citadel-cli#903 Stage 1: on a maxConcurrency=1 node with a GPU tracker
-// (the node-1297 incident node -- a discrete GPU, so cmd/work.go constructs
+// (the incident node -- a discrete GPU, so cmd/work.go constructs
 // a non-nil r.gpuTracker), a GPU-bound inference job (llm_inference, per
 // gpuBoundJobTypes in gpu_tracker.go) must not occupy the node's only
 // sequential slot for the length of the inference call and starve every
@@ -2914,7 +2914,7 @@ func TestRunnerGPUBoundJobDoesNotBlockOtherJobs(t *testing.T) {
 	config := RunnerConfig{
 		WorkerID:       "test-worker",
 		MaxConcurrency: 1,                // the default that triggers #903's head-of-line blocking
-		GPUTracker:     NewGPUTracker(1), // node-1297-class: a real discrete GPU
+		GPUTracker:     NewGPUTracker(1), // node-4321-class: a real discrete GPU
 		State:          state,
 	}
 	runner := NewRunner(source, []JobHandler{inferenceHandler, fileHandler}, config)
@@ -2941,7 +2941,7 @@ func TestRunnerGPUBoundJobDoesNotBlockOtherJobs(t *testing.T) {
 	// must still be fetched and dispatched -- the core #903 assertion. Before
 	// the fix, llm_inference ran inline on the sole sequential slot and
 	// FILE_READ_BYTES was never even fetched until the inference finished
-	// (reproducing the claim-window fast-fail from node 1297's OCR incident).
+	// (reproducing the claim-window fast-fail from a dev node's OCR incident).
 	deadline := time.Now().Add(2 * time.Second)
 	var fileDispatched bool
 	for time.Now().Before(deadline) {

@@ -2,7 +2,7 @@
 
 ## Context
 
-2026-08-25: a video render on node 1297 (50GB RAM, ~0 free, swap full) OOM-killed
+2026-08-25: a video render on a dev node (50GB RAM, ~0 free, swap full) OOM-killed
 — the kernel's victim-selection is by badness/size, not by "which container is
 production," so it could have taken down `bonsai` or `unlimited-ocr` instead. The
 trigger was CPU-offload of a ~19GB text encoder into already-full RAM. Owner
@@ -11,7 +11,7 @@ single-node BYO-compute customer has no second node to move work to. A dedicated
 node is a preferred *optimization*, not a substitute for isolation on a shared
 one.
 
-**Target hardware:** node 1297 is an RTX 3090 — no MIG, limited/fragile MPS. This
+**Target hardware:** the dev node is an RTX 3090 — no MIG, limited/fragile MPS. This
 doc is scoped around that constraint, not around what would be easy on an
 A100/H100 fleet citadel does not yet operate.
 

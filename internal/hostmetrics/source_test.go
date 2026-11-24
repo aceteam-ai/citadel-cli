@@ -39,12 +39,12 @@ func TestNativeSourceUsesOnlyBoundedSyntheticKernelFiles(t *testing.T) {
 	source := &ProcSource{FS: root, PageSize: 4096, Processes: []ProcessRef{{PID: 42, StartTicks: 100, Role: "worker"}}, GPURead: func(context.Context) (Group, error) {
 		return Group{true, []Reading{{GPUUtilizationRatio, "privateGPU", .25}, {GPUMemoryBytes, "privateGPU", 512}}}, nil
 	}}
-	c, _ := New("1297", testLimits(), source)
+	c, _ := New("4321", testLimits(), source)
 	out, e := c.Collect(context.Background())
 	if e != nil {
 		t.Fatal(e)
 	}
-	for _, value := range []string{`citadel_cpu_ticks_total{node_id="1297",slot="0"} 46`, `citadel_cpu_idle_ticks_total{node_id="1297",slot="0"} 20`, `citadel_memory_available_bytes{node_id="1297",slot="0"} 25600`, `citadel_disk_read_bytes_total{node_id="1297",slot="0"} 2048`, `citadel_disk_written_bytes_total{node_id="1297",slot="0"} 3072`, `citadel_network_received_bytes_total{node_id="1297",slot="0"} 42`, `citadel_temperature_celsius{node_id="1297",slot="0"} 42`, `citadel_throttle_events_total{node_id="1297",slot="0"} 3`, `citadel_process_cpu_ticks_total{node_id="1297",slot="0"} 10`, `citadel_process_resident_bytes{node_id="1297",slot="0"} 16384`, `citadel_gpu_utilization_ratio{node_id="1297",slot="0"} 0.25`} {
+	for _, value := range []string{`citadel_cpu_ticks_total{node_id="4321",slot="0"} 46`, `citadel_cpu_idle_ticks_total{node_id="4321",slot="0"} 20`, `citadel_memory_available_bytes{node_id="4321",slot="0"} 25600`, `citadel_disk_read_bytes_total{node_id="4321",slot="0"} 2048`, `citadel_disk_written_bytes_total{node_id="4321",slot="0"} 3072`, `citadel_network_received_bytes_total{node_id="4321",slot="0"} 42`, `citadel_temperature_celsius{node_id="4321",slot="0"} 42`, `citadel_throttle_events_total{node_id="4321",slot="0"} 3`, `citadel_process_cpu_ticks_total{node_id="4321",slot="0"} 10`, `citadel_process_resident_bytes{node_id="4321",slot="0"} 16384`, `citadel_gpu_utilization_ratio{node_id="4321",slot="0"} 0.25`} {
 		if !strings.Contains(out, value) {
 			t.Fatalf("missing observation %s\n%s", value, out)
 		}

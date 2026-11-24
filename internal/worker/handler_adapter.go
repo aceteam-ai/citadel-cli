@@ -256,7 +256,7 @@ type LegacyHandlerOpts struct {
 	IndexesDir string
 	// WorkReceiptSigner signs the dispatched-work receipts for FILE_INDEX and
 	// embedding (aceteam#10876 C7). Injected explicitly (NOT resolved inside this
-	// package) so a test never signs with node 1795's real convergent identity:
+	// package) so a test never signs with the dev node's real convergent identity:
 	// cmd/work.go passes nodeidentity.Convergent(network.GetNodeConfigDir()). When
 	// non-nil, those handlers run as fail-closed DISPATCHED work — a job that
 	// cannot sign fails with ErrReceiptSigningUnavailable. nil leaves them unsigned

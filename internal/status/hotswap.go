@@ -85,7 +85,7 @@ func EngineDefaultModel(name string) (string, bool) {
 // engineDefaultModel is the served model id an engine falls back to when its
 // <name>.env sets no override — the same value the compose ${VAR:-default}
 // carries. This is what lets a freshly-installed bonsai/unlimited-ocr advertise a
-// concrete model while stopped (the pilot case on node 1297). Engines with no
+// concrete model while stopped (the pilot case on a dev node). Engines with no
 // stable default (vllm serves whatever weights the deploy selected) are absent,
 // so they are advertised only when a model was persisted.
 //

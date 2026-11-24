@@ -8,7 +8,7 @@ import "testing"
 // constant, so each pins the literal in a test.
 func TestNodeWakeChannel(t *testing.T) {
 	cases := map[string]string{
-		"1297":    "wake:v1:node:1297",
+		"4321":    "wake:v1:node:4321",
 		"my-node": "wake:v1:node:my-node",
 	}
 	for nodeID, want := range cases {
@@ -22,13 +22,13 @@ func TestNodeWakeChannel(t *testing.T) {
 // per-node stream stay keyed by the SAME node id (a nudge must address the same
 // node whose stream it wakes).
 func TestNodeWakeChannelTracksNodeQueue(t *testing.T) {
-	const org, node = "org-abc", "1297"
+	const org, node = "org-abc", "4321"
 	q := nodeQueueName(org, node)
 	w := nodeWakeChannel(node)
-	if want := "jobs:v1:shell:org_org-abc:node:1297"; q != want {
+	if want := "jobs:v1:shell:org_org-abc:node:4321"; q != want {
 		t.Fatalf("nodeQueueName = %q, want %q", q, want)
 	}
-	if want := "wake:v1:node:1297"; w != want {
+	if want := "wake:v1:node:4321"; w != want {
 		t.Fatalf("nodeWakeChannel = %q, want %q", w, want)
 	}
 }

@@ -357,12 +357,12 @@ func TestNeverManagedThroughRealProtoWireNoUninstall(t *testing.T) {
 		Revision: "0",
 		Modules:  nil,
 	}}
-	provider := NewProtoProvider(tr, tr, "node-1297", "v1")
+	provider := NewProtoProvider(tr, tr, "node-4321", "v1")
 	ops := newFakeOps(
 		InstalledModule{Name: "a", Source: "a", Health: HealthRunning},
 		InstalledModule{Name: "b", Source: "b", Health: HealthRunning},
 	)
-	rec := NewReconciler(provider, ops, "node-1297")
+	rec := NewReconciler(provider, ops, "node-4321")
 	rec.RefuseFullWipe = true
 
 	plan, _, err := rec.ReconcileOnce(context.Background())
@@ -394,7 +394,7 @@ func TestNeverManagedThroughRealProtoWireNoUninstall(t *testing.T) {
 // asserts the fetch path param and the reported envelope both carry the numeric
 // ID — never a hostname.
 func TestReconcileUsesHeadscaleNodeIDNotHostname(t *testing.T) {
-	const headscaleNodeID = "1084" // fabric_node_status.node_id — Headscale numeric ID
+	const headscaleNodeID = "4321" // fabric_node_status.node_id — Headscale numeric ID
 	const hostname = "ubuntu-gpu"  // the WRONG key the loop used before #535
 
 	tr := &fakeTransport{desired: &fabricpb.DesiredState{

@@ -160,7 +160,7 @@ func TestRollingTranscriber_Run_EmitsAcrossPassesAndFinalizes(t *testing.T) {
 }
 
 // TestRollingTranscriber_Run_NoPeriodicPassAfterStop is the Bug B lifecycle
-// guard (live-prod node 1084, 2026-07-16: rolling passes still firing 68s after
+// guard (a production node, 2026-07-16: rolling passes still firing 68s after
 // "leaving"). Go's select picks a uniformly random ready case, so once stop is
 // closed a still-firing ticker could keep winning and run more periodic passes.
 // The priority re-check of stop must ensure that after stop closes, at most the

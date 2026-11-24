@@ -748,7 +748,7 @@ func (m *SwapManager) MeasuredVRAMBytes(backend, model string) (uint64, bool) {
 // doc comment in internal/status/hotswap.go: sizing at raw steady-state lets
 // the planner see "fits, no evict" and admit a second model into a card that
 // cannot actually hold both, "a no-op swap followed by an OOM". A zero-margin
-// MEASURED value reintroduces exactly that: on node 1297's 3090,
+// MEASURED value reintroduces exactly that: on a dev node's 3090,
 // unlimited-ocr (~14GB measured) + bonsai (~6GB measured) sum to ~20GB
 // resident against a 24GB card -- only ~4GB free, no headroom for load-time
 // transients (KV-cache warm-up, allocator fragmentation, CUDA context
