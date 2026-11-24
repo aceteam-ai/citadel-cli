@@ -142,6 +142,25 @@ by PID: it removes only dirs whose owner PID plus creation time no longer
 match. The session base dir there requires an owner-only, protected DACL
 (`validateCobrowseBaseDirPerms`), and a launch refuses without one. The
 windows-latest CI job runs the real-browser tests against both browsers.
+`darwinHeadlessRunner` (`cobrowse_runner_darwin.go`, citadel-cli#1635) is the
+macOS runner: local mode uses it, and it is the node-wide manager's host
+fallback behind `selectingRunner`, whose container selection it does not touch.
+`discoverMacBrowser` (`cobrowse_macos_logic.go`) owns the search order (Chrome,
+Edge, Chromium, Canary under `/Applications` then `~/Applications`, then PATH,
+or `CITADEL_COBROWSE_BROWSER`) and lists what it searched on failure. macOS has
+no job object or parent-death signal, so `startHeadless` puts the browser in its
+own process group (`Setpgid`) and `killProcessGroup` ends the whole group on
+stop. A crashed owner's browser lives until the next sweep: `sweepMacSessions`
+removes only dirs whose owner PID plus start time (`processStartToken`, sysctl
+`kern.proc.pid`) no longer match, and `killVerifiedBrowserGroup` kills a group
+only when the recorded PID's command line (`ps`) names that session's exact
+`--user-data-dir` and the PID leads its own group; nothing is killed by bare PID.
+`validatePrivateSessionDir` refuses a non-0700, foreign-owned or symlinked
+session dir before launch; the default base is under the user cache dir
+(`macDefaultBaseDir`). `--use-mock-keychain` (`mockKeychain`) keeps a hidden
+browser off the Keychain prompt, so profile cookies use Chromium's mock key. The
+decision logic is untagged and tested on Linux (`cobrowse_macos_logic_test.go`);
+the real-browser macOS acceptance is manual until CI has a macOS job.
 
 Browser account sign-in and sync are disabled per launch with
 `--allow-browser-signin=false` and `--disable-sync` in `buildChromeArgs` and

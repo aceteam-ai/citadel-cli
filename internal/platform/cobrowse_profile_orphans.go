@@ -118,7 +118,7 @@ func CleanOrphanedProfileSessions(baseDir string, owns func(identity string) boo
 			continue
 		}
 		if _, browserPID, xvfbPID := readSessionPidfile(dir); browserPID > 0 || xvfbPID > 0 {
-			killOrphanSessionProcs(browserPID, xvfbPID)
+			killOrphanSessionProcs(dir, browserPID, xvfbPID)
 		}
 		if err := removeAllRetry(dir, orphanRemoveAttempts, orphanRemoveDelay); err != nil {
 			remain = append(remain, fmt.Sprintf("%s (%v)", dir, err))
