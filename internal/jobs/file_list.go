@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
@@ -31,10 +32,12 @@ func NewFileListHandler(workspace string) *FileListHandler {
 
 // fileEntry represents one item in a directory listing.
 type fileEntry struct {
-	Name string `json:"name"`
-	Type string `json:"type"` // "file", "dir", "symlink"
-	Size int64  `json:"size"`
-	Mode string `json:"mode"`
+	Name       string `json:"name"`
+	Type       string `json:"type"` // "file", "dir", "symlink"
+	Size       int64  `json:"size"`
+	Mode       string `json:"mode"`
+	ModifiedAt string `json:"modified_at"`
+	CreatedAt  string `json:"created_at,omitempty"`
 }
 
 // maxListResults caps directory listings to prevent huge responses.
@@ -103,11 +106,17 @@ func (h *FileListHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error
 			entryType = "symlink"
 		}
 
+		createdAt := ""
+		if birthTime, ok := fileBirthTime(filepath.Join(validated, name)); ok {
+			createdAt = birthTime.UTC().Format(time.RFC3339Nano)
+		}
 		results = append(results, fileEntry{
-			Name: name,
-			Type: entryType,
-			Size: info.Size(),
-			Mode: info.Mode().String(),
+			Name:       name,
+			Type:       entryType,
+			Size:       info.Size(),
+			Mode:       info.Mode().String(),
+			ModifiedAt: info.ModTime().UTC().Format(time.RFC3339Nano),
+			CreatedAt:  createdAt,
 		})
 
 		if len(results) >= maxListResults {

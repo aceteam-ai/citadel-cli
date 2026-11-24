@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
@@ -464,6 +465,22 @@ func TestFileList_Basic(t *testing.T) {
 	count := int(result["count"].(float64))
 	if count != 3 {
 		t.Errorf("count = %d, want 3", count)
+	}
+	entries := result["entries"].([]any)
+	for _, raw := range entries {
+		entry := raw.(map[string]any)
+		modified, ok := entry["modified_at"].(string)
+		if !ok {
+			t.Fatalf("missing modified_at in entry %v", entry)
+		}
+		if _, err := time.Parse(time.RFC3339Nano, modified); err != nil {
+			t.Fatalf("invalid modified_at %q: %v", modified, err)
+		}
+		if created, ok := entry["created_at"].(string); ok {
+			if _, err := time.Parse(time.RFC3339Nano, created); err != nil {
+				t.Fatalf("invalid created_at %q: %v", created, err)
+			}
+		}
 	}
 }
 
