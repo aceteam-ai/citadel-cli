@@ -125,9 +125,9 @@ func resolveExisting(p string) string {
 	}
 }
 
-// ErrUserAutostartUnsupported is returned off Windows, where the worker runs
+// ErrUserAutostartUnsupported is returned off Windows and macOS, where the worker runs
 // under systemd or launchd (`citadel service install`) instead.
-var ErrUserAutostartUnsupported = errors.New("per-user autostart is only used on Windows; on Linux and macOS run 'citadel service install'")
+var ErrUserAutostartUnsupported = errors.New("per-user autostart is only used on Windows and macOS; on Linux run 'citadel service install'")
 
 // UserAutostartStatus is the state of the Run value.
 type UserAutostartStatus struct {
