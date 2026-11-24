@@ -16,12 +16,13 @@ func runGated(h *CobrowseSessionHandler, payload map[string]string) error {
 func filePayloads() []map[string]string {
 	b := base64.StdEncoding.EncodeToString([]byte("x"))
 	return []map[string]string{
+		{"action": CobrowseSessionActionRecord, "session_id": "cb-none", "seconds": "1"},
 		{"action": CobrowseSessionActionStageFile, "session_id": "cb-none", "name": "a.pdf", CobrowseStageBytesKey: b},
 		{"action": CobrowseSessionActionSetFileInput, "session_id": "cb-none", "staged_name": "a.pdf", "selector": "#f", "expected_url": "http://example.test/"},
 	}
 }
 
-// Files off refuses both actions with the terminal files_disabled error before
+// Files off refuses all file-producing actions with the terminal files_disabled error before
 // the session is even looked up, so nothing can reach a staging dir.
 func TestCobrowseSession_FileActionsRefusedWhenFilesOff(t *testing.T) {
 	for _, h := range []*CobrowseSessionHandler{

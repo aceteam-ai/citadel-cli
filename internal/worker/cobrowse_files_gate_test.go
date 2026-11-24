@@ -17,3 +17,11 @@ func TestCobrowseSessionHandlerFollowsLiveFilesPermission(t *testing.T) {
 		t.Fatal("no live source must leave the handler denying")
 	}
 }
+
+func TestCobrowseSessionHandlerKeepsWorkspaceAndFilesPermission(t *testing.T) {
+	workspace := t.TempDir()
+	h := cobrowseSessionHandlerFor(LegacyHandlerOpts{WorkspaceDir: workspace, FilesEnabled: func() bool { return false }})
+	if h.WorkspaceDir != workspace || h.Enabled == nil || h.Enabled() {
+		t.Fatal("recording workspace and default-deny Files permission must both be retained")
+	}
+}
