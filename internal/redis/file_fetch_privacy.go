@@ -46,9 +46,9 @@ func (job Job) MarshalJSON() ([]byte, error) {
 	safe := plain(job)
 	if job.Type == jobprivacy.FileFetch {
 		safe.Payload, safe.RawPayload, safe.RawData = nil, nil, nil
-	} else if jobprivacy.HasPasscode(job.Payload) {
-		// The raw stream bytes carry the passcode too, so drop them.
-		safe.Payload = jobprivacy.WithoutPasscode(job.Payload)
+	} else if retained, changed := jobprivacy.Retained(job.Type, job.Payload); changed {
+		// The raw stream bytes carry the same fields, so drop them.
+		safe.Payload = retained
 		safe.RawPayload, safe.RawData = nil, nil
 	}
 	return json.Marshal(safe)
@@ -61,8 +61,8 @@ func (job Job) Format(state fmt.State, verb rune) {
 	}
 	type plain Job
 	safe := plain(job)
-	if jobprivacy.HasPasscode(job.Payload) {
-		safe.Payload = jobprivacy.WithoutPasscode(job.Payload)
+	if retained, changed := jobprivacy.Retained(job.Type, job.Payload); changed {
+		safe.Payload = retained
 		safe.RawPayload, safe.RawData = nil, nil
 	}
 	_, _ = fmt.Fprintf(state, fmt.FormatString(state, verb), safe)

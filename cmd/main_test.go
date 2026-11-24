@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/clilog"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
+	"github.com/aceteam-ai/citadel-cli/internal/laneop"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 )
@@ -25,6 +27,11 @@ var wiredLegacyPasscodeLockout func() config.PasscodeAttemptLimiter
 // fixtures must install their own scoped override. No native execution is authorized by
 // this setup. Legacy passcode lockout is unwired unless explicitly reinstalled.
 func TestMain(m *testing.M) {
+	// LANE_OPERATION's advertisement probes tmux. No cmd test may reach the
+	// real tmux binary or a real tmux server.
+	nativeLaneExec = func() laneop.Exec {
+		return func(context.Context, []byte, ...string) ([]byte, error) { return nil, laneop.ErrTmuxUnavailable }
+	}
 	// A direct init-time assignment would otherwise be overwritten by the
 	// Once below, masking its pre-fixture reads and captured paths.
 	if jobHandlers != nil {

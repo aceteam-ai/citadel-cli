@@ -1123,6 +1123,22 @@ not appear in diagnostics. `tests/test_hosted_turn_token.py` and
 
 ### Worker Mode (Redis Streams) - High-Performance Private Cloud
 
+`worker.LaneOperationHandler` serves aceteam's `lane_capture` and `lane_send`
+(`LANE_OPERATION`, #1659). It accepts only this node's exact per-node stream and
+payload node id. Those checks run before the SHELL_COMMAND shell gate and shared
+passcode throttle, so a misrouted job never counts as a wrong passcode. It is
+advertised only while tmux accepts `-N`, the gates are wired and shell is on.
+`laneop.Service.Send` owns once-per-offer submission. The `laneop.Ledger` record
+is written before any paste, and a redelivered offer replays it without calling
+tmux. The message reaches tmux only on stdin, through a bracketed paste. Enter
+is pressed only when `laneop.ReadScreen` shows an empty, framed input box before
+the paste and exactly the message after it. Unrecognized screens refuse.
+A send refusal is a successful result with `status: rejected`, because the
+server reads send status only from an end event. `jobprivacy.Retained` drops
+the message from every retained rendering. The recognizer fixtures are
+synthetic, so acceptance against a live harness happens after merge. Nothing
+writes `mcp:lane:binding` yet: the server has no authenticated binding verb.
+
 `laneinventory.Collector` owns the read-only #1699 metadata projection and its
 bounded redaction. `worker.LaneInventoryHandler` requires the exact configured
 own-node stream; paired platform key-bound session-read admission is #14139,
