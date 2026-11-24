@@ -45,8 +45,10 @@ func TestVPNRestartRouteIndependentOfBrokenOutboundPlatform(t *testing.T) {
 	s, mux := newAgentMux(&AgentProviders{WorkerRestart: func() (any, error) { called++; return map[string]any{"ok": true, "restarting": true}, nil }})
 	validator := &offlineRestartValidator{}
 	s.tokenValidator = validator
+	cmux := http.NewServeMux()
+	s.registerAgentControlRoutes(cmux, func(next http.HandlerFunc) http.HandlerFunc { return next })
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, loopbackReq(http.MethodPost, "/agent/worker-restart"))
+	cmux.ServeHTTP(w, vpnReq(http.MethodPost, "/agent/worker-restart"))
 	if w.Code != http.StatusOK || called != 1 || validator.calls != 0 {
 		t.Fatal("mesh restart depended on outbound token validation")
 	}

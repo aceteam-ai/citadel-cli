@@ -1904,12 +1904,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				if certErr != nil {
 					fmt.Fprintf(os.Stderr, "   - ⚠️ Coordinator mTLS control listener NOT enabled (server cert: %v)\n", certErr)
 				} else {
-					controlPort := status.DefaultControlPort
-					if p := strings.TrimSpace(os.Getenv("CITADEL_CONTROL_PORT")); p != "" {
-						if parsed, perr := strconv.Atoi(p); perr == nil && parsed > 0 {
-							controlPort = parsed
-						}
-					}
+					controlPort := resolveControlPort()
 					serverCfg.CAVerifier = verifier
 					serverCfg.ControlServerCert = &ctrlCert
 					serverCfg.ControlPort = controlPort

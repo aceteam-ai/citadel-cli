@@ -26,28 +26,12 @@ func hasForwardingHeader(r *http.Request) bool {
 	return false
 }
 
-// isLoopbackCaller reports a direct loopback connection with no forwarding
-// header. A loopback source cannot be forged from the LAN or the mesh. A
-// forwarded request is refused because the exposure relay dials loopback on
-// behalf of remote visitors.
-func isLoopbackCaller(r *http.Request) bool {
-	if hasForwardingHeader(r) {
-		return false
-	}
-	src, ok := addrIP(r.RemoteAddr)
-	return ok && src.IsLoopback()
-}
-
 // requireAgentCaller gates the read-only /agent/* routes on the plaintext
-// listener. Mesh origin alone is not an identity: it admits a direct loopback
-// caller, a mesh peer the PeerVerifier vouches for, or a valid org token, and
-// refuses everyone else (including a CGNAT source with no verified identity).
+// listener. Neither mesh origin nor loopback is an identity: it admits only a
+// mesh peer the PeerVerifier vouches for or a valid org token, and refuses
+// everyone else (a CGNAT source with no verified identity, any loopback source).
 func (s *Server) requireAgentCaller(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if isLoopbackCaller(r) {
-			next(w, r)
-			return
-		}
 		if !hasForwardingHeader(r) && isVPNOrigin(r) && s.peerVerifier != nil && s.peerVerifier(r.Context(), r.RemoteAddr) {
 			next(w, r)
 			return
@@ -61,20 +45,16 @@ func (s *Server) requireAgentCaller(next http.HandlerFunc) http.HandlerFunc {
 				}
 			}
 		}
-		writeJSONError(w, "a verified caller is required: same-owner mesh identity, loopback, or a valid token", http.StatusForbidden)
+		writeJSONError(w, "a verified caller is required: same-owner mesh identity or a valid token", http.StatusForbidden)
 	}
 }
 
 // agentMovedToControl is the fail-closed stub left on the plaintext listener
-// for /agent/* routes that read node content or mutate state. Only a direct
-// loopback caller (the operator on the node) is served; everyone else, mesh
-// peers included, is pointed at the mTLS control listener.
-func (s *Server) agentMovedToControl(next http.HandlerFunc) http.HandlerFunc {
+// for /agent/* routes that read node content or mutate state. Every caller,
+// loopback and mesh peers included, is pointed at the mTLS control listener;
+// next is never run.
+func (s *Server) agentMovedToControl(_ http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if isLoopbackCaller(r) {
-			next(w, r)
-			return
-		}
 		msg := "this endpoint requires a coordinator mTLS client certificate on the control listener"
 		if s.controlEnabled() {
 			msg = fmt.Sprintf("%s (port %d)", msg, s.controlPort)

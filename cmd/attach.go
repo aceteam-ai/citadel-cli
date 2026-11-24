@@ -21,9 +21,10 @@
 // Transport is deliberately the UNAUTHENTICATED, loopback-reachable read surface
 // (`/status`, `/health`, `/services`) plus the lock record — the same
 // zero-daemon-change ethos as work_attach.go. The richer `/agent/*` control
-// surface (worker-status, tail logs, restart) is NOT reachable over loopback today
-// (it is gated by requireVPNOrAuth, which trusts VPN origin or a token, not
-// 127.0.0.1); driving those verbs from a local client is a deferred transport
+// surface (worker-status, tail logs, restart) is NOT reachable over loopback: loopback
+// is not an identity there (read-only routes need a verified same-owner mesh
+// peer or a token, the rest are served only on the mTLS control listener);
+// driving those verbs from a local client is a deferred transport
 // question (see the command's deferred-scope note and issue #524). For mutating
 // verbs this command points at the existing paths (`citadel logs`, systemctl).
 package cmd

@@ -87,8 +87,7 @@ func TestAgentVerifiedPeerReadOnlyOnly(t *testing.T) {
 	}
 }
 
-// A verified source address does not survive a forwarding header: the exposure
-// relay and proxies must not borrow it.
+// A verified source address does not survive a forwarding header.
 func TestAgentForwardedRequestRefused(t *testing.T) {
 	var calls int
 	_, mux := newAgentMux(allAgentProviders(&calls))
@@ -102,19 +101,28 @@ func TestAgentForwardedRequestRefused(t *testing.T) {
 	}
 }
 
-// Loopback is served on every route of the plaintext listener.
-func TestAgentLoopbackAllowed(t *testing.T) {
+// Loopback is not an identity: every /agent/* route refuses it, including with
+// a loopback Host, a non-loopback Host, an Origin header, or IPv6 loopback.
+func TestAgentLoopbackRefused(t *testing.T) {
 	var calls int
 	_, mux := newAgentMux(allAgentProviders(&calls))
 	for _, path := range append(append([]string{}, readOnlyAgentPaths...), sensitiveAgentPaths...) {
-		if code := serve(mux, loopbackReq(agentMethod(path), path)); code != http.StatusOK {
-			t.Errorf("%s: loopback want 200, got %d", path, code)
+		for name, mod := range map[string]func(*http.Request){
+			"plain":        func(*http.Request) {},
+			"loopbackHost": func(r *http.Request) { r.Host = "127.0.0.1:8080" },
+			"rebindHost":   func(r *http.Request) { r.Host = "attacker.example:8080" },
+			"origin":       func(r *http.Request) { r.Header.Set("Origin", "http://attacker.example") },
+			"ipv6":         func(r *http.Request) { r.RemoteAddr = "[::1]:5" },
+		} {
+			r := loopbackReq(agentMethod(path), path)
+			mod(r)
+			if code := serve(mux, r); code != http.StatusForbidden {
+				t.Errorf("%s (%s): loopback want 403, got %d", path, name, code)
+			}
 		}
 	}
-	r := httptest.NewRequest(http.MethodGet, "/agent/worker-status", nil)
-	r.RemoteAddr = "[::1]:5"
-	if code := serve(mux, r); code != http.StatusOK {
-		t.Errorf("ipv6 loopback want 200, got %d", code)
+	if calls != 0 {
+		t.Fatalf("providers ran %d time(s) for loopback requests", calls)
 	}
 }
 

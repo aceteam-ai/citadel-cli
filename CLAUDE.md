@@ -2327,24 +2327,28 @@ and the control server cert.) Check callers before moving a route, in aceteam
 as well as in this repo's own CLI commands. Wire both sides with
 `cmd.registerControlOnlyAPI`, whose test pins which listener each side lands on.
 
-`status.Server.bindAddr` owns the plaintext listener's bind: loopback by default,
-all interfaces only on the explicit `cmd.statusBindLAN` opt-in (logged loudly at
-start); mesh reachability comes only from the `AddListener` VPN listener. The
-`/agent/*` table is `status.Server.agentRoutes`: its `sensitive` routes (logs,
-config, log level, resubscribe, worker restart) answer a fail-closed 403 stub
-on the plaintext listener (`agentMovedToControl`, loopback excepted) and are
-served for real by `registerAgentControlRoutes` behind `requireCoordinator`;
-the read-only routes use `requireAgentCaller`, which admits direct loopback, a
-mesh peer that `cmd.meshPeerVerifier` (WhoIs: same owner, stable device and
-owner id) vouches for, or a valid org token. A CGNAT source alone is never
-enough, and a forwarding header voids loopback and mesh. Change a route's
-class in that table, not at the registration sites.
 A coordinator cert does not override the operator's permission toggles: a
 control route for a toggled surface also takes that permission, read strictly
 per request, as its extra gate (`registerRAGControlAPI` and
 `registerProvisionControlAPI` own this for `/rag` and provisioning), and
 `/ssh/authorized-keys` takes it through `status.ServerConfig.SSHDeployAllowed`,
 where nil refuses.
+
+`status.Server.bindAddr` owns the plaintext listener's bind: loopback by default,
+all interfaces only on the explicit `cmd.statusBindLAN` opt-in (logged loudly at
+start); mesh reachability comes only from the `AddListener` VPN listener. The
+`/agent/*` table is `status.Server.agentRoutes`: its `sensitive` routes (logs,
+config, log level, resubscribe, worker restart) answer a flat fail-closed 403
+on the plaintext listener (`agentMovedToControl`) and are served for real by
+`registerAgentControlRoutes` behind `requireCoordinator`; the read-only routes
+use `requireAgentCaller`, which admits only a mesh peer that
+`cmd.meshPeerVerifier` (WhoIs: same owner, stable device and owner id) vouches
+for, or a valid org token. Neither a CGNAT source nor loopback is an identity
+(the exposure relay and the gateway dial loopback for remote callers), and a
+forwarding header voids the mesh branch. `cmd.platformTarget` refuses a
+platform exposure that would forward to loopback on the node's own status or
+control port. Change a route's class in that table, not at the registration
+sites.
 
 `status.Server.ControlTLS` reports the public certificate held by the active
 control listener, using the same immutable DER snapshot as its TLS config.

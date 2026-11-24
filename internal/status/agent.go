@@ -169,7 +169,7 @@ func (s *Server) agentRoutes() []agentRoute {
 
 // registerAgentRoutes attaches the agent routes to the PLAINTEXT mux. Read-only
 // routes need a verified caller (requireAgentCaller); sensitive routes answer a
-// fail-closed 403 to everyone but loopback (agentMovedToControl) and are
+// fail-closed 403 to everyone (agentMovedToControl) and are
 // served for real by registerAgentControlRoutes.
 func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	if s.agent == nil {

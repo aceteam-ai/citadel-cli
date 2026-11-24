@@ -29,6 +29,15 @@ func loopbackReq(method, target string) *http.Request {
 	return r
 }
 
+// newAgentControlMux builds a mux of the control-listener copy of the agent
+// routes with the coordinator gate stubbed open, to exercise the handlers.
+func newAgentControlMux(p *AgentProviders) (*Server, *http.ServeMux) {
+	s := NewServer(ServerConfig{Port: 8080, Version: "test", Agent: p}, NewCollector(CollectorConfig{NodeName: "n"}))
+	mux := http.NewServeMux()
+	s.registerAgentControlRoutes(mux, func(next http.HandlerFunc) http.HandlerFunc { return next })
+	return s, mux
+}
+
 // vpnReq builds a request from a mesh peer that testPeerVerifier vouches for.
 func vpnReq(method, target string) *http.Request {
 	r := httptest.NewRequest(method, target, nil)
@@ -87,18 +96,18 @@ func TestAgentNilProviderReturns503(t *testing.T) {
 }
 
 func TestAgentControlRequiresPost(t *testing.T) {
-	_, mux := newAgentMux(&AgentProviders{
+	_, mux := newAgentControlMux(&AgentProviders{
 		Resubscribe: func() (any, error) { return map[string]any{"ok": true}, nil },
 	})
 	// GET on a control endpoint must be 405.
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, loopbackReq(http.MethodGet, "/agent/resubscribe"))
+	mux.ServeHTTP(w, vpnReq(http.MethodGet, "/agent/resubscribe"))
 	if w.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("expected 405 for GET on control endpoint, got %d", w.Code)
 	}
 	// POST works.
 	w = httptest.NewRecorder()
-	mux.ServeHTTP(w, loopbackReq(http.MethodPost, "/agent/resubscribe"))
+	mux.ServeHTTP(w, vpnReq(http.MethodPost, "/agent/resubscribe"))
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 for POST resubscribe, got %d", w.Code)
 	}
@@ -106,11 +115,11 @@ func TestAgentControlRequiresPost(t *testing.T) {
 
 func TestAgentLogsQueryParams(t *testing.T) {
 	var got LogQuery
-	_, mux := newAgentMux(&AgentProviders{
+	_, mux := newAgentControlMux(&AgentProviders{
 		Logs: func(q LogQuery) (string, error) { got = q; return "line1\nline2", nil },
 	})
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, loopbackReq(http.MethodGet, "/agent/logs?lines=50&level=error&grep=consume&since=5m"))
+	mux.ServeHTTP(w, vpnReq(http.MethodGet, "/agent/logs?lines=50&level=error&grep=consume&since=5m"))
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
