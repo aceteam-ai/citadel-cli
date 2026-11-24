@@ -145,6 +145,43 @@ jobs:
   # never written to run on Windows. The real-browser tests are opt-in through
   # CITADEL_COBROWSE_BROWSER_IT and run once against Chrome and once against
   # Edge (both preinstalled on the image), plus once through plain discovery.
+  macos-cobrowse:
+    name: macOS co-browse (unit)
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet (local-mode packages)
+        run: go vet ./internal/platform/ ./internal/localcobrowse/ ./internal/localviewer/ ./internal/localaudit/ ./internal/cobrowsestream/ ./internal/cobrowseprofile/ ./internal/nodevault/ ./internal/browserurl/
+
+      # The macOS host runner (#1635): discovery, the owner start-time token,
+      # the verified process-group kill and the session-dir trust checks. The
+      # darwin-tagged tests only run here. A pattern with no matching test yet
+      # passes, so this step is live as each macOS slice lands.
+      - name: macOS runner and session dirs (darwin-only paths)
+        run: go test ./internal/platform/ -count=1 -run '^(TestMac|TestDarwin|TestValidatePrivateSessionDir|TestBuildChromeArgs|TestRunner|TestCobrowse|TestSweep|TestOrphan)'
+
+      - name: Local co-browse service, owner lock, viewer and audit log
+        run: go test ./internal/localcobrowse/... ./internal/localviewer/ ./internal/localaudit/ -count=1
+
+      - name: Saved-logins profile store and at-rest passphrase
+        run: |
+          go test ./internal/cobrowseprofile/ -count=1
+          go test ./internal/nodevault/ -count=1 -run '^(TestAtRest|TestSetPassphrase|TestUnlockAtRest|TestChangePassphrase|TestWeakSecret|TestRemoveKeeps|TestNonFinitePolicy|TestSavePolicyRejects)'
+
+      - name: Egress guard (darwin route data)
+        run: go test ./internal/browserurl/ -count=1
+
+      - name: citadel local mcp and doctor
+        run: go test ./cmd/ -count=1 -run '^(TestHarnessPaths|TestRenderBlocks|TestMerge|TestRunLocalConfig|TestDetectHarness|TestLocalDoctor|TestLocalAudit|TestLocalMCP|TestLocalMode|TestLocalViewer|TestNewLocalMCPTools|TestLocalToolNamesDoNotCollide|TestNoLocalMCPToolCanApprove|TestLocalPassphrase|TestLocalProfileStore|TestLocalStoreDirsArePrivate|TestSignalDuringClose)'
+
   windows-cobrowse:
     name: Windows co-browse (unit + real browser)
     runs-on: windows-latest
