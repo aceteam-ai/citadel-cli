@@ -1828,7 +1828,7 @@ admits a loopback `RemoteAddr` (same-host processes are trusted as for the statu
 server's loopback routes) and otherwise requires a verified mesh peer: the
 injected `MeshIdentityResolver` (`gatewayMeshResolver` -> `network.WhoIsPeer`)
 plus `serviceborrow.Decide` (stable and owner id present, same-owner OR a login on
-the operator's `platformAllowedLogins` allowlist (behind the stat-keyed `cachedAllowedLogins`, so a file change is picked up and a loader error is never cached), wired through
+the operator's `platformAllowedLogins` allowlist (behind `cachedAllowedLogins`, keyed on device, inode, mtime, ctime and size via `statFileStamp`, with a racy-window guard; a loader error is never cached and platforms without a stamp do not cache), wired through
 `Server.SetV1AllowedLogins`). The source address range is never a credential, a
 forwarding header is never read, and a nil resolver, resolver error or
 allowlist-loader error is refused (the loader error narrows to same-owner only).
