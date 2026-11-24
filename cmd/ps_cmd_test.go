@@ -268,7 +268,7 @@ func TestPSSortRows(t *testing.T) {
 func TestPSJSON_ShapeAndOmitEmpty(t *testing.T) {
 	// Empty node: workloads must serialize as [] (not null) so scripts can index it.
 	emptyRows := buildPSRows(&status.NodeStatus{}, nil, "docker", psOptions{sortBy: "vram"})
-	emptyBytes, err := json.Marshal(psJSONOutput{Node: "node-1297", Workloads: emptyRows})
+	emptyBytes, err := json.Marshal(psJSONOutput{Node: "node-4321", Workloads: emptyRows})
 	if err != nil {
 		t.Fatalf("marshal empty: %v", err)
 	}
@@ -283,7 +283,7 @@ func TestPSJSON_ShapeAndOmitEmpty(t *testing.T) {
 		},
 	}
 	rows := buildPSRows(st, nil, "docker", psOptions{sortBy: "vram"})
-	data, err := json.Marshal(psJSONOutput{Node: "node-1297", Workloads: rows})
+	data, err := json.Marshal(psJSONOutput{Node: "node-4321", Workloads: rows})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -304,7 +304,7 @@ func TestPSJSON_ShapeAndOmitEmpty(t *testing.T) {
 	if err := json.Unmarshal(data, &out); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if out.Node != "node-1297" || len(out.Workloads) != 2 {
+	if out.Node != "node-4321" || len(out.Workloads) != 2 {
 		t.Fatalf("unexpected json: node=%q workloads=%d", out.Node, len(out.Workloads))
 	}
 

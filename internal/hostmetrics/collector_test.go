@@ -17,7 +17,7 @@ func testLimits() Limits {
 }
 func collectSnapshot(t *testing.T, s Snapshot) (string, error) {
 	t.Helper()
-	c, e := New("1297", testLimits(), sourceFunc(func(context.Context, *Budget) (Snapshot, error) { return s, nil }))
+	c, e := New("4321", testLimits(), sourceFunc(func(context.Context, *Budget) (Snapshot, error) { return s, nil }))
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -46,7 +46,7 @@ func TestLabelsAreFiniteAndDoNotExposeSourceIdentity(t *testing.T) {
 	if strings.Contains(out, "private") || strings.Contains(out, "secret") || strings.Contains(out, "GPU-") {
 		t.Fatal("private source identity leaked")
 	}
-	if !strings.Contains(out, `citadel_disk_read_bytes_total{node_id="1297",slot="0"} 100`) {
+	if !strings.Contains(out, `citadel_disk_read_bytes_total{node_id="4321",slot="0"} 100`) {
 		t.Fatal(out)
 	}
 }

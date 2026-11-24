@@ -44,7 +44,7 @@ func selfSignedPEM(t *testing.T) string {
 // It drives ensureNodeIdentityWithStore against a hermetic temp-dir store
 // rather than ensureNodeIdentity's real nodeidentity.Convergent
 // (network.GetNodeConfigDir()) target: on a machine with a global
-// /etc/citadel/config.yaml (e.g. this dev box, node 1297) that resolves to a
+// /etc/citadel/config.yaml (e.g. this dev box) that resolves to a
 // REAL node dir even under an overridden HOME, so touching it from a unit test
 // would mutate production key material. The wiring from ensureNodeIdentity to
 // ensureNodeIdentityWithStore is trivial and covered by the convergence tests.

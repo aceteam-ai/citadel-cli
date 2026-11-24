@@ -2065,7 +2065,7 @@ func ensureNodeIdentity(baseURL string) {
 
 // ensureNodeIdentityWithStore is the store-injected core of ensureNodeIdentity,
 // split out so tests can drive a hermetic temp-dir store rather than the real
-// machine-convergent (and, on this dev box, node-1297-pinned) directory.
+// machine-convergent (and, on this dev box, dev-node-pinned) directory.
 func ensureNodeIdentityWithStore(store *nodeidentity.Store, baseURL string) {
 	if _, err := store.GetOrCreateKey(); err != nil {
 		// Non-fatal: a node without an identity key simply pairs with an authkey

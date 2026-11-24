@@ -16,7 +16,7 @@ import (
 // polled on every iteration of the rotation so a node-pinned job waits at most
 // one round trip, while the fungible tag queues stay on the round robin.
 
-const testPerNodeQueue = "jobs:v1:shell:org_test:node:1297"
+const testPerNodeQueue = "jobs:v1:shell:org_test:node:4321"
 
 // consumeCall is one recorded POST to the consume endpoint.
 type consumeCall struct {

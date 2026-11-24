@@ -175,7 +175,7 @@ func testHuddleParams() huddleJoinParams {
 		ChannelID:      huddleTestChannelID,
 		CallID:         huddleTestCallID,
 		AgentID:        huddleTestAgentID,
-		NodeID:         "1297",
+		NodeID:         "4321",
 		JobID:          huddleTestJobID,
 		AttemptID:      huddleTestAttemptID,
 	}
@@ -190,7 +190,7 @@ func huddleJob() *nexus.Job {
 			"channelId":          huddleTestChannelID,
 			"callId":             huddleTestCallID,
 			"agentId":            huddleTestAgentID,
-			"target_node":        "1297",
+			"target_node":        "4321",
 			"lifecycleAttemptId": huddleTestAttemptID,
 			"api_base":           "https://aceteam.ai",
 		},
@@ -1072,7 +1072,7 @@ func TestHuddleJoin_TeardownOnlyCleansThenConfirmsExactAttempt(t *testing.T) {
 		},
 		cleanupNodeSession: func(_ context.Context, p huddleJoinParams) error {
 			cleanupCalls++
-			if p.JobID != huddleTestJobID || p.AttemptID != huddleTestAttemptID || p.NodeID != "1297" {
+			if p.JobID != huddleTestJobID || p.AttemptID != huddleTestAttemptID || p.NodeID != "4321" {
 				t.Fatalf("cleanup identity = %+v", p)
 			}
 			return nil
@@ -1357,7 +1357,7 @@ func TestHuddleLifecycleOutboxRejectsSymlinkRootAndRecord(t *testing.T) {
 	target := filepath.Join(t.TempDir(), "planted.json")
 	debt := huddleLifecycleDebt{
 		OrganizationID: huddleTestOrgID, ChannelID: huddleTestChannelID,
-		CallID: huddleTestCallID, AgentID: huddleTestAgentID, NodeID: "1297",
+		CallID: huddleTestCallID, AgentID: huddleTestAgentID, NodeID: "4321",
 		JobID: huddleTestJobID, AttemptID: huddleTestAttemptID,
 		Status: "failed", Detail: "planted",
 	}

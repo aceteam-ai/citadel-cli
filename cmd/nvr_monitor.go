@@ -86,7 +86,7 @@ func newNVRSelfHealMonitor() *nvr.Monitor {
 	// Restart the whole wyze-bridge container through the runtime seam. (A
 	// per-camera stream restart via the wyze-bridge REST API is deferred -- it
 	// needs an API-key/web-port config the compose does not set and is a
-	// Jason-gated node-1314 verification step; see the PR body.)
+	// operator-gated node verification step; see the PR body.)
 	restart := func(ctx context.Context, reason string) error {
 		runCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 		defer cancel()

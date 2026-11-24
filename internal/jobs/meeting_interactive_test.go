@@ -120,7 +120,7 @@ func TestInteractive_LeaveViaSpokenTranscript(t *testing.T) {
 }
 
 // TestInteractive_RollingStopsWhenCallEnds is the Bug B lifecycle guard at the
-// loop level (live-prod node 1084, 2026-07-16). Even when EVERY rolling pass
+// loop level (a production node, 2026-07-16). Even when EVERY rolling pass
 // fails (simulating the Bug A perms cascade where the scratch clip + whole-file
 // read were both denied), the interactive loop must (1) return promptly with a
 // terminal endReason, and (2) fully stop the rolling goroutine before returning

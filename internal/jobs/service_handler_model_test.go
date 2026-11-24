@@ -68,7 +68,7 @@ services:
 	// Hermeticity (citadel-cli#1084): these flow tests neuter PATH to simulate a
 	// docker-less box, and post-#1084 the docker-branch adoption gate probes the
 	// external engine on exactly such a box. Seam it to "nothing serving" so the
-	// probe never fires a real 127.0.0.1:<VLLMHostPort> request (node 1297 serves a
+	// probe never fires a real 127.0.0.1:<VLLMHostPort> request (a dev node serves a
 	// real vLLM there) -- this handler represents "docker-less, no external engine,"
 	// which correctly falls through to the launch path and the docker-missing error
 	// these tests assert (issue #1084 acceptance #2). A test that wants adoption

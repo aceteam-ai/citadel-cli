@@ -9,15 +9,15 @@ access, `node:exec` grants, and the per-node Redis job stream. The operator must
 re-provision and re-grant by hand, and the superseded offline registrations
 accumulate as ghosts.
 
-Observed on `ubuntu-gpu`: it registered as 1063, then 1084, 1297, now 1795, each
-with a fresh node id, a de-duplicated given-name (`ubuntu-gpu`, `-1`, `-2`, ...),
+Observed on a dev box: it registered as node A, then B, C, now D, each
+with a fresh node id, a de-duplicated given-name (`devbox`, `-1`, `-2`, ...),
 and often a new mesh IP.
 
 ## Root cause (verified, not inferred)
 
 Three independent sources (a read of the live reconnect/tsnet code, a read of
 Headscale's registration source at the pinned tag, and the forensic transcript of
-the 2026-10-07 `1297 -> 1795` incident) converge:
+the 2026-10-07 `C -> D` incident) converge:
 
 1. **This is NOT a Headscale bug, and a Headscale upgrade does not fix it.** nexus
    pins `headscale v0.29.1`. Its `state.HandleNodeFromPreAuthKey` /
@@ -50,7 +50,7 @@ the 2026-10-07 `1297 -> 1795` incident) converge:
      re-registration paths to a fresh key.
 
 4. **The trigger in the observed incident was a transient timeout, not an expiry.**
-   At churn time `nexus_get_node 1297` showed `Expiry: None` (valid) and the live
+   At churn time `nexus_get_node C` showed `Expiry: None` (valid) and the live
    status was `DISCONNECTED (context deadline exceeded)`. `isStaleStateError`
    (`internal/network/singleton.go`) maps `context.DeadlineExceeded` and the
    generic `"timeout waiting for network connection"` string to **stale**, so a
@@ -70,10 +70,10 @@ the 2026-10-07 `1297 -> 1795` incident) converge:
    preserved" (confirmed in the incident stdout).
 
 6. **The given-name climb is against a permanent collision, not just the ghost.**
-   The box has three `ubuntu-gpu*` registrations: `ubuntu-gpu` (1297, org-owned,
-   the offline citadel ghost), `ubuntu-gpu-1` (the **host's own system tailscaled**,
-   owner `jason@`, kernel `tailscale0`, where host SSH rides), and `ubuntu-gpu-2`
-   (1795, org-owned, the live citadel tsnet). The host system-tailscale node never
+   The box has three `devbox*` registrations: `devbox` (C, org-owned,
+   the offline citadel ghost), `devbox-1` (the **host's own system tailscaled**,
+   owned by the operator, kernel `tailscale0`, where host SSH rides), and `devbox-2`
+   (D, org-owned, the live citadel tsnet). The host system-tailscale node never
    goes away, so deleting ghosts alone cannot stop the `-N` climb on the fresh-key
    path.
 

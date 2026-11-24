@@ -395,13 +395,13 @@ func TestExpectNodeMatchesFast(t *testing.T) {
 
 	// A numeric mesh ID is NOT resolvable by the fast path -- it requires the
 	// live gatherIdentity fallback.
-	if expectNodeMatchesFast(manifest, "1084") {
+	if expectNodeMatchesFast(manifest, "4321") {
 		t.Error("want no fast match for a mesh ID (that requires the live gatherIdentity fallback)")
 	}
 }
 
 func TestNodeIdentityMatches(t *testing.T) {
-	id := NodeIdentity{NodeName: "gpu-node-1", Hostname: "box42", HeadscaleNodeID: "1084"}
+	id := NodeIdentity{NodeName: "gpu-node-1", Hostname: "box42", HeadscaleNodeID: "4321"}
 	cases := []struct {
 		expect string
 		want   bool
@@ -410,7 +410,7 @@ func TestNodeIdentityMatches(t *testing.T) {
 		{"gpu-node-1", true},
 		{"GPU-NODE-1", true}, // case-insensitive
 		{"box42", true},
-		{"1084", true},
+		{"4321", true},
 		{"some-other-node", false},
 	}
 	for _, c := range cases {

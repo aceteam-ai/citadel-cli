@@ -18,7 +18,7 @@ import (
 // embeddingProbeServices. A service materialized by SERVICE_START straight from
 // the embedded services.ServiceMap (the path Quick Deploy and the per-node
 // Deploy tab use) was therefore invisible unless it happened to be one of those
-// six AND answered a probe. Deploying TEI to node 1314 left `service_status`
+// six AND answered a probe. Deploying TEI to an acceptance node left `service_status`
 // saying "tei is running (docker)" while `fabric_node_status` said "Running
 // Services: none", and every embedded compose engine other than TEI (kokoro,
 // transcribe, diffusers, extraction, sglang) had no path into the

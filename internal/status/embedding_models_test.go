@@ -165,7 +165,7 @@ func TestCollectEmbeddingServices_ProbeFailureLeavesModelsEmpty(t *testing.T) {
 
 // A stopped engine must not claim a model a RUNNING service already serves.
 // This is what re-attributes gte-multilingual-base from the stopped vllm to the
-// running tei on node 1297.
+// running tei on a dev node.
 func TestCollectInstalledEngines_SkipsModelClaimedByRunningService(t *testing.T) {
 	stubHotswapPreflightPass(t)
 	dir := t.TempDir()

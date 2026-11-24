@@ -19,7 +19,7 @@ import (
 // (docs/design-trust-receipt-v2.md §4, aceteam#8253). They use the in-package
 // newStore(dir, legacyDir) seam so BOTH the convergent dir and the "legacy"
 // dir are temp dirs — never the real platform.ConfigDir()/network dirs (which,
-// on this dev box, are node 1297's live identity paths).
+// on this dev box, are a live node's identity paths).
 
 func selfSignedCertPEM(t *testing.T) string {
 	t.Helper()

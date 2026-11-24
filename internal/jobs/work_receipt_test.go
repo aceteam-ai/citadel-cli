@@ -17,7 +17,7 @@ import (
 )
 
 // inMemSigner is a hermetic ECDSA P-256 aep.Signer for tests — it NEVER touches
-// disk or the real node identity (node 1795 on this box), so these tests can
+// disk or the real node identity (the dev node on this box), so these tests can
 // exercise signing without minting/reading real key material.
 type inMemSigner struct {
 	key *ecdsa.PrivateKey

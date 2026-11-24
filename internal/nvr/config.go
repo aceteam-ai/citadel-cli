@@ -10,7 +10,7 @@
 //     retention, discovered cameras). Frigate reads /config/config.yml; the
 //     module ships no static config because the detector block, retention, and
 //     camera list are all assignment/runtime inputs. GenerateFrigateConfig bakes
-//     in every scar observed on the live SJC build (node 1314) — see below.
+//     in every scar observed on the live acceptance build; see below.
 //  2. Resolving + verifying the media storage target (local | nas | volume). The
 //     NAS mount + fstab persistence + writability check are HOST/root operations
 //     a container can't perform, and getting them wrong silently writes
@@ -407,7 +407,7 @@ func GenerateFrigateConfig(cfg Config, cameras []Camera) (string, error) {
 // a comma-separated list of `name` or `name=stream-path` entries (stream-path
 // defaults to name), e.g. "front-door,garage=garage-cam". This is the explicit,
 // deterministic camera source the init container ships with; auto-discovery from
-// docker-wyze-bridge's API is a runtime enhancement validated at the node-1314
+// docker-wyze-bridge's API is a runtime enhancement validated at the node
 // human acceptance step, not the shipped default.
 func ParseCameras(raw string) []Camera {
 	var out []Camera

@@ -91,13 +91,13 @@ func TestBuildAttachView_BannerPlusServices(t *testing.T) {
 	start := time.Date(2026, 7, 15, 9, 12, 44, 0, time.UTC)
 	now := start.Add(90 * time.Minute)
 	holder := worklock.HolderRecord{PID: 4242, StartTime: start, Version: "2.87.0"}
-	st := &attachStatus{Version: "2.87.0", NodeName: "gpu-1297", Health: "ok"}
+	st := &attachStatus{Version: "2.87.0", NodeName: "gpu-4321", Health: "ok"}
 	services := []attachService{{Name: "vllm", Status: "running", Port: 8000}}
 
 	out := buildAttachView(holder, now, st, services)
 
 	// Banner content (reused from work_attach.go) is present...
-	for _, want := range []string{"already running", "PID 4242", "Node: gpu-1297 (ok)"} {
+	for _, want := range []string{"already running", "PID 4242", "Node: gpu-4321 (ok)"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("attach view missing banner element %q\n---\n%s", want, out)
 		}
