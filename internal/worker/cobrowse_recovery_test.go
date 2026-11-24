@@ -46,3 +46,19 @@ func TestCobrowseRecoveryCapabilityFollowsConfiguredHandler(t *testing.T) {
 		t.Fatal("missing adapter advertised")
 	}
 }
+
+// The registered session handler keeps both the live Files gate and the
+// recovery node binding; neither wiring replaces the other.
+func TestCobrowseSessionHandlerForKeepsFilesGateAndRecoveryBinding(t *testing.T) {
+	on := true
+	h := cobrowseSessionHandlerFor(LegacyHandlerOpts{CobrowseRecoveryNodeID: "node-fixture", FilesEnabled: func() bool { return on }})
+	if h.Enabled == nil || !h.Enabled() {
+		t.Fatal("Files gate not wired")
+	}
+	if h.CobrowseJobRecoveryAvailable() != cobrowserecovery.Supported() {
+		t.Fatal("recovery binding lost")
+	}
+	if cobrowseSessionHandlerFor(LegacyHandlerOpts{FilesEnabled: func() bool { return on }}).CobrowseJobRecoveryAvailable() {
+		t.Fatal("unbound node advertised recovery")
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/cobrowserecovery"
 )
@@ -197,6 +198,9 @@ func TestCobrowseRecoveryProfilePersistenceRetainsCustodyForRetry(t *testing.T) 
 }
 
 func TestCobrowseRecoveryPlaintextRemovalFailureIsRetryable(t *testing.T) {
+	prevA, prevD := sessionRemoveAttempts, sessionRemoveDelay
+	sessionRemoveAttempts, sessionRemoveDelay = 1, time.Millisecond
+	t.Cleanup(func() { sessionRemoveAttempts, sessionRemoveDelay = prevA, prevD })
 	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
 	id := "cb-remove-retry"
 	// An existing regular file used as a parent deterministically produces ENOTDIR
@@ -222,6 +226,11 @@ func TestCobrowseRecoveryPlaintextRemovalFailureIsRetryable(t *testing.T) {
 	}
 	if m.sessions[id] != s || s.proc == nil {
 		t.Fatal("removal failure lost cleanup custody")
+	}
+	// The staging dir under the same blocked path cannot be removed either, so
+	// nothing may be sealed yet (root-independent, unlike a read-only pin).
+	if p.persistCalls != 0 || p.closeCalls != 0 {
+		t.Fatal("sealed while the staging dir could not be removed")
 	}
 	if err := os.Remove(blocker); err != nil {
 		t.Fatal(err)

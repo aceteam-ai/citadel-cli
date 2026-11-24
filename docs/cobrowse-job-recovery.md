@@ -72,7 +72,14 @@ recovery must retain the charge and must not invent a successful stop. Persisten
 profile cleanup still belongs to the session manager. After verified exit,
 recovery retains its exact process/profile handles until sealing, key closure and
 checked plaintext-directory removal all succeed. A transient failure is retried
-without repeating a completed process stop or sealing a closed key. Plaintext stays
+without repeating a completed process stop or sealing a closed key. Recovery
+applies the same sealing rules as ordinary teardown (`quiesceStaging`,
+`settleBeforeSeal`, `sealDir`, `removeProfileWorkDir`): the file-chooser watcher
+and staging close before the stop, nothing is sealed while a browser helper may
+still use the profile or the staging dir cannot be removed, the seal reads the
+session's working directory (the container profile subdirectory for a container
+session), and helpers are re-reaped during removal. Each of those failures keeps
+the record nonterminal. Plaintext stays
 in the owned private working directory while sealing is unconfirmed; a restart
 that loses the in-memory sealing handle remains unknown and needs reconciliation.
 

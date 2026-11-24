@@ -906,26 +906,18 @@ func (s *cobrowseSession) teardown() error {
 	proc := s.proc
 	s.proc = nil
 	profile := s.profile
-	workDir := s.workDir
-	if workDir == "" {
-		workDir = profile
-	}
+	workDir := sealDir(profile, s.workDir)
 	enc := s.encProfile
 	s.encProfile = nil
 	regDir := s.regDir
 	s.mu.Unlock()
-	s.stopChooserWatch()
-	// No stage may start from here on; one already running has finished.
-	// Staged user files go first, so a persistent profile's sealed copy can
-	// never contain them.
-	s.closeStaging()
-	_ = s.removeStagingDir()
+	s.quiesceStaging()
 	// A stopped session leaves no registry record: it did not "end" unexpectedly.
 	if regDir != "" {
 		deleteRecord(regDir, s.id)
 	}
 
-	var err, reapErr error
+	var err error
 	if enc != nil && proc != nil {
 		// A persistent profile is sealed from what the browser wrote to disk.
 		// Chromium keeps recent cookie and login writes in memory and commits
@@ -939,15 +931,8 @@ func (s *cobrowseSession) teardown() error {
 	}
 	if proc != nil {
 		dropTargetSet(proc.debugPort)
-		// The main process is dead; its helpers may not be yet, and they
-		// recreate files under the profile. Nothing is sealed until they are
-		// gone (citadel-cli#1836); a survivor fails closed below.
-		reapErr = reapProfileUsers(profile, proc.browserScope)
 	}
-	// Again after the browser is gone (it may have held a staged file open),
-	// and always before Persist seals anything. A dir that cannot be removed
-	// is never sealed.
-	stageErr := s.removeStagingDir()
+	reapErr, stageErr := s.settleBeforeSeal(proc)
 	if enc != nil {
 		// Persist ONLY if the browser ran (proc != nil): a failed launch never
 		// produced new state, and sealing an empty/partial working dir would
@@ -975,18 +960,9 @@ func (s *cobrowseSession) teardown() error {
 	// cookies (and no throwaway state) behind. The pidfile lives under it and goes
 	// too. For a persistent profile the durable state now lives only as ciphertext.
 	if profile != "" {
-		rerr := removeSessionDir(profile)
-		// A helper can recreate the tree after a removal that succeeded, so
-		// with a browser involved re-reap and re-check until the dir is gone.
-		for i := 0; proc != nil && i < 3; i++ {
-			if r := reapProfileUsers(profile, proc.browserScope); r != nil && reapErr == nil {
-				reapErr = r
-			}
-			if _, serr := os.Lstat(profile); os.IsNotExist(serr) {
-				rerr = nil
-				break
-			}
-			rerr = removeSessionDir(profile)
+		rerr, r := removeProfileWorkDir(profile, proc)
+		if r != nil && reapErr == nil {
+			reapErr = r
 		}
 		if rerr != nil && enc != nil && err == nil {
 			// A persistent session's working dir holds decrypted cookies; a
@@ -998,6 +974,58 @@ func (s *cobrowseSession) teardown() error {
 		err = reapErr
 	}
 	return err
+}
+
+// sealDir is the directory a persistent profile is sealed from: the
+// session's workDir (the container profile subdirectory for a container
+// session), else the session dir itself.
+func sealDir(profile, workDir string) string {
+	if workDir == "" {
+		return profile
+	}
+	return workDir
+}
+
+// quiesceStaging is the first step of every stop: no chooser is filled and no
+// stage may start from here on (one already running has finished), and staged
+// user files are removed first, so a persistent profile's sealed copy can never
+// contain them. The removal here is best effort; settleBeforeSeal checks again.
+func (s *cobrowseSession) quiesceStaging() {
+	s.stopChooserWatch()
+	s.closeStaging()
+	_ = s.removeStagingDir()
+}
+
+// settleBeforeSeal runs after the browser process stopped and before anything
+// is sealed. The main process is dead; its helpers may not be yet, and they
+// recreate files under the profile, so nothing is sealed until they are gone
+// (citadel-cli#1836). The staging dir is removed again (the browser may have
+// held a staged file open). A non-nil result from either means the profile
+// must not be sealed.
+func (s *cobrowseSession) settleBeforeSeal(proc *cobrowseProc) (reapErr, stageErr error) {
+	if proc != nil {
+		reapErr = reapProfileUsers(s.profile, proc.browserScope)
+	}
+	return reapErr, s.removeStagingDir()
+}
+
+// removeProfileWorkDir removes the plaintext session dir. A helper can recreate
+// the tree after a removal that succeeded, so with a browser involved it
+// re-reaps and re-checks until the dir is gone. reapErr is the first reap
+// failure seen here.
+func removeProfileWorkDir(profile string, proc *cobrowseProc) (rerr, reapErr error) {
+	rerr = removeSessionDir(profile)
+	for i := 0; proc != nil && i < 3; i++ {
+		if r := reapProfileUsers(profile, proc.browserScope); r != nil && reapErr == nil {
+			reapErr = r
+		}
+		if _, serr := os.Lstat(profile); os.IsNotExist(serr) {
+			rerr = nil
+			break
+		}
+		rerr = removeSessionDir(profile)
+	}
+	return rerr, reapErr
 }
 
 // status computes the live queryable state, detecting a crashed browser via the

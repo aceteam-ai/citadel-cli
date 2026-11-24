@@ -54,10 +54,21 @@ func (m *CobrowseSessionManager) StopRecoverySession(id string) (bool, error) {
 	if proc == nil || proc.exited == nil || proc.stop == nil {
 		return false, nil
 	}
+	s.mu.Lock()
+	enc := s.encProfile
+	s.mu.Unlock()
+	// The same first step as teardown: no chooser fill and no new stage once a
+	// stop was requested, and staged files are removed before anything else.
+	s.quiesceStaging()
 	// A confirmed process stop is not repeated just because profile sealing or
 	// directory removal needs another attempt. Keep its exact handle until all
 	// cleanup stages succeed; a concurrent legacy teardown uses teardownMu too.
 	if !s.recoveryStopped {
+		if enc != nil {
+			// As in teardown: let Chromium flush cookie and login writes before
+			// the stop, so a later seal does not lose them.
+			closeBrowserGracefully(proc)
+		}
 		if err := proc.stop(); err != nil {
 			return false, fmt.Errorf("browser exit unconfirmed")
 		}
@@ -69,8 +80,9 @@ func (m *CobrowseSessionManager) StopRecoverySession(id string) (bool, error) {
 			return false, fmt.Errorf("browser exit unconfirmed")
 		}
 		s.recoveryStopped = true
+		dropTargetSet(proc.debugPort)
 	}
-	if err := s.finishRecoveryCleanup(); err != nil {
+	if err := s.finishRecoveryCleanup(proc); err != nil {
 		return false, fmt.Errorf("browser cleanup unconfirmed")
 	}
 	m.mu.Lock()
@@ -81,18 +93,33 @@ func (m *CobrowseSessionManager) StopRecoverySession(id string) (bool, error) {
 	return true, nil
 }
 
-// Caller holds teardownMu after verified process exit. Persist before closing or
-// deleting anything. Completed stages survive retries in this owner; a restart
-// that loses the unlocked profile handle remains unknown, never falsely clean.
-func (s *cobrowseSession) finishRecoveryCleanup() error {
+// Caller holds teardownMu after verified process exit. It applies teardown's
+// sealing rules (settleBeforeSeal, sealDir, removeProfileWorkDir) but keeps
+// custody: any failure returns before the record, process handle or unlocked
+// profile is released, so another attempt can finish. Completed stages survive
+// retries in this owner; a restart that loses the unlocked profile handle
+// remains unknown, never falsely clean.
+func (s *cobrowseSession) finishRecoveryCleanup(proc *cobrowseProc) error {
 	s.mu.Lock()
 	enc, profile, regDir := s.encProfile, s.profile, s.regDir
+	src := sealDir(profile, s.workDir)
 	s.mu.Unlock()
-	if enc != nil && !s.recoveryPersisted {
-		if err := enc.Persist(profile); err != nil {
-			return err
+	if !s.recoveryPersisted {
+		// Nothing is sealed while a helper still uses the profile or staged
+		// files remain; both are rechecked on every attempt until sealed.
+		reapErr, stageErr := s.settleBeforeSeal(proc)
+		if reapErr != nil {
+			return reapErr
 		}
-		s.recoveryPersisted = true
+		if stageErr != nil {
+			return stageErr
+		}
+		if enc != nil {
+			if err := enc.Persist(src); err != nil {
+				return err
+			}
+			s.recoveryPersisted = true
+		}
 	}
 	if enc != nil && !s.recoveryClosed {
 		if err := enc.Close(); err != nil {
@@ -100,11 +127,15 @@ func (s *cobrowseSession) finishRecoveryCleanup() error {
 		}
 		s.recoveryClosed = true
 	}
-	// removeSessionDir is best effort for legacy teardown. Recovery must inspect
-	// the actual error and retain this session for another cleanup attempt.
+	// Teardown's removal is best effort for a throwaway session. Recovery must
+	// see every removal or reap failure and retain this session for retry.
 	if profile != "" {
-		if err := os.RemoveAll(profile); err != nil {
-			return err
+		rerr, reapErr := removeProfileWorkDir(profile, proc)
+		if reapErr != nil {
+			return reapErr
+		}
+		if rerr != nil {
+			return rerr
 		}
 		if _, err := os.Lstat(profile); !os.IsNotExist(err) {
 			return fmt.Errorf("profile removal unconfirmed")
