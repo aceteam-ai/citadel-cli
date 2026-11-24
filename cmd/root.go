@@ -129,6 +129,11 @@ control center. All other subcommands are for scripting and advanced use.`,
 		} else if handled {
 			return
 		}
+		// Advisory housekeeping consumes only supplied stdin metadata. Keep
+		// profile admission above it; do not initialize node state or updates.
+		if isHousekeepingPlanCommand(cmd) {
+			return
+		}
 		// MCP command uses stdout as JSON-RPC transport -- any non-protocol
 		// output there corrupts the stream. Redirect debug to stderr FIRST,
 		// before any Log()/Debug() call in this function -- including
