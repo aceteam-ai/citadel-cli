@@ -1,12 +1,14 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fakeLaunchctl is a launchctl runner over an in-memory job table. It records
@@ -21,11 +23,12 @@ type fakeLaunchctl struct {
 	bootoutFails   bool  // bootout and unload both fail and the job stays loaded
 	bootoutLies    bool  // bootout reports failure but the job is gone
 	bootstrapFails bool  // bootstrap fails
+	bootstrapNoPID bool  // bootstrap loads the job but the worker exits at once
 	hardErr        error // returned for every call: launchctl itself is unusable
 	printExit      int   // non-zero: print exits with this status (113 means absent)
 }
 
-func (f *fakeLaunchctl) run(args ...string) ([]byte, error) {
+func (f *fakeLaunchctl) run(_ context.Context, args ...string) ([]byte, error) {
 	f.calls = append(f.calls, strings.Join(args, " "))
 	if f.hardErr != nil {
 		return nil, f.hardErr
@@ -65,6 +68,9 @@ func (f *fakeLaunchctl) run(args ...string) ([]byte, error) {
 			return nil, exit
 		}
 		f.loaded, f.pid = true, 4242
+		if f.bootstrapNoPID {
+			f.pid = 0
+		}
 		return nil, nil
 	}
 	return nil, errors.New("unexpected launchctl " + args[0])
@@ -159,7 +165,7 @@ func TestLaunchdUserAgentReinstallIsIdempotent(t *testing.T) {
 	if err := a.Enable(testExe); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.Start(); err != nil {
+	if err := a.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	// Same content: nothing rewritten, and a running worker is not bounced.
@@ -198,7 +204,7 @@ func TestLaunchdUserAgentChangedPlistBootsOutTheOldJob(t *testing.T) {
 	if f.loaded {
 		t.Error("the job loaded from the old plist was not booted out")
 	}
-	if err := a.Start(); err != nil {
+	if err := a.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if !f.loaded || f.pid == 0 {
@@ -209,7 +215,7 @@ func TestLaunchdUserAgentChangedPlistBootsOutTheOldJob(t *testing.T) {
 func TestLaunchdUserAgentRefusesRootAndUntrustedBinaries(t *testing.T) {
 	a, f := newTestAgent(t)
 	a.Euid = 0
-	for name, err := range map[string]error{"enable": a.Enable(testExe), "start": a.Start()} {
+	for name, err := range map[string]error{"enable": a.Enable(testExe), "start": a.Start(context.Background())} {
 		if err == nil || !strings.Contains(err.Error(), "not as root") {
 			t.Errorf("%s as root: %v", name, err)
 		}
@@ -254,7 +260,7 @@ func TestLaunchdUserAgentStart(t *testing.T) {
 			t.Fatal(err)
 		}
 		f.calls = nil
-		if err := a.Start(); err != nil {
+		if err := a.Start(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 		want := "bootstrap gui/501 " + a.PlistPath()
@@ -266,7 +272,7 @@ func TestLaunchdUserAgentStart(t *testing.T) {
 		a, f := newTestAgent(t)
 		_ = a.Enable(testExe)
 		f.bootstrapFails = true
-		err := a.Start()
+		err := a.Start(context.Background())
 		if err == nil || !strings.Contains(err.Error(), "desktop session") {
 			t.Fatalf("err = %v", err)
 		}
@@ -274,11 +280,65 @@ func TestLaunchdUserAgentStart(t *testing.T) {
 			t.Errorf("calls = %v loaded = %v", f.calls, f.loaded)
 		}
 	})
+	t.Run("a worker that exits at once is a failed start", func(t *testing.T) {
+		defer func(w, p time.Duration) { StartWait, StartPoll = w, p }(StartWait, StartPoll)
+		StartWait, StartPoll = 30*time.Millisecond, 5*time.Millisecond
+		a, f := newTestAgent(t)
+		_ = a.Enable(testExe)
+		f.bootstrapNoPID = true
+		err := a.Start(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "not running") || !strings.Contains(err.Error(), "citadel-error.log") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("the caller's context bounds the wait", func(t *testing.T) {
+		defer func(w, p time.Duration) { StartWait, StartPoll = w, p }(StartWait, StartPoll)
+		StartWait, StartPoll = time.Minute, 5*time.Millisecond
+		a, f := newTestAgent(t)
+		_ = a.Enable(testExe)
+		f.bootstrapNoPID = true
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		defer cancel()
+		start := time.Now()
+		if err := a.Start(ctx); err == nil || time.Since(start) > 5*time.Second {
+			t.Fatalf("err = %v after %v", err, time.Since(start))
+		}
+	})
+	t.Run("a running worker that is switched off in Login Items is refused", func(t *testing.T) {
+		a, f := newTestAgent(t)
+		_ = a.Enable(testExe)
+		f.loaded, f.pid, f.disabled = true, 8, true
+		err := a.Start(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "Login Items") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("the context reaches every launchctl call", func(t *testing.T) {
+		a, _ := newTestAgent(t)
+		_ = a.Enable(testExe)
+		type key struct{}
+		ctx := context.WithValue(context.Background(), key{}, "x")
+		seen := 0
+		inner := a.Run
+		a.Run = func(c context.Context, args ...string) ([]byte, error) {
+			if c.Value(key{}) == nil {
+				t.Errorf("launchctl %v ran without the caller's context", args)
+			}
+			seen++
+			return inner(c, args...)
+		}
+		if err := a.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if seen == 0 {
+			t.Fatal("no launchctl calls")
+		}
+	})
 	t.Run("a Login Items switch-off is named", func(t *testing.T) {
 		a, f := newTestAgent(t)
 		_ = a.Enable(testExe)
 		f.disabled = true
-		err := a.Start()
+		err := a.Start(context.Background())
 		if err == nil || !strings.Contains(err.Error(), "Login Items") {
 			t.Fatalf("err = %v", err)
 		}
@@ -288,7 +348,7 @@ func TestLaunchdUserAgentStart(t *testing.T) {
 	})
 	t.Run("no plist is refused", func(t *testing.T) {
 		a, _ := newTestAgent(t)
-		if err := a.Start(); err == nil {
+		if err := a.Start(context.Background()); err == nil {
 			t.Fatal("expected an error")
 		}
 	})
@@ -302,7 +362,7 @@ func TestLaunchdUserAgentStart(t *testing.T) {
 		if err := os.Truncate(big, LaunchAgentLogMaxBytes+1); err != nil {
 			t.Fatal(err)
 		}
-		if err := a.Start(); err != nil {
+		if err := a.Start(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 		if fi, _ := os.Stat(big); fi.Size() != 0 {

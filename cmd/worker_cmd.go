@@ -8,6 +8,7 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -122,7 +123,11 @@ var workerStartCmd = &cobra.Command{
 		if runtime.GOOS != "darwin" {
 			return errors.New("'citadel worker start' is only for the macOS LaunchAgent; on Windows run 'citadel work --background', on Linux use 'citadel service start'")
 		}
-		if err := service.StartUserWorker(); err != nil {
+		ctx := cmd.Context()
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if err := service.StartUserWorker(ctx); err != nil {
 			return err
 		}
 		fmt.Fprintln(cmd.OutOrStdout(), "The background worker is running (a LaunchAgent that macOS keeps running).")

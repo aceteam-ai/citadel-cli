@@ -177,6 +177,6 @@ func darwinSetupWorkerDeps(exe string, offered func() bool) setupWorkerDeps {
 		postureHolds:    func() bool { return setupPostureHolds(nodeConfigDirFn()) },
 		releaseNetwork:  network.Disconnect,
 		enableAutostart: func() error { return service.EnableUserAutostart(exe) },
-		start:           func(ctx context.Context) error { return service.StartUserWorker() },
+		start:           service.StartUserWorker,
 	}
 }

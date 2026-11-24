@@ -18,6 +18,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -25,6 +26,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // LaunchAgentLogMaxBytes bounds each launchd log file. launchd appends to
@@ -43,6 +45,14 @@ const launchctlServiceNotFound = 113
 // own session domain (an SSH login has a different one), so they are never
 // used: they could start or stop a job that gui/<uid> does not show.
 const errNeedDesktopSession = "run this from your logged-in desktop session (Terminal on the Mac itself, or the setup page), not over SSH"
+
+// StartWait bounds how long Start waits for the worker to show a running PID
+// after bootstrap; StartPoll is the gap between checks. Both are vars so tests
+// need not sleep. The caller's context bounds them further.
+var (
+	StartWait = 10 * time.Second
+	StartPoll = 250 * time.Millisecond
+)
 
 // launchctlOutputMax caps what a launchctl call's output is read as.
 const launchctlOutputMax = 64 << 10
@@ -75,8 +85,9 @@ type LaunchAgent struct {
 	// Euid is the process's effective uid; 0 refuses everything, so a LaunchDaemon
 	// or a gui/0 agent is never written.
 	Euid int
-	// Run runs `launchctl args...`, with its output capped.
-	Run func(args ...string) ([]byte, error)
+	// Run runs `launchctl args...`, with its output capped, and gives up when
+	// ctx does.
+	Run func(ctx context.Context, args ...string) ([]byte, error)
 	// StatExe reads an executable's owner and mode, following symlinks.
 	StatExe func(path string) (ExeInfo, error)
 }
@@ -212,7 +223,7 @@ func (a *LaunchAgent) Enable(exe string) error {
 	if err := writeFileAtomic(pp, []byte(content), 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", pp, err)
 	}
-	return a.Stop()
+	return a.stop(context.Background())
 }
 
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
@@ -237,8 +248,8 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 }
 
 // print reads the job from launchd: loaded, and its PID when running.
-func (a *LaunchAgent) print() (loaded bool, pid int, err error) {
-	out, err := a.Run("print", a.target())
+func (a *LaunchAgent) print(ctx context.Context) (loaded bool, pid int, err error) {
+	out, err := a.Run(ctx, "print", a.target())
 	var exit *LaunchctlExit
 	switch {
 	case err == nil:
@@ -259,8 +270,8 @@ func (a *LaunchAgent) print() (loaded bool, pid int, err error) {
 }
 
 // disabled reads launchctl print-disabled for this label.
-func (a *LaunchAgent) disabled() (bool, error) {
-	out, err := a.Run("print-disabled", a.domain())
+func (a *LaunchAgent) disabled(ctx context.Context) (bool, error) {
+	out, err := a.Run(ctx, "print-disabled", a.domain())
 	if err != nil {
 		return false, fmt.Errorf("launchctl print-disabled: %w", err)
 	}
@@ -275,11 +286,14 @@ func (a *LaunchAgent) disabled() (bool, error) {
 	return false, nil
 }
 
-// Start loads the agent, which RunAtLoad starts at once. It is idempotent: a
-// job that is already running is left alone, so a second click never drops a
-// healthy worker's jobs. It refuses a missing plist and an agent the user
-// switched off in Login Items.
-func (a *LaunchAgent) Start() error {
+// Start loads the agent, which RunAtLoad starts at once, and waits (bounded by
+// StartWait and ctx) for launchd to show a running PID: a job that loads but
+// exits at once is a failed start, reported with the log path. It is
+// idempotent: a job that is already running is left alone, so a second click
+// never drops a healthy worker's jobs. It refuses a missing plist and an agent
+// the user switched off in Login Items, even if it is running now, since it
+// would not start at the next sign-in. Every launchctl call honours ctx.
+func (a *LaunchAgent) Start(ctx context.Context) error {
 	if err := a.refuseRoot(); err != nil {
 		return err
 	}
@@ -287,38 +301,58 @@ func (a *LaunchAgent) Start() error {
 	if _, err := os.Stat(pp); err != nil {
 		return fmt.Errorf("the worker agent is not installed (%s): %w", pp, err)
 	}
-	loaded, pid, err := a.print()
+	if off, err := a.disabled(ctx); err != nil {
+		return err
+	} else if off {
+		return errors.New("the Citadel worker is switched off in System Settings > General > Login Items & Extensions; turn it on there, then try again")
+	}
+	loaded, pid, err := a.print(ctx)
 	if err != nil {
 		return err
 	}
 	if loaded && pid > 0 {
 		return nil
 	}
-	if off, err := a.disabled(); err != nil {
-		return err
-	} else if off {
-		return errors.New("the Citadel worker is switched off in System Settings > General > Login Items & Extensions; turn it on there, then try again")
-	}
 	a.trimLogs()
 	if loaded {
 		// Loaded but not running: reload so launchd starts a fresh one.
-		if err := a.bootout(); err != nil {
+		if err := a.bootout(ctx); err != nil {
 			return err
 		}
 	}
-	if _, err := a.Run("bootstrap", a.domain(), pp); err != nil {
+	if _, err := a.Run(ctx, "bootstrap", a.domain(), pp); err != nil {
 		return fmt.Errorf("launchctl bootstrap into %s failed (%v); %s", a.domain(), err, errNeedDesktopSession)
 	}
-	if loaded, _, err := a.print(); err != nil {
-		return err
-	} else if !loaded {
-		return errors.New("launchd did not load the Citadel worker")
+	deadline := time.NewTimer(StartWait)
+	defer deadline.Stop()
+	for {
+		loaded, pid, err := a.print(ctx)
+		if err != nil {
+			return err
+		}
+		if loaded && pid > 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return a.notRunning(ctx.Err())
+		case <-deadline.C:
+			return a.notRunning(nil)
+		case <-time.After(StartPoll):
+		}
 	}
-	return nil
 }
 
-func (a *LaunchAgent) bootout() error {
-	if _, err := a.Run("bootout", a.target()); err != nil {
+func (a *LaunchAgent) notRunning(cause error) error {
+	msg := fmt.Sprintf("launchd loaded the Citadel worker but it is not running; see %s", filepath.Join(a.logDir(), "citadel-error.log"))
+	if cause != nil {
+		return fmt.Errorf("%s (%w)", msg, cause)
+	}
+	return errors.New(msg)
+}
+
+func (a *LaunchAgent) bootout(ctx context.Context) error {
+	if _, err := a.Run(ctx, "bootout", a.target()); err != nil {
 		return fmt.Errorf("launchctl bootout %s failed (%v); %s", a.target(), err, errNeedDesktopSession)
 	}
 	return nil
@@ -330,16 +364,18 @@ func (a *LaunchAgent) bootout() error {
 // still loaded afterwards, so the caller can trust "nil" to mean the KeepAlive
 // job is gone and will not restart. There is no legacy unload fallback: it acts
 // on the caller's session domain, not gui/<uid>.
-func (a *LaunchAgent) Stop() error {
-	loaded, _, err := a.print()
+func (a *LaunchAgent) Stop() error { return a.stop(context.Background()) }
+
+func (a *LaunchAgent) stop(ctx context.Context) error {
+	loaded, _, err := a.print(ctx)
 	if err != nil {
 		return err
 	}
 	if !loaded {
 		return nil
 	}
-	berr := a.bootout()
-	loaded, _, err = a.print()
+	berr := a.bootout(ctx)
+	loaded, _, err = a.print(ctx)
 	if err != nil {
 		return err
 	}
@@ -382,12 +418,12 @@ func (a *LaunchAgent) State(thisExe string) LaunchAgentState {
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		st.Err = err
 	}
-	loaded, pid, err := a.print()
+	loaded, pid, err := a.print(context.Background())
 	if err != nil && st.Err == nil {
 		st.Err = err
 	}
 	st.Loaded, st.PID = loaded, pid
-	if off, err := a.disabled(); err != nil {
+	if off, err := a.disabled(context.Background()); err != nil {
 		if st.Err == nil {
 			st.Err = err
 		}

@@ -35,8 +35,8 @@ func NewUserLaunchAgent() (*LaunchAgent, error) {
 }
 
 // runLaunchctl runs launchctl with a deadline and a capped output.
-func runLaunchctl(args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+func runLaunchctl(ctx context.Context, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	var buf bytes.Buffer
 	cmd := exec.CommandContext(ctx, "launchctl", args...)
@@ -107,12 +107,12 @@ func DisableUserAutostart() error {
 }
 
 // StartUserWorker loads the LaunchAgent, which starts the worker.
-func StartUserWorker() error {
+func StartUserWorker(ctx context.Context) error {
 	a, err := NewUserLaunchAgent()
 	if err != nil {
 		return err
 	}
-	return a.Start()
+	return a.Start(ctx)
 }
 
 // StopUserWorker boots the LaunchAgent out of launchd.

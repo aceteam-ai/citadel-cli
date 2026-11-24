@@ -2,7 +2,10 @@
 
 package service
 
-import "errors"
+import (
+	"context"
+	"errors"
+)
 
 // errNoLaunchAgent is returned where there is no launchd.
 var errNoLaunchAgent = errors.New("the LaunchAgent worker is only used on macOS")
@@ -11,7 +14,7 @@ var errNoLaunchAgent = errors.New("the LaunchAgent worker is only used on macOS"
 func NewUserLaunchAgent() (*LaunchAgent, error) { return nil, errNoLaunchAgent }
 
 // StartUserWorker is macOS-only.
-func StartUserWorker() error { return errNoLaunchAgent }
+func StartUserWorker(ctx context.Context) error { return errNoLaunchAgent }
 
 // StopUserWorker is macOS-only.
 func StopUserWorker() error { return errNoLaunchAgent }

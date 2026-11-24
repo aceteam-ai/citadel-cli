@@ -23,7 +23,7 @@ type macLaunchctl struct {
 	printExit    int // non-zero: print exits with it (an SSH-style unreachable domain)
 }
 
-func (m *macLaunchctl) run(args ...string) ([]byte, error) {
+func (m *macLaunchctl) run(_ context.Context, args ...string) ([]byte, error) {
 	*m.log = append(*m.log, "launchctl "+args[0])
 	exit := &service.LaunchctlExit{Code: 113}
 	switch args[0] {
@@ -71,7 +71,7 @@ func macSetupDeps(a *service.LaunchAgent, calls *[]string, posture bool) setupWo
 		postureHolds:    func() bool { return posture },
 		releaseNetwork:  func() error { *calls = append(*calls, "release"); return nil },
 		enableAutostart: func() error { *calls = append(*calls, "autostart"); return a.Enable(macTestExe) },
-		start:           func(context.Context) error { *calls = append(*calls, "start"); return a.Start() },
+		start:           func(context.Context) error { *calls = append(*calls, "start"); return a.Start(context.Background()) },
 	}
 }
 
