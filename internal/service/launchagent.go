@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -57,6 +58,15 @@ var (
 // launchctlOutputMax caps what a launchctl call's output is read as.
 const launchctlOutputMax = 64 << 10
 
+// launchctlPath is launchctl by absolute path. It is never found through PATH,
+// which a user-writable directory could shadow.
+const launchctlPath = "/bin/launchctl"
+
+// launchctlCommand builds the launchctl invocation. A test asserts its path.
+func launchctlCommand(ctx context.Context, args ...string) *exec.Cmd {
+	return exec.CommandContext(ctx, launchctlPath, args...)
+}
+
 // LaunchctlExit is returned by a runner when launchctl ran and exited
 // non-zero. Any other runner error (launchctl missing, a timeout) is a hard
 // failure and is never read as "the job is not loaded".
@@ -90,6 +100,9 @@ type LaunchAgent struct {
 	Run func(ctx context.Context, args ...string) ([]byte, error)
 	// StatExe reads an executable's owner and mode, following symlinks.
 	StatExe func(path string) (ExeInfo, error)
+	// Resolve returns a path with its symlinks resolved; nil is
+	// filepath.EvalSymlinks. A failure refuses the executable.
+	Resolve func(path string) (string, error)
 }
 
 // LaunchAgentState is a read-only view for the doctor and the setup page.
@@ -159,25 +172,65 @@ func (a *LaunchAgent) checkExe(exe string) error {
 	if info.Mode.Perm()&0o022 != 0 {
 		return fmt.Errorf("worker agent: %s can be changed by other users (mode %o), so it will not be started at sign-in. Run: chmod go-w %q", exe, info.Mode.Perm(), exe)
 	}
-	// The directory holding the binary, and the one holding a symlink's target
-	// (a Homebrew prefix bin links into the Cellar), must not let group or
-	// other swap the file either. Owned by this user or root; Homebrew's
-	// Apple Silicon prefix is user-owned and 755, so it passes.
-	dirs := []string{filepath.Dir(exe)}
-	if real, err := filepath.EvalSymlinks(exe); err == nil && filepath.Dir(real) != dirs[0] {
-		dirs = append(dirs, filepath.Dir(real))
-	}
-	for _, dir := range dirs {
-		di, err := a.StatExe(dir)
+	// Every directory above the binary, for the path the plist will name and
+	// for what it resolves to (a Homebrew prefix bin links into the Cellar),
+	// must be owned by this user or root and closed to group and other: one
+	// writable ancestor lets another user swap a whole subtree. A sticky
+	// directory (such as /tmp) is the one exception, because there others
+	// cannot rename or remove entries they do not own; it still has to be owned
+	// by this user or root. Homebrew's user-owned 755 Apple Silicon prefix and
+	// root-owned system folders pass. A group-writable folder (an Intel Homebrew
+	// /usr/local/bin is typically user:admin 775) is refused: install citadel
+	// under ~/.local/bin instead.
+	resolved := exe
+	if a.Resolve != nil {
+		r, err := a.Resolve(exe)
 		if err != nil {
-			return fmt.Errorf("worker agent: could not check %s: %w", dir, err)
+			return fmt.Errorf("worker agent: could not resolve %s: %w", exe, err)
 		}
-		if di.UID != a.Euid && di.UID != 0 {
-			return fmt.Errorf("worker agent: the folder %s is owned by another user, so %s will not be started at sign-in", dir, exe)
+		resolved = r
+	} else if r, err := filepath.EvalSymlinks(exe); err != nil {
+		return fmt.Errorf("worker agent: could not resolve %s: %w", exe, err)
+	} else {
+		resolved = r
+	}
+	seen := map[string]bool{}
+	for _, p := range []string{exe, resolved} {
+		for dir := filepath.Dir(filepath.Clean(p)); ; dir = filepath.Dir(dir) {
+			if !seen[dir] {
+				seen[dir] = true
+				if err := a.checkDir(dir, exe); err != nil {
+					return err
+				}
+			}
+			if dir == "/" || dir == "." || dir == filepath.Dir(dir) {
+				break
+			}
 		}
-		if di.Mode.Perm()&0o022 != 0 {
-			return fmt.Errorf("worker agent: the folder %s can be changed by other users (mode %o), so %s will not be started at sign-in. Run: chmod go-w %q", dir, di.Mode.Perm(), exe, dir)
+	}
+	// The resolved file itself, when it is another file than the one checked.
+	if resolved != exe {
+		ri, err := a.StatExe(resolved)
+		if err != nil {
+			return fmt.Errorf("worker agent: could not check %s: %w", resolved, err)
 		}
+		if ri.UID != a.Euid || ri.Mode.Perm()&0o022 != 0 {
+			return fmt.Errorf("worker agent: %s (what %s points to) is not owned by you or can be changed by other users, so it will not be started at sign-in", resolved, exe)
+		}
+	}
+	return nil
+}
+
+func (a *LaunchAgent) checkDir(dir, exe string) error {
+	di, err := a.StatExe(dir)
+	if err != nil {
+		return fmt.Errorf("worker agent: could not check %s: %w", dir, err)
+	}
+	if di.UID != a.Euid && di.UID != 0 {
+		return fmt.Errorf("worker agent: the folder %s is owned by another user, so %s will not be started at sign-in", dir, exe)
+	}
+	if di.Mode.Perm()&0o022 != 0 && di.Mode&fs.ModeSticky == 0 {
+		return fmt.Errorf("worker agent: the folder %s can be changed by other users (mode %o), so %s will not be started at sign-in. Run: chmod go-w %q", dir, di.Mode.Perm(), exe, dir)
 	}
 	return nil
 }
@@ -211,8 +264,15 @@ func (a *LaunchAgent) Enable(exe string) error {
 	}
 	content := a.render(exe)
 	pp := a.plistPath()
-	if existing, err := os.ReadFile(pp); err == nil && string(existing) == content {
+	prev, prevErr := os.ReadFile(pp)
+	if prevErr == nil && string(prev) == content {
 		return nil
+	}
+	// Reach launchd's per-user domain BEFORE writing a RunAtLoad plist: if it
+	// cannot be read, a plist written now could start at the next sign-in
+	// without this step ever having confirmed anything.
+	if _, _, err := a.print(context.Background()); err != nil {
+		return fmt.Errorf("%w; %s", err, errNeedDesktopSession)
 	}
 	if err := os.MkdirAll(filepath.Dir(pp), 0o755); err != nil {
 		return fmt.Errorf("create %s: %w", filepath.Dir(pp), err)
@@ -223,7 +283,16 @@ func (a *LaunchAgent) Enable(exe string) error {
 	if err := writeFileAtomic(pp, []byte(content), 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", pp, err)
 	}
-	return a.stop(context.Background())
+	if err := a.stop(context.Background()); err != nil {
+		// Roll back: restore the plist that was there, or remove the new one.
+		if prevErr == nil {
+			_ = writeFileAtomic(pp, prev, 0o644)
+		} else {
+			_ = os.Remove(pp)
+		}
+		return err
+	}
+	return nil
 }
 
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {

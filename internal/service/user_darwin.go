@@ -39,7 +39,7 @@ func runLaunchctl(ctx context.Context, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	var buf bytes.Buffer
-	cmd := exec.CommandContext(ctx, "launchctl", args...)
+	cmd := launchctlCommand(ctx, args...)
 	cmd.Stdout = &limitedBuffer{w: &buf, max: launchctlOutputMax}
 	cmd.Stderr = cmd.Stdout
 	err := cmd.Run()

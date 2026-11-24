@@ -103,10 +103,11 @@ func newTestAgent(t *testing.T) (*LaunchAgent, *fakeLaunchctl) {
 	t.Helper()
 	f := &fakeLaunchctl{}
 	return &LaunchAgent{
-		Home: t.TempDir(),
-		UID:  501,
-		Euid: 501,
-		Run:  f.run,
+		Home:    t.TempDir(),
+		UID:     501,
+		Euid:    501,
+		Run:     f.run,
+		Resolve: func(p string) (string, error) { return p, nil },
 		StatExe: func(string) (ExeInfo, error) {
 			return ExeInfo{UID: 501, Mode: 0o755}, nil
 		},
@@ -148,8 +149,10 @@ func TestLaunchdUserAgentEnableWritesPerUserPlist(t *testing.T) {
 	if fi, _ := os.Stat(a.PlistPath()); fi.Mode().Perm()&0o022 != 0 {
 		t.Errorf("plist mode %o is group/other writable", fi.Mode().Perm())
 	}
-	if len(f.calls) != 1 || !strings.HasPrefix(f.calls[0], "print ") {
-		t.Errorf("enable should only look at launchd, calls = %v", f.calls)
+	for _, v := range f.verbs() {
+		if v != "print" {
+			t.Errorf("enable should only look at launchd, calls = %v", f.calls)
+		}
 	}
 }
 
@@ -546,4 +549,133 @@ func contains(list []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// dirTable builds a StatExe from per-path facts; a path not listed is a
+// user-owned 755 folder or file.
+func dirTable(facts map[string]ExeInfo) func(string) (ExeInfo, error) {
+	return func(p string) (ExeInfo, error) {
+		if i, ok := facts[p]; ok {
+			return i, nil
+		}
+		if p == testExe {
+			return ExeInfo{UID: 501, Mode: 0o755}, nil
+		}
+		return ExeInfo{UID: 501, Mode: fs.ModeDir | 0o755}, nil
+	}
+}
+
+func TestLaunchdUserAgentChecksEveryAncestorDirectory(t *testing.T) {
+	const brewLink = "/opt/homebrew/bin/citadel"
+	const brewReal = "/opt/homebrew/Cellar/citadel/1.0/bin/citadel"
+	root := ExeInfo{UID: 0, Mode: fs.ModeDir | 0o755}
+	sticky := ExeInfo{UID: 0, Mode: fs.ModeDir | fs.ModeSticky | 0o777}
+	cases := []struct {
+		name    string
+		exe     string
+		resolve string
+		facts   map[string]ExeInfo
+		want    string // "" passes
+	}{
+		{"user bin, root ancestors", testExe, testExe, map[string]ExeInfo{"/": root, "/Users": root}, ""},
+		{"homebrew apple silicon: user-owned 755 prefix, resolved into the cellar", brewLink, brewReal,
+			map[string]ExeInfo{"/": root, "/opt": root}, ""},
+		{"writable grandparent of the path", testExe, testExe,
+			map[string]ExeInfo{"/Users/test": {UID: 501, Mode: fs.ModeDir | 0o777}}, "/Users/test"},
+		{"writable root-level ancestor", testExe, testExe,
+			map[string]ExeInfo{"/Users": {UID: 0, Mode: fs.ModeDir | 0o775}}, "/Users"},
+		{"group-writable ancestor of the resolved target only", brewLink, brewReal,
+			map[string]ExeInfo{"/opt/homebrew/Cellar": {UID: 501, Mode: fs.ModeDir | 0o775}}, "/opt/homebrew/Cellar"},
+		{"writable ancestor of the symlink path only", brewLink, brewReal,
+			map[string]ExeInfo{"/opt/homebrew": {UID: 501, Mode: fs.ModeDir | 0o770}}, "/opt/homebrew"},
+		{"ancestor owned by another user", testExe, testExe,
+			map[string]ExeInfo{"/Users": {UID: 502, Mode: fs.ModeDir | 0o755}}, "owned by another user"},
+		{"sticky root-owned ancestor (like /tmp) is allowed", "/tmp/x/citadel", "/tmp/x/citadel",
+			map[string]ExeInfo{"/tmp": sticky, "/tmp/x/citadel": {UID: 501, Mode: 0o755}}, ""},
+		{"sticky ancestor owned by another user is refused", "/tmp/x/citadel", "/tmp/x/citadel",
+			map[string]ExeInfo{"/tmp": {UID: 502, Mode: fs.ModeDir | fs.ModeSticky | 0o777}, "/tmp/x/citadel": {UID: 501, Mode: 0o755}}, "owned by another user"},
+		{"resolved file owned by another user", brewLink, brewReal,
+			map[string]ExeInfo{brewReal: {UID: 0, Mode: 0o755}}, "what"},
+	}
+	for _, c := range cases {
+		a, _ := newTestAgent(t)
+		facts := c.facts
+		if _, ok := facts[c.exe]; !ok {
+			facts[c.exe] = ExeInfo{UID: 501, Mode: 0o755}
+		}
+		if _, ok := facts[c.resolve]; !ok {
+			facts[c.resolve] = ExeInfo{UID: 501, Mode: 0o755}
+		}
+		a.StatExe = dirTable(facts)
+		a.Resolve = func(string) (string, error) { return c.resolve, nil }
+		err := a.checkExe(c.exe)
+		switch {
+		case c.want == "" && err != nil:
+			t.Errorf("%s: unexpected refusal: %v", c.name, err)
+		case c.want != "" && (err == nil || !strings.Contains(err.Error(), c.want)):
+			t.Errorf("%s: err = %v, want %q", c.name, err, c.want)
+		}
+	}
+	a, _ := newTestAgent(t)
+	a.Resolve = func(string) (string, error) { return "", errors.New("dangling") }
+	if err := a.checkExe(testExe); err == nil || !strings.Contains(err.Error(), "could not resolve") {
+		t.Errorf("an unresolvable path must be refused: %v", err)
+	}
+}
+
+func TestLaunchdRunsLaunchctlByAbsolutePath(t *testing.T) {
+	cmd := launchctlCommand(context.Background(), "print", "gui/501/x")
+	if cmd.Path != "/bin/launchctl" || cmd.Args[0] != "/bin/launchctl" {
+		t.Fatalf("path = %q args = %q", cmd.Path, cmd.Args)
+	}
+	if launchctlPath != "/bin/launchctl" || !filepath.IsAbs(launchctlPath) {
+		t.Fatalf("launchctlPath = %q", launchctlPath)
+	}
+}
+
+func TestLaunchdEnableLeavesNoPlistWhenLaunchdIsUnreachable(t *testing.T) {
+	a, f := newTestAgent(t)
+	f.printExit = 112
+	err := a.Enable(testExe)
+	if err == nil || !strings.Contains(err.Error(), "desktop session") {
+		t.Fatalf("err = %v", err)
+	}
+	if _, serr := os.Stat(a.PlistPath()); !errors.Is(serr, fs.ErrNotExist) {
+		t.Error("a RunAtLoad plist was left behind")
+	}
+	for _, v := range f.verbs() {
+		if v != "print" {
+			t.Errorf("unexpected launchctl %v", f.calls)
+		}
+	}
+}
+
+func TestLaunchdEnableRollsBackWhenTheOldJobCannotBeBootedOut(t *testing.T) {
+	// A new plist is removed.
+	a, f := newTestAgent(t)
+	f.loaded, f.bootoutFails = true, true
+	// pre-check passes (print ok), stop fails after the write.
+	if err := a.Enable(testExe); err == nil {
+		t.Fatal("expected an error")
+	}
+	if _, serr := os.Stat(a.PlistPath()); !errors.Is(serr, fs.ErrNotExist) {
+		t.Error("the new plist was kept")
+	}
+
+	// A replaced plist is restored.
+	b, g := newTestAgent(t)
+	old := b.render("/old/citadel")
+	if err := os.MkdirAll(filepath.Dir(b.PlistPath()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(b.PlistPath(), []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	g.loaded, g.bootoutFails = true, true
+	if err := b.Enable(testExe); err == nil {
+		t.Fatal("expected an error")
+	}
+	if got, _ := os.ReadFile(b.PlistPath()); string(got) != old {
+		t.Errorf("the previous plist was not restored:\n%s", got)
+	}
 }

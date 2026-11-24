@@ -57,6 +57,7 @@ func newMacAgent(t *testing.T, log *[]string) (*service.LaunchAgent, *macLaunchc
 	m := &macLaunchctl{log: log}
 	return &service.LaunchAgent{
 		Home: t.TempDir(), UID: 501, Euid: 501, Run: m.run,
+		Resolve: func(p string) (string, error) { return p, nil },
 		StatExe: func(string) (service.ExeInfo, error) { return service.ExeInfo{UID: 501, Mode: 0o755}, nil },
 	}, m
 }
