@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"syscall"
+	"time"
 )
 
 // validateCobrowseBaseDirPerms confirms dir is owned by the current UID and is not
@@ -35,3 +36,19 @@ func validateCobrowseBaseDirPerms(dir string, info os.FileInfo) error {
 
 // secureNewCobrowseBaseDir is a no-op on Unix: the dir was just created 0o700.
 func secureNewCobrowseBaseDir(string) error { return nil }
+
+// removeSessionDirRetry returns the last error, or one saying the dir is still
+// there, when every attempt left it behind.
+func removeSessionDirRetry(dir string, attempts int, delay time.Duration) error {
+	var err error
+	for i := 0; i < attempts; i++ {
+		if err = os.RemoveAll(dir); err == nil {
+			if _, serr := os.Lstat(dir); os.IsNotExist(serr) {
+				return nil
+			}
+			err = fmt.Errorf("%s is still present after removal", dir)
+		}
+		time.Sleep(delay)
+	}
+	return err
+}

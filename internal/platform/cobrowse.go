@@ -112,6 +112,14 @@ type cobrowseLaunchOptions struct {
 	// requires. Also set for the managed-Xvfb co-browse runner (buildXvfbChromeArgs), where
 	// the keyring wait stalled the first page load ~25s (citadel-cli#1694).
 	passwordStoreBasic bool
+	// mockKeychain keeps Chromium off the macOS login Keychain
+	// (--use-mock-keychain). A hidden session has no window to answer the
+	// "confidential information in your keychain" prompt, which would stall
+	// the first cookie-store use. Consequence: cookies in a profile are
+	// encrypted with Chromium's fixed mock key, not the user's Keychain item
+	// (the sealed profile blob is vault-encrypted either way). Set only by the
+	// macOS headless runner.
+	mockKeychain bool
 	// autoplayNoUserGesture relaxes Chrome's autoplay policy
 	// (--autoplay-policy=no-user-gesture-required). An automated browser has no
 	// user gesture, so by default Chrome refuses to start an AudioContext / play
@@ -252,6 +260,10 @@ func buildChromeArgs(opts cobrowseLaunchOptions) []string {
 	}
 	if opts.quiet {
 		args = append(args, "--disable-background-networking", "--disable-component-update")
+	}
+
+	if opts.mockKeychain {
+		args = append(args, "--use-mock-keychain")
 	}
 
 	if opts.softwareGL {
