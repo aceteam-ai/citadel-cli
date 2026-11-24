@@ -610,7 +610,7 @@ func (s *Server) Start(ctx context.Context) error {
 		listenAddr = fmt.Sprintf("127.0.0.1:%d", s.config.Port)
 	}
 	if !listenAddrIsLoopback(listenAddr) {
-		log.Printf("[Gateway] WARNING: listening on %s, which is reachable beyond this host. /v1/* callers are still authenticated, but other routes follow their own gates; prefer the default loopback+mesh bind.", listenAddr)
+		log.Printf("[Gateway] WARNING: listening on %s, which is reachable beyond this host. routes proxied to loopback upstreams (status, services, screenshot and others) are reachable by LAN callers; only /v1/* requires a verified mesh identity. Prefer the default loopback+mesh bind.", listenAddr)
 	}
 
 	s.httpServer = &http.Server{

@@ -208,7 +208,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// exposed service under /expose/<name>/ can be gated by mesh identity or a
 	// signed link token. Harmless when nothing is exposed.
 	gw.SetMeshResolver(gatewayMeshResolver{})
-	gw.SetV1AllowedLogins(platformAllowedLogins)
+	gw.SetV1AllowedLogins(platformAllowedLoginsCached())
 	warnGatewayLANBind("--bind", serveBind)
 	if key, err := config.LoadOrCreateExposeSigningKey(platform.ConfigDir()); err != nil {
 		Log("warning: gateway link-token signing disabled: %v", err)

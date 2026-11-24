@@ -2674,7 +2674,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		// /v1/* callers: same-host (loopback) or a verified same-owner mesh peer;
 		// the operator's platform-infra allowlist (platform-exposure.json) adds
 		// named platform logins. See internal/gateway/v1_auth.go.
-		gw.SetV1AllowedLogins(platformAllowedLogins)
+		gw.SetV1AllowedLogins(platformAllowedLoginsCached())
 		warnGatewayLANBind("--gateway-bind", workGatewayBind)
 		if key, err := config.LoadOrCreateExposeSigningKey(platform.ConfigDir()); err != nil {
 			Log("warning: gateway link-token signing disabled: %v", err)

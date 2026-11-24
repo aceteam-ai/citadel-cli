@@ -1828,14 +1828,14 @@ admits a loopback `RemoteAddr` (same-host processes are trusted as for the statu
 server's loopback routes) and otherwise requires a verified mesh peer: the
 injected `MeshIdentityResolver` (`gatewayMeshResolver` -> `network.WhoIsPeer`)
 plus `serviceborrow.Decide` (stable and owner id present, same-owner OR a login on
-the operator's `platformAllowedLogins` allowlist, wired through
+the operator's `platformAllowedLogins` allowlist (behind the stat-keyed `cachedAllowedLogins`, so a file change is picked up and a loader error is never cached), wired through
 `Server.SetV1AllowedLogins`). The source address range is never a credential, a
 forwarding header is never read, and a nil resolver, resolver error or
 allowlist-loader error is refused (the loader error narrows to same-owner only).
 `Server.Start` binds loopback unless `Config.ListenAddress` names another host:
 `cmd.defaultGatewayBind` is the `--gateway-bind` / `serve --bind` default, the mesh
 listener is added separately, and a non-loopback value is the explicit LAN opt-in,
-announced by `cmd.warnGatewayLANBind` and `Server.Start`. The gateway does NOT
+announced by `cmd.warnGatewayLANBind` and `Server.Start` (the notice says plainly that loopback-proxied routes are LAN-reachable on such a bind). `citadel gateway` (the metering proxy) follows the same rule through `cmd.gatewayListenAddr`. The gateway does NOT
 wire `SetMetering`, so chat is not metered. A single chat response is bounded by
 the gateway `http.Server` `WriteTimeout` (120s), a pre-existing server-wide cap.
 Tests: `internal/gateway/v1_auth_test.go`, `cmd/gateway_bind_test.go`.
