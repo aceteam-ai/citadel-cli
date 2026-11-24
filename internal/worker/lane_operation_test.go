@@ -85,7 +85,9 @@ func newLaneHandler(t *testing.T, env *laneEnv, tmux *laneFakeTmux) *LaneOperati
 }
 
 func laneJob(payload map[string]any) *Job {
-	base := map[string]any{"lane": "lane-a", "lease_id": "lease-1", "node_id": "42", "pane": "%7", "target_node": "42", "passcode": lanePasscode}
+	// Exactly what aceteam's LaneJobEnvelope.to_wire() plus _dispatch_file_job
+	// put on the stream: every value a string, target_node and timeout_ms added.
+	base := map[string]any{"lane": "lane-a", "lease_id": "lease-1", "node_id": "42", "pane": "%7", "target_node": "42", "timeout_ms": "28000", "passcode": lanePasscode}
 	for k, v := range payload {
 		if v == nil {
 			delete(base, k)
