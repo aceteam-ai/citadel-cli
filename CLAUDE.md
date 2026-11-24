@@ -1817,15 +1817,28 @@ and reverse-proxies to `http://127.0.0.1:<port>/v1/chat/completions` — streami
 SSE included (`ReverseProxy.FlushInterval=-1`). Model matching mirrors
 `mesh.FindModel` (exact case-insensitive → substring); an unknown model returns a
 404 OpenAI-shaped `model_not_found`. Because these routes sit on the same gateway
-mux, they ride the LAN listener AND the tsnet VPN listener, so `mesh.Client.
-ChatCompletion(ip, gatewayPort, body)` reaches them over the mesh. `mesh chat`
+mux, they ride the primary (loopback by default) listener AND the tsnet VPN
+listener, so `mesh.Client.ChatCompletion(ip, gatewayPort, body)` reaches them over the mesh. `mesh chat`
 now works end-to-end (target the node's gateway port, not the engine port).
 
-Auth posture: `categoryForPath` returns `""` for `/v1/chat/completions`, so it is
-always-allowed — same as `/v1/embeddings`. TLS + mesh membership are the only
-gate; the gateway does NOT currently wire `SetMetering`, so chat is neither
-metered nor authenticated per-request. A single chat response is bounded by the
-gateway `http.Server` `WriteTimeout` (120s), a pre-existing server-wide cap.
+Auth posture: `categoryForPath` still returns `""` for `/v1/*` (not a permission
+category); `gateway.v1AuthMiddleware` (`internal/gateway/v1_auth.go`) is the sole
+caller gate for every `/v1/*` route, including the `/v1/embeddings` upstream. It
+admits a loopback `RemoteAddr` (same-host processes are trusted as for the status
+server's loopback routes) and otherwise requires a verified mesh peer: the
+injected `MeshIdentityResolver` (`gatewayMeshResolver` -> `network.WhoIsPeer`)
+plus `serviceborrow.Decide` (stable and owner id present, same-owner OR a login on
+the operator's `platformAllowedLogins` allowlist (behind `cachedAllowedLogins`, keyed on device, inode, mtime, ctime and size via `statFileStamp`, with a racy-window guard; a loader error is never cached and platforms without a stamp do not cache), wired through
+`Server.SetV1AllowedLogins`). The source address range is never a credential, a
+forwarding header is never read, and a nil resolver, resolver error or
+allowlist-loader error is refused (the loader error narrows to same-owner only).
+`Server.Start` binds loopback unless `Config.ListenAddress` names another host:
+`cmd.defaultGatewayBind` is the `--gateway-bind` / `serve --bind` default, the mesh
+listener is added separately, and a non-loopback value is the explicit LAN opt-in,
+announced by `cmd.warnGatewayLANBind` and `Server.Start` (the notice says plainly that loopback-proxied routes are LAN-reachable on such a bind). `citadel gateway` (the metering proxy) follows the same rule through `cmd.gatewayListenAddr`. The gateway does NOT
+wire `SetMetering`, so chat is not metered. A single chat response is bounded by
+the gateway `http.Server` `WriteTimeout` (120s), a pre-existing server-wide cap.
+Tests: `internal/gateway/v1_auth_test.go`, `cmd/gateway_bind_test.go`.
 
 ```bash
 citadel mesh models                 # list model -> node/engine/addr across the mesh

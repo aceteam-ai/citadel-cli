@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -24,6 +26,7 @@ var (
 	gatewayModelTier string
 	gatewayAPIToken  string
 	gatewayPlatform  string
+	gatewayBind      string
 )
 
 var gatewayCmd = &cobra.Command{
@@ -64,6 +67,7 @@ Examples:
 
 func init() {
 	gatewayCmd.Flags().IntVar(&gatewayPort, "port", 8080, "Port to listen on")
+	gatewayCmd.Flags().StringVar(&gatewayBind, "bind", defaultGatewayBind, "Listen host. Default is loopback; a non-loopback value is an explicit LAN opt-in and is logged loudly")
 	gatewayCmd.Flags().StringVar(&gatewayUpstream, "upstream", "http://localhost:11434", "Upstream inference engine URL")
 	gatewayCmd.Flags().StringVar(&gatewayModelTier, "model-tier", "medium", "Pricing tier: small, medium, large, xlarge")
 	gatewayCmd.Flags().StringVar(&gatewayAPIToken, "api-token", "", "API token for ACET settlement (optional)")
@@ -116,7 +120,8 @@ func runGateway(cmd *cobra.Command, args []string) error {
 	metered := gateway.NewMeteringMiddleware(proxy, ledger, acet, tier)
 
 	// Create server
-	addr := fmt.Sprintf("0.0.0.0:%d", gatewayPort)
+	warnGatewayLANBind("--bind", gatewayBind)
+	addr := gatewayListenAddr(gatewayBind, gatewayPort)
 	server := &http.Server{
 		Addr:         addr,
 		Handler:      metered,
@@ -169,4 +174,13 @@ func runGateway(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// gatewayListenAddr builds the metering proxy's listen address; an empty host
+// means the loopback default.
+func gatewayListenAddr(host string, port int) string {
+	if host == "" {
+		host = defaultGatewayBind
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
 }
