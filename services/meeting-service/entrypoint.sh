@@ -8,7 +8,7 @@
 # the node process (end-of-call transcribe + rolling-window transcriber), which
 # runs as the NODE OWNER on the host — a different UID than the image's built-in
 # `bot` (10001). Writing the WAV as 10001 left it unreadable/un-traversable by the
-# node (observed during production acceptance).
+# node (live-prod node 1084, 2026-07-16).
 #
 # Fix (PUID/PGID host-UID mapping): remap the `bot` user to the node owner's
 # UID/GID at boot, so every file `bot` writes into the mounts is owned by the node

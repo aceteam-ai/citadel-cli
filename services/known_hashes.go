@@ -155,8 +155,6 @@ var KnownComposeHashes = map[string]map[string]bool{
 		// (${CITADEL_TEI_IMAGE_TAG:-cpu-1.6}) + opt-in CPU thread count
 		// (${CITADEL_TEI_NUM_THREADS:-1}); --dtype float32 preserved on both paths.
 		"81a1ef70f613f18c72ce9d7d68f523d4fb9d50b2348dc014719f2942433e4b6d": true,
-		// citadel-cli#1918: neutral wording in the embedded compose comment.
-		"9292268ccf61886bbba4aad8bcb04963dfccc33d32e7b69eb8958f05bd3ee563": true,
 	},
 	"unlimited-ocr": {
 		"2f1e1f1ffae72db007b65d1b8d275f69c33c0c7e3207f8139ee8c2c1c8d2c9c0": true,

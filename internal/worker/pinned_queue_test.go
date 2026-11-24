@@ -8,7 +8,7 @@ import (
 )
 
 func TestPinnedQueueSourcesCannotBeBroadened(t *testing.T) {
-	const pin = "jobs:v1:shell:org_fixture:node:1915"
+	const pin = "jobs:v1:shell:org_fixture:node:4321"
 	api := NewAPISource(APISourceConfig{PinnedQueue: pin, QueueNames: []string{DefaultCPUQueue}, LogFn: func(string, string) {}})
 	direct := NewRedisSource(RedisSourceConfig{PinnedQueue: pin, QueueNames: []string{DefaultCPUQueue}, LogFn: func(string, string) {}})
 	for _, q := range []string{DefaultCPUQueue, "jobs:v1:gpu-general", "jobs:v1:shell:org_fixture", "jobs:v1:shell:org_fixture:node:other"} {
