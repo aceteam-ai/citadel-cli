@@ -32,6 +32,7 @@ type reapProc struct {
 
 // Seams so tests need no real /proc, browser or signals.
 var (
+	reapProcRoot   = "/proc"
 	listReapProcs  = listProcForReap
 	lookupReapProc = readProcForReap
 	reapEUID       = os.Geteuid
@@ -80,10 +81,11 @@ func splitCmdline(raw []byte) []string {
 }
 
 func listProcForReap() ([]reapProc, error) {
-	ents, err := os.ReadDir("/proc")
+	ents, err := os.ReadDir(reapProcRoot)
 	if err != nil {
-		// No /proc: nothing to find, as before.
-		return nil, nil
+		// An unreadable /proc is unknown, not "no processes": callers must not
+		// seal a profile or settle a recovery launch on an empty list.
+		return nil, fmt.Errorf("list processes: %w", err)
 	}
 	var out []reapProc
 	for _, e := range ents {

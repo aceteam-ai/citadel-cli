@@ -230,3 +230,18 @@ func TestTeardownCatchesRecreateAfterRemove(t *testing.T) {
 		t.Fatalf("killed = %v", f.killed)
 	}
 }
+
+// An unreadable /proc must not read as "no processes": a reap, a seal and a
+// failed recovery launch would otherwise treat a surviving browser as gone.
+func TestListProcForReapFailsClosedWithoutProc(t *testing.T) {
+	prevRoot, prevList := reapProcRoot, listReapProcs
+	t.Cleanup(func() { reapProcRoot, listReapProcs = prevRoot, prevList })
+	reapProcRoot = filepath.Join(t.TempDir(), "missing-proc")
+	if procs, err := listProcForReap(); err == nil {
+		t.Fatalf("listProcForReap with no /proc = %v, nil; want an error", procs)
+	}
+	listReapProcs = listProcForReap
+	if err := reapProfileUsers(t.TempDir(), ""); err == nil {
+		t.Fatal("reapProfileUsers must fail closed when the process list cannot be read")
+	}
+}
