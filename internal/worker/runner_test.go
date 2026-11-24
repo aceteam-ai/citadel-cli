@@ -2914,7 +2914,7 @@ func TestRunnerGPUBoundJobDoesNotBlockOtherJobs(t *testing.T) {
 	config := RunnerConfig{
 		WorkerID:       "test-worker",
 		MaxConcurrency: 1,                // the default that triggers #903's head-of-line blocking
-		GPUTracker:     NewGPUTracker(1), // node-4321-class: a real discrete GPU
+		GPUTracker:     NewGPUTracker(1), // single-GPU-node class: a real discrete GPU
 		State:          state,
 	}
 	runner := NewRunner(source, []JobHandler{inferenceHandler, fileHandler}, config)

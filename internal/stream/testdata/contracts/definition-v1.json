@@ -3,7 +3,7 @@
   "definition": {
     "stream_id": "synthetic-auth",
     "version": 1,
-    "node_id": "9000000000000000001",
+    "node_id": "1297",
     "sources": [
       {
         "id": "synthetic-auth-log",

@@ -2,7 +2,7 @@
   "profile": "stream.definition.v1",
   "base": {
     "fixture": "definition-v1.json",
-    "digest": "sha256:9cc19c46ce86e92b6225ea8765228d328514ba20126dcd5e20045753fa013c26"
+    "digest": "sha256:a18fb0ddae24e05cdd6e0784418a03a4d249f45d2b5bba0975f194611a864cbc"
   },
   "negative_definitions": [
     {"id":"unknown-top-field","operation":"replace_first","old":"\"version\": 1","new":"\"version\": 1, \"status\": \"active\""},
@@ -24,7 +24,7 @@
     {"id":"low-then-high-surrogate","operation":"replace_first","old":"\"logs\": \"$logs\"","new":"\"\\udc00\\ud800\": \"$logs\""},
     {"id":"low-then-low-surrogate","operation":"replace_first","old":"\"logs\": \"$logs\"","new":"\"\\udc00\\udc00\": \"$logs\""},
     {"id":"path-traversal","operation":"replace_first","old":"/tmp/synthetic-stream/auth.log","new":"/tmp/../auth.log"},
-    {"id":"node-overflow","operation":"replace_first","old":"\"node_id\": \"9000000000000000001\"","new":"\"node_id\": \"18446744073709551616\""},
+    {"id":"node-overflow","operation":"replace_first","old":"\"node_id\": \"1297\"","new":"\"node_id\": \"18446744073709551616\""},
     {"id":"empty-object","operation":"raw_text","text":"{}"},
     {"id":"null","operation":"raw_text","text":"null"},
     {"id":"array","operation":"raw_text","text":"[]"},
@@ -53,6 +53,6 @@
       "escalate.input_map": {"é<\n": "$logs", "e\u0301": "$logs", "\ue000": "$alert", "\ud800\udc00": "$alert"}
     },
     "canonical_input_map_json": "{\"é\":\"$logs\",\"é<\\n\":\"$logs\",\"𐀀\":\"$alert\",\"\":\"$alert\"}",
-    "digest": "sha256:cd6ee113e745d960819e3ed6b0d66f1adca955d20e32ab6db8ae1a7f98c7a2a0"
+    "digest": "sha256:2d43d2653bbaf66794761ea578e78bd293b100ce94eb9c8bdd934d7c4bdaf782"
   }
 }
