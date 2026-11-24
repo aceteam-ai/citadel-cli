@@ -64,11 +64,11 @@ func agentChecks(uw userWorkerState, exe string, ok, warn func(what, detail stri
 	case st.Loaded:
 		warn("Worker", "the LaunchAgent is loaded but its worker is not running right now (macOS restarts it; if it keeps failing, see ~/Library/Logs/citadel/citadel-error.log)")
 	case st.PlistPresent && !st.Disabled:
-		warn("Worker", "the LaunchAgent is installed but not running. It starts at your next sign-in, or run: "+exe+" service start")
+		warn("Worker", "the LaunchAgent is installed but not running. It starts at your next sign-in, or run: "+exe+" worker start")
 	default:
 		ok("Worker", "no background worker is running (it is only needed to use this computer from AceTeam)")
 	}
 	if st.LogBytes > service.LaunchAgentLogMaxBytes {
-		warn("Worker log", fmt.Sprintf("the worker's log files in ~/Library/Logs/citadel are %d MB. They are emptied the next time the worker starts. To empty them now, run: %s worker stop; %s service start", st.LogBytes>>20, exe, exe))
+		warn("Worker log", fmt.Sprintf("the worker's log files in ~/Library/Logs/citadel are %d MB. They are emptied the next time the worker starts. To empty them now, run: %s worker stop; %s worker start", st.LogBytes>>20, exe, exe))
 	}
 }

@@ -41,9 +41,9 @@ const (
 	workerMacAutostartFail = "Citadel could not set itself to start at sign-in. Run \"citadel worker autostart enable\" in Terminal to see why."
 	workerMacStartOKCopy   = "The worker is running in the background, restarted by macOS if it stops. Stop it any time with Disconnect this PC or \"citadel worker stop\"."
 	workerMacStartSkipCopy = "Not started, because the sign-in entry above was not written."
-	workerMacStartFailCopy = "The worker did not start. Run \"citadel service start\" in Terminal to see why."
+	workerMacStartFailCopy = "The worker did not start. Run \"citadel worker start\" in Terminal to see why."
 
-	workerOtherOSCopy = "On Linux and macOS, keep the worker running with \"citadel service install\" in a terminal."
+	workerOtherOSCopy = "On Linux, keep the worker running with \"citadel service install\" in a terminal."
 
 	workerHandOffOKCopy     = "This page no longer holds the connection."
 	workerHandOffFailCopy   = "Citadel could not release this page's connection, so the worker was not started. Close this window, then run \"citadel work --background\" in a terminal."

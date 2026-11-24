@@ -5486,12 +5486,19 @@ the only production wiring. What each method decides: `Enable` writes the plist
 (refuses root, and a binary this user does not own or others can write,
 `checkExe`) and boots out a job loaded from older content; `Start` is a no-op
 for a running job, refuses a Login Items switch-off (`print-disabled`), empties
-a log past `LaunchAgentLogMaxBytes`, then bootstrap with the legacy `load`
-fallback; `Stop` boots out by service target (`gui/<uid>/<label>`) and returns
-nil only once `launchctl print` no longer finds the job, so a failed bootout
-that left it loaded is an error and a missing launchctl is never read as "not
-loaded" (`LaunchctlExit` marks a real non-zero exit); `Remove` deletes the
-plist. Never a LaunchDaemon, never `SUDO_UID`.
+a log past `LaunchAgentLogMaxBytes` (through an `O_NOFOLLOW` descriptor), then
+bootstraps into `gui/<uid>`. There is no legacy `load`/`unload` fallback: those
+verbs act on the caller's session domain (an SSH login has another), so a
+failed bootstrap or bootout fails closed and says to use the desktop session.
+`Stop` boots out by service target (`gui/<uid>/<label>`) and returns nil only
+once `launchctl print` exits 113 ("service not found", the only absent signal;
+any other exit is an error, as is a missing launchctl), so a failed bootout
+that left the job loaded is an error. `checkExe` also refuses a binary whose
+folder (or symlink-target folder) group or other can write, or another user
+owns. `Remove` deletes the plist, and Disconnect keeps it when the stop failed.
+`citadel worker start` is the macOS start command (`citadel service start`
+still has `launchdManager`'s load fallback for the `init` agent and can place
+the label outside `gui/<uid>`, so no macOS copy points at it). Never a LaunchDaemon, never `SUDO_UID`.
 `cmd.darwinSetupWorkerDeps` maps the setup page's three worker steps onto
 `Enable`/`Start` (`startSetupWorker` still refuses unless this page connected
 the PC and `setupPostureHolds`, exactly as on Windows). `cmd.darwinDisconnectDeps`

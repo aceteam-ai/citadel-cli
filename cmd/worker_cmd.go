@@ -52,7 +52,7 @@ var workerAutostartEnableCmd = &cobra.Command{
 			if err := service.EnableUserAutostart(exe); err != nil {
 				return err
 			}
-			fmt.Fprintln(cmd.OutOrStdout(), "Autostart enabled: macOS will start the Citadel worker when you sign in.\nIt does not start now; run 'citadel service start' to start it.")
+			fmt.Fprintln(cmd.OutOrStdout(), "Autostart enabled: macOS will start the Citadel worker when you sign in.\nIt does not start now; run 'citadel worker start' to start it.")
 			return nil
 		}
 		if err := enableUserAutostart(exe, autostartExeOwnership, service.EnableUserAutostart); err != nil {
@@ -113,6 +113,23 @@ var workerAutostartStatusCmd = &cobra.Command{
 	},
 }
 
+var workerStartCmd = &cobra.Command{
+	Use:          "start",
+	Short:        "Start the background worker (macOS LaunchAgent)",
+	Args:         cobra.NoArgs,
+	SilenceUsage: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if runtime.GOOS != "darwin" {
+			return errors.New("'citadel worker start' is only for the macOS LaunchAgent; on Windows run 'citadel work --background', on Linux use 'citadel service start'")
+		}
+		if err := service.StartUserWorker(); err != nil {
+			return err
+		}
+		fmt.Fprintln(cmd.OutOrStdout(), "The background worker is running (a LaunchAgent that macOS keeps running).")
+		return nil
+	},
+}
+
 var workerStopCmd = &cobra.Command{
 	Use:          "stop",
 	Short:        "Stop the background worker and its supervisor",
@@ -136,7 +153,7 @@ var workerStopCmd = &cobra.Command{
 
 func init() {
 	workerAutostartCmd.AddCommand(workerAutostartEnableCmd, workerAutostartDisableCmd, workerAutostartStatusCmd)
-	workerCmd.AddCommand(workerAutostartCmd, workerStopCmd)
+	workerCmd.AddCommand(workerAutostartCmd, workerStartCmd, workerStopCmd)
 	rootCmd.AddCommand(workerCmd)
 }
 

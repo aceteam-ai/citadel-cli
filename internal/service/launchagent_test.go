@@ -18,11 +18,11 @@ type fakeLaunchctl struct {
 	pid      int
 	disabled bool
 
-	bootoutFails   bool // bootout and unload both fail and the job stays loaded
-	bootoutLies    bool // bootout reports failure but the job is gone
-	bootstrapFails bool // bootstrap fails (load still works)
-	loadFails      bool
+	bootoutFails   bool  // bootout and unload both fail and the job stays loaded
+	bootoutLies    bool  // bootout reports failure but the job is gone
+	bootstrapFails bool  // bootstrap fails
 	hardErr        error // returned for every call: launchctl itself is unusable
+	printExit      int   // non-zero: print exits with this status (113 means absent)
 }
 
 func (f *fakeLaunchctl) run(args ...string) ([]byte, error) {
@@ -33,6 +33,9 @@ func (f *fakeLaunchctl) run(args ...string) ([]byte, error) {
 	exit := &LaunchctlExit{Code: 113, Output: "Could not find service"}
 	switch args[0] {
 	case "print":
+		if f.printExit != 0 {
+			return nil, &LaunchctlExit{Code: f.printExit, Output: "Could not find domain"}
+		}
 		if !f.loaded {
 			return nil, exit
 		}
@@ -47,7 +50,7 @@ func (f *fakeLaunchctl) run(args ...string) ([]byte, error) {
 			v = "disabled"
 		}
 		return []byte("disabled services = {\n\t\"com.example.other\" => enabled\n\t\"ai.aceteam.citadel\" => " + v + "\n}\n"), nil
-	case "bootout", "unload":
+	case "bootout":
 		if f.bootoutLies {
 			f.loaded, f.pid = false, 0
 			return nil, exit
@@ -59,12 +62,6 @@ func (f *fakeLaunchctl) run(args ...string) ([]byte, error) {
 		return nil, nil
 	case "bootstrap":
 		if f.bootstrapFails {
-			return nil, exit
-		}
-		f.loaded, f.pid = true, 4242
-		return nil, nil
-	case "load":
-		if f.loadFails {
 			return nil, exit
 		}
 		f.loaded, f.pid = true, 4242
@@ -265,20 +262,16 @@ func TestLaunchdUserAgentStart(t *testing.T) {
 			t.Errorf("calls = %v, want %q", f.calls, want)
 		}
 	})
-	t.Run("falls back to load without a GUI session", func(t *testing.T) {
+	t.Run("a failed bootstrap fails closed, with no legacy load", func(t *testing.T) {
 		a, f := newTestAgent(t)
 		_ = a.Enable(testExe)
 		f.bootstrapFails = true
-		if err := a.Start(); err != nil || !f.loaded {
-			t.Fatalf("err = %v loaded = %v", err, f.loaded)
+		err := a.Start()
+		if err == nil || !strings.Contains(err.Error(), "desktop session") {
+			t.Fatalf("err = %v", err)
 		}
-	})
-	t.Run("both verbs failing is an error", func(t *testing.T) {
-		a, f := newTestAgent(t)
-		_ = a.Enable(testExe)
-		f.bootstrapFails, f.loadFails = true, true
-		if err := a.Start(); err == nil {
-			t.Fatal("expected an error")
+		if contains(f.verbs(), "load") || f.loaded {
+			t.Errorf("calls = %v loaded = %v", f.calls, f.loaded)
 		}
 	})
 	t.Run("a Login Items switch-off is named", func(t *testing.T) {
@@ -345,8 +338,11 @@ func TestLaunchdUserAgentStop(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "could not stop") {
 			t.Fatalf("err = %v", err)
 		}
-		if !contains(f.verbs(), "unload") {
-			t.Errorf("the legacy unload was not tried: %v", f.calls)
+		if contains(f.verbs(), "unload") {
+			t.Errorf("the legacy unload must not be used: %v", f.calls)
+		}
+		if !strings.Contains(err.Error(), "desktop session") {
+			t.Errorf("no guidance: %v", err)
 		}
 	})
 	t.Run("a bootout that errors but removed the job is success", func(t *testing.T) {
@@ -363,6 +359,73 @@ func TestLaunchdUserAgentStop(t *testing.T) {
 			t.Fatal("expected an error")
 		}
 	})
+}
+
+// TestLaunchdUserAgentStopOverSSHStyleFailureIsNotStopped: where gui/<uid> is
+// unreachable, print exits with something other than "service not found". That
+// is never read as "stopped".
+func TestLaunchdUserAgentStopOverSSHStyleFailureIsNotStopped(t *testing.T) {
+	a, f := newTestAgent(t)
+	f.printExit = 112 // no such domain
+	err := a.Stop()
+	if err == nil || !strings.Contains(err.Error(), "launchctl print") {
+		t.Fatalf("err = %v", err)
+	}
+	f.printExit = 113
+	if err := a.Stop(); err != nil {
+		t.Fatalf("service-not-found is the only absent signal: %v", err)
+	}
+	f.printExit = 112
+	if st := a.State(testExe); st.Err == nil {
+		t.Error("State must report an unreadable domain")
+	}
+}
+
+func TestLaunchdUserAgentRefusesWritableParentDirectories(t *testing.T) {
+	a, _ := newTestAgent(t)
+	dirMode := os.FileMode(0o755)
+	dirUID := 501
+	a.StatExe = func(p string) (ExeInfo, error) {
+		if p == filepath.Dir(testExe) {
+			return ExeInfo{UID: dirUID, Mode: fs.ModeDir | dirMode}, nil
+		}
+		return ExeInfo{UID: 501, Mode: 0o755}, nil
+	}
+	if err := a.Enable(testExe); err != nil {
+		t.Fatalf("a user-owned 755 folder (Homebrew on Apple Silicon): %v", err)
+	}
+	dirMode = 0o775
+	if err := a.Enable(testExe); err == nil || !strings.Contains(err.Error(), "folder") {
+		t.Fatalf("group-writable folder: %v", err)
+	}
+	dirMode, dirUID = 0o755, 502
+	if err := a.Enable(testExe); err == nil || !strings.Contains(err.Error(), "owned by another user") {
+		t.Fatalf("foreign folder: %v", err)
+	}
+	dirUID = 0 // root-owned (for example /usr/local/bin) is fine
+	if err := a.Enable(testExe); err != nil {
+		t.Fatalf("root-owned folder: %v", err)
+	}
+}
+
+func TestLaunchdTruncateIfOversizeSkipsSymlinks(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(target, []byte("0123456789"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "log")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skip("no symlinks")
+	}
+	truncateIfOversize(link, 4)
+	if b, _ := os.ReadFile(target); len(b) != 10 {
+		t.Error("a symlinked log was followed and truncated")
+	}
+	truncateIfOversize(target, 4)
+	if b, _ := os.ReadFile(target); len(b) != 0 {
+		t.Error("an oversize regular file was not emptied")
+	}
 }
 
 func TestLaunchdUserAgentRemoveAndState(t *testing.T) {

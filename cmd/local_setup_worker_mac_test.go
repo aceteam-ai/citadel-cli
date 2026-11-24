@@ -20,6 +20,7 @@ type macLaunchctl struct {
 	log          *[]string
 	loaded       bool
 	bootoutFails bool
+	printExit    int // non-zero: print exits with it (an SSH-style unreachable domain)
 }
 
 func (m *macLaunchctl) run(args ...string) ([]byte, error) {
@@ -27,19 +28,22 @@ func (m *macLaunchctl) run(args ...string) ([]byte, error) {
 	exit := &service.LaunchctlExit{Code: 113}
 	switch args[0] {
 	case "print":
+		if m.printExit != 0 {
+			return nil, &service.LaunchctlExit{Code: m.printExit}
+		}
 		if !m.loaded {
 			return nil, exit
 		}
 		return []byte("\tpid = 99\n"), nil
 	case "print-disabled":
 		return []byte("disabled services = {\n}\n"), nil
-	case "bootout", "unload":
+	case "bootout":
 		if m.bootoutFails {
 			return nil, exit
 		}
 		m.loaded = false
 		return nil, nil
-	case "bootstrap", "load":
+	case "bootstrap":
 		m.loaded = true
 		return nil, nil
 	}
@@ -201,12 +205,13 @@ func TestDisconnectMacBootoutFailureStopsTheDisconnect(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.loaded, m.bootoutFails = true, true
+	m.printExit = 0
 	base := disconnectDeps{
 		logout:            func() (logoutOutcome, error) { log = append(log, "logout"); return logoutOutcome{}, nil },
 		removeCredentials: func() (bool, error) { log = append(log, "remove key"); return true, nil },
 	}
 	res := disconnectThisPC(darwinDisconnectDeps(base, a, nil))
-	if res.OK || stepStatuses(res) != "failed,ok,skipped,skipped" {
+	if res.OK || stepStatuses(res) != "failed,failed,skipped,skipped" {
 		t.Fatalf("res = %+v", res)
 	}
 	for _, l := range log {
@@ -219,6 +224,9 @@ func TestDisconnectMacBootoutFailureStopsTheDisconnect(t *testing.T) {
 	}
 	if !strings.Contains(res.Steps[0].Message, "citadel worker stop") {
 		t.Error("the message must say what to run")
+	}
+	if _, err := os.Stat(a.PlistPath()); err != nil {
+		t.Errorf("the plist was removed although the stop failed: %v", err)
 	}
 
 	// A failure to even build the agent also clears nothing.
@@ -312,5 +320,32 @@ func TestMacWorkerDepsWriteOnlyUnderTheInjectedHome(t *testing.T) {
 	}
 	if !strings.HasPrefix(a.PlistPath(), filepath.Clean(a.Home)) {
 		t.Fatalf("plist %s is outside %s", a.PlistPath(), a.Home)
+	}
+}
+
+// TestDisconnectMacSSHStyleFailureKeepsTheCredentials: where gui/<uid> cannot
+// be read, Stop errors, so the logout and key removal never run.
+func TestDisconnectMacSSHStyleFailureKeepsTheCredentials(t *testing.T) {
+	var log []string
+	a, m := newMacAgent(t, &log)
+	if err := a.Enable(macTestExe); err != nil {
+		t.Fatal(err)
+	}
+	m.printExit = 112
+	base := disconnectDeps{
+		logout:            func() (logoutOutcome, error) { log = append(log, "logout"); return logoutOutcome{}, nil },
+		removeCredentials: func() (bool, error) { log = append(log, "remove key"); return true, nil },
+	}
+	res := disconnectThisPC(darwinDisconnectDeps(base, a, nil))
+	if res.OK || res.Steps[0].Status != stepFailed {
+		t.Fatalf("res = %+v", res)
+	}
+	for _, l := range log {
+		if l == "logout" || l == "remove key" {
+			t.Fatalf("%s ran: %v", l, log)
+		}
+	}
+	if _, err := os.Stat(a.PlistPath()); err != nil {
+		t.Errorf("plist removed: %v", err)
 	}
 }

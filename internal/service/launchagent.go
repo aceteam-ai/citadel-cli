@@ -32,6 +32,18 @@ import (
 // this and the doctor warns about one.
 const LaunchAgentLogMaxBytes = 50 << 20
 
+// launchctlServiceNotFound is launchctl's "Could not find service" exit status.
+// It is the only exit that means the job is absent from the domain; any other
+// failure (no such domain over SSH, a permission error) says nothing about
+// whether the worker runs, so it is an error, never "stopped".
+const launchctlServiceNotFound = 113
+
+// errNeedDesktopSession is the fail-closed answer where launchd's per-user GUI
+// domain cannot be reached. The legacy load/unload verbs act on the caller's
+// own session domain (an SSH login has a different one), so they are never
+// used: they could start or stop a job that gui/<uid> does not show.
+const errNeedDesktopSession = "run this from your logged-in desktop session (Terminal on the Mac itself, or the setup page), not over SSH"
+
 // launchctlOutputMax caps what a launchctl call's output is read as.
 const launchctlOutputMax = 64 << 10
 
@@ -136,6 +148,26 @@ func (a *LaunchAgent) checkExe(exe string) error {
 	if info.Mode.Perm()&0o022 != 0 {
 		return fmt.Errorf("worker agent: %s can be changed by other users (mode %o), so it will not be started at sign-in. Run: chmod go-w %q", exe, info.Mode.Perm(), exe)
 	}
+	// The directory holding the binary, and the one holding a symlink's target
+	// (a Homebrew prefix bin links into the Cellar), must not let group or
+	// other swap the file either. Owned by this user or root; Homebrew's
+	// Apple Silicon prefix is user-owned and 755, so it passes.
+	dirs := []string{filepath.Dir(exe)}
+	if real, err := filepath.EvalSymlinks(exe); err == nil && filepath.Dir(real) != dirs[0] {
+		dirs = append(dirs, filepath.Dir(real))
+	}
+	for _, dir := range dirs {
+		di, err := a.StatExe(dir)
+		if err != nil {
+			return fmt.Errorf("worker agent: could not check %s: %w", dir, err)
+		}
+		if di.UID != a.Euid && di.UID != 0 {
+			return fmt.Errorf("worker agent: the folder %s is owned by another user, so %s will not be started at sign-in", dir, exe)
+		}
+		if di.Mode.Perm()&0o022 != 0 {
+			return fmt.Errorf("worker agent: the folder %s can be changed by other users (mode %o), so %s will not be started at sign-in. Run: chmod go-w %q", dir, di.Mode.Perm(), exe, dir)
+		}
+	}
 	return nil
 }
 
@@ -156,7 +188,9 @@ func (a *LaunchAgent) render(exe string) string {
 // start the worker. An existing plist with the same content is left alone; a
 // different one (an init agent for another path, a moved binary) is replaced
 // atomically, and a job already loaded from the old content is booted out so
-// Start loads the new one.
+// Start loads the new one. Every field the plist carries (executable, arguments,
+// PATH, HOME, log paths) changes what the worker runs or sees, and launchd reads
+// the plist only at load, so a differing plist always needs that restart.
 func (a *LaunchAgent) Enable(exe string) error {
 	if err := a.refuseRoot(); err != nil {
 		return err
@@ -217,7 +251,7 @@ func (a *LaunchAgent) print() (loaded bool, pid int, err error) {
 			}
 		}
 		return true, pid, nil
-	case errors.As(err, &exit):
+	case errors.As(err, &exit) && exit.Code == launchctlServiceNotFound:
 		return false, 0, nil
 	default:
 		return false, 0, fmt.Errorf("launchctl print: %w", err)
@@ -273,10 +307,7 @@ func (a *LaunchAgent) Start() error {
 		}
 	}
 	if _, err := a.Run("bootstrap", a.domain(), pp); err != nil {
-		// No Aqua session (an SSH login) cannot bootstrap into gui/<uid>.
-		if _, lerr := a.Run("load", pp); lerr != nil {
-			return fmt.Errorf("launchctl bootstrap: %v; launchctl load: %w", err, lerr)
-		}
+		return fmt.Errorf("launchctl bootstrap into %s failed (%v); %s", a.domain(), err, errNeedDesktopSession)
 	}
 	if loaded, _, err := a.print(); err != nil {
 		return err
@@ -288,17 +319,17 @@ func (a *LaunchAgent) Start() error {
 
 func (a *LaunchAgent) bootout() error {
 	if _, err := a.Run("bootout", a.target()); err != nil {
-		if _, uerr := a.Run("unload", a.plistPath()); uerr != nil {
-			return fmt.Errorf("launchctl bootout: %v; launchctl unload: %w", err, uerr)
-		}
+		return fmt.Errorf("launchctl bootout %s failed (%v); %s", a.target(), err, errNeedDesktopSession)
 	}
 	return nil
 }
 
 // Stop makes sure launchd no longer runs the worker. A job that is not loaded
-// is success. A bootout that fails (and its unload fallback) is an error only
-// if the job is still loaded afterwards, so the caller can trust "nil" to mean
-// the KeepAlive job is gone and will not restart.
+// is success, but only on launchctl's "service not found" exit: any other print
+// failure is an error. A bootout that fails is an error only if the job is
+// still loaded afterwards, so the caller can trust "nil" to mean the KeepAlive
+// job is gone and will not restart. There is no legacy unload fallback: it acts
+// on the caller's session domain, not gui/<uid>.
 func (a *LaunchAgent) Stop() error {
 	loaded, _, err := a.print()
 	if err != nil {
@@ -333,9 +364,7 @@ func (a *LaunchAgent) Remove() error {
 // trimLogs truncates a launchd log past LaunchAgentLogMaxBytes (best effort).
 func (a *LaunchAgent) trimLogs() {
 	for _, f := range a.logFiles() {
-		if fi, err := os.Lstat(f); err == nil && fi.Mode().IsRegular() && fi.Size() > LaunchAgentLogMaxBytes {
-			_ = os.Truncate(f, 0)
-		}
+		truncateIfOversize(f, LaunchAgentLogMaxBytes)
 	}
 }
 

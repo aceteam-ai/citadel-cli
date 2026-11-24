@@ -376,15 +376,24 @@ func productionDisconnectDepsBase() disconnectDeps {
 // failure to build the agent; it fails both steps, so nothing is cleared.
 func darwinDisconnectDeps(d disconnectDeps, a *service.LaunchAgent, agentErr error) disconnectDeps {
 	d.goos = "darwin"
+	// The plist stays while the stop failed: it is what a retry, and a worker
+	// that is somehow still running, are tied to.
+	stopFailed := false
 	d.stopWorker = func() (bool, error) {
 		if agentErr != nil {
+			stopFailed = true
 			return true, agentErr
 		}
-		return true, a.Stop()
+		err := a.Stop()
+		stopFailed = err != nil
+		return true, err
 	}
 	d.disableAutostart = func() (bool, error) {
 		if agentErr != nil {
 			return true, agentErr
+		}
+		if stopFailed {
+			return true, errors.New("the worker was not stopped, so its LaunchAgent file was kept")
 		}
 		return true, a.Remove()
 	}
