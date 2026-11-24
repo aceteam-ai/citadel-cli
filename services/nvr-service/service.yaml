@@ -146,7 +146,7 @@ config:
       `name` or `name=stream-path`). Frigate 0.17 refuses to start with an empty
       cameras: block, so this is required and the nvr-config init container fails
       loudly if it is empty. Auto-discovery from docker-wyze-bridge's API is a
-      runtime enhancement validated at node-1314 acceptance, not the default.
+      runtime enhancement validated during node acceptance, not the default.
     required: true
 
 health_check:

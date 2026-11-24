@@ -55,8 +55,8 @@ jobs:
       # Build once into the local daemon and smoke-test BEFORE anything is pushed.
       # What this can and cannot catch: triton only compiles its CUDA driver stub
       # when a GPU driver initializes, so a GPU-less runner cannot reproduce the
-      # exact "Failed to find C compiler" failure seen in GPU acceptance on node
-      # 1795. It CAN catch the cause: a missing compiler or libc/Python headers
+      # exact "Failed to find C compiler" failure seen during GPU acceptance.
+      # It CAN catch the cause: a missing compiler or libc/Python headers
       # (compiling a C file against Python.h with CC unset), and a broken import
       # of bitsandbytes / diffusers / the pipeline classes. The sidecar's /health
       # `self_test` repeats the import check at boot on the real node.
