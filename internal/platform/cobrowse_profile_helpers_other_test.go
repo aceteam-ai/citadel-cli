@@ -34,7 +34,7 @@ func installFakeHelpers(t *testing.T, f *fakeHelpers) {
 	})
 	profileReapDelay, profileReapBudget, sessionRemoveDelay = time.Millisecond, 100*time.Millisecond, time.Millisecond
 	reapEUID = func() int { return f.euid }
-	listReapProcs = func() []reapProc {
+	listReapProcs = func() ([]reapProc, error) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		f.listed++
@@ -42,7 +42,7 @@ func installFakeHelpers(t *testing.T, f *fakeHelpers) {
 		for _, p := range f.procs {
 			out = append(out, p)
 		}
-		return out
+		return out, nil
 	}
 	lookupReapProc = func(pid int) (reapProc, bool) {
 		f.mu.Lock()
@@ -202,18 +202,18 @@ func TestTeardownCatchesRecreateAfterRemove(t *testing.T) {
 	f := &fakeHelpers{euid: os.Geteuid(), procs: map[int]reapProc{}}
 	m, st, _ := startOrdered(t, f, func(string) {})
 	listed := 0
-	listReapProcs = func() []reapProc {
+	listReapProcs = func() ([]reapProc, error) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		listed++
 		if listed == 1 {
-			return nil // main process just died, no helper visible yet
+			return nil, nil // main process just died, no helper visible yet
 		}
 		var out []reapProc
 		for _, p := range f.procs {
 			out = append(out, p)
 		}
-		return out
+		return out, nil
 	}
 	f.procs[10] = helperProc(10, 7, os.Geteuid(), "chrome", "--user-data-dir="+st.Profile)
 	f.onKill = func(int) { // dying helper recreates files

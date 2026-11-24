@@ -193,22 +193,34 @@ func macOwnerAliveWithStart(pid int, start int64, sig0 func(int) error, startOf 
 
 // macCmdlineHasProfile reports whether a browser's command line carries
 // --user-data-dir=<dir> for exactly this session dir (not a prefix of a longer
-// path).
+// path; the dir may contain spaces).
 func macCmdlineHasProfile(cmdline, dir string) bool {
-	if dir == "" || !filepath.IsAbs(dir) {
+	return macCmdlineHasFlag(cmdline, "--user-data-dir="+dir, false)
+}
+
+// macCmdlineUsesProfile reports whether a command line names the profile dir:
+// an exact --user-data-dir=<dir>, or --database=<dir>/<anything> (crashpad).
+func macCmdlineUsesProfile(cmdline, dir string) bool {
+	return macCmdlineHasProfile(cmdline, dir) || macCmdlineHasFlag(cmdline, "--database="+dir+"/", true)
+}
+
+// macCmdlineHasFlag finds needle at an argument start. When prefix is false the
+// match must also end an argument.
+func macCmdlineHasFlag(cmdline, needle string, prefix bool) bool {
+	i := strings.Index(needle, "=") + 1
+	if i <= 1 || !filepath.IsAbs(needle[i:]) {
 		return false
 	}
-	needle := "--user-data-dir=" + dir
-	for i := 0; ; {
-		j := strings.Index(cmdline[i:], needle)
+	for from := 0; ; {
+		j := strings.Index(cmdline[from:], needle)
 		if j < 0 {
 			return false
 		}
-		end := i + j + len(needle)
-		if end == len(cmdline) || cmdline[end] == ' ' || cmdline[end] == '\n' {
+		start, end := from+j, from+j+len(needle)
+		if (start == 0 || cmdline[start-1] == ' ') && (prefix || end == len(cmdline) || cmdline[end] == ' ' || cmdline[end] == '\n') {
 			return true
 		}
-		i += j + 1
+		from = start + 1
 	}
 }
 

@@ -113,7 +113,7 @@ func startHeadless(info BrowserInfo, profileDir, startURL, userAgent string, lo 
 	// to the group is sent to our own group. It polls the owner and exits with
 	// it, which keeps a crashed owner from leaking it; the browser then still
 	// holds the group.
-	leader := exec.Command("/bin/sh", "-c", `while kill -0 "$1" 2>/dev/null; do sleep 1; done`, "sh", strconv.Itoa(os.Getpid()))
+	leader := exec.Command("/bin/sh", "-c", `while kill -0 "$1" 2>/dev/null; do /bin/sleep 1; done`, "sh", strconv.Itoa(os.Getpid()))
 	leader.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := leader.Start(); err != nil {
 		return nil, fmt.Errorf("start browser process group: %w", err)
@@ -138,6 +138,7 @@ func startHeadless(info BrowserInfo, profileDir, startURL, userAgent string, lo 
 		},
 	}
 	if err := cmd.Start(); err != nil {
+		close(exited) // no browser started: do not wait out the TERM grace
 		_ = guard.teardown()
 		return nil, fmt.Errorf("launch %s: %w", info.Kind, err)
 	}
@@ -292,28 +293,16 @@ func macReapProc(r macPSRow) (reapProc, bool) {
 	if err != nil {
 		return reapProc{}, false
 	}
-	return reapProc{pid: r.pid, start: uint64(start), uid: r.uid, args: strings.Fields(r.cmd)}, true
+	return reapProc{pid: r.pid, start: uint64(start), uid: r.uid, args: strings.Fields(r.cmd), cmd: r.cmd}, true
 }
 
-func listMacReapProcs() []reapProc {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "/bin/ps", "-ww", "-axo", "pid=,uid=,command=").Output()
-	if err != nil {
-		return nil
-	}
-	var res []reapProc
-	for _, r := range parseMacPS(string(out)) {
-		// Only the argv match needs the full list; the start time (a sysctl)
-		// is read just for processes naming a profile.
-		if !strings.Contains(r.cmd, "--user-data-dir=") && !strings.Contains(r.cmd, "--database=") {
-			continue
-		}
-		if p, ok := macReapProc(r); ok {
-			res = append(res, p)
-		}
-	}
-	return res
+func listMacReapProcs() ([]reapProc, error) {
+	return listMacReapProcsFrom(func() (string, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		out, err := exec.CommandContext(ctx, "/bin/ps", "-ww", "-axo", "pid=,uid=,command=").Output()
+		return string(out), err
+	}, processStartToken)
 }
 
 func lookupMacReapProc(pid int) (reapProc, bool) {
