@@ -93,6 +93,10 @@ func realLocalDoctorDeps(skipLaunch bool) localDoctorDeps {
 			}
 			d.userWorker = func() userWorkerState { return readUserWorkerState(exe, network.GetNodeConfigDir()) }
 		}
+		if runtime.GOOS == "darwin" {
+			// The worker is a LaunchAgent (citadel-cli#1903 M3).
+			d.userWorker = func() userWorkerState { return readUserWorkerState(exe, network.GetNodeConfigDir()) }
+		}
 	}
 	if !skipLaunch {
 		d.launchTest = func() (string, string, error) {
@@ -266,18 +270,10 @@ func collectLocalDoctor(d localDoctorDeps) (checks []localDoctorCheck, failed bo
 
 	if d.userWorker != nil {
 		uw := d.userWorker()
-		switch {
-		case uw.AutostartErr != nil:
-			warn("Autostart", fmt.Sprintf("could not read the sign-in entry: %v", uw.AutostartErr))
-		case uw.Autostart.Set && (uw.Autostart.DisabledByUser || !uw.Autostart.PointsAtThis):
-			warn("Autostart", describeUserAutostart(uw.Autostart))
-		default:
-			ok("Autostart", describeUserAutostart(uw.Autostart))
-		}
-		if uw.Running {
-			ok("Worker", fmt.Sprintf("a background worker is running (supervisor PID %d) and connects to AceTeam on its own, separately from local mode. Stop it: %s worker stop", uw.SupervisorPID, d.exe))
+		if uw.Agent != nil {
+			agentChecks(uw, d.exe, ok, warn)
 		} else {
-			ok("Worker", "no background worker is running (it is only needed to use this computer from AceTeam)")
+			windowsWorkerChecks(uw, d.exe, ok, warn)
 		}
 	}
 

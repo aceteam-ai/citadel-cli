@@ -5518,6 +5518,44 @@ own the Run value (local drive paths only, no UNC); only `citadel worker
 autostart enable` writes it, and `cmd.enableUserAutostart` refuses an exe this
 user does not own (`update.ExecutableOwnership`).
 
+### Per-user worker on macOS: a LaunchAgent (citadel-cli#1903 M3)
+
+launchd is the supervisor, so none of the Windows `--background` supervisor is
+ported. `service.LaunchAgent` owns the per-user agent (label and plist shape
+shared with the `init` agent through `renderLaunchdPlist`, so an earlier init
+agent is adopted and rewritten only when its content differs). Every side effect
+is a field (`Run` launchctl runner, `StatExe`, `Home`, `Euid`), so
+`launchagent_test.go` and `cmd/local_setup_worker_mac_test.go` run on Linux
+with a fake runner and a temp home; `NewUserLaunchAgent` (`user_darwin.go`) is
+the only production wiring. What each method decides: `Enable` writes the plist
+(refuses root, and a binary this user does not own or others can write,
+`checkExe`) and boots out a job loaded from older content; `Start` is a no-op
+for a running job, refuses a Login Items switch-off (`print-disabled`), empties
+a log past `LaunchAgentLogMaxBytes` (through an `O_NOFOLLOW` descriptor), then
+bootstraps into `gui/<uid>`. There is no legacy `load`/`unload` fallback: those
+verbs act on the caller's session domain (an SSH login has another), so a
+failed bootstrap or bootout fails closed and says to use the desktop session.
+`Stop` boots out by service target (`gui/<uid>/<label>`) and returns nil only
+once `launchctl print` exits 113 ("service not found", the only absent signal;
+any other exit is an error, as is a missing launchctl), so a failed bootout
+that left the job loaded is an error. `checkExe` also refuses a binary whose
+folder (or symlink-target folder) group or other can write, or another user
+owns. `Remove` deletes the plist, and Disconnect keeps it when the stop failed.
+`citadel worker start` is the macOS start command (`citadel service start`
+still has `launchdManager`'s load fallback for the `init` agent and can place
+the label outside `gui/<uid>`, so no macOS copy points at it). Never a LaunchDaemon, never `SUDO_UID`.
+`cmd.darwinSetupWorkerDeps` maps the setup page's three worker steps onto
+`Enable`/`Start` (`startSetupWorker` still refuses unless this page connected
+the PC and `setupPostureHolds`, exactly as on Windows). `cmd.darwinDisconnectDeps`
+swaps `stopWorker` and `disableAutostart` for `Stop` and `Remove`;
+`disconnectThisPC` already skips the logout and key removal when either fails,
+so a KeepAlive worker cannot restart against deleted credentials.
+`cmd.agentChecks` (via `userWorkerStateFromAgent`) is the doctor's and setup
+page's Autostart/Worker/Worker-log lines on macOS; they read launchd only and
+show no log content. `citadel worker autostart enable|disable` and `worker stop`
+map to the same methods on macOS. Native acceptance on Apple Silicon is
+post-merge (checklist in the PR).
+
 ### Known Limitations on Windows
 
 - WSL2 is required (not available on older Windows versions)
