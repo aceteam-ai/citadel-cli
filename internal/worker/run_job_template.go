@@ -62,6 +62,11 @@ type TemplateRunRequest struct {
 	// JobID is set by the handler from the Job (never parsed from the payload) so
 	// TemplateRunOps can bind the AEP receipt to this job.
 	JobID string `json:"-"`
+	// OrgID is set by the handler from the exact per-node source queue
+	// (jobs:v1:shell:org_<id>:node:<nodeid>), never parsed from the payload.
+	// Empty when the queue does not have that exact shape; a builtin that binds
+	// the run to an organization must refuse an empty value.
+	OrgID string `json:"-"`
 
 	// TemplateKey and TemplateVersion identify the template; ContentHash pins the
 	// exact approved manifest version. All three feed the anti-tamper recompute.
@@ -102,6 +107,16 @@ type TemplateRunResult struct {
 	DurationMs  int64            `json:"duration_ms"`
 	InputHashes []string         `json:"input_hashes"`
 	Receipt     map[string]any   `json:"receipt,omitempty"`
+
+	// The fields below are set only by an attested builtin (one whose receipt is
+	// required, cmd.registerAttestedTemplateRunner). AEPReceipt is the key the
+	// platform's dispatch_run_job_template verifies; WorkReceipts and Usage are
+	// the keys buildUsageRecord carries onto the node usage ledger. Report is the
+	// builtin's bounded inline result.
+	AEPReceipt   map[string]any   `json:"aep_receipt,omitempty"`
+	WorkReceipts []map[string]any `json:"work_receipts,omitempty"`
+	Usage        map[string]any   `json:"usage,omitempty"`
+	Report       map[string]any   `json:"report,omitempty"`
 }
 
 // TemplateRunOps is the live side-effect surface behind RUN_JOB_TEMPLATE,
@@ -163,6 +178,7 @@ func (h *RunJobTemplateHandler) Execute(ctx context.Context, job *Job, stream St
 		return h.failure(fmt.Errorf("RUN_JOB_TEMPLATE: %w", err)), nil
 	}
 	req.JobID = job.ID
+	req.OrgID = templateQueueOrg(job.SourceQueue, h.cfg.NodeID)
 	if h.cfg.NodeID == "" || !strings.HasSuffix(job.SourceQueue, ":node:"+h.cfg.NodeID) {
 		return h.failure(fmt.Errorf("RUN_JOB_TEMPLATE: source queue does not match executing node")), nil
 	}
@@ -243,6 +259,21 @@ func ValidateTemplateRunRequest(req TemplateRunRequest, nodeID string) (jobs.Tem
 		}
 	}
 	return runner, nil
+}
+
+// templateQueueOrg returns the organization id of the exact per-node shell
+// stream jobs:v1:shell:org_<id>:node:<nodeID>, or "" for any other shape.
+func templateQueueOrg(sourceQueue, nodeID string) string {
+	const prefix = "jobs:v1:shell:org_"
+	suffix := ":node:" + nodeID
+	if nodeID == "" || !strings.HasPrefix(sourceQueue, prefix) || !strings.HasSuffix(sourceQueue, suffix) {
+		return ""
+	}
+	org := strings.TrimSuffix(strings.TrimPrefix(sourceQueue, prefix), suffix)
+	if org == "" || strings.ContainsAny(org, ": \t\r\n") {
+		return ""
+	}
+	return org
 }
 
 // parseTemplateRunRequest decodes the payload. It requires every field needed to

@@ -2186,6 +2186,18 @@ stdout/stderr captures and overflow cancellation without changing audio-mix.
 landscape with silent audio; it does not supply card assets. The proposed contract
 and remaining activation gates are in `docs/run-job-template-contract.md`.
 
+`cmd.registerAttestedTemplateRunner` registers a builtin whose run is bound to
+the node, job and stream organization (`templateRunBinding`; the org comes from
+`worker.templateQueueOrg`, never params). For it, `liveTemplateRunOps.Run`
+preflights the signer before execution and `signAttestedReceipt` signs a
+`run_job_template` receipt whose input_sha256 is the builtin's binding object;
+it ignores `CITADEL_SIGN_AEP_RECEIPTS` and never fails open. `local-flow-run`
+(`cmd.admitLocalFlowRun`, `cmd.runLocalFlowBuiltin`) is the first: every
+refusal precedes the container start, and `localFlowPinnedImage` stays empty
+until a release pins the engine image, so it refuses today. A `LocalInference`
+graph runs with host networking because the engine client dials 127.0.0.1. See
+`docs/local-flow-run.md` for the engine contract, binding and activation gates.
+
 `cmd/run_job_template_ops.go` remains the workspace/hash/receipt adapter;
 `cmd/template_builtin_papercraft.go`, `template_builtin_audio_mix.go`,
 `template_builtin_papercraft_scene.go` and `template_builtin_papercraft_scene_v2.go`
