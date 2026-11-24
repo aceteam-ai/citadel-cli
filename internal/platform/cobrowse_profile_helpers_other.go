@@ -88,14 +88,23 @@ func listProcForReap() ([]reapProc, error) {
 		return nil, fmt.Errorf("list processes: %w", err)
 	}
 	var out []reapProc
+	self, sawSelf := os.Getpid(), false
 	for _, e := range ents {
 		pid, err := strconv.Atoi(e.Name())
 		if err != nil {
 			continue
 		}
+		if pid == self {
+			sawSelf = true
+		}
 		if p, ok := readProcForReap(pid); ok {
 			out = append(out, p)
 		}
+	}
+	// A real procfs always lists the scanning process. An empty or foreign
+	// directory at the mount point (procfs unmounted) is unknown, not "none".
+	if !sawSelf {
+		return nil, fmt.Errorf("list processes: %s does not list this process; procfs may not be mounted", reapProcRoot)
 	}
 	return out, nil
 }

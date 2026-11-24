@@ -5,6 +5,7 @@ package platform
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -243,5 +244,22 @@ func TestListProcForReapFailsClosedWithoutProc(t *testing.T) {
 	listReapProcs = listProcForReap
 	if err := reapProfileUsers(t.TempDir(), ""); err == nil {
 		t.Fatal("reapProfileUsers must fail closed when the process list cannot be read")
+	}
+}
+
+// An empty directory at /proc (procfs unmounted) reads without error but lists
+// nothing, not even this process; that must also count as unknown.
+func TestListProcForReapRequiresSelfInListing(t *testing.T) {
+	prevRoot := reapProcRoot
+	t.Cleanup(func() { reapProcRoot = prevRoot })
+	reapProcRoot = t.TempDir()
+	if _, err := listProcForReap(); err == nil {
+		t.Fatal("an empty /proc directory must not read as an empty process list")
+	}
+	if err := os.Mkdir(filepath.Join(reapProcRoot, strconv.Itoa(os.Getpid())), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := listProcForReap(); err != nil {
+		t.Fatalf("a listing that includes this process must succeed: %v", err)
 	}
 }
