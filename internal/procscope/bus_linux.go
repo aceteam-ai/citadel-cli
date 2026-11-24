@@ -20,6 +20,7 @@ const (
 	managerPath      = dbus.ObjectPath("/org/freedesktop/systemd1")
 	managerInterface = "org.freedesktop.systemd1.Manager"
 	unitInterface    = "org.freedesktop.systemd1.Unit"
+	scopeInterface   = "org.freedesktop.systemd1.Scope"
 	invocationPrefix = "/org/freedesktop/systemd1/unit/"
 )
 
@@ -136,8 +137,14 @@ func (b *userScopeBus) call(ctx context.Context, object dbus.ObjectPath, method 
 }
 
 func (b *userScopeBus) property(ctx context.Context, object dbus.ObjectPath, name string, target any) error {
+	iface := unitInterface
+	// ControlGroup is declared by Scope, while Id, InvocationID and ActiveState
+	// belong to Unit. Properties.Get requires the declaring interface.
+	if name == "ControlGroup" {
+		iface = scopeInterface
+	}
 	var value dbus.Variant
-	if b.call(ctx, object, "org.freedesktop.DBus.Properties.Get", unitInterface, name).Store(&value) != nil || value.Store(target) != nil {
+	if b.call(ctx, object, "org.freedesktop.DBus.Properties.Get", iface, name).Store(&value) != nil || value.Store(target) != nil {
 		return ErrUnknown
 	}
 	return nil
