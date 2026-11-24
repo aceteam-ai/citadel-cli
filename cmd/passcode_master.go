@@ -183,7 +183,13 @@ func legacyClearDirs(legacy config.LegacyPasscodeSearchResult) []string {
 func clearLegacyPasscodeAt(dirs []string) error {
 	var errs []error
 	for _, dir := range dirs {
-		p := config.LoadPermissions(dir)
+		// Strict: a damaged file read as the defaults and saved back would
+		// lose every other setting in it.
+		p, err := config.LoadPermissionsStrict(dir)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", dir, err))
+			continue
+		}
 		_ = p.SetPasscode("") // empty clears the hash; never re-hashes (guard-safe)
 		if err := config.SavePermissions(dir, p); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", dir, err))

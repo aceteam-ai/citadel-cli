@@ -316,6 +316,7 @@ func startManagedCobrowse(m *CobrowseSessionManager) {
 // service_restart in case it does not survive) for the next worker to re-adopt;
 // everything else is stopped as StopAll does.
 func (m *CobrowseSessionManager) ShutdownSessions() error {
+	m.stopEgressSweep()
 	if !detachedWorker.Load() || !m.useResolver || !adoptionSupported {
 		return m.StopAll()
 	}
@@ -326,7 +327,7 @@ func (m *CobrowseSessionManager) ShutdownSessions() error {
 	var lastErr error
 	for _, s := range all {
 		s.mu.Lock()
-		keep := s.proc != nil && s.proc.browserScope != "" && !s.persistent && s.encProfile == nil
+		keep := s.proc != nil && (s.proc.browserScope != "" || s.proc.containerID != "") && !s.persistent && s.encProfile == nil && s.egress == ""
 		s.mu.Unlock()
 		if keep {
 			_ = m.MarkSessionEnding(s, EndedReasonServiceRestart,

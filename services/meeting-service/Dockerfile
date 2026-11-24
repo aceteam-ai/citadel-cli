@@ -60,9 +60,40 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY meetingd.py /app/meetingd.py
+COPY sandbox_check.py /app/sandbox_check.py
 COPY supervisord.conf /etc/supervisor/supervisord.conf
+COPY supervisord-nonroot.conf /etc/supervisor/supervisord-nonroot.conf
 COPY citadel.pa /etc/pulse/citadel.pa
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+
+# Chromium major recorded in the image (aceteam-ai/citadel-cli#1759). CI builds
+# once, reads the installed major, then rebuilds with CHROMIUM_MAJOR set so the
+# label below is real; a non-empty value that disagrees with the installed
+# Chromium fails the build. The same value is written to a file so the runtime
+# can read it without the label. Profile files are written and read by THIS
+# Chromium, and a profile from a newer major must be refused, not opened.
+ARG CHROMIUM_MAJOR=""
+RUN set -e; \
+    major="$(chromium --version | sed -E 's/[^0-9]*([0-9]+)\..*/\1/')"; \
+    case "$major" in ''|*[!0-9]*) echo "cannot parse chromium major" >&2; exit 1;; esac; \
+    if [ -n "$CHROMIUM_MAJOR" ] && [ "$CHROMIUM_MAJOR" != "$major" ]; then \
+        echo "CHROMIUM_MAJOR=$CHROMIUM_MAJOR but installed chromium is $major" >&2; exit 1; \
+    fi; \
+    mkdir -p /etc/browser-runtime; \
+    echo "$major" > /etc/browser-runtime/chromium-major
+# Renderer sandbox marker (aceteam-ai/citadel-cli#1788). Empty unless the build
+# passes SANDBOX_VERIFIED=1, which a build step may do ONLY after
+#   docker run ... --security-opt seccomp=<internal/browserruntime/seccomp.json> \
+#     --entrypoint python3 <image> /app/meetingd.py --sandbox-selfcheck
+# exits 0 (Chromium started and /proc shows seccomp-filtered renderers in their
+# own user namespace). Nodes refuse an image without the marker, and meetingd
+# re-verifies every session, so an image whose sandbox does not work is unusable.
+ARG SANDBOX_VERIFIED=""
+LABEL aceteam.browser-runtime.contract="1" \
+      aceteam.browser-runtime.chromium-major="${CHROMIUM_MAJOR}" \
+      aceteam.browser-runtime.sandbox="${SANDBOX_VERIFIED}" \
+      org.opencontainers.image.source="https://github.com/aceteam-ai/citadel-cli" \
+      org.opencontainers.image.title="browser-runtime"
 
 # Non-root runtime user with a real home + a pulse runtime dir. 10001 is only the
 # DEFAULT uid: the entrypoint remaps `bot` to the node owner's UID/GID (PUID/PGID,
@@ -93,11 +124,17 @@ ENV DISPLAY=:99
 ENV HOME=/home/bot
 ENV XDG_RUNTIME_DIR=/run/user/10001
 ENV PULSE_SERVER=unix:/run/user/10001/pulse/native
+ENV PYTHONDONTWRITEBYTECODE=1
 ENV MEETING_PROFILE_DIR=/profile
 ENV CITADEL_WORKSPACE=/workspace
 
 EXPOSE 8102 9223
 
+# Per-session run contract (browser-runtime, #1759): started with docker's
+# `--user <uid>:<gid>` the entrypoint does no remap, chown or privilege drop and
+# uses supervisord-nonroot.conf; the caller supplies writable /run, /tmp and
+# /home/bot (tmpfs) and an already-owned /profile. See internal/browserruntime.
+#
 # dumb-init as PID 1 for signal handling; entrypoint fixes mount ownership then
 # execs supervisord (which drops each program to the bot user).
 ENTRYPOINT ["/usr/bin/dumb-init", "--", "/usr/local/bin/entrypoint.sh"]

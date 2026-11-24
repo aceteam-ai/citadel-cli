@@ -1,0 +1,42 @@
+//go:build !windows
+
+// internal/platform/cobrowse_macos_reap.go
+//
+// The macOS source for reapProfileUsers (cobrowse_profile_helpers_other.go),
+// kept untagged by OS so its parsing runs on Linux CI.
+package platform
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"syscall"
+)
+
+// listMacReapProcsFrom turns `ps -ww -axo pid=,uid=,command=` output into the
+// processes naming a profile (a start time is read only for those). A failed ps
+// is an error, never an empty list. sig0 is kill(pid, 0).
+func listMacReapProcsFrom(ps func() (string, error), start func(pid int) (int64, error), sig0 func(pid int) error) ([]reapProc, error) {
+	out, err := ps()
+	if err != nil {
+		return nil, err
+	}
+	var res []reapProc
+	for _, r := range parseMacPS(out) {
+		if !strings.Contains(r.cmd, "--user-data-dir=") && !strings.Contains(r.cmd, "--database=") {
+			continue
+		}
+		st, err := start(r.pid)
+		if err != nil {
+			// A row naming the profile whose identity cannot be read: gone
+			// (ESRCH) is safe to omit; alive or unknowable is an error, so the
+			// caller never reports success past a live helper.
+			if serr := sig0(r.pid); errors.Is(serr, syscall.ESRCH) {
+				continue
+			}
+			return nil, fmt.Errorf("cannot read the start time of pid %d, which names the profile: %w", r.pid, err)
+		}
+		res = append(res, reapProc{pid: r.pid, start: uint64(st), uid: r.uid, args: strings.Fields(r.cmd), cmd: r.cmd})
+	}
+	return res, nil
+}

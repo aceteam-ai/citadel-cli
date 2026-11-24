@@ -208,6 +208,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// exposed service under /expose/<name>/ can be gated by mesh identity or a
 	// signed link token. Harmless when nothing is exposed.
 	gw.SetMeshResolver(gatewayMeshResolver{})
+	gw.SetV1AllowedLogins(platformAllowedLoginsCached())
+	warnGatewayLANBind("--bind", serveBind)
 	if key, err := config.LoadOrCreateExposeSigningKey(platform.ConfigDir()); err != nil {
 		Log("warning: gateway link-token signing disabled: %v", err)
 	} else {
@@ -301,7 +303,7 @@ func init() {
 	rootCmd.AddCommand(serveCmd)
 
 	serveCmd.Flags().IntVar(&servePort, "port", 8443, "HTTPS gateway port")
-	serveCmd.Flags().StringVar(&serveBind, "bind", "0.0.0.0", "Bind address for the gateway")
+	serveCmd.Flags().StringVar(&serveBind, "bind", defaultGatewayBind, "Gateway bind host. Default is loopback; the mesh listener is always added. A non-loopback value is an explicit LAN opt-in and is logged loudly")
 	serveCmd.Flags().BoolVar(&serveNoTLS, "no-tls", false, "Disable TLS (plain HTTP, for testing only)")
 	serveCmd.Flags().StringVar(&serveCertDir, "cert-dir", "", "Custom directory for TLS certificates")
 

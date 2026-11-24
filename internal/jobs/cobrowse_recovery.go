@@ -25,7 +25,7 @@ func hasRecoveryScope(job *nexus.Job) bool {
 	}
 	return false
 }
-func (h *CobrowseSessionHandler) recoverJob(action string, job *nexus.Job) ([]byte, error) {
+func (h *CobrowseSessionHandler) recoverJob(action string, job *nexus.Job, mgr *platform.CobrowseSessionManager) ([]byte, error) {
 	p := job.Payload
 	id := p["start_job_id"]
 	if action == "start" {
@@ -63,7 +63,7 @@ func (h *CobrowseSessionHandler) recoverJob(action string, job *nexus.Job) ([]by
 	if h.recoveryOps != nil {
 		ops = h.recoveryOps(job)
 	} else {
-		ops = &nodeRecoveryBrowser{manager: platform.GetCobrowseSessionManager(), job: job, root: root}
+		ops = &nodeRecoveryBrowser{manager: mgr, job: job, root: root}
 	}
 	result, err := (cobrowserecovery.Engine{Store: cobrowserecovery.FileStore{Dir: filepath.Join(root, "cobrowse-job-recovery")}}).Do(action, scope, digest, ops)
 	if err != nil {

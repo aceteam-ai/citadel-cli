@@ -66,27 +66,36 @@ func secureNewCobrowseBaseDir(dir string) error {
 // not inherit permissions from its parent, and grants access to nobody else.
 // Fails closed on any read error or unrecognized ACE.
 func validateCobrowseBaseDirPerms(dir string, _ os.FileInfo) error {
-	user, err := currentUserSID()
-	if err != nil {
-		return err
-	}
 	sd, err := windows.GetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT,
 		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
 	if err != nil {
 		return fmt.Errorf("cobrowse base dir %s: read permissions: %w", dir, err)
 	}
+	return validatePrivateDescriptor(dir, sd, true)
+}
+
+// Strict files/dirs need a protected owner-only ACL. A container directory may
+// retain its inherited ACL, but no unprivileged other user may replace children.
+func validatePrivateDescriptor(dir string, sd *windows.SECURITY_DESCRIPTOR, strict bool) error {
+	user, err := currentUserSID()
+	if err != nil {
+		return err
+	}
 	owner, _, err := sd.Owner()
 	if err != nil || owner == nil {
 		return fmt.Errorf("cobrowse base dir %s: could not determine owner", dir)
 	}
-	if !owner.Equals(user) {
+	privileged := func(sid *windows.SID) bool {
+		return sid.IsWellKnown(windows.WinLocalSystemSid) || sid.IsWellKnown(windows.WinBuiltinAdministratorsSid)
+	}
+	if !owner.Equals(user) && (strict || !privileged(owner)) {
 		return fmt.Errorf("cobrowse base dir %s is owned by %s, not the current user %s; refusing to use it", dir, owner, user)
 	}
 	control, _, err := sd.Control()
 	if err != nil {
 		return fmt.Errorf("cobrowse base dir %s: read security control: %w", dir, err)
 	}
-	if control&windows.SE_DACL_PROTECTED == 0 {
+	if strict && control&windows.SE_DACL_PROTECTED == 0 {
 		return fmt.Errorf("cobrowse base dir %s inherits permissions from its parent; refusing to use it", dir)
 	}
 	dacl, _, err := sd.DACL()
@@ -106,7 +115,14 @@ func validateCobrowseBaseDirPerms(dir string, _ os.FileInfo) error {
 			continue
 		case windows.ACCESS_ALLOWED_ACE_TYPE:
 			sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
-			if !sid.Equals(user) {
+			if !strict && ace.Header.AceFlags&windows.INHERIT_ONLY_ACE != 0 {
+				continue
+			}
+			// FILE_DELETE_CHILD is absent from this x/sys version. WinNT.h
+			// defines it as 0x40: https://learn.microsoft.com/en-us/windows/win32/fileio/file-access-rights-constants
+			const fileDeleteChild = 0x40
+			const write = windows.GENERIC_ALL | windows.GENERIC_WRITE | windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA | windows.FILE_WRITE_EA | windows.FILE_WRITE_ATTRIBUTES | fileDeleteChild | windows.DELETE | windows.WRITE_DAC | windows.WRITE_OWNER
+			if !sid.Equals(user) && (strict || (!privileged(sid) && ace.Mask&write != 0)) {
 				return fmt.Errorf("cobrowse base dir %s grants access to %s; only the current user may have access", dir, sid)
 			}
 		default:

@@ -13,9 +13,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -69,9 +71,17 @@ type localCobrowseOptions struct {
 	// default-browser opener (tests).
 	viewer  bool
 	openURL func(string) error
+	// nodePermissions serves the viewer's Files and Shell toggles for this
+	// PC's AceTeam node (citadel-cli#1867 C5); nil hides them.
+	nodePermissions *localviewer.NodePermissionHooks
 	// auditRetention overrides the audit retention (default 90 days, or
 	// CITADEL_LOCAL_AUDIT_RETENTION_DAYS).
 	auditRetention time.Duration
+	// resolve and dial replace the system resolver and dialer in both the URL
+	// policy and the egress guard. They are only set by the citadel_e2e test
+	// build (local_e2e_hook.go); the address policy itself is unchanged.
+	resolve localcobrowse.Resolver
+	dial    func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // localAuditRetention reads CITADEL_LOCAL_AUDIT_RETENTION_DAYS (1 to 3650).
@@ -88,8 +98,11 @@ func localAuditRetention() time.Duration {
 // reaches here: the event carries only its length.
 func auditRecordFor(ev localcobrowse.Event) localaudit.Record {
 	actor := "agent"
-	if ev.Class == "H" {
+	switch ev.Class {
+	case "H":
 		actor = "user"
+	case "B":
+		actor = "citadel" // the browser or Citadel acting on its own
 	}
 	rules := ""
 	if ev.Fingerprint != "" {
@@ -164,6 +177,23 @@ func (rt *localCobrowseRuntime) auditPrecheck() error {
 
 func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 	rt := &localCobrowseRuntime{stop: make(chan struct{}), closed: make(chan struct{})}
+	// Capture only the environment now; resolve the local state path lazily,
+	// so constructing a bridge never reads user state or creates a directory.
+	uploadEnvironment := os.Getenv("CITADEL_LOCAL_UPLOADS")
+	var uploadOnce sync.Once
+	var uploadSettings *localcobrowse.UploadSettings
+	uploadStatus := func() localcobrowse.UploadStatus {
+		uploadOnce.Do(func() {
+			var dir string
+			if opts.ownerDir != nil {
+				dir = opts.ownerDir()
+			} else {
+				dir = localStateDir()
+			}
+			uploadSettings = localcobrowse.NewUploadSettings(dir, uploadEnvironment)
+		})
+		return uploadSettings.Status()
+	}
 	browser := opts.browser
 	var manager *platform.CobrowseSessionManager
 	if browser == nil {
@@ -179,7 +209,7 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 			openURL = platform.OpenURL
 		}
 		rt.viewerFactory = func() (*localviewer.Server, error) {
-			cfg := localviewer.Config{Service: rt.svc, OpenURL: openURL, MaxSessions: localcobrowse.DefaultMaxSessions}
+			cfg := localviewer.Config{Service: rt.svc, OpenURL: openURL, MaxSessions: localcobrowse.DefaultMaxSessions, NodePermissions: opts.nodePermissions}
 			if opts.ownerDir != nil {
 				dir := filepath.Join(opts.ownerDir(), localaudit.DirName)
 				cfg.Activity = func(session string, limit int) ([]localaudit.Record, error) {
@@ -202,14 +232,19 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 		onAttention = rt.attention
 		viewerNote = "The Citadel viewer opens in the user's default browser, where they watch, approve and take control. If it is closed, they can run `citadel local viewer`."
 	}
+	policy := opts.policy
+	if policy == nil && opts.resolve != nil {
+		policy = localcobrowse.NewURLPolicy(opts.resolve, viewerPorts)
+	}
 	var profiles localcobrowse.ProfileStore
 	if opts.ownerDir != nil {
 		profiles = localProfileStore{dir: opts.ownerDir}
 	}
 	rt.svc = localcobrowse.New(localcobrowse.Config{
 		Browser:     browser,
+		Uploads:     uploadStatus,
 		Profiles:    profiles,
-		URLPolicy:   opts.policy,
+		URLPolicy:   policy,
 		ViewerPorts: viewerPorts,
 		OnAttention: onAttention,
 		OnEvent: func(ev localcobrowse.Event) {
@@ -247,7 +282,7 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 				// Every connection of the real browser goes through the
 				// egress guard. If it cannot start, co-browse refuses: the
 				// URL filter alone does not see redirects or subresources.
-				g, gerr := localcobrowse.StartEgressGuard(nil, nil)
+				g, gerr := localcobrowse.StartEgressGuard(opts.resolve, opts.dial)
 				if gerr != nil {
 					// Drop the log before the lock: once released, another
 					// process may own (and write) this chain.
@@ -271,6 +306,11 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 			return nil
 		},
 	})
+	if manager != nil {
+		// A popup or new tab passes the same address filter as navigation;
+		// the egress guard still covers its connections.
+		manager.EnableTargetTracking(rt.svc.TargetPolicy(), rt.svc.RecordTargetEvent)
+	}
 	go func() {
 		t := time.NewTicker(time.Minute)
 		defer t.Stop()
@@ -283,6 +323,9 @@ func newLocalCobrowseRuntime(opts localCobrowseOptions) *localCobrowseRuntime {
 			}
 		}
 	}()
+	if manager != nil {
+		manager.SetFilesAllowed(rt.svc.UploadsAllowed)
+	}
 	return rt
 }
 
@@ -405,10 +448,147 @@ func decodeArgs(args json.RawMessage, into any) error {
 	return nil
 }
 
+// receivedKeys lists the top-level key names of args, sorted and bounded.
+// Never values.
+func receivedKeys(args json.RawMessage) string {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(args, &m) != nil {
+		return "(none)"
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		if len(k) > 64 {
+			k = k[:64] + "..."
+		}
+		keys = append(keys, strconv.Quote(k))
+	}
+	sort.Strings(keys)
+	if len(keys) > 32 {
+		keys = append(keys[:32], "...")
+	}
+	return "[" + strings.Join(keys, ", ") + "]"
+}
+
+// withReceivedKeys names the keys a refused call actually sent (as received,
+// before normalization), so a client that renames arguments is diagnosable.
+// Other errors pass through.
+func withReceivedKeys(raw json.RawMessage, err error) error {
+	var ae argError
+	if !errors.As(err, &ae) {
+		return err
+	}
+	return argError{fmt.Errorf("%w; received argument keys: %s", ae.error, receivedKeys(raw))}
+}
+
+// argKeyCanon folds a property name or a client's spelling of it to one form,
+// so session_id, sessionId, sessionID and session-id compare equal.
+func argKeyCanon(k string) string {
+	return strings.ToLower(strings.NewReplacer("_", "", "-", "").Replace(k))
+}
+
+// normalizeArgKeys maps top-level argument keys that are another-case spelling
+// of a declared property (some MCP clients send camelCase) to the declared
+// name. A variant next to the declared name, or two variants of one name, is
+// refused rather than guessed. Unknown keys and non-object arguments pass
+// through for decodeArgs to handle. Values are never inspected.
+func normalizeArgKeys(args json.RawMessage, declared map[string]any) (json.RawMessage, error) {
+	var m map[string]json.RawMessage
+	if len(args) == 0 || json.Unmarshal(args, &m) != nil || m == nil {
+		return args, nil
+	}
+	byCanon := make(map[string]string, len(declared))
+	for name := range declared {
+		byCanon[argKeyCanon(name)] = name
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make(map[string]json.RawMessage, len(m))
+	changed := false
+	for _, k := range keys {
+		// encoding/json folds struct-tag matches with Unicode simple folding
+		// (long s, Kelvin sign), which argKeyCanon does not see. Refuse any
+		// non-ASCII key so no spelling can slip past the duplicate check.
+		for i := 0; i < len(k); i++ {
+			if k[i] >= 0x80 {
+				return nil, argError{fmt.Errorf("argument key %s contains non-ASCII characters", strconv.QuoteToASCII(truncKey(k)))}
+			}
+		}
+		name := k
+		if d, ok := byCanon[argKeyCanon(k)]; ok && d != k {
+			name, changed = d, true
+		}
+		if _, dup := out[name]; dup {
+			return nil, argError{fmt.Errorf("duplicate argument %q (sent more than once under different spellings)", name)}
+		}
+		out[name] = m[k]
+	}
+	if !changed {
+		return args, nil
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return args, nil
+	}
+	return b, nil
+}
+
+// normalizeLocalArgs is normalizeArgKeys plus the session alias: tools declare
+// "cobrowse_session" (some clients drop an argument named session_id), and
+// session_id and its spelling variants are still accepted. The result always
+// carries the id under session_id, which the handlers decode. Both names with
+// different values are refused.
+func normalizeLocalArgs(args json.RawMessage, declared map[string]any) (json.RawMessage, error) {
+	if _, ok := declared["cobrowse_session"]; !ok {
+		return normalizeArgKeys(args, declared)
+	}
+	decl := make(map[string]any, len(declared)+1)
+	for k, v := range declared {
+		decl[k] = v
+	}
+	decl["session_id"] = nil
+	args, err := normalizeArgKeys(args, decl)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]json.RawMessage
+	if len(args) == 0 || json.Unmarshal(args, &m) != nil || m == nil {
+		return args, nil
+	}
+	cs, hasC := m["cobrowse_session"]
+	sid, hasS := m["session_id"]
+	if !hasC {
+		return args, nil
+	}
+	if hasS && !sameSessionValue(cs, sid) {
+		return nil, argError{fmt.Errorf("'cobrowse_session' and 'session_id' were both sent with different values; send only cobrowse_session")}
+	}
+	m["session_id"] = cs
+	delete(m, "cobrowse_session")
+	return json.Marshal(m)
+}
+
+func sameSessionValue(a, b json.RawMessage) bool {
+	var x, y string
+	if json.Unmarshal(a, &x) == nil && json.Unmarshal(b, &y) == nil {
+		return strings.TrimSpace(x) == strings.TrimSpace(y)
+	}
+	return string(a) == string(b)
+}
+
+func truncKey(k string) string {
+	if len(k) > 64 {
+		return k[:64]
+	}
+	return k
+}
+
 func requireSession(id string) (string, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
-		return "", argError{fmt.Errorf("'session_id' is required (from local_cobrowse_start)")}
+		return "", argError{fmt.Errorf("'cobrowse_session' is required (the session id returned by local_cobrowse_start; 'session_id' is accepted as an alias)")}
 	}
 	return id, nil
 }
@@ -420,10 +600,18 @@ func recordArgRefusal(s *localcobrowse.Service, tool string, args json.RawMessag
 		return
 	}
 	var in struct {
-		SessionID string `json:"session_id"`
+		SessionID    string `json:"session_id"`
+		CobrowseSess string `json:"cobrowse_session"`
+	}
+	if norm, nerr := normalizeLocalArgs(args, map[string]any{"cobrowse_session": nil}); nerr == nil {
+		args = norm
 	}
 	_ = json.Unmarshal(args, &in)
-	s.RecordRefusal(strings.TrimSpace(in.SessionID), strings.TrimPrefix(tool, "local_cobrowse_"), "", err)
+	id := strings.TrimSpace(in.CobrowseSess)
+	if id == "" {
+		id = strings.TrimSpace(in.SessionID)
+	}
+	s.RecordRefusal(id, strings.TrimPrefix(tool, "local_cobrowse_"), "", err)
 }
 
 func strProp(desc string) map[string]any {
@@ -442,7 +630,7 @@ func objSchema(props map[string]any, required ...string) map[string]any {
 }
 
 const (
-	descSession = "A session id from local_cobrowse_start."
+	descSession = "The co-browse session id returned by local_cobrowse_start."
 	descGoal    = "Optional short description of what you are trying to do, recorded in the local audit log."
 )
 
@@ -464,9 +652,15 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				if err != nil {
 					return "", err
 				}
-				v, err := do(ctx, s, args)
+				raw := args
+				var v any
+				args, err = normalizeLocalArgs(raw, props)
+				if err == nil {
+					v, err = do(ctx, s, args)
+				}
 				if err != nil {
-					recordArgRefusal(s, name, args, err)
+					err = withReceivedKeys(raw, err)
+					recordArgRefusal(s, name, raw, err)
 					return "", err
 				}
 				return jsonText(v)
@@ -474,6 +668,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 		}
 	}
 
+	screenshotProps := map[string]any{"cobrowse_session": strProp(descSession), "goal": strProp(descGoal)}
 	writeNote := " A WRITE: needs the user's approval for the site (its registrable domain) in the Citadel viewer. Without it the call returns approval_required; then call local_cobrowse_wait with until=approved. Anything that sends, posts, submits, pays or deletes (a Send or Post button, Enter in a message or form field, an unlabeled or unidentifiable target) needs the user's approval every time, whatever was approved: the call returns commit_approval_required; call local_cobrowse_wait with until=commit, then repeat the same call. Refused while the user has control."
 	readNote := " A READ: no approval needed. Refused while the user has control, so you never see what they type."
 
@@ -506,8 +701,8 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				return s.Start(ctx, in.URL, in.Goal, in.Profile)
 			}),
 		writeTool("local_cobrowse_status",
-			"Show local co-browse sessions: state, who is driving, URL, approval state and expiry, a pending handoff, and the lifetime policy. Omit session_id to list all.",
-			map[string]any{"session_id": strProp("Optional session id.")}, nil,
+			"Show local co-browse sessions: state, who is driving, URL, approval state and expiry, a pending handoff, and the lifetime policy. Omit cobrowse_session to list all.",
+			map[string]any{"cobrowse_session": strProp("Optional co-browse session id.")}, nil,
 			func(ctx context.Context, s *localcobrowse.Service, args json.RawMessage) (any, error) {
 				var in struct {
 					SessionID string `json:"session_id"`
@@ -522,8 +717,8 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				return map[string]any{"sessions": views, "agent": s.Agent()}, nil
 			}),
 		writeTool("local_cobrowse_navigate", "Open a URL in a local session."+writeNote,
-			map[string]any{"session_id": strProp(descSession), "url": strProp("The http(s) URL to open."), "goal": strProp(descGoal)},
-			[]string{"session_id", "url"},
+			map[string]any{"cobrowse_session": strProp(descSession), "url": strProp("The http(s) URL to open."), "goal": strProp(descGoal)},
+			[]string{"cobrowse_session", "url"},
 			func(ctx context.Context, s *localcobrowse.Service, args json.RawMessage) (any, error) {
 				var in struct {
 					SessionID string `json:"session_id"`
@@ -539,9 +734,9 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				return s.Navigate(ctx, id, in.URL, in.Goal)
 			}),
 		writeTool("local_cobrowse_click", "Click an element by CSS selector, or a viewport point by x and y. Returns dispatched, settled and navigated; a slow page after the click is not a failure, so do not repeat a dispatched click."+writeNote,
-			map[string]any{"session_id": strProp(descSession), "selector": strProp("CSS selector; wins over x/y."),
+			map[string]any{"cobrowse_session": strProp(descSession), "selector": strProp("CSS selector; wins over x/y."),
 				"x": numProp("Viewport X in CSS pixels (with y)."), "y": numProp("Viewport Y in CSS pixels (with x)."), "goal": strProp(descGoal)},
-			[]string{"session_id"},
+			[]string{"cobrowse_session"},
 			func(ctx context.Context, s *localcobrowse.Service, args json.RawMessage) (any, error) {
 				var in clickArgs
 				if err := decodeArgs(args, &in); err != nil {
@@ -554,11 +749,11 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				if in.Selector == "" && (in.X == nil || in.Y == nil) {
 					return nil, argError{fmt.Errorf("click requires 'selector' or both 'x' and 'y'")}
 				}
-				return s.Click(ctx, id, in.Selector, in.X, in.Y, in.Goal)
+				return partialActionResult(s.Click(ctx, id, in.Selector, in.X, in.Y, in.Goal))
 			}),
 		writeTool("local_cobrowse_type", "Type text into the focused field (click it first). Only the text length is recorded. Never use this for passwords: hand off to the user instead."+writeNote,
-			map[string]any{"session_id": strProp(descSession), "text": strProp("Text to insert."), "goal": strProp(descGoal)},
-			[]string{"session_id", "text"},
+			map[string]any{"cobrowse_session": strProp(descSession), "text": strProp("Text to insert."), "goal": strProp(descGoal)},
+			[]string{"cobrowse_session", "text"},
 			func(ctx context.Context, s *localcobrowse.Service, args json.RawMessage) (any, error) {
 				var in struct {
 					SessionID  string `json:"session_id"`
@@ -571,12 +766,12 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				if err != nil {
 					return nil, err
 				}
-				return s.Type(ctx, id, in.Text, in.Goal)
+				return partialActionResult(s.Type(ctx, id, in.Text, in.Goal))
 			}),
 		writeTool("local_cobrowse_select", "Choose an option in a native select element by value or label."+writeNote,
-			map[string]any{"session_id": strProp(descSession), "selector": strProp("CSS selector of the select element."),
+			map[string]any{"cobrowse_session": strProp(descSession), "selector": strProp("CSS selector of the select element."),
 				"value": strProp("Option value."), "label": strProp("Option label, used when value is empty."), "goal": strProp(descGoal)},
-			[]string{"session_id", "selector"},
+			[]string{"cobrowse_session", "selector"},
 			func(ctx context.Context, s *localcobrowse.Service, args json.RawMessage) (any, error) {
 				var in struct {
 					SessionID                    string `json:"session_id"`
@@ -592,8 +787,8 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				return s.Select(ctx, id, in.Selector, in.Value, in.Label, in.Goal)
 			}),
 		writeTool("local_cobrowse_key", "Press one key: Enter, Tab, Escape, Backspace, Delete, arrows, Home, End, PageUp, PageDown, a letter, digit or space."+writeNote,
-			map[string]any{"session_id": strProp(descSession), "key": strProp("The key name."), "goal": strProp(descGoal)},
-			[]string{"session_id", "key"},
+			map[string]any{"cobrowse_session": strProp(descSession), "key": strProp("The key name."), "goal": strProp(descGoal)},
+			[]string{"cobrowse_session", "key"},
 			func(ctx context.Context, s *localcobrowse.Service, args json.RawMessage) (any, error) {
 				var in struct {
 					SessionID string `json:"session_id"`
@@ -606,13 +801,13 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				if err != nil {
 					return nil, err
 				}
-				return s.Key(ctx, id, in.Key, in.Goal)
+				return partialActionResult(s.Key(ctx, id, in.Key, in.Goal))
 			}),
 		writeTool("local_cobrowse_scroll", "Scroll with the mouse wheel at an element or viewport point."+writeNote,
-			map[string]any{"session_id": strProp(descSession), "selector": strProp("CSS selector; wins over x/y."),
+			map[string]any{"cobrowse_session": strProp(descSession), "selector": strProp("CSS selector; wins over x/y."),
 				"x": numProp("Viewport X."), "y": numProp("Viewport Y."),
 				"delta_x": numProp("Horizontal scroll in pixels."), "delta_y": numProp("Vertical scroll in pixels (positive scrolls down)."), "goal": strProp(descGoal)},
-			[]string{"session_id"},
+			[]string{"cobrowse_session"},
 			func(ctx context.Context, s *localcobrowse.Service, args json.RawMessage) (any, error) {
 				var in scrollArgs
 				if err := decodeArgs(args, &in); err != nil {
@@ -622,14 +817,14 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				if err != nil {
 					return nil, err
 				}
-				return s.Scroll(ctx, id, in.Selector, in.X, in.Y, in.DeltaX, in.DeltaY, in.Goal)
+				return partialActionResult(s.Scroll(ctx, id, in.Selector, in.X, in.Y, in.DeltaX, in.DeltaY, in.Goal))
 			}),
 		writeTool("local_cobrowse_extract", "Read an element's text (bounded; truncated is true when cut) and optional attributes. The value of a password field is never returned."+readNote,
-			map[string]any{"session_id": strProp(descSession), "selector": strProp("CSS selector."),
+			map[string]any{"cobrowse_session": strProp(descSession), "selector": strProp("CSS selector."),
 				"attrs":     strProp("Optional comma-separated attribute names, e.g. \"href,id\"."),
 				"max_chars": numProp(fmt.Sprintf("Maximum text characters (default %d, at most %d).", localcobrowse.DefaultExtractChars, localcobrowse.MaxExtractChars)),
 				"goal":      strProp(descGoal)},
-			[]string{"session_id", "selector"},
+			[]string{"cobrowse_session", "selector"},
 			func(ctx context.Context, s *localcobrowse.Service, args json.RawMessage) (any, error) {
 				var in struct {
 					SessionID string  `json:"session_id"`
@@ -660,7 +855,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 		{
 			Name:        "local_cobrowse_screenshot",
 			Description: "Capture the session's current viewport as a PNG image." + readNote,
-			InputSchema: objSchema(map[string]any{"session_id": strProp(descSession), "goal": strProp(descGoal)}, "session_id"),
+			InputSchema: objSchema(screenshotProps, "cobrowse_session"),
 			Async:       true,
 			CallContent: func(ctx context.Context, args json.RawMessage) ([]map[string]any, error) {
 				s, err := svc()
@@ -671,13 +866,20 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 					SessionID string `json:"session_id"`
 					Goal      string `json:"goal"`
 				}
-				if err := decodeArgs(args, &in); err != nil {
-					recordArgRefusal(s, "local_cobrowse_screenshot", args, err)
+				raw := args
+				args, err = normalizeLocalArgs(raw, screenshotProps)
+				if err == nil {
+					err = decodeArgs(args, &in)
+				}
+				if err != nil {
+					err = withReceivedKeys(raw, err)
+					recordArgRefusal(s, "local_cobrowse_screenshot", raw, err)
 					return nil, err
 				}
 				id, err := requireSession(in.SessionID)
 				if err != nil {
-					recordArgRefusal(s, "local_cobrowse_screenshot", args, err)
+					err = withReceivedKeys(raw, err)
+					recordArgRefusal(s, "local_cobrowse_screenshot", raw, err)
 					return nil, err
 				}
 				png, err := s.Screenshot(ctx, id, in.Goal)
@@ -688,8 +890,8 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 			},
 		},
 		writeTool("local_cobrowse_handoff", "Hand the browser to the user, for example to log in or pay. The viewer shows them a one-line message from reason. Every browser action of yours is refused until they press Hand back; call local_cobrowse_wait with until=resumed.",
-			map[string]any{"session_id": strProp(descSession), "reason": strProp("Short instruction shown to the user, e.g. \"log in, then hand back\"."), "goal": strProp(descGoal)},
-			[]string{"session_id"},
+			map[string]any{"cobrowse_session": strProp(descSession), "reason": strProp("Short instruction shown to the user, e.g. \"log in, then hand back\"."), "goal": strProp(descGoal)},
+			[]string{"cobrowse_session"},
 			func(ctx context.Context, s *localcobrowse.Service, args json.RawMessage) (any, error) {
 				var in struct {
 					SessionID    string `json:"session_id"`
@@ -705,7 +907,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				return s.Handoff(ctx, id, in.Reason, in.Goal)
 			}),
 		writeTool("local_cobrowse_resume", "Confirm the browser is back with you. Only the user can hand control back (Hand back to agent in the viewer); while they have control this is refused, so call local_cobrowse_wait with until=resumed instead.",
-			map[string]any{"session_id": strProp(descSession)}, []string{"session_id"},
+			map[string]any{"cobrowse_session": strProp(descSession)}, []string{"cobrowse_session"},
 			func(ctx context.Context, s *localcobrowse.Service, args json.RawMessage) (any, error) {
 				var in struct {
 					SessionID string `json:"session_id"`
@@ -720,7 +922,7 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				return s.Resume(ctx, id)
 			}),
 		writeTool("local_cobrowse_stop", "End a session. A throwaway session's cookies and logins are deleted; a saved-logins profile is encrypted again and kept.",
-			map[string]any{"session_id": strProp(descSession)}, []string{"session_id"},
+			map[string]any{"cobrowse_session": strProp(descSession)}, []string{"cobrowse_session"},
 			func(ctx context.Context, s *localcobrowse.Service, args json.RawMessage) (any, error) {
 				var in struct {
 					SessionID string `json:"session_id"`
@@ -738,10 +940,10 @@ func newLocalCobrowseTools(rt *localCobrowseRuntime) []localMCPTool {
 				return map[string]any{"session_id": id, "stopped": true}, nil
 			}),
 		writeTool("local_cobrowse_wait", "Wait for the user: until=approved (they approved AI actions on the site), until=commit (they answered a send/post/submit/pay request; approved means repeat the same call, denied is final), until=resumed (they handed control back) or until=unlocked (they unlocked a saved-logins profile; a detail says if they chose a throwaway session instead). Returns within timeout_seconds (at most 50). If still_waiting is true, call again; denied or revoked are final answers.",
-			map[string]any{"session_id": strProp(descSession),
+			map[string]any{"cobrowse_session": strProp(descSession),
 				"until":           map[string]any{"type": "string", "enum": []string{"approved", "resumed", "unlocked", "commit"}},
 				"timeout_seconds": numProp("Seconds to wait, at most 50 (default 50).")},
-			[]string{"session_id", "until"},
+			[]string{"cobrowse_session", "until"},
 			func(ctx context.Context, s *localcobrowse.Service, args json.RawMessage) (any, error) {
 				var in struct {
 					SessionID string  `json:"session_id"`
@@ -777,4 +979,32 @@ func handleLocalCobrowseSignals(rt *localCobrowseRuntime) {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 	go closeOnSignal(rt, sigs, os.Exit)
+}
+
+// partialToolError is the error a partly done write returns: the failure text
+// first, then the structured result (done=false, effects), so the MCP result is
+// isError with the details attached. It is never a plain success.
+type partialToolError struct {
+	err    error
+	result []byte
+}
+
+func (e *partialToolError) Error() string { return e.err.Error() + "\nresult: " + string(e.result) }
+func (e *partialToolError) Unwrap() error { return e.err }
+
+// partialActionResult attaches the structured effects of a write that hit its
+// deadline or failed after it may have acted to the tool ERROR. Refusals stay
+// exactly as they were. The failure was already audited.
+func partialActionResult(res localcobrowse.ActionResult, err error) (any, error) {
+	if err == nil || res.Done == nil || *res.Done {
+		return res, err
+	}
+	if errors.Is(err, platform.ErrTargetChanged) || errors.Is(err, platform.ErrPageRefused) {
+		return nil, err
+	}
+	b, merr := json.Marshal(res)
+	if merr != nil {
+		return nil, err
+	}
+	return nil, &partialToolError{err: err, result: b}
 }

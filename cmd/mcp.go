@@ -240,7 +240,7 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	if memoryCfg == nil {
 		// The enrolled bridge also serves local_cobrowse_* for THIS machine,
 		// alongside the remote cobrowse_* tools that take a node_id.
-		cobrowseRT = newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: localStateDir, viewer: true})
+		cobrowseRT = newLocalCobrowseRuntime(localCobrowseOptions{ownerDir: localStateDir, viewer: true, nodePermissions: viewerNodePermissions()})
 		defer cobrowseRT.close()
 		// Saved-logins sessions are re-sealed on close, so a signal must run
 		// the same teardown before the process exits.

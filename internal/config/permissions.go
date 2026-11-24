@@ -45,6 +45,24 @@ type Permissions struct {
 	Provision bool `yaml:"provision" json:"provision"` // Container provisioning API (default-on, opt-out)
 	Shell     bool `yaml:"shell" json:"shell"`         // SHELL_COMMAND job execution (default-deny, opt-in)
 
+	// CobrowsePublicOnly runs every remote (node-wide) co-browse session behind
+	// an egress guard that refuses loopback, private, link-local and mesh
+	// addresses, so a remote agent cannot reach this machine's home network
+	// (citadel-cli#1867 C4b). Absent or false keeps the historical behavior,
+	// since server nodes may legitimately browse an intranet. Read live at
+	// every session start. Remote config may turn it on; only a local command
+	// turns it off.
+	CobrowsePublicOnly bool `yaml:"cobrowse_public_only,omitempty" json:"cobrowse_public_only,omitempty"`
+
+	// SetupPosture marks a PC connected to AceTeam from the local setup page
+	// (citadel-cli#1867 C5). While it is set, remote APPLY_DEVICE_CONFIG may
+	// turn surfaces off but never on and may not push a passcode, and the
+	// worker refuses the job types that start software on the PC
+	// (worker.setupPostureRefusedJobTypes). Only the human at the PC (the setup
+	// page, the local viewer, the `citadel permission` CLI) grants Files or
+	// Shell. Absent on every other node, so fleet behavior is unchanged.
+	SetupPosture string `yaml:"setup_posture,omitempty" json:"setup_posture,omitempty"`
+
 	// PasscodeHash is the bcrypt hash of the per-node passcode that gates the
 	// sensitive remote-access surfaces (console/desktop/files). It is never the
 	// plaintext PIN — bcrypt embeds its own salt, so no separate salt field is
@@ -54,6 +72,25 @@ type Permissions struct {
 }
 
 const permissionsFile = "permissions.yaml"
+
+// SetupPostureCobrowseOnly is the SetupPosture a setup-page enrollment writes.
+const SetupPostureCobrowseOnly = "cobrowse_only"
+
+// SetupPostureActive reports whether configDir's permissions file carries a
+// SetupPosture. A file that cannot be parsed counts as carrying one when the
+// key appears in it, so damage never silently lifts the posture, while a
+// damaged file on a node that never had one keeps today's behavior. A file
+// this process cannot read at all (for example one a root process saved on a
+// fleet node) reads as no posture, as it does for every other permission; a
+// setup-page PC's file belongs to its own user.
+func SetupPostureActive(configDir string) bool {
+	p, err := LoadPermissionsStrict(configDir)
+	if err == nil {
+		return p.SetupPosture != ""
+	}
+	data, rerr := os.ReadFile(filepath.Join(configDir, permissionsFile))
+	return rerr == nil && strings.Contains(string(data), "setup_posture")
+}
 
 // bcryptPasscodeCost is deliberately the library default. The passcode is a
 // short interactive PIN, not a password database, and verification runs on the

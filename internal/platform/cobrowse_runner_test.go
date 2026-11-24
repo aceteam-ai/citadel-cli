@@ -15,26 +15,26 @@ import (
 )
 
 // TestBuildChromeArgs_LinuxArgsUnchanged pins the exact headed (Xvfb) argument
-// list so the Windows headless options cannot change the Linux launch.
+// list (the real runner argv, including --password-store=basic) so the Windows
+// headless options cannot change the Linux launch.
 func TestBuildChromeArgs_LinuxArgsUnchanged(t *testing.T) {
-	got := buildChromeArgs(cobrowseLaunchOptions{
-		debugPort:  9333,
-		profileDir: "/p",
-		startURL:   "http://example.test/",
-		stealth:    true,
-		softwareGL: true,
-	})
+	t.Setenv(EnvCobrowseUserAgent, "")
+	t.Setenv(EnvCobrowseStealth, "")
+	got := buildXvfbChromeArgs(9333, "/p", "http://example.test/", LaunchOptions{})
 	want := []string{
 		"--remote-debugging-port=9333",
 		"--remote-debugging-address=127.0.0.1",
 		"--user-data-dir=/p",
 		"--no-first-run",
 		"--no-default-browser-check",
+		"--allow-browser-signin=false",
+		"--disable-sync",
 		"--start-maximized",
 		"--disable-blink-features=AutomationControlled",
 		"--lang=en-US",
 		"--disable-features=Translate",
 		"--disable-gpu",
+		"--password-store=basic",
 		"--",
 		"http://example.test/",
 	}
@@ -164,6 +164,38 @@ func TestDiscoverWindowsBrowser_OverrideIsExact(t *testing.T) {
 	}
 }
 
+func TestDiscoverWindowsBrowser_OverrideByName(t *testing.T) {
+	chrome := `C:\Program Files\Google\Chrome\Application\chrome.exe`
+	edge := `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`
+	for _, tc := range []struct{ val, want, kind string }{
+		{"edge", edge, "edge"},
+		{"EDGE", edge, "edge"},
+		{"Chrome", chrome, "chrome"},
+	} {
+		f := &fakeWinProbe{env: baseWinEnv(), files: map[string]bool{chrome: true, edge: true}}
+		f.env[EnvCobrowseBrowser] = tc.val
+		info, err := discoverWindowsBrowser(f.probe())
+		if err != nil || info.Path != tc.want || info.Kind != tc.kind {
+			t.Fatalf("%q: got %+v err %v", tc.val, info, err)
+		}
+	}
+	// A named browser that is not installed never falls back to the other.
+	f := &fakeWinProbe{env: baseWinEnv(), files: map[string]bool{chrome: true}}
+	f.env[EnvCobrowseBrowser] = "edge"
+	if _, err := discoverWindowsBrowser(f.probe()); !errors.Is(err, ErrNoBrowser) {
+		t.Fatalf("missing edge must fail, got %v", err)
+	}
+}
+
+func TestDiscoverWindowsBrowser_OverrideUnknownListsForms(t *testing.T) {
+	f := &fakeWinProbe{env: baseWinEnv(), files: map[string]bool{}}
+	f.env[EnvCobrowseBrowser] = "firefox"
+	_, err := discoverWindowsBrowser(f.probe())
+	if !errors.Is(err, ErrNoBrowser) || !strings.Contains(err.Error(), "a path to the browser executable, or one of: chrome, edge") {
+		t.Fatalf("got %v", err)
+	}
+}
+
 func TestDiscoverWindowsBrowser_NoneListsSearched(t *testing.T) {
 	f := &fakeWinProbe{env: baseWinEnv(), files: map[string]bool{}}
 	_, err := discoverWindowsBrowser(f.probe())
@@ -275,6 +307,9 @@ func TestBuildChromeArgs_ProxyAndQuiet(t *testing.T) {
 		"--proxy-server=http://127.0.0.1:4000",
 		"--proxy-bypass-list=<-loopback>",
 		"--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+		"--webrtc-ip-handling-policy=disable_non_proxied_udp",
+		"--disable-extensions",
+		"--disable-quic",
 		"--disable-background-networking",
 		"--disable-component-update",
 	} {

@@ -18,6 +18,8 @@ import (
 // NodeStatus represents the complete status of a Citadel node.
 // This is the payload sent in heartbeats and returned from /status endpoint.
 type NodeStatus struct {
+	// Role is the running worker's startup policy. Legacy/full nodes omit it.
+	Role string `json:"role,omitempty"`
 	// Cached daemon report. Unknown is explicit null, never false/synced.
 	NTPSynced *bool `json:"ntp_synced"`
 	// Optional S5 placeholder; nil means no measurement, not zero recordings.
@@ -307,6 +309,10 @@ type WorkerLiveness struct {
 	PlatformFailingSince   *time.Time `json:"platform_failing_since,omitempty"`
 	PlatformLastOutcome    string     `json:"platform_last_outcome,omitempty"`
 	PlatformLastHTTPStatus int        `json:"platform_last_http_status,omitempty"`
+	// RateLimitedSince / LastRetryAfterSeconds mirror worker.WorkerSnapshot: an
+	// open platform 429 window, cleared on the next successful API request.
+	RateLimitedSince      *time.Time `json:"rate_limited_since,omitempty"`
+	LastRetryAfterSeconds int64      `json:"last_retry_after_seconds,omitempty"`
 	// InFlight is the number of jobs currently executing in a handler.
 	InFlight int64 `json:"in_flight"`
 	// Processed / Failed are cumulative since worker start (diagnostic context).
@@ -602,10 +608,20 @@ type NodeInfo struct {
 
 // SystemMetrics contains system resource utilization.
 type SystemMetrics struct {
-	CPUPercent    float64 `json:"cpu_percent"`
-	MemoryUsedGB  float64 `json:"memory_used_gb"`
-	MemoryTotalGB float64 `json:"memory_total_gb"`
-	MemoryPercent float64 `json:"memory_percent"`
+	// Optional placement signals. Pointers distinguish observed zero from an
+	// unavailable source; pressure avg60 values use the kernel's percent unit.
+	Load1              *float64 `json:"load1,omitempty"`
+	Load5              *float64 `json:"load5,omitempty"`
+	Load15             *float64 `json:"load15,omitempty"`
+	NCPU               *int     `json:"ncpu,omitempty"`
+	PSICPUSomeAvg60    *float64 `json:"psi_cpu_some_avg60,omitempty"`
+	PSIIOSomeAvg60     *float64 `json:"psi_io_some_avg60,omitempty"`
+	PSIIOFullAvg60     *float64 `json:"psi_io_full_avg60,omitempty"`
+	PSIMemorySomeAvg60 *float64 `json:"psi_mem_some_avg60,omitempty"`
+	CPUPercent         float64  `json:"cpu_percent"`
+	MemoryUsedGB       float64  `json:"memory_used_gb"`
+	MemoryTotalGB      float64  `json:"memory_total_gb"`
+	MemoryPercent      float64  `json:"memory_percent"`
 	// MemoryAvailableGB is RAM available for programs to allocate (gopsutil's
 	// kernel-computed "available", e.g. Linux MemAvailable — it already
 	// accounts for reclaimable page cache, unlike a naive total-used).

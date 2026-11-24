@@ -36,6 +36,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/cdpdiscovery"
@@ -108,8 +109,17 @@ type cobrowseLaunchOptions struct {
 	// (--password-store=basic) instead of the OS keyring. See buildChromeArgs for
 	// the full rationale: it makes cookie encryption binary- and
 	// environment-independent, which a persistent, externally-seeded profile
-	// requires. Left false for co-browse (keeps keyring-backed persistent logins).
+	// requires. Also set for the managed-Xvfb co-browse runner (buildXvfbChromeArgs), where
+	// the keyring wait stalled the first page load ~25s (citadel-cli#1694).
 	passwordStoreBasic bool
+	// mockKeychain keeps Chromium off the macOS login Keychain
+	// (--use-mock-keychain). A hidden session has no window to answer the
+	// "confidential information in your keychain" prompt, which would stall
+	// the first cookie-store use. Consequence: cookies in a profile are
+	// encrypted with Chromium's fixed mock key, not the user's Keychain item
+	// (the sealed profile blob is vault-encrypted either way). Set only by the
+	// macOS headless runner.
+	mockKeychain bool
 	// autoplayNoUserGesture relaxes Chrome's autoplay policy
 	// (--autoplay-policy=no-user-gesture-required). An automated browser has no
 	// user gesture, so by default Chrome refuses to start an AudioContext / play
@@ -125,7 +135,8 @@ type cobrowseLaunchOptions struct {
 	// the screencast viewer shows it instead. Left false on the Linux Xvfb path,
 	// whose argument list is unchanged.
 	headless bool
-	// windowSize is "W,H" for --window-size, applied only when headless.
+	// windowSize is "W,H" for --window-size. An explicit appliance size also
+	// applies to headed sessions instead of --start-maximized.
 	windowSize string
 	// proxyServer routes every browser connection through this HTTP proxy,
 	// including loopback ("<-loopback>" removes Chrome's implicit bypass), and
@@ -174,7 +185,16 @@ func stealthEnabled() bool {
 // plugins / languages, window.chrome.runtime, permissions.query, WebGL
 // vendor/renderer, canvas/audio noise), per-identity consistent fingerprints,
 // and proxy/TLS (JA3) alignment.
+// configuredBrowserWindow is set only by the explicit appliance profile.
+// An unset value preserves every existing runner's argument defaults.
+var configuredBrowserWindow atomic.Value
+
+func SetBrowserWindowSize(size string) { configuredBrowserWindow.Store(size) }
+
 func buildChromeArgs(opts cobrowseLaunchOptions) []string {
+	if size, ok := configuredBrowserWindow.Load().(string); ok && size != "" {
+		opts.windowSize = size
+	}
 	// disableFeatures is built as a single slice and emitted as ONE
 	// --disable-features flag. Chrome only honors the last --disable-features
 	// occurrence, so appending a second flag would silently drop earlier values
@@ -187,14 +207,20 @@ func buildChromeArgs(opts cobrowseLaunchOptions) []string {
 		"--user-data-dir=" + opts.profileDir,
 		"--no-first-run",
 		"--no-default-browser-check",
+		// Session-local: browser identity is never the site's SSO identity.
+		// Chromium's command-line refusal overrides restored sign-in prefs.
+		"--allow-browser-signin=false",
+		"--disable-sync",
 	}
 	if opts.headless {
 		args = append(args, "--headless=new")
-		if opts.windowSize != "" {
-			args = append(args, "--window-size="+opts.windowSize)
-		}
 	} else {
-		args = append(args, "--start-maximized")
+		if opts.windowSize == "" {
+			args = append(args, "--start-maximized")
+		}
+	}
+	if opts.windowSize != "" {
+		args = append(args, "--window-size="+opts.windowSize)
 	}
 
 	if opts.stealth {
@@ -218,10 +244,26 @@ func buildChromeArgs(opts cobrowseLaunchOptions) []string {
 		args = append(args,
 			"--proxy-server="+opts.proxyServer,
 			"--proxy-bypass-list=<-loopback>",
-			"--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
+			"--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+			// Current Chrome ignores the force- spelling above and honors only
+			// this one (verified on Chrome 156: a page's STUN request reached a
+			// loopback UDP port with the force- form alone). Both are passed
+			// so older and newer builds each get one they read.
+			"--webrtc-ip-handling-policy=disable_non_proxied_udp",
+			// An extension can set its own proxy (chrome.proxy) and route
+			// around the guard; a guarded browser runs none.
+			"--disable-extensions",
+			// QUIC is UDP and never goes through an HTTP proxy. Chrome does
+			// not use it for proxied requests, and this keeps any QUIC-based
+			// API (HTTP/3, WebTransport) from opening its own UDP path.
+			"--disable-quic")
 	}
 	if opts.quiet {
 		args = append(args, "--disable-background-networking", "--disable-component-update")
+	}
+
+	if opts.mockKeychain {
+		args = append(args, "--use-mock-keychain")
 	}
 
 	if opts.softwareGL {
@@ -287,13 +329,14 @@ var ErrNotStarted = fmt.Errorf("no co-browse session; call cobrowse_start first"
 
 // CobrowseStatus is the queryable state of the session.
 type CobrowseStatus struct {
-	Running   bool           `json:"running"`
-	Driver    CobrowseDriver `json:"driver"`
-	URL       string         `json:"url"`
-	DebugPort int            `json:"debug_port"`
-	Profile   string         `json:"profile"`
-	Display   string         `json:"display,omitempty"`
-	StartedAt string         `json:"started_at,omitempty"`
+	Interstitial BrowserInterstitial `json:"interstitial,omitempty"`
+	Running      bool                `json:"running"`
+	Driver       CobrowseDriver      `json:"driver"`
+	URL          string              `json:"url"`
+	DebugPort    int                 `json:"debug_port"`
+	Profile      string              `json:"profile"`
+	Display      string              `json:"display,omitempty"`
+	StartedAt    string              `json:"started_at,omitempty"`
 }
 
 // CobrowseManager owns the single managed browser process and its driver state.
@@ -404,6 +447,9 @@ func resolveCobrowseDisplay() (displayMode, string) {
 func xvfbResolution() string {
 	if r := strings.TrimSpace(os.Getenv(EnvCobrowseResolution)); r != "" {
 		return r
+	}
+	if size, ok := configuredBrowserWindow.Load().(string); ok && size != "" {
+		return strings.ReplaceAll(size, ",", "x") + "x24"
 	}
 	return defaultXvfbResolution
 }
@@ -522,6 +568,9 @@ func (m *CobrowseManager) isRunningLocked() bool {
 // multi-session is left as future work. startURL may be empty.
 func (m *CobrowseManager) Start(profileDir, startURL string, debugPort int) (CobrowseStatus, error) {
 	if err := ValidateCobrowseURL(startURL); err != nil {
+		return CobrowseStatus{}, err
+	}
+	if err := m.refuseWhenPublicOnly(); err != nil {
 		return CobrowseStatus{}, err
 	}
 	m.mu.Lock()
@@ -724,6 +773,9 @@ func (m *CobrowseManager) teardownXvfbLocked() {
 
 // Handoff transfers control to the human. Idempotent.
 func (m *CobrowseManager) Handoff() (CobrowseStatus, error) {
+	if err := m.refuseWhenPublicOnly(); err != nil {
+		return CobrowseStatus{}, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.isRunningLocked() {
@@ -735,6 +787,9 @@ func (m *CobrowseManager) Handoff() (CobrowseStatus, error) {
 
 // Resume returns control to the AI agent. Idempotent.
 func (m *CobrowseManager) Resume() (CobrowseStatus, error) {
+	if err := m.refuseWhenPublicOnly(); err != nil {
+		return CobrowseStatus{}, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.isRunningLocked() {
@@ -767,12 +822,17 @@ func (m *CobrowseManager) statusLocked() CobrowseStatus {
 			st.URL = url
 		}
 	}
+	safe := withBrowserInterstitial(CobrowseSessionStatus{URL: st.URL})
+	st.URL, st.Interstitial = safe.URL, safe.Interstitial
 	return st
 }
 
 // Navigate drives the browser to a URL. Refused while handed off to the human.
 func (m *CobrowseManager) Navigate(url string) (CobrowseStatus, error) {
 	if err := ValidateCobrowseURL(url); err != nil {
+		return CobrowseStatus{}, err
+	}
+	if err := m.refuseWhenPublicOnly(); err != nil {
 		return CobrowseStatus{}, err
 	}
 	m.mu.Lock()
@@ -792,6 +852,9 @@ func (m *CobrowseManager) Navigate(url string) (CobrowseStatus, error) {
 // Screenshot captures the current viewport as base64 PNG. Refused while handed
 // off to the human (the live VNC stream is the human's view during handoff).
 func (m *CobrowseManager) Screenshot() (string, error) {
+	if err := m.refuseWhenPublicOnly(); err != nil {
+		return "", err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.isRunningLocked() {

@@ -31,6 +31,20 @@ So, when adding to this file:
 
 ## Project Overview
 
+`status.collectCapacityMetrics` owns additive optional heartbeat placement
+signals and per-source unknown handling. `nativeCapacityProbes` owns the
+build-tagged OS readers; `TestCapacity*` exercises bounded procfs parsing and
+both heartbeat transports without native sampling. See
+`docs/heartbeat-capacity.md` for field semantics and platform limits.
+
+`localcobrowse.UploadSettings` owns local mode's upload opt-out: environment
+captured at owner construction, live bounded settings reads, and fail-closed
+permissions/parsing. `Service.CheckUploads` and `Service.UploadsAllowed` are the
+shared operation and dispatch gates for later upload slices. The reserved
+`local config uploads` command never enters harness-config code. This setting
+does not enable local staging, chooser interception or attachment by itself;
+see Q8 in `docs/local-cobrowse-upload-and-edit.md`.
+
 `mediainput.openWorkspaceInput` owns the inactive Linux workspace freezer's
 descriptor acquisition: it checks a no-follow leaf pin before any readable
 leaf open, and fails closed if the verified procfs FD route is unavailable.
@@ -91,6 +105,33 @@ the platform supplies a unique staging destination and receives that exact
 relative path in the receipt. See `docs/file-fetch.md` for
 the contract.
 
+`platform.containerRunner` (citadel-cli#1760) is the browserRunner that runs each node co-browse session in its own browser-runtime container. `selectingRunner.useContainer` is the one per-launch decision, made by `launch` before it lays out the session dir (`LaunchOptions.UseContainer`): only the node-wide manager, only while `containerRunner.healthy` holds (engine reachable, pinned image present or pulled, contract label AND the `browserruntime.ImageLabelSandbox` marker that #1788 must set, since the contract-1 image runs Chromium with `--no-sandbox`), otherwise the host runner, logged once per reason. The argv is only `browserruntime.RunSpec.Args` (name, owner label, pull policy, userns, cache env and the read-only staging bind are RunSpec fields); engine calls go through the `ContainerEngine` seam wired in `cmd.configureBrowserRuntime`, with output capped by `cappedBuffer`. Only `<session>/profile` (`containerProfileSubdir`) is mounted writable: the pidfile, `.citadel-profile` marker and `.citadel-stage` stay outside it, staging is bound read-only at `StageMountPath`, and `cobrowseProc.browserFilePath` fails closed for anything else. `Launch` owns the fresh per-session network, `checkIsolation`, and `cleanupFailedLaunch` (known id, else the deterministic name after a label check); `verifyCDPIdentity` compares the in-container and published-port browser ids; `containerIdentity` gives a Windows host (no uid) the image user. `ownerFor` (base dir, registry dir, uid) stamps the owner label, and `sweepContainers` removes only containers and networks matching owner, `purpose=cobrowse`, the name `aceteam-brc-<id>` and `sessionIDPattern`, skipping the rest. `adoptContainer` owns re-adoption (id, StartedAt, labels incl. owner, network, ports, CDP id); `recoverContainer` leaves a record on `errCDPCheck` or `errRecordNotOurs` (which includes an owner or purpose label mismatch, so another worker's container is never removed) and expires and discards one that fails verification; `discardContainer` removes a container only when `ownsLabels` (runtime, session, owner, purpose) holds and a network only when `networkOwned` finds the same labels on the network itself. `ShutdownSessions` retains container sessions like scoped ones. `browserruntime.PinnedImage` is empty until a release pins an image, which keeps host runners in charge. The slot count is `BrowserSlots` in device config via `platform.SetBrowserSlots`; `CITADEL_COBROWSE_MAX_SESSIONS` still wins. Tests: `internal/platform/cobrowse_container_test.go`.
+
+The renderer sandbox in the browser-runtime container (citadel-cli#1788) has three owners and is opt-in per run. `browserruntime.RunSpec.Args` requires `SeccompProfile` (emits `--security-opt seccomp=<file>`) and passes `-e MEETING_REQUIRE_SANDBOX=1`; without that env the image behaves as it always did (`--no-sandbox`, no check), which keeps the catalog meeting module, which pulls `:latest` under the engine's default seccomp, unaffected. The profile is `browserruntime.SeccompProfileJSON` (Docker's default plus one unconditional allow of clone/unshare/chroot for Chromium's user-namespace sandbox, no capabilities, no `--privileged`), pinned by `SeccompProfileSHA256` and `TestSeccompProfilePinned`, written into the session dir by `WriteSeccompProfile` from `containerRunner.Launch`. Accepted risk: that rule lets every process in the container create user and network namespaces, the nf_tables/netlink CVE class Docker's default withholds; it is still better than `--no-sandbox`, and a `socket()` argument filter refusing netlink-netfilter is an optional follow-up. A host that forbids unprivileged user namespaces cannot run it and the session is refused. `sandbox_check.inspect_tree` (stdlib, `/proc`) is the proof, and it deliberately does not trust `Seccomp: 2` (the engine profile puts every container process in mode 2): every renderer must have a different user namespace and strictly more `Seccomp_filters` than the browser, a missing field fails, no process may carry `--no-sandbox` (cmdline is whitespace-tokenized because Chromium retitles processes), and no renderer is not a pass. `wait_for_sandbox` retries only "not there yet" verdicts and returns at once when the browser exits. `meetingd.start_session` runs it when `REQUIRE_SANDBOX` and tears the session down with `sandbox_unverified`; `defaultStartBrowser` trusts a 201 only when the reply says `sandboxed:true` and `browser=chromium`, with a POST timeout above meetingd's verify window. `meetingd.py --sandbox-selfcheck` implies require. The image label is `ARG SANDBOX_VERIFIED` (default empty, so nodes refuse the image); a build step may pass `1` only after the self-check exits 0 under the pinned profile, and that workflow step is not wired yet, so `PinnedImage` stays empty. `RunSpec.Browser` is a closed set (`browserruntime.browsers`, only `chromium`), stamped as `LabelBrowser` and `MEETING_BROWSER`; meetingd reports `browser` and `sandboxed` in session status. CloakBrowser is deferred: its binary license forbids redistributing it in a published image.
+
+Container image platform checks (citadel-cli#1889) use the engine's JSON `info`
+platform, including Docker Desktop's VM platform, and local image OS/architecture/
+variant metadata. Informational discovery never pulls: an absent image is unknown.
+The node-wide per-launch selection and explicit container launch may resolve and
+pull an absent digest-pinned image before selecting it; an index must have a matching immutable
+child, which is used for both inspection and the run contract. A single manifest
+must pass the local image-config check after pulling. Contract and sandbox labels
+remain mandatory. Tests in `cobrowse_container_platform_test.go` execute a fake
+`ContainerEngine` process, not a real engine or registry.
+
+The explicit `citadel appliance apply` command (citadel-cli#1890) reuses
+`writeSetupPosture`, with the closed `appliance` audit source, and the existing
+atomic config/update owners. It saves `browser_appliance`, `browser_slots` and
+optional `browser_window_size` in device config, without changing default
+permissions or restarting a worker. `configureBrowserRuntime` reads those
+settings even before enrollment. `doctor_cobrowse.go` owns injected, read-only
+readiness checks; browser/Xvfb absence is fatal for an applied appliance or
+retained co-browse-only posture. Damaged/unreadable device configuration fails
+readiness. Apply refuses node-directory overrides and POSIX elevation/foreign
+ownership before creating locks or writing configuration.
+Unknown namespace policy and missing fonts warn, not claim sandbox proof.
+See `docs/browser-appliance.md`; tests use temporary config and fake probes.
+
 `platform.browserRunner` owns the per-OS half of a co-browse session:
 discovery, launch, owner-lifetime binding and the orphan sweep. The Linux
 `xvfbRunner` is the historical managed-Xvfb path, and its argument list is pinned
@@ -101,6 +142,208 @@ by PID: it removes only dirs whose owner PID plus creation time no longer
 match. The session base dir there requires an owner-only, protected DACL
 (`validateCobrowseBaseDirPerms`), and a launch refuses without one. The
 windows-latest CI job runs the real-browser tests against both browsers.
+`darwinHeadlessRunner` (`cobrowse_runner_darwin.go`, citadel-cli#1635) is the
+macOS runner: local mode uses it, and it is the node-wide manager's host
+fallback behind `selectingRunner`, whose container selection it does not touch.
+`discoverMacBrowser` (`cobrowse_macos_logic.go`) owns the search order (Chrome,
+Edge, Chromium, Canary under `/Applications` then `~/Applications`, then PATH,
+or `CITADEL_COBROWSE_BROWSER`) and lists what it searched on failure. macOS has
+no job object or parent-death signal, so `startHeadless` starts a citadel-owned
+placeholder as the leader of a process group and joins the browser to it
+(`Pgid`). `groupGuard.teardown` is the only signaller: SIGTERM, a grace wait,
+SIGKILL of the group, then the placeholder is reaped last, under one mutex, and
+never signals again, so a group id is never signalled after it could be reused
+(Stop and the exit waiter both call it). The placeholder polls the owner and
+exits with it. A crashed owner's browser lives until the next sweep:
+`sweepMacSessions` removes only dirs whose owner PID plus start time
+(`processStartToken`, sysctl `kern.proc.pid`) no longer match, and
+`killVerifiedBrowserGroup` kills a group only when the recorded PID's command
+line (`ps`) names that session's exact `--user-data-dir` and the PID is in the
+recorded group (the pidfile's third slot holds the leader); nothing is killed
+by bare PID. A browser it cannot verify or kill keeps its dir and pidfile for a
+later retry, and `killOrphanSessionProcs` returns that error so the
+persistent-profile cleanup never reports "cleaned". On darwin the shared
+`reapProfileUsers` reads `ps` (`listMacReapProcs`) instead of /proc, so a
+surviving helper fails persistence and cleanup.
+`validatePrivateSessionDir` refuses a non-0700, foreign-owned or symlinked
+session dir before launch; the default base is `~/Library/Caches/Citadel`
+(`macDefaultBaseDir`), and with no home dir the launch is refused rather than
+falling back to a shared temp parent. `--use-mock-keychain` (`mockKeychain`)
+keeps a hidden browser off the Keychain prompt: during a session the decrypted
+working copy uses Chromium's mock key (the Linux basic-password-store posture),
+while the at-rest sealed profile is unchanged. The
+decision logic is untagged and tested on Linux (`cobrowse_macos_logic_test.go`);
+the real-browser macOS acceptance is manual until CI has a macOS job.
+
+Browser account sign-in and sync are disabled per launch with
+`--allow-browser-signin=false` and `--disable-sync` in `buildChromeArgs` and
+the browser-runtime image's `meetingd.build_chrome_args` (#1799). The refusal
+is command-line scoped, not a machine policy or registry change; restored
+profile sign-in preferences cannot override it. Website cookies/SSO remain
+separate. This also affects host and container meeting bots; seeded notetaker
+profiles require authorized MEETING_JOIN acceptance before rollout. Existing
+account material is not erased or revoked (follow-ups #1803 and #1804).
+Node session status classifies known Chrome/Edge sign-in pages as
+`interstitial: chrome_signin`, blanking titles and retaining only scheme/host.
+Tracked target lists redact every entry, including the quarantined last page,
+without making it active or bypassing the page fence. Account-page text is not
+read: both the connected frame URL and the execution-context protocol are gated.
+The backend formatter must preserve that field and never infer website auth
+for browser-internal URLs. The opt-in Linux and Windows
+`RealBrowserSigninDisabledAfterProfileRestore` tests inspect effective sign-in
+prefs through CDP and use a synthetic website redirect, never Google SSO.
+
+`cobrowseSession.runAction` owns one scripted co-browse action (click, type, key,
+scroll): one WebSocket for all its CDP calls, bounded by
+`platform.CobrowseActionDeadline`, which must stay below the platform's 15s job
+wait with `cobrowseReportReserve` added. Untracked sessions discover the page
+once; tracked (local mode) sessions dial the page `pinAction` pinned, and the
+page-list reads left are target syncs that apply the page policy
+(`pageActive`): before the before-probe and before every read-back, so no script
+runs in a page that is refused or no longer active, and a URL is only reported or
+cached after policy. Refusals (`ErrHandedOff`, `ErrNotStarted`,
+`ErrTargetChanged`, `ErrPageRefused`) and failures that changed nothing return
+the original error unchanged. Otherwise a deadline or failure after the action
+may have acted returns `*ActionIncompleteError` with `ActionEffects` (scrolled
+with offset, focused, clicked, typed length only; `Dispatched` only means input
+may have been sent), and nothing is retried. A click that timed out between press
+and release gets a best-effort release on the pinned page. On the job path the
+error is returned as an error (platform tools treat any non-error result as
+success); only a payload `report_partial: true` gets the structured `done:false`
+result. Local mode returns the same details as a tool error. An approved commit
+that was dispatched and then failed resolves as `unconfirmed`, not failed.
+`TestCobrowseRealBrowserActionLatency` pins the budgets.
+`CobrowseSessionManager.WithPageSignals` owns `page_text` and `password_field` on
+the start and single-session status results (aceteam#13773): an isolated-world
+read with the live driver fence re-checked after every await, node-wide sessions
+only (which have no page policy, so `pageActiveErr` is a no-op there), omitted on
+handoff or any failure, and never logged or put in the registry record.
+`TypeWith` and `KeyWith` (#1730) own the targeted replace and key modifiers, each still one
+`runAction`: resolve the selector (or the focused field) to an element and bind to it, select the whole
+content (refused unless the selection spans it), then insert (or a real Backspace for an empty clear, read
+back as empty), with `midActionFence` between steps. The last awaited call before the destructive event is
+`verifyBound`: same document (`loaderId`), same element still focused and, with clear, the selection still
+spanning the content; only the insert round trip follows. After the insert the page confirms it holds
+exactly the typed text (a boolean only), on every clear path, or `Cleared` stays false. A change after the page was touched is an incomplete action
+(not a refusal) carrying what happened. Only an input, textarea or the contenteditable host itself is a
+target, never under designMode; page-returned refusal strings are mapped to a fixed set. `CheckKeyChord` owns
+the modifier allowlist and decides which chords are refused (clipboard and editing chords are not allowed);
+`parseKeyAction` and `KeyWith` both call it before any dispatch. Other refusals (empty text without `clear`, selector over `MaxCobrowseSelectorLen`,
+modifiers outside 0..15, a selector that matches nothing or is not editable) send nothing.
+`ActionEffects.Cleared` is confirmed; `ClearedUnconfirmed` means the destructive event was sent without
+confirmation. Status `input_edit` (`InputEditV1`, non-tracking sessions only, like `FileUploadPageFence`)
+is the marker a caller checks first. Local mode does not pass the new fields.
+`TestCobrowseRealBrowserTypeEdit` pins it on Linux and Windows.
+
+`containersession.Runner` owns a declared session that runs as one container plus an
+engine-managed named volume (#1533, #1165 S1; `Declaration.IsContainer` selects it). The
+`aceteam.session*` labels (`RecordFromLabels` validates them, failing closed on a volume that is
+not the name-derived one) are the only record: `Runner.Observe` recovers state from the engine,
+with no store. `Runner.Wake` decides the argv (`buildRunArgs`: cap-drop, no-new-privileges,
+preflighted cpu/memory/pids, the node's own binary bind-mounted read-only, `--restart no`, `--mount`
+never `-v`, one bind of a host-built `Runner.ViewDir` at `/run/session`); `Runner.Sleep` records the
+operator's durable sleep intent, stops, re-seals and removes the container but keeps the volume.
+Wake, sleep and `Runner.ResealOnce` serialize on one flock in the host run dir (never mounted), and
+a failed wake removes only the container id its own `run` returned. Credentials never
+reach the volume: `SealedFileStore` keeps one bundle per session, sealed under
+`nodevault.OpenKeyCompartment` (a node key file, so wake is unattended and the master PIN stays
+human-only); `Materialize` writes them only under a run dir `Runner.RunDir` has proven tmpfs. That tmpfs tree is
+bound over the whole harness config dir, and `declaredsession.HarnessConfigFor` pins which subpaths
+(transcripts, memory) are bound from the volume on top, so a rename-based writer's temp file stays
+on tmpfs. `ResealBundle` captures a rotated token before `Wipe`; the worker re-seals awake sessions
+on a poll (`ResealOnce`) so a reboot does not lose a rotation; a failed re-seal keeps the secrets
+for a retry. `nodevault.KeyCompartment` is deliberately not a `Session`, so it cannot satisfy an
+at-rest passphrase-floor consumer. `containersession.Decide` is the boot wake rule (`cmd.reconcileContainerSessions`, run by
+the single-instance worker): a stopped container exiting non-zero is woken, exit 0 stays down
+(`declaredsession.RunContainerHolder` exits non-zero whenever signalled, so a reboot-killed
+session never looks like a clean exit), and no container with a volume is a deliberate sleep.
+`LaunchCommand` decides resume inside the container from the transcript on the volume.
+`declaredsession.DialContainerHolder` owns host-side attach verification (the engine proves the
+incarnation and that the socket peer is the container's PID 1; the host holder's PID checks do not
+apply across the PID namespace). Known limit: on a kernel-TUN `citadel up` node the default bridge
+may NAT container traffic out as the host's mesh address, which `requireVPNOrAuth` admits; no
+dedicated network is created yet. And
+`Manager` refuses container declarations with `ErrContainerSession`.
+
+`InspectTarget` owns the browser-created isolated world used for the complete
+target probe and form snapshot. The session caches only its latest target,
+frame and loader context, invalidates a lost context without retrying the read,
+and checks the live driver after every awaited call. `FormSnapshotScript` binds each File entry's
+field name, native file name, size, type and lastModified; it normalizes the
+browser's synthetic empty-file timestamp, refuses unreadable or excessive
+metadata, and never reads bytes or paths. The local commit card copies bounded
+metadata for display using text only, removes format/control characters and
+preserves the filename's final extension; an extension too long to display is
+unverifiable. `Classify` trusts only the probe's native-control chooser signal
+for a non-actionable file input or associated label. Other labels are described
+by the native control they activate, not the label's text; an uninspectable
+associated custom control is refused. Interactive descendants stay their own
+targets; actionable chooser controls retain commit checks. Agent views omit file
+metadata while the human drives, without altering the human's card. It does not attach a file
+or authorize staging; those remain separate upload slices. The rule version and
+`TestRealBrowserCommitActionsFileSnapshots` pin this approval behavior.
+
+`platform.StageFile` and `platform.SetFileInput` own file upload for remotely
+dispatched sessions (#1721, node side of aceteam#13831). Staged files live in a
+`cobrowseStagingDirName` dir inside the session's own working dir, so every
+teardown, failed launch and orphan sweep removes it; teardown also removes it
+before a persistent profile is sealed. `ValidateStagedName` owns the single
+base-name rule and `resolveStagedFile` owns the proof that a path handed to the
+browser is a regular file directly inside that dir; the size and count caps are
+`MaxCobrowseStagedFileBytes` and `MaxCobrowseStagedFiles`. `set_file_input` is an
+ordinary `runAction` action. `cobrowseSession.watchChooserOnce` keeps one extra
+CDP connection that intercepts file choosers and `handleChooserEvent` owns the
+pending-chooser state reported in status; it never fills anything. The stage
+bytes ride in the `jobprivacy.BytesKey` payload field, which is dropped from
+every retained copy. `CobrowseSessionHandler.filesAllowed` gates `stage_file` and
+`set_file_input` on the live Files permission (same source as FILE_WRITE_BYTES,
+read per job) and refuses with `jobs.ErrFilesDisabled`; no passcode; a handler with no permission source denies.
+Teardown closes staging (`closeStaging`, under `stageMu`) before removing it and
+refuses to seal a persistent profile if removal fails; `cobrowseprofile` also
+never archives or restores `.citadel-stage`. A `backend_node_id` is accepted only
+for the chooser the page opened. `set_file_input` requires `expected_url`:
+the fence uses no page script: `checkFrameURL` takes the target frame's
+browser-side URL from `Page.getFrameTree` (url plus urlFragment), the target
+is resolved in an isolated world of that frame (`Page.createIsolatedWorld`),
+and `setFilesIfPageIs` re-reads the frame URL, re-checks the driver, then
+dispatches on that isolated object; any mismatch is `ErrTargetChanged`,
+returned unchanged; status
+reports `file_upload_page_fence: expected_url_v1`. The worker acks a `stage_file` entry with
+`AckStagedFileJob` (XACK then XDEL, no payload decoding); other actions use the
+plain ack (API mode has no equivalent yet). Page-tracking (local) sessions get
+none of this.
+`TestCobrowseRealBrowserFileUpload` and `TestWindowsRealBrowserFileUpload` are
+the real-browser acceptance.
+
+`platform.CobrowseSessionManager.HumanAttachStagedFile` owns the human's answer
+to a pending file chooser (#1723): a `file_attach` stream input
+(`cobrowsestream.InputTypeFileAttach`), not a job action, MCP tool or HTTP route,
+so `fileAttachManagerSession` in `cobrowsestream/adapter.go` is its only caller
+(`TestOnlyTheStreamAdapterCallsHumanAttach`; `TestNoLocalMCPToolCanAttachAsHuman`
+and `TestCobrowseSession_NoActionReachesHumanFileAttach` pin the agent side).
+`fileFill`/`fillFileInput` is the one dispatch path both it and `set_file_input`
+use (isolated world, `checkFileInput`, `setFilesIfPageIs`, `redactPath`); the two
+differ only in their fences. The agent's "refused while a human drives" becomes
+`humanAttachFence` (requesting viewer connection still open, the captured
+chooser still pending by pointer, then `humanControlFence`: viewer attached and
+`explicitHandoff`), run after the lookups and again after the final frame read,
+immediately before `DOM.setFileInputFiles`. A frame mismatch also drops that
+stale chooser. And `expected_url` becomes the chooser binding:
+the node id must be the pending chooser's, the chooser must still be the pending
+one, and the frame URL `watchChooserOnce` read from `Page.getFrameTree` when the
+chooser opened (`FileChooserPending.FrameURL`) must still be the frame's URL at
+dispatch, since only a main-frame navigation clears a chooser. The node manager
+has no per-session action lock: agent actions and the human attach are kept apart
+only by the `explicitHandoff` flag, each checking it right before dispatch with
+no lock held across the CDP call, so a handoff or resume landing in that gap can
+let both dispatch (the gap every agent action already has; `attachMu` only
+serializes human attaches). Files is read live (`SetFilesAllowed`, wired from `nodeFilesEnabled` in
+`startCobrowseStreamServer`, nil denies) on the offer, up front and again before
+dispatch. `HumanFileAttachSupported` is false for a page-tracking manager, so
+local mode never gets the `file_chooser` frame or handles the input. The audit is
+a `[cobrowse] audit file_attach actor=human` log line (name, size, sha256), like
+`stage_file` and `set_file_input`; the target-event sink is local-mode only.
+Errors reach the viewer only as the fixed codes `AttachFailureReason` returns.
 
 `localcobrowse.Service` owns local mode's co-browse rules (aceteam#13503): the
 per-domain write grant (default deny, see the next paragraph), the abuse limits, the
@@ -118,6 +361,84 @@ fallthrough, and `isLocalModeCommand` skips the root pre-run's CA trust and
 update check. `localcobrowse.AcquireOwner` enforces one co-browse owner per OS
 user. `TestLocalMCPStdioMakesNoOutboundCalls` pins the no-egress contract.
 
+The guard itself is `browserurl.EgressGuard` (the `localcobrowse` names are
+aliases), so remote sessions can use it too (citadel-cli#1867 C4b).
+`CobrowseSessionManager.egressRequiredNow` decides, at every session start,
+whether a node-wide session runs behind its own per-session guard. It reads
+`Permissions.CobrowsePublicOnly` through the source `cmd` installs
+(`platform.SetNodeCobrowseEgressSource`, `cmd.cobrowsePublicOnlyIn`). Absent or
+false keeps the old behavior; an unparseable permissions file counts as on.
+`startEgressForLaunch` refuses the start when the guard cannot listen. A guarded
+session runs on the host browser, never in the container (the container's
+network cannot reach the loopback guard) and never in a detached scope.
+`guardProc` closes the guard whenever the browser stops, and `watchGuard` stops
+the session if the guard's server exits on its own (`EgressGuard.Failed`).
+Before the session is usable, `verifyEgressRoute` opens the guard's random
+`.invalid` canary URL through CDP and refuses the session unless the guard saw
+it (a managed proxy policy would otherwise route around it). Nothing loads
+before that check: a guarded browser launches on about:blank, a restored
+profile's saved tabs are removed first (`clearSessionRestore`), and
+`startSession` sends the start URL once afterwards (`egressFirstNavigate`).
+Besides `BlockedAddr`, the guard refuses this machine's own addresses and
+on-link networks (`ownNet`, refreshed every 30s, fail-closed with no list):
+`browserurl.DefaultInterfacePrefixes` owns that list, the interface masks plus
+the directly connected (no-gateway) routes read by the per-OS
+`osOnLinkRoutes` (procfs, GetIpForwardTable2, the route sysctl), so a /128
+DHCPv6 or /32 address still covers its LAN, and the /64 around each global
+IPv6 address is added (`ipv6Slash64s`, for an off-link prefix); a failed route
+read falls back to the masks. Linux reads only the main routing table. Hairpin
+NAT through the router's public IPv4 stays a known gap. A
+proxied browser also gets `--disable-extensions`, `--disable-quic` and BOTH
+WebRTC policy spellings: Chrome 156 ignores `--force-webrtc-ip-handling-policy`
+and honors only `--webrtc-ip-handling-policy`. An unguarded session on a
+manager that reads the setting is stopped at its next action or by
+`sweepUnguarded` (every 30s) once public-only turns on. `startEgressSweep`
+runs after an unguarded launch, a re-adoption and `SetEgressRequired`, and
+`StopAll`/`ShutdownSessions` end it; `stopUnguarded` never overwrites the end
+reason of a session something else already stopped. Such sessions are
+stopped before a self-restart and on shutdown, and `verifyAdoptable` never
+re-adopts one: the browser still points at the old guard port. The legacy
+single-browser `CobrowseManager` has no guard, so `refuseLegacyWhenPublicOnly`
+refuses every legacy action on such a node, and stops a legacy browser
+that was already running when the setting turned on. The APPLY_DEVICE_CONFIG
+permissions block and every local writer (`citadel permission`, `citadel
+passcode`, master-PIN migration, the Control Center) load strictly. The
+Control Center saves a toggle by name (`toggleNodePermission`, its
+`SaveToggle` callback), and `savePermissionsChecked` keeps the on-disk
+`CobrowsePublicOnly`, so a modal opened earlier cannot turn it off. Nothing
+rewrites a damaged permissions file from defaults, and the direct-Redis config
+consumer and
+subscriber carry the worker's `PermissionsDir`. Status reports
+`egress: public_only`. Refusals are logged as scheme plus host
+(`egressAudit`). APPLY_DEVICE_CONFIG `cobrowsePublicOnly` may only turn it on
+(`jobs.applyCobrowsePublicOnly`); `citadel permission cobrowse-public-only`
+turns it off locally. `TestEgress*` in `internal/platform` and the
+`RealBrowserEgressGuard` tests for Linux and Windows pin it. #1858 is the
+separate document-level host policy that sits above this address floor.
+
+`platform.targetSet` owns a session's open pages (S15, aceteam#13503): popups
+and new tabs. It is local mode only: a manager opts in with
+`EnableTargetTracking`; the node-wide manager does not, and its status, actions
+and stream are unchanged. `reconcileTargets` is the pure rule: a page becomes
+active only when the browser reports (`Target.getTargets` openerId; `/json` has
+no opener) that the active page opened it, a page opened by a background tab
+stays listed until the user picks it, and a closing page returns to the most
+recent opener. Pages keep first-seen order, never the browser's list order.
+`targetSet.sync` judges each new or navigated page after the fact: the page
+opens, then is closed if it fails the policy (local mode passes
+`Service.TargetPolicy`, the navigation address filter; an unconfigured set uses
+the http(s) scheme rule), audited as `target_closed` (actor citadel). The egress
+guard is what stops its network traffic, not the close. It bounds pages at
+`MaxCobrowseTargets`, tolerates a flood through `cdpdiscovery.ListBounded`, and
+never closes the last page. `pin` fixes the page an action works on: every CDP
+command of one action goes to that page, `verify` refuses input if it stopped
+being active, and `ExpectTarget` lets `Service` pin the page its gates checked.
+The viewer protocol is shared with the future cloud viewer:
+`cobrowsestream.TargetSession` (offered only for a tracking manager), a
+`targets` TEXT frame, and `target_switch` / `target_close` input that need live
+control and are audited. `TestRealBrowserPopupSignIn` is the real-browser
+acceptance (windows-latest).
+
 Local-mode write consent is per registrable domain, not per session
 (aceteam#13687 D1-D5, citadel-cli#1636). `localcobrowse.RegistrableDomain` owns
 the scope (public suffix list); `Service.grantEvalLocked` owns a grant's state
@@ -132,7 +453,10 @@ reference and fingerprint only, never typed text), and only the human methods
 `ApproveCommit` executes on approve (D5): under the session write lock it
 re-probes the target, requires the fingerprint to equal the approved one, then
 runs the action and shows the outcome; a changed page runs nothing. `fingerprint`
-binds the approval to the action. Every write is serialized per session (`wmu`)
+binds the approval to the action: the complete page, link and form URLs
+(query and fragment included, hashed privately, never shown) and a SHA-256 of the
+full form content computed in the page; content too large to hash is `Oversized`,
+a commit no approval can redeem. Every write is serialized per session (`wmu`)
 and re-probed before dispatch. `TestNoLocalMCPToolCanApprove`,
 `TestCommitAlwaysAsksDespiteGrantAndDenyBlocks` and
 `TestRealBrowserCommitActions` (windows-latest) pin it. It is a label and
@@ -162,6 +486,65 @@ the entry (a different existing `citadel` entry is declined and left to
 Sessions come from the owner through the token-authenticated `/api/summary`.
 `TestSetupRoutesAreGuarded` pins the boundary. Muse has no confirmed local
 config file, so it is not a harness; the page offers the generic entry.
+"Connect this PC to AceTeam" (#1867 C2) is `cmd.setupEnroller` over
+`enrollDevice`: one enrollment at a time, options resolved at click time (the
+node config dir, not the page's private dir), and only display fields plus
+fixed copy per `enrollFailure` (`setupEnrollCopy`) reach the page; it is the
+page's only outbound call. `setupApprovalLink` refuses an approval link off
+the auth service's host, or carrying a different code, and opens only the bare
+URL, so the user code is never on a command line. `checkSetupNodeDir` refuses
+a node config dir outside the user's own folder, and on Windows an existing
+`%ProgramData%\Citadel` that is not administrator-only
+(`network.CheckMachineConfigDirTrusted`), because another local user could
+create it and redirect the device key; `guardEnrollDeps` repeats the check
+before the save and the connect. The setup process skips
+private CA trust (local-mode pre-run), so a private-CA control plane cannot be
+enrolled from the page.
+
+The co-browse-only posture of a setup-page PC (#1867 C5) is
+`cmd.writeSetupPosture`, run by `setupEnroller` only after a successful
+enrollment (and by the page's Retry): every surface off, services/SSH/provision
+off, `cobrowse_public_only` on, the `setup_posture` marker, a passcode hash kept,
+a damaged file refused, then `meeting_enabled: false` (the meeting browser has
+no egress guard). Co-browse has no key of its own. `DefaultPermissions` and
+other enrollment paths are unchanged. `config.SetupPostureActive` owns reading
+the marker (a damaged file counts when the key is in it). While it is set,
+`jobs.applySetupPostureFilter` drops every remote APPLY_DEVICE_CONFIG request
+that turns something on (Console/Desktop/Files/Shell, meeting, egress relay,
+default-serve, VNC, services) and every passcode push, reporting each in the
+job result; turning things off still applies. The worker runs only
+`worker.setupPostureAllowedJobTypes` there (co-browse sessions, the filtered
+config job, self-update, worker restart, and the Shell/Files jobs that recheck
+their own human-granted permission); every other type, including one added
+later, is refused terminally (`ReasonSetupPosture`) through the source cmd
+installs with `worker.SetSetupPostureSource` (`setupPostureCache` stats the file
+per job). `TestSetupPostureClassifiesEveryJobType` fails until a new job type is
+classified. `cmd.sshDeployAllowedIn` also refuses SSH key deployment (the
+control listener's `/ssh/authorized-keys` and every
+`syncAuthorizedKeysIfAllowed` sync) while the marker is set, even with SSH on.
+A failed posture save runs `setupPostureQuarantine` (autostart off,
+worker stopped) and offers Retry. The marker stays after Disconnect;
+`citadel permission setup-posture disable` (`clearSetupPosture`) removes it.
+The Control Center's `savePermissionsChecked` and `toggleNodePermission` keep
+the marker and the public-only guard from disk. `cmd.setNodeSurface` is the one writer for
+the human Files/Shell grant (setup page, viewer, `citadel permission
+files|shell`): strict load, never a rewrite from defaults, one `[permission]
+audit` log line per change. Both pages serve it at `/api/node-permissions`
+(`localviewer.NodePermissionHooks`, behind the guard, cookie and bearer); Shell
+on needs `confirm_shell` and still fails closed without a passcode.
+`TestNodePermissionGrantHasNoMCPPath` pins which files may call the grant, and
+`TestEnrolledBridgeCannotGrantOnAPosturePC` drives the enrolled bridge's backend
+fallthrough into the refusal. `cmd.disconnectThisPC` (page and `citadel local
+disconnect`) stops the per-user worker, removes autostart, runs
+`logoutThisNode`, then `removeDeviceCredentialsIn(deviceConfigDirs())` (through
+the enrollment rollback helper, never `clearSavedConfig`, in the node and the
+legacy invoker config dir), so a later worker has no device token to take API
+jobs with; a failed stop or autostart removal skips the logout
+and the credential removal. Local-mode state is never touched.
+`cmd.startSetupWorker` starts the worker only after this page connected the PC,
+the registration still exists and the marker and public-only guard still hold,
+and drops the page's own network connection first so one node key has one
+endpoint; a Disconnect that logged out returns the page to idle.
 
 `nodevault.Vault.UnlockAtRest` owns #820: every consumer that encrypts data
 at rest unlocks through it, and it refuses a secret below
@@ -191,6 +574,21 @@ an interrupted session's decrypted copy whose owner is gone and reports any it
 cannot, including any dir whose marker is present but unreadable or damaged, and `citadel local passphrase forget` refuses unless that comes back
 clean. A persistent session's teardown returns a working-dir removal failure. `TestRealBrowserPersistentProfileRoundTrip`
 is the real-browser acceptance (Windows Chrome and Edge, Linux Chrome).
+
+`botprofile.Open` owns the unattended bot-profile store (#1761, epic #1757 C3):
+`<node config dir>/bot-profiles/`, sealed through `cobrowseprofile.OpenSealedHandle`
+(same archive, lock and atomic write; only the `Sealer` key source differs). The
+key is `deriveKey` over the node share (`loadOrCreateNodeShare`, a refuse-never-repair
+0600 file in a 0700 dir) and an AceTeam share from a `ShareProvider`; the sealer
+binds org id, identity id and the Chromium major (`ErrNewerChromium`) inside the
+AEAD. `botprofile.DenyPath` owns the denial and decides by identity (`os.SameFile`
+against the config dirs, case-insensitive name), so it holds for a store that does
+not exist yet; every `os.Root` handler (FILE_FETCH, template inputs, mediainput,
+memorygit) and every walker calls it. A share this process did not create is never
+adopted (`ErrNodeShareContested`). Recovery is deleting `bot-profiles/`, which
+crypto-shreds every bot profile.
+The A0 payload key for the AceTeam share is not named yet: when it is, add it to
+`jobprivacy` redaction. `internal/botprofile` tests pin the construction.
 
 `localaudit.Log` owns the local co-browse audit chain under
 `<local state dir>/cobrowse-audit`, an owner-only dir with one JSONL file per UTC
@@ -334,20 +732,21 @@ go test -v ./cmd -run TestReadManifest
 
 ### Windows E2E Test
 ```bash
+# Set WIN_HOST, WIN_USER and WIN_PASSWORD for your Windows test machine first.
 # Full E2E test (clean → install → init → verify) on a Windows machine via WinRM
-./scripts/windows-e2e-test.sh --host 192.168.2.207 --user aceteam --password 'P@ssword' --authkey tskey-auth-xxx
+./scripts/windows-e2e-test.sh --host "$WIN_HOST" --user "$WIN_USER" --password "$WIN_PASSWORD" --authkey tskey-auth-xxx
 
 # Run a single phase
-./scripts/windows-e2e-test.sh verify --host 192.168.2.207 --user aceteam --password 'P@ssword'
+./scripts/windows-e2e-test.sh verify --host "$WIN_HOST" --user "$WIN_USER" --password "$WIN_PASSWORD"
 
 # Skip clean phase (test on already-dirty machine)
-./scripts/windows-e2e-test.sh --skip-clean --host 192.168.2.207 ...
+./scripts/windows-e2e-test.sh --skip-clean --host "$WIN_HOST" ...
 
 # Install a specific version
-./scripts/windows-e2e-test.sh --version v2.3.0 --host 192.168.2.207 ...
+./scripts/windows-e2e-test.sh --version v2.3.0 --host "$WIN_HOST" ...
 
 # Dry run (show commands without executing)
-./scripts/windows-e2e-test.sh --dry-run --host 192.168.2.207 ...
+./scripts/windows-e2e-test.sh --dry-run --host "$WIN_HOST" ...
 ```
 
 Requires `pywinrm` (`pip install pywinrm`) and WinRM enabled on the target machine. See `scripts/windows-e2e-test.sh` header for WinRM setup instructions.
@@ -521,6 +920,14 @@ authority for the live handler set after platform, configuration, and permission
 gates. `cmd/work.go` publishes that set as `capabilities.job_types` through the
 status collector; do not infer handler availability from a version threshold.
 
+`cmd.resolveWorkerQueues` and `cmd.resolveDirectRedisQueuesForRole` own the
+control-only worker policy. `config.ResolveWorkerRole` defaults legacy nodes
+to full; control sources pin their sole per-node stream before connecting,
+including later resubscribe paths. `controlWorkerIdentity` refuses missing
+identity instead of allowing an empty queue list to activate shared defaults.
+Role edits require restart. See `docs/control-worker-role.md` for configured
+versus active reporting and the fake-broker/native-acceptance boundary.
+
 **Node Installer**: `install.sh` is a standalone script served at `get.aceteam.ai/citadel` that provisions a fresh Ubuntu machine end-to-end (NVIDIA drivers, Docker, citadel binary, systemd service, vLLM pre-pull). `uninstall.sh` reverses it. The Packer template (`packer/`) bakes the same stack into a qcow2 VM image for Proxmox-based fleet deployment.
 
 ### Key Packages
@@ -621,7 +1028,7 @@ type to `"Tailscale"` AND a static adapter GUID, and Wintun keys on the GUID —
 so citadel collided with an installed Tailscale (`0x800700B7`, "file already
 exists") regardless of the interface name. `internal/network/tun_windows.go`
 overrides both (its init runs after tstun's). The GUID is fixed so restarts
-re-attach instead of leaking adapters. Verified on DESKTOP-6UKHJAN with
+re-attach instead of leaking adapters. Verified on a Windows test machine with
 Tailscale running and undisturbed — but note that test (`--check`) installs no
 routes, so it proves only that the **adapter** no longer collides. Both
 products want to route `100.64.0.0/10`; route-level coexistence is untested.
@@ -709,6 +1116,13 @@ not appear in diagnostics. `tests/test_hosted_turn_token.py` and
 `internal/jobs/instance_message_handler_test.go` pin this contract.
 
 ### Worker Mode (Redis Streams) - High-Performance Private Cloud
+
+`laneinventory.Collector` owns the read-only #1699 metadata projection and its
+bounded redaction. `worker.LaneInventoryHandler` requires the exact configured
+own-node stream; paired platform key-bound session-read admission is #14139,
+not something pane/process metadata can prove. The CLI and worker share
+`laneinventory.Encode`; native acceptance and limits are in
+`docs/lane-inventory.md`. Do not run native inventory to test fixture source.
 
 `meetingcapacity.Capacity` owns the inactive #1505 meeting-intake custody
 model: one shared reservation, exact incarnation/job binding, uncertain-read
@@ -1435,15 +1849,28 @@ and reverse-proxies to `http://127.0.0.1:<port>/v1/chat/completions` — streami
 SSE included (`ReverseProxy.FlushInterval=-1`). Model matching mirrors
 `mesh.FindModel` (exact case-insensitive → substring); an unknown model returns a
 404 OpenAI-shaped `model_not_found`. Because these routes sit on the same gateway
-mux, they ride the LAN listener AND the tsnet VPN listener, so `mesh.Client.
-ChatCompletion(ip, gatewayPort, body)` reaches them over the mesh. `mesh chat`
+mux, they ride the primary (loopback by default) listener AND the tsnet VPN
+listener, so `mesh.Client.ChatCompletion(ip, gatewayPort, body)` reaches them over the mesh. `mesh chat`
 now works end-to-end (target the node's gateway port, not the engine port).
 
-Auth posture: `categoryForPath` returns `""` for `/v1/chat/completions`, so it is
-always-allowed — same as `/v1/embeddings`. TLS + mesh membership are the only
-gate; the gateway does NOT currently wire `SetMetering`, so chat is neither
-metered nor authenticated per-request. A single chat response is bounded by the
-gateway `http.Server` `WriteTimeout` (120s), a pre-existing server-wide cap.
+Auth posture: `categoryForPath` still returns `""` for `/v1/*` (not a permission
+category); `gateway.v1AuthMiddleware` (`internal/gateway/v1_auth.go`) is the sole
+caller gate for every `/v1/*` route, including the `/v1/embeddings` upstream. It
+admits a loopback `RemoteAddr` (same-host processes are trusted as for the status
+server's loopback routes) and otherwise requires a verified mesh peer: the
+injected `MeshIdentityResolver` (`gatewayMeshResolver` -> `network.WhoIsPeer`)
+plus `serviceborrow.Decide` (stable and owner id present, same-owner OR a login on
+the operator's `platformAllowedLogins` allowlist (behind `cachedAllowedLogins`, keyed on device, inode, mtime, ctime and size via `statFileStamp`, with a racy-window guard; a loader error is never cached and platforms without a stamp do not cache), wired through
+`Server.SetV1AllowedLogins`). The source address range is never a credential, a
+forwarding header is never read, and a nil resolver, resolver error or
+allowlist-loader error is refused (the loader error narrows to same-owner only).
+`Server.Start` binds loopback unless `Config.ListenAddress` names another host:
+`cmd.defaultGatewayBind` is the `--gateway-bind` / `serve --bind` default, the mesh
+listener is added separately, and a non-loopback value is the explicit LAN opt-in,
+announced by `cmd.warnGatewayLANBind` and `Server.Start` (the notice says plainly that loopback-proxied routes are LAN-reachable on such a bind). `citadel gateway` (the metering proxy) follows the same rule through `cmd.gatewayListenAddr`. The gateway does NOT
+wire `SetMetering`, so chat is not metered. A single chat response is bounded by
+the gateway `http.Server` `WriteTimeout` (120s), a pre-existing server-wide cap.
+Tests: `internal/gateway/v1_auth_test.go`, `cmd/gateway_bind_test.go`.
 
 ```bash
 citadel mesh models                 # list model -> node/engine/addr across the mesh
@@ -1944,6 +2371,12 @@ the intended fail-closed direction. (Constructing it also needs the verifier
 and the control server cert.) Check callers before moving a route, in aceteam
 as well as in this repo's own CLI commands. Wire both sides with
 `cmd.registerControlOnlyAPI`, whose test pins which listener each side lands on.
+A coordinator cert does not override the operator's permission toggles: a
+control route for a toggled surface also takes that permission, read strictly
+per request, as its extra gate (`registerRAGControlAPI` and
+`registerProvisionControlAPI` own this for `/rag` and provisioning), and
+`/ssh/authorized-keys` takes it through `status.ServerConfig.SSHDeployAllowed`,
+where nil refuses.
 
 `status.Server.ControlTLS` reports the public certificate held by the active
 control listener, using the same immutable DER snapshot as its TLS config.
@@ -1975,6 +2408,20 @@ expansion. If `init` obtains a fresh grant while already connected, its link
 can refuse the old registration: run `citadel logout && citadel init` to
 register through a fresh reservation. Saved credentials alone never establish
 completed device binding; the link response must confirm it.
+
+`cmd.enrollDevice` (`cmd/enroll_core.go`, #1867) owns the non-interactive
+enrollment sequence: it never prints, prompts or exits, saves to the explicit
+`enrollOptions.ConfigDir`, and keeps grant secrets out of its result,
+callbacks and errors (`redactEnrollError`). It is single-flight per process,
+refuses a machine with saved mesh state unless `ForceNew` (which then forces the
+new key past the saved state), and passes its resolved control URL to connect
+instead of setting `nexusURL`. A failure after the save and before the link is
+sent disconnects and rolls back this grant, restoring the values the save
+overwrote (`rollbackEnrollmentCredentialsRestoring`); link outcomes keep
+`linkDeviceEnrollmentGatedWith`'s rules. Cancellation is honored until the link
+starts; a started link completes. `citadel enroll` is a terminal wrapper over it
+(`terminalEnrollDeps` keeps the QR UI and the name offer); `init` does not use
+it yet.
 
 ### Two ActualState reporters, two different module sets (#733)
 
@@ -2173,7 +2620,7 @@ adoption short-circuits before native startup/readiness. Preserve those ownershi
 boundaries rather than copying endpoint rules into consumers.
 
 **Adopt an already-running EXTERNAL vLLM instead of launching one — even with NO
-docker runtime (citadel-cli#1081 + #1084, RM-01 / aceteam#9945).**
+docker runtime (citadel-cli#1081 + #1084, aceteam#9945).**
 `status.AdoptableExternalEnginePort` (the allowlist — vLLM only) +
 `status.OpenAICompatServing` (the probe) are the authority. The consequence: a
 `SERVICE_START vllm` (or a boot-time start) on a box where an external OpenAI-compat
@@ -2195,7 +2642,7 @@ PATH, `resolveKind` returns "native" and the pre-existing #649
 `IsNativeServiceServing` short-circuit already skips the launch (a `type: docker`
 entry pins docker regardless of PATH, so it reaches this branch); (2) **#1084 fixed
 #1083's docker-reachability gate.** #1083 DECLINED adoption whenever the container
-runtime was unreachable — which meant the docker-less RM-01 (vendor vLLM under its
+runtime was unreachable — which meant a docker-less appliance (vendor vLLM under its
 own systemd on `CITADEL_VLLM_HOST_PORT`) errored on `SERVICE_START vllm` instead of
 adopting. Ownership (`ourContainerRunning`'s two-state return / the `runtimeAvailable`
 seam) now DECLINES adoption ONLY when the runtime is reachable AND our own container
@@ -2204,7 +2651,7 @@ unreachable runtime no longer declines: a box with no container runtime cannot b
 running our container, so a live OpenAI-compat engine there is necessarily external
 and is adopted. Consequence for hermeticity: post-#1084 the external probe fires on
 a neutered-PATH box, so a docker-branch unit test that must not hit the real
-resolved vLLM endpoint (node 1297 serves a real vLLM) injects the probe via
+resolved vLLM endpoint (a dev box may serve a real vLLM) injects the probe via
 `externalEngineServingFn` (jobs) / the `servingCheck` seam (cmd) — `newModelTestHandler`
 seams it to "nothing serving" for exactly this reason. TCP reachability is necessary
 but not sufficient: the body must decode as OpenAI-shaped `{"data":[...]}` (an empty
@@ -2443,7 +2890,7 @@ Quantized V-cache requires flash attention, so `--flash-attn on` is mandatory he
 Flag names verified against the PrismML fork's `common/arg.cpp` (`-fa` takes an
 `[on|off|auto]` value). Override the context via the `BONSAI_CTX` env var.
 
-**Live inference is a documented human step:** node 1084's GPU is VRAM-contended
+**Live inference is a documented human step:** a shared GPU node may be VRAM-contended
 (vLLM holds ~21GB); do NOT stop vLLM to validate. Bonsai fits alongside once VRAM
 is free.
 
@@ -3788,7 +4235,7 @@ case of the semaphore pool: it never touches `sem`, so it can never occupy a
 pool slot either, and it applies regardless of `--max-concurrency`.
 
 **#903 Stage 1 (GPU-bound extension):** on a `--max-concurrency=1` GPU node
-(the node-1297 incident node — a discrete GPU, so `cmd/work.go` constructs a
+(the incident node — a discrete GPU, so `cmd/work.go` constructs a
 non-nil `r.gpuTracker`), a long-running `llm_inference` job used to run INLINE
 in the fetch loop exactly like any other job — blocking `source.Next()` until
 it returned, so a *targeted* dispatch to that node (e.g. `FILE_READ_BYTES` in
@@ -4050,7 +4497,7 @@ a layered resolver, first match wins — explicit `agents_probe_user` (manifest)
 owner uid of `network.GetStateDir()` (home from PASSWD via `user.LookupId`, NOT
 the dir path) > `SUDO_USER` (the #1012 branch) > process user. Each `Target`
 carries a `Signal` (`config`/`node-dir-owner`/`sudo-user`/`process`) so "probed
-jason's env" is distinguishable from "probed root's env on a root-owned node" —
+the operator's env" is distinguishable from "probed root's env on a root-owned node" —
 the two outcomes that look identical otherwise. A configured user missing from
 passwd is an ERROR (→ honest Unknown probe), never a silent fallback. Do NOT add
 systemd `User=` reading (answers the wrong question) or `/home/*` enumeration (a
@@ -4417,7 +4864,7 @@ service/installer and native acceptance scope.
 
 **Lesson that bit the live node: every `internal/update` test MUST sandbox HOME.**
 The update state file resolves from HOME (`getUserHomeDir`), and the shipped
-`citadel.service` is a systemd USER unit (HOME=/home/jason), so that file is the
+`citadel.service` is a systemd USER unit (HOME=the operator's home), so that file is the
 LIVE node's updater state — not a throwaway. `runOnce` now records a result on
 every terminal path (not just apply-success as before), so a `go test
 ./internal/update/` with no HOME sandbox writes bogus telemetry (e.g.
@@ -4546,7 +4993,7 @@ seam for tests, and also driving the new `citadel service refresh-unit`). Before
 this, `sudo citadel update install` on an up-to-date node exited at "You are
 running the latest version" without ever re-materializing the unit, so a node
 deployed by a pre-#444 binary never received the restart-storm hardening (seen on
-node 1314). `finishManualNoOp` also honors an explicit `--restart`: a managed
+a production node). `finishManualNoOp` also honors an explicit `--restart`: a managed
 worker may still run an older image even when the CLI is already current. A
 requested restart without a verified active target exits nonzero. Separately, the
 unprivileged-system-unit remediation (`service.rootRemediationCommand`) resolves
@@ -4599,7 +5046,7 @@ runs `citadel init --authkey`, which writes NO device creds
 (`saveDeviceConfigToFile` is reached only on the device-auth path), so
 `hasDeviceConfigured()` is false there and install.sh keeps sole ownership of
 `citadel-worker.service` — there is no competing-unit race. It fires on the
-interactive device-auth enroll (the RM-01/Jetson demo path).
+interactive device-auth enroll (the Jetson demo path).
 
 Two halves:
 - **Scaffold (`ensureNodeScaffoldAt`, root or not):** writes a minimal
@@ -4879,8 +5326,7 @@ Citadel CLI has full cross-platform support for Linux, macOS (darwin), and Windo
   any owner-home fallback — and that path is NOT `$HOME`-scoped, so a test's
   `t.Setenv("HOME", tempdir)` does not redirect it on a dev box where
   `/etc/citadel/config.yaml` already points `node_config_dir` at a real,
-  possibly-live node's directory (this repo's own dev machine is such a box —
-  see the RESUME notes on node 1297). A test that calls
+  possibly-live node's directory (a maintainer's dev machine can be such a box). A test that calls
   `config.SaveX(network.GetNodeConfigDir(), ...)` to seed a scenario silently
   WRITES into that real node's config, not a sandbox — caught only because the
   written file was visible afterward, not because any test failed. The fix
@@ -5041,6 +5487,75 @@ Docker Desktop on Windows requires WSL2:
 2. `nvidia-smi` in PATH
 3. WMI query: `wmic path win32_VideoController get name` (checks for "nvidia")
 
+### Per-user worker for a standard user (citadel-cli#1867 C3)
+
+A standard user cannot install the LocalSystem service, so `citadel work
+--background` keeps the worker running instead. `cmd.handleBackgroundModes`
+owns the three roles: the launcher (what the HKCU Run value starts) spawns
+`work --supervise` hidden and returns; the supervisor holds
+`service.SupervisorLockPath` (a `worklock.AcquireFile` lock beside the worker
+lock) and runs `service.RunSupervisor`, which owns restart policy (backoff,
+reset after stable uptime, immediate relaunch on
+`update.SupervisorRestartExitCode`, stop on exit 0). On that restart code
+`service.SupervisorHandover` moves supervision to a fresh supervisor started
+from the updated path (spawn, then release, then confirm; retake on failure),
+because a supervisor left on the renamed `.old` image makes the next update's
+`os.Remove(.old)` fail. The worker carries `--supervisor-pid` and
+`--supervisor-lock`. `cmd.supervisedByUserSupervisor` is the only way that
+worker counts as service-managed (`managedByServiceManager`, AGENT_UPDATE's
+`IsService`): the named PID must be the live parent and still hold the
+supervisor lock. The Windows update restart instead keys on the flag alone
+(`update.SetSupervisedRestart`), so a failed probe never spawns a copy. Never
+set `INVOCATION_ID` for it. `service.CheckUserWorkerDir` refuses a node dir
+outside the user's profile; stop requests are per-PID files
+(`service.SupervisorStopPath`) so none is lost to a supervisor that started in
+between. `cmd/work_background_windows.go` owns the process
+flags (the supervisor gets a hidden console, not `DETACHED_PROCESS`, so console
+children never open a window) and puts the worker in a kill-on-close job;
+graceful stop is CTRL_BREAK, and `citadel worker stop` asks through
+`service.SupervisorStopPath`. `service.BuildRunValue` and `service.UserAutostart`
+own the Run value (local drive paths only, no UNC); only `citadel worker
+autostart enable` writes it, and `cmd.enableUserAutostart` refuses an exe this
+user does not own (`update.ExecutableOwnership`).
+
+### Per-user worker on macOS: a LaunchAgent (citadel-cli#1903 M3)
+
+launchd is the supervisor, so none of the Windows `--background` supervisor is
+ported. `service.LaunchAgent` owns the per-user agent (label and plist shape
+shared with the `init` agent through `renderLaunchdPlist`, so an earlier init
+agent is adopted and rewritten only when its content differs). Every side effect
+is a field (`Run` launchctl runner, `StatExe`, `Home`, `Euid`), so
+`launchagent_test.go` and `cmd/local_setup_worker_mac_test.go` run on Linux
+with a fake runner and a temp home; `NewUserLaunchAgent` (`user_darwin.go`) is
+the only production wiring. What each method decides: `Enable` writes the plist
+(refuses root, and a binary this user does not own or others can write,
+`checkExe`) and boots out a job loaded from older content; `Start` is a no-op
+for a running job, refuses a Login Items switch-off (`print-disabled`), empties
+a log past `LaunchAgentLogMaxBytes` (through an `O_NOFOLLOW` descriptor), then
+bootstraps into `gui/<uid>`. There is no legacy `load`/`unload` fallback: those
+verbs act on the caller's session domain (an SSH login has another), so a
+failed bootstrap or bootout fails closed and says to use the desktop session.
+`Stop` boots out by service target (`gui/<uid>/<label>`) and returns nil only
+once `launchctl print` exits 113 ("service not found", the only absent signal;
+any other exit is an error, as is a missing launchctl), so a failed bootout
+that left the job loaded is an error. `checkExe` also refuses a binary whose
+folder (or symlink-target folder) group or other can write, or another user
+owns. `Remove` deletes the plist, and Disconnect keeps it when the stop failed.
+`citadel worker start` is the macOS start command (`citadel service start`
+still has `launchdManager`'s load fallback for the `init` agent and can place
+the label outside `gui/<uid>`, so no macOS copy points at it). Never a LaunchDaemon, never `SUDO_UID`.
+`cmd.darwinSetupWorkerDeps` maps the setup page's three worker steps onto
+`Enable`/`Start` (`startSetupWorker` still refuses unless this page connected
+the PC and `setupPostureHolds`, exactly as on Windows). `cmd.darwinDisconnectDeps`
+swaps `stopWorker` and `disableAutostart` for `Stop` and `Remove`;
+`disconnectThisPC` already skips the logout and key removal when either fails,
+so a KeepAlive worker cannot restart against deleted credentials.
+`cmd.agentChecks` (via `userWorkerStateFromAgent`) is the doctor's and setup
+page's Autostart/Worker/Worker-log lines on macOS; they read launchd only and
+show no log content. `citadel worker autostart enable|disable` and `worker stop`
+map to the same methods on macOS. Native acceptance on Apple Silicon is
+post-merge (checklist in the PR).
+
 ### Known Limitations on Windows
 
 - WSL2 is required (not available on older Windows versions)
@@ -5055,7 +5570,7 @@ Docker Desktop on Windows requires WSL2:
 
 A remote E2E test script (`scripts/windows-e2e-test.sh`) validates the full first-time user experience on a Windows machine via WinRM. It tests: clean → install → init → verify.
 
-**Test machine**: `192.168.2.207` (DESKTOP-6UKHJAN, Windows 11, 8 GiB RAM, user: `acewin`)
+**Test machine**: a Windows 11 machine on the maintainers' LAN (8 GiB RAM, a local test user)
 
 **WinRM prerequisites** (one-time on the Windows machine, elevated PowerShell):
 ```powershell
@@ -5069,7 +5584,7 @@ New-NetFirewallRule -Name "WinRM-HTTP" -DisplayName "WinRM HTTP" -Protocol TCP -
 ```bash
 # Requires pywinrm in a venv
 PYTHON=~/.venvs/winrm/bin/python3 ./scripts/windows-e2e-test.sh \
-  --host 192.168.2.207 --user acewin --password '***' --authkey tskey-auth-xxx
+  --host "$WIN_HOST" --user "$WIN_USER" --password "$WIN_PASSWORD" --authkey tskey-auth-xxx
 ```
 
 **Current test status** (as of v2.3.0):

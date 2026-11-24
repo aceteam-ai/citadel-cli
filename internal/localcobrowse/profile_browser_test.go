@@ -82,16 +82,41 @@ func TestRealBrowserPersistentProfileRoundTrip(t *testing.T) {
 	const pass = "lantern orbit pebble saffron"
 	ctx := context.Background()
 
-	waitText := func(id, want string) {
+	// waitText polls until the page's #t reads want. The browser can be slow to
+	// load the launch URL on a hosted runner (#1689: Edge took 48.9s and #t never
+	// appeared), so it polls for up to 120s, and if the page still is not there
+	// after 30s it navigates to the same URL again (through the manager, which
+	// settles the navigation) every 30s. The server still decides what the
+	// cookie check shows, so the round trip proves the same thing. On failure it
+	// reports the phase, elapsed time, last result and the session's status.
+	waitText := func(phase, id, url, want string) {
 		t.Helper()
-		deadline := time.Now().Add(30 * time.Second)
+		begin := time.Now()
+		deadline := begin.Add(120 * time.Second)
+		nextNav := begin.Add(30 * time.Second)
+		renavs := 0
+		var res platform.ExtractResult
+		var err error
 		for {
-			res, err := svc.Extract(ctx, id, "#t", nil, 200, "check")
+			res, err = svc.Extract(ctx, id, "#t", nil, 200, "check")
 			if err == nil && res.Text == want {
+				t.Logf("%s: page ready after %s, %d re-navigation(s)", phase, time.Since(begin).Round(time.Millisecond), renavs)
 				return
 			}
-			if time.Now().After(deadline) {
-				t.Fatalf("page text = %q (%v), want %q", res.Text, err, want)
+			now := time.Now()
+			if now.After(deadline) {
+				st, ok := m.SessionStatus(id)
+				t.Fatalf("%s: page text = %q (%v), want %q after %s; re-navigations=%d; session known=%v state=%q url=%q title=%q browser=%q",
+					phase, res.Text, err, want, now.Sub(begin).Round(time.Millisecond), renavs, ok, st.State, st.URL, st.Title, st.Browser)
+			}
+			if now.After(nextNav) {
+				renavs++
+				nextNav = now.Add(30 * time.Second)
+				if st, nerr := m.Navigate(id, url); nerr != nil {
+					t.Logf("%s: re-navigate: %v", phase, nerr)
+				} else {
+					t.Logf("%s: re-navigated at %s, url=%q", phase, now.Sub(begin).Round(time.Millisecond), st.URL)
+				}
 			}
 			time.Sleep(250 * time.Millisecond)
 		}
@@ -105,7 +130,7 @@ func TestRealBrowserPersistentProfileRoundTrip(t *testing.T) {
 	if err := svc.HumanSetupAndUnlock(ctx, s1.SessionID, pass, true); err != nil {
 		t.Fatalf("setup and unlock: %v", err)
 	}
-	waitText(s1.SessionID, "set")
+	waitText("session 1 (new persistent profile)", s1.SessionID, page.URL+"/set", "set")
 	st1, _ := m.SessionStatus(s1.SessionID)
 	if err := svc.Stop(ctx, s1.SessionID); err != nil {
 		t.Fatalf("stop 1: %v", err)
@@ -134,7 +159,7 @@ func TestRealBrowserPersistentProfileRoundTrip(t *testing.T) {
 	if err := svc.HumanUnlock(ctx, s2.SessionID, pass); err != nil {
 		t.Fatalf("unlock 2: %v", err)
 	}
-	waitText(s2.SessionID, cookie)
+	waitText("session 2 (reopened persistent profile)", s2.SessionID, page.URL+"/get", cookie)
 	if err := svc.Stop(ctx, s2.SessionID); err != nil {
 		t.Fatalf("stop 2: %v", err)
 	}
@@ -144,5 +169,5 @@ func TestRealBrowserPersistentProfileRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start 3: %v", err)
 	}
-	waitText(s3.SessionID, "none")
+	waitText("session 3 (throwaway)", s3.SessionID, page.URL+"/get", "none")
 }

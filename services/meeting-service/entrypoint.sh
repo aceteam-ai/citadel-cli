@@ -20,6 +20,27 @@
 # Chrome refuses to run as root anyway, so a real user is required regardless.
 set -e
 
+# Non-root start (docker `--user`, the browser-runtime per-session contract,
+# aceteam-ai/citadel-cli#1759): no usermod/groupmod remap, no chown, no
+# supervisord privilege drop. Everything runs as the invoking uid, so mounts the
+# caller owns "just work" and nothing needs CAP_CHOWN/SETUID. The caller provides
+# a writable /run, /tmp and $HOME (tmpfs) and a profile dir it already owns.
+if [ "$(id -u)" != "0" ]; then
+    PROFILE_DIR="${MEETING_PROFILE_DIR:-/profile}"
+    WORKSPACE_DIR="${CITADEL_WORKSPACE:-/workspace}"
+    RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/10001}"
+    mkdir -p "$RUNTIME_DIR/pulse" "$HOME/.config/pulse"
+    chmod 700 "$RUNTIME_DIR"
+    # Only this session's own container uses the profile; a lock left by a
+    # previous container (different hostname) would otherwise block launch.
+    rm -f "$PROFILE_DIR/SingletonLock" "$PROFILE_DIR/SingletonSocket" "$PROFILE_DIR/SingletonCookie" 2>/dev/null || true
+    [ -d "$WORKSPACE_DIR" ] && mkdir -p "$WORKSPACE_DIR/meetings" 2>/dev/null || true
+    if [ "$1" = "/usr/bin/supervisord" ]; then
+        exec /usr/bin/supervisord -c /etc/supervisor/supervisord-nonroot.conf
+    fi
+    exec "$@"
+fi
+
 PROFILE_DIR="${MEETING_PROFILE_DIR:-/profile}"
 WORKSPACE_DIR="${CITADEL_WORKSPACE:-/workspace}"
 mkdir -p "$PROFILE_DIR" "$WORKSPACE_DIR"

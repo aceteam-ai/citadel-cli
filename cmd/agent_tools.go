@@ -151,9 +151,11 @@ var serviceRestartDelay = 500 * time.Millisecond
 // on the processes of the units it starts; this is the signal that an exit is a
 // restart, not a suicide. Deliberately conservative: if we cannot prove we are
 // under such a manager we do NOT exit (that would leave the node dead), and fall
-// back to guidance instead.
+// back to guidance instead. The per-user Windows supervisor (`citadel work
+// --background`, citadel-cli#1867) is the other such manager; it is recognised
+// by an explicit, verified check, never by faking INVOCATION_ID.
 func managedByServiceManager() bool {
-	return strings.TrimSpace(os.Getenv("INVOCATION_ID")) != ""
+	return strings.TrimSpace(os.Getenv("INVOCATION_ID")) != "" || supervisedByUserSupervisor()
 }
 
 // agentWorkerRestart is the break-glass remote restart behind

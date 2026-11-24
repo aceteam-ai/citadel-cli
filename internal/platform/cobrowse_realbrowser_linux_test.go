@@ -58,6 +58,25 @@ func newRealEnv(t *testing.T) realEnv {
 	if err := os.MkdirAll(e.base, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	// Registered after t.TempDir, so it runs after every session Stop (cleanups
+	// are LIFO) and before the TempDir removal. Stop kills the main browser
+	// process, but Chrome's helper processes (zygote, renderer, GPU, network)
+	// can outlive it briefly and keep writing under the profile, which makes the
+	// TempDir RemoveAll fail with "directory not empty" (citadel-cli#1706). Wait
+	// for them to exit, then remove the tree ourselves with retries.
+	t.Cleanup(func() {
+		if !waitUntilReal(30*time.Second, func() bool { return len(procsMentioning(e.base)) == 0 }) {
+			t.Logf("browser helper processes still reference %s after 30s: %v", e.base, procsMentioning(e.base))
+		}
+		var err error
+		for i := 0; i < 50; i++ {
+			if err = os.RemoveAll(e.base); err == nil {
+				return
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		t.Logf("could not remove %s before TempDir cleanup: %v", e.base, err)
+	})
 	prev := registryDirResolver
 	registryDirResolver = func() string { return e.reg }
 	t.Cleanup(func() { registryDirResolver = prev })

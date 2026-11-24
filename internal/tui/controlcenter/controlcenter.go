@@ -737,6 +737,11 @@ func shouldOfferDetachOnQuit(worker WorkerCallbacks) bool {
 type PermissionsCallbacks struct {
 	Load func() *config.Permissions        // Load current permissions
 	Save func(p *config.Permissions) error // Save updated permissions
+	// SaveToggle, when set, persists one Built-in Services toggle by name
+	// against the file as it is now, so a modal opened earlier cannot write
+	// back fields that changed on disk since (for example co-browse
+	// public-only). Save is the fallback.
+	SaveToggle func(name string, enabled bool) error
 }
 
 // Config holds control center configuration

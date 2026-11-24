@@ -170,3 +170,7 @@ python3 -m pytest services/meeting-service/test_meetingd.py
 pip install websocket-client
 python3 services/meeting-service/smoke_test.py
 ```
+
+## browser-runtime per-session contract (citadel-cli#1759)
+
+This image is also published as `ghcr.io/aceteam-ai/browser-runtime` (same digest; `meeting-service` stays as an alias for one release). `internal/browserruntime` owns the contract the container runner uses: one container per session, started with docker `--user UID:GID` (no userns remap, no chown, no caps), tmpfs `/run`, `/tmp`, `/home/bot`, labels `aceteam.browser-runtime{,.session,.purpose}`, control (8102) and CDP (9223) published to `127.0.0.1` on dynamic host ports, and an optional `/profile` mount the caller already owns. Started non-root, the entrypoint skips its root-only steps and uses `supervisord-nonroot.conf`. The Chromium major is in the `aceteam.browser-runtime.chromium-major` label and `/etc/browser-runtime/chromium-major`. A release pins the image by `:<sha>@sha256:<digest>`; the pin bump is a follow-up PR after CI publishes.

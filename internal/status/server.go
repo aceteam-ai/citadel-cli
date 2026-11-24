@@ -97,6 +97,10 @@ type Server struct {
 	// listener) the mTLS control server will also serve on. Added via
 	// AddControlListener before Start.
 	extraControlListeners []net.Listener
+
+	// sshDeployAllowed backs the operator SSH permission on the control
+	// listener's /ssh/authorized-keys; see ServerConfig.SSHDeployAllowed.
+	sshDeployAllowed func() bool
 }
 
 // ServerConfig holds configuration for the status server.
@@ -148,6 +152,13 @@ type ServerConfig struct {
 	// ControlServerCert is the TLS server certificate the control listener
 	// presents. Required (together with CAVerifier) to start the control listener.
 	ControlServerCert *tls.Certificate
+
+	// SSHDeployAllowed reports, per request, whether the node operator's SSH
+	// permission currently admits SSH-key deployment on the control listener.
+	// It runs after requireCoordinator. Nil refuses every request (fail
+	// closed); the caller is expected to read the live permissions strictly so
+	// an unreadable or damaged file also refuses.
+	SSHDeployAllowed func() bool
 }
 
 // DefaultControlPort is the default port for the mTLS control listener. It is
@@ -182,6 +193,7 @@ func NewServer(cfg ServerConfig, collector *Collector) *Server {
 		caVerifier:        cfg.CAVerifier,
 		controlPort:       cfg.ControlPort,
 		controlServerCert: cfg.ControlServerCert,
+		sshDeployAllowed:  cfg.SSHDeployAllowed,
 	}
 }
 
@@ -221,6 +233,18 @@ func (s *Server) handleSSHMovedToControl(w http.ResponseWriter, r *http.Request)
 	writeJSONError(w, msg, http.StatusForbidden)
 }
 
+// requireSSHPermission refuses with a fixed 403 unless sshDeployAllowed
+// reports true for this request. A nil callback refuses.
+func (s *Server) requireSSHPermission(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.sshDeployAllowed == nil || !s.sshDeployAllowed() {
+			writeJSONError(w, "SSH key deployment is disabled on this node by its permission toggle", http.StatusForbidden)
+			return
+		}
+		next(w, r)
+	}
+}
+
 // buildControlMux constructs the multiplexer for the dedicated mTLS control
 // listener. Only MUTATING control endpoints live here, each gated by
 // requireCoordinator (a verified fabric-CA-signed coordinator client cert). The
@@ -230,8 +254,9 @@ func (s *Server) buildControlMux() *http.ServeMux {
 	// Liveness probe (still requires the mTLS handshake to reach, but no identity
 	// check) so a coordinator can confirm the control listener is up.
 	mux.HandleFunc("/ping", s.handlePing)
-	// SSH-key injection: the host-takeover crown jewel. Coordinator identity only.
-	mux.HandleFunc("/ssh/authorized-keys", s.caVerifier.requireCoordinator(s.handleSSHAuthorizedKeys))
+	// SSH-key injection: coordinator identity, then the operator's live SSH
+	// permission.
+	mux.HandleFunc("/ssh/authorized-keys", s.caVerifier.requireCoordinator(s.requireSSHPermission(s.handleSSHAuthorizedKeys)))
 	// Feature-package mutating routes (e.g. /workflow/run), each handed the
 	// coordinator-identity gate rather than the VPN-origin one.
 	for _, reg := range s.controlRouteRegistrars {
@@ -433,10 +458,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 // endpoint and a caller can fall back from /worker to /status without a second
 // decoder.
 type WorkerEnvelope struct {
+	Role   string          `json:"role,omitempty"`
 	Worker *WorkerLiveness `json:"worker,omitempty"`
 }
 
-// handleWorker returns ONLY the worker liveness block.
+// handleWorker returns cached startup role and worker liveness without probes.
 // GET /worker
 //
 // It exists because /status runs a full collection (docker stats across every
@@ -466,12 +492,14 @@ func (s *Server) handleWorker(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var live *WorkerLiveness
+	var role string
 	if s.collector != nil {
 		live = s.collector.WorkerLivenessSnapshot()
+		role = s.collector.role
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(WorkerEnvelope{Worker: live})
+	json.NewEncoder(w).Encode(WorkerEnvelope{Role: role, Worker: live})
 }
 
 // handleHealth returns a simple health check response.

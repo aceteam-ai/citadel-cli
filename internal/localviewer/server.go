@@ -96,6 +96,10 @@ type Config struct {
 	PrivateDir string
 	// MaxSessions is reported to the setup page through /api/summary.
 	MaxSessions int
+	// NodePermissions, when set, serves the Files and Shell toggles for this
+	// PC's AceTeam node on both the setup page and the viewer
+	// (citadel-cli#1867 C5). Nil hides them.
+	NodePermissions *NodePermissionHooks
 }
 
 // Server is the loopback viewer.
@@ -387,6 +391,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /open", s.handleOpen)
 	mux.HandleFunc("GET /{$}", s.withCookie(s.handleIndex))
 	mux.HandleFunc("GET /assets/{file}", s.withCookie(s.handleAsset))
+	s.nodePermissionRoutes(mux)
 	if s.cfg.Setup != nil {
 		s.setupRoutes(mux)
 		return s.guard(mux)
@@ -515,7 +520,7 @@ func (s *Server) handleAsset(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("file")
 	var ctype string
 	switch name {
-	case "app.js", "open.js", "setup.js":
+	case "app.js", "open.js", "setup.js", "permissions.js":
 		ctype = "text/javascript; charset=utf-8"
 	case "app.css":
 		ctype = "text/css; charset=utf-8"
@@ -534,6 +539,7 @@ func (s *Server) handleAsset(w http.ResponseWriter, r *http.Request) {
 
 // State is GET /api/state.
 type State struct {
+	Uploads  localcobrowse.UploadStatus  `json:"uploads"`
 	Agent    string                      `json:"agent"`
 	Sessions []localcobrowse.SessionView `json:"sessions"`
 	Now      string                      `json:"now"`
@@ -549,6 +555,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	s.lastPoll = s.cfg.Now()
 	s.mu.Unlock()
 	st := State{
+		Uploads:  s.cfg.Service.UploadStatus(),
 		Agent:    s.cfg.Service.Agent(),
 		Sessions: s.cfg.Service.Sessions(""),
 		Now:      s.cfg.Now().UTC().Format(time.RFC3339),
