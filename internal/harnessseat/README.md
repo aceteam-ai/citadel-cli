@@ -13,6 +13,24 @@ the reporting projection has a domain-separated opaque reference and bounded
 seat metadata, never local owner/configuration/work paths or account digests.
 Salted account digests support local duplicate-account refusal.
 
+`reconcileProbeObservation` is an internal, currently unwired metadata handoff
+for future trusted status adapters. It requires the snapshot captured before
+probing and the exact resolved seat identity. It hashes a known account ID with
+the existing local salt, lets reported entitlement replace a declaration with an
+advisory mismatch flag, and publishes only bounded metadata. Account IDs and
+paths are excluded from the observation's JSON and normal/debug formatting.
+Duplicate account bindings refuse atomically. Concurrent writers, replaced
+salts and changed local state are fenced rather than silently retried; a fresh
+observation never changes local enable, binding, roots or ceiling.
+
+Explicit unknown/signed-out observations clear derived account/plan/model
+evidence; the last entitlement remains only a saved declaration. Invalid
+observations refuse without a partial write and must never authorize fallback
+to previously saved auth. A snapshot is not a freshness or native-process
+attestation. Future adapters still must establish result provenance, directory
+privacy and process-lifetime custody. No raw-response parser, status execution,
+CLI probe, remote read or launch consumer is added by this helper.
+
 These are structural, fake-only proofs, not proof of native login isolation or
 permission to launch. A caller must still establish the actual owner, private
 directory modes, registry integrity, entitlement/scope/data-class policy,

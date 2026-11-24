@@ -39,6 +39,11 @@ scopes the startup exemption after run-profile admission. See
 `internal/harnessseat/README.md` for the incomplete
 seat-registry boundary and focused tests.
 
+`harnessseat.reconcileProbeObservation` owns the internal, unwired status-result
+metadata handoff: exact identity and snapshot fencing, salted account binding,
+duplicate refusal and preservation of local enable/policy. It is not a probe,
+freshness attestation or launch authorization.
+
 `status.collectCapacityMetrics` owns additive optional heartbeat placement
 signals and per-source unknown handling. `nativeCapacityProbes` owns the
 build-tagged OS readers; `TestCapacity*` exercises bounded procfs parsing and
