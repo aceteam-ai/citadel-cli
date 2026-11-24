@@ -35,17 +35,24 @@ func TestHousekeepingPlanFromRootIsOfflineAndAdvisory(t *testing.T) {
 }
 
 func TestHousekeepingStartupExceptionIsExactAndHPCStaysClosed(t *testing.T) {
-	for _, name := range []string{"plan", "status", "run", "future"} {
+	for _, name := range []string{"plan", "plan-extra", "planning", "status", "run", "future"} {
 		root := &cobra.Command{Use: "citadel"}
 		parent := &cobra.Command{Use: "housekeeping"}
 		leaf := &cobra.Command{Use: name}
 		root.AddCommand(parent)
 		parent.AddCommand(leaf)
+		if isHousekeepingPlanCommand(parent) {
+			t.Fatal("bare group received startup exemption")
+		}
 		if isHousekeepingPlanCommand(leaf) != (name == "plan") {
 			t.Fatal("broad startup exemption")
 		}
 		if hpcProfileAllowsCommand(leaf.CommandPath()) {
 			t.Fatal("housekeeping expanded HPC admission")
+		}
+		root.Use = "other"
+		if isHousekeepingPlanCommand(leaf) {
+			t.Fatal("foreign root received startup exemption")
 		}
 	}
 }
