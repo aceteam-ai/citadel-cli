@@ -18,10 +18,10 @@ func NvidiaGPUCountForCompose() int {
 		cmd := exec.CommandContext(ctx, name, args...)
 		cmd.WaitDelay = 100 * time.Millisecond
 		return cmd.Output()
-	}, os.Stat)
+	}, os.Stat, os.ReadFile)
 }
 
-func composeGPUCount(parent context.Context, run func(context.Context, string, ...string) ([]byte, error), stat func(string) (os.FileInfo, error)) int {
+func composeGPUCount(parent context.Context, run func(context.Context, string, ...string) ([]byte, error), stat func(string) (os.FileInfo, error), readFile func(string) ([]byte, error)) int {
 	ctx, cancel := context.WithTimeout(parent, ComposeGPUProbeTimeout)
 	defer cancel()
 	output, queryErr := run(ctx, "nvidia-smi", "--query-gpu=name", "--format=csv,noheader")
@@ -33,6 +33,18 @@ func composeGPUCount(parent context.Context, run func(context.Context, string, .
 	}
 	// Hardware evidence wins even when the driver/query is broken or unavailable.
 	if _, err := stat("/dev/nvidiactl"); err == nil || !os.IsNotExist(err) {
+		return -1
+	}
+	// Tegra GPUs are integrated, so PCI absence is not GPU absence. Driver
+	// tools and /dev/nvidiactl may both be absent on these hosts. Evidence of
+	// Tegra, or an unreadable hardware marker, preserves the existing flavor.
+	for _, path := range []string{"/etc/nv_tegra_release", "/dev/nvhost-ctrl-gpu"} {
+		if _, err := stat(path); err == nil || !os.IsNotExist(err) {
+			return -1
+		}
+	}
+	compatible, err := readFile("/proc/device-tree/compatible")
+	if (err != nil && !os.IsNotExist(err)) || strings.Contains(strings.ToLower(string(compatible)), "nvidia,tegra") || ctx.Err() != nil {
 		return -1
 	}
 	hardware, err := run(ctx, "lspci", "-nn")
