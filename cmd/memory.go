@@ -501,18 +501,32 @@ func runMemoryCapture(cmd *cobra.Command, args []string) {
 const captureExcerptLimit = 1500
 
 // checkCaptureScope owns what scope a capture may write to. memory_write
-// defaults an empty scope to the broadly readable "global", and no private
-// per-user scope exists in the API, so the scope must be named explicitly and
-// "global" additionally needs the explicit allowGlobal opt-in.
+// defaults an empty scope, and an "agent:" scope with no agent name, to the
+// broadly readable "global". Citadel's memory key carries only memory:read and
+// memory:write, so a per-user "person" scope is refused server-side (a
+// person-scoped key is tracked in #1916). The scope must therefore be named
+// explicitly, and anything that resolves to global needs the allowGlobal opt-in.
 func checkCaptureScope(scope string, allowGlobal bool) error {
 	scope = strings.TrimSpace(scope)
 	if scope == "" {
 		return errors.New("no capture scope set; refusing to write (an empty scope would default to the shared global scope). Reinstall with 'citadel memory install --capture-scope <scope>'")
 	}
-	if strings.EqualFold(scope, "global") && !allowGlobal {
+	if captureScopeIsGlobal(scope) && !allowGlobal {
 		return errors.New("refusing to capture into the shared global scope without --allow-global-capture")
 	}
 	return nil
+}
+
+// captureScopeIsGlobal reports whether a trimmed scope resolves to the shared
+// global scope: "global" in any case, or an "agent:" prefix with no agent name.
+func captureScopeIsGlobal(scope string) bool {
+	if strings.EqualFold(scope, "global") {
+		return true
+	}
+	const agentPrefix = "agent:"
+	return len(scope) >= len(agentPrefix) &&
+		strings.EqualFold(scope[:len(agentPrefix)], agentPrefix) &&
+		strings.TrimSpace(scope[len(agentPrefix):]) == ""
 }
 
 // --- helpers -----------------------------------------------------------------

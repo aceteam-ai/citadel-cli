@@ -112,7 +112,8 @@ func TestCheckCaptureScope(t *testing.T) {
 	}{
 		{"", false, false}, {"  ", true, false},
 		{"global", false, false}, {"Global", false, false}, {"global", true, true},
-		{"my-project", false, true},
+		{"agent:", false, false}, {"Agent:  ", false, false}, {"agent:", true, true},
+		{"agent:hermes", false, true}, {"my-project", false, true},
 	} {
 		err := checkCaptureScope(tc.scope, tc.allow)
 		if (err == nil) != tc.ok {
@@ -173,8 +174,9 @@ func TestWireClaudeCode_ScopedHookAndLegacyRemoval(t *testing.T) {
 	}
 }
 
-func TestRunMemoryCapture_EmptyScopeWritesNothing(t *testing.T) {
-	// An old install runs the hook with no --scope: must not reach the network.
+func TestCheckCaptureScope_RefusesOldUnscopedInstall(t *testing.T) {
+	// An old install runs the hook with no --scope. The network-level refusal
+	// is pinned by memory.CaptureNote's own empty-scope test.
 	if err := checkCaptureScope("", false); err == nil {
 		t.Fatal("empty scope must be refused before any write")
 	}
