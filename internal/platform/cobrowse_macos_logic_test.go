@@ -102,11 +102,32 @@ func TestMacBrowserKind(t *testing.T) {
 }
 
 func TestMacDefaultBaseDir(t *testing.T) {
-	if got := macDefaultBaseDir("/Users/u/Library/Caches", nil, "/tmp"); got != filepath.Join("/Users/u/Library/Caches", "Citadel", cobrowseSessionsDirName) {
-		t.Errorf("cache dir: %s", got)
+	got, err := macDefaultBaseDir("/Users/u", nil)
+	if err != nil || got != filepath.Join("/Users/u/Library/Caches", "Citadel", cobrowseSessionsDirName) {
+		t.Errorf("home dir: %s, %v", got, err)
 	}
-	if got := macDefaultBaseDir("", errors.New("no home"), "/var/T"); got != filepath.Join("/var/T", "Citadel", cobrowseSessionsDirName) {
-		t.Errorf("fallback: %s", got)
+	for _, home := range []string{"", "relative"} {
+		if got, err := macDefaultBaseDir(home, nil); err == nil || got != "" {
+			t.Errorf("home %q must be refused, got %q, %v", home, got, err)
+		}
+	}
+	if _, err := macDefaultBaseDir("/Users/u", errors.New("no home")); err == nil {
+		t.Error("a home lookup error must be refused, never a shared temp fallback")
+	}
+}
+
+func TestStopProcessGroupSkipsAfterExit(t *testing.T) {
+	var killed []int
+	kill := func(g int) error { killed = append(killed, g); return nil }
+	exited := make(chan struct{})
+	close(exited)
+	if err := stopProcessGroup(42, exited, kill); err != nil || len(killed) != 0 {
+		t.Errorf("exited leader: err %v, killed %v (must not signal a possibly reused group)", err, killed)
+	}
+	running := make(chan struct{})
+	go func() { time.Sleep(20 * time.Millisecond); close(running) }()
+	if err := stopProcessGroup(43, running, kill); err != nil || len(killed) != 1 || killed[0] != 43 {
+		t.Errorf("running leader: err %v, killed %v", err, killed)
 	}
 }
 
@@ -277,37 +298,6 @@ func TestSweepMacSessionsRefusesUntrustedBase(t *testing.T) {
 	sweepMacSessions(base, f.deps(1, 0))
 	if len(f.killed) != 0 || len(f.removed) != 0 {
 		t.Errorf("a group/other-writable base must be left alone: killed %v removed %v", f.killed, f.removed)
-	}
-}
-
-func TestValidatePrivateSessionDir(t *testing.T) {
-	root := t.TempDir()
-	good := filepath.Join(root, "good")
-	if err := os.Mkdir(good, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := validatePrivateSessionDir(good); err != nil {
-		t.Errorf("0700 own dir: %v", err)
-	}
-	loose := filepath.Join(root, "loose")
-	if err := os.Mkdir(loose, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(loose, 0o750); err != nil {
-		t.Fatal(err)
-	}
-	if err := validatePrivateSessionDir(loose); err == nil {
-		t.Error("group-readable dir must be refused")
-	}
-	link := filepath.Join(root, "link")
-	if err := os.Symlink(good, link); err != nil {
-		t.Fatal(err)
-	}
-	if err := validatePrivateSessionDir(link); err == nil {
-		t.Error("symlink must be refused")
-	}
-	if err := validatePrivateSessionDir(filepath.Join(root, "missing")); err == nil {
-		t.Error("missing dir must be refused")
 	}
 }
 

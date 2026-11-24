@@ -145,16 +145,15 @@ func discoverMacBrowser(p macBrowserProbe) (BrowserInfo, error) {
 		ErrNoBrowser, EnvCobrowseBrowser, strings.Join(searched, "; "))
 }
 
-// macDefaultBaseDir is the per-user session parent: <cache dir>/Citadel/
-// cobrowse-sessions (~/Library/Caches on macOS), falling back to the user's
-// own temp dir when the cache dir is unknown. Its owner-only check is
+// macDefaultBaseDir is the per-user session parent: <home>/Library/Caches/
+// Citadel/cobrowse-sessions. With no home dir it returns an error and never
+// falls back to a shared temp parent. Its owner-only check is
 // ensureCobrowseBaseDir.
-func macDefaultBaseDir(cacheDir string, cacheErr error, tmpDir string) string {
-	root := cacheDir
-	if cacheErr != nil || root == "" {
-		root = tmpDir
+func macDefaultBaseDir(home string, homeErr error) (string, error) {
+	if homeErr != nil || home == "" || !filepath.IsAbs(home) {
+		return "", fmt.Errorf("cannot determine your home folder for the co-browse session directory: %v", homeErr)
 	}
-	return filepath.Join(root, "Citadel", cobrowseSessionsDirName)
+	return filepath.Join(home, "Library", "Caches", "Citadel", cobrowseSessionsDirName), nil
 }
 
 // macOwnerAliveWithStart reports whether pid is a live process whose start
@@ -286,4 +285,18 @@ func sweepMacSessions(baseDir string, d macSweepDeps) {
 			log.Printf("[cobrowse] sweep: could not remove stale session dir %s: %v", dir, err)
 		}
 	}
+}
+
+// stopProcessGroup kills the group unless the leader already exited (its
+// reaper has then killed the group, and the id may be reused), then waits
+// (bounded) for the reaper.
+func stopProcessGroup(pgid int, exited <-chan struct{}, kill func(int) error) error {
+	select {
+	case <-exited:
+		return nil
+	default:
+	}
+	err := kill(pgid)
+	waitBounded(exited)
+	return err
 }

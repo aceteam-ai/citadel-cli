@@ -323,6 +323,11 @@ The command opens a fresh one-time link.
   only `http`/`https` pages are allowed.
 - There is no batch or URL-list tool, and none for proxies or for solving
   CAPTCHAs.
+- On macOS the browser runs hidden with `--use-mock-keychain`, so it never asks
+  for your login Keychain. While a session runs, the decrypted working copy of
+  a saved-login profile uses Chromium's mock key (the same posture as the Linux
+  basic password store). The sealed profile at rest is unchanged: it is still
+  encrypted with your passphrase.
 
 ## When something goes wrong
 

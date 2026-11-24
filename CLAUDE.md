@@ -156,9 +156,13 @@ removes only dirs whose owner PID plus start time (`processStartToken`, sysctl
 only when the recorded PID's command line (`ps`) names that session's exact
 `--user-data-dir` and the PID leads its own group; nothing is killed by bare PID.
 `validatePrivateSessionDir` refuses a non-0700, foreign-owned or symlinked
-session dir before launch; the default base is under the user cache dir
-(`macDefaultBaseDir`). `--use-mock-keychain` (`mockKeychain`) keeps a hidden
-browser off the Keychain prompt, so profile cookies use Chromium's mock key. The
+session dir before launch; the default base is `~/Library/Caches/Citadel`
+(`macDefaultBaseDir`), and with no home dir the launch is refused rather than
+falling back to a shared temp parent. The reaper kills the group as soon as the
+leader exits and `stopProcessGroup` never signals a group after that. `--use-mock-keychain` (`mockKeychain`) keeps a hidden
+browser off the Keychain prompt: during a session the decrypted working copy
+uses Chromium's mock key (the Linux basic-password-store posture), while the
+at-rest sealed profile is unchanged. The
 decision logic is untagged and tested on Linux (`cobrowse_macos_logic_test.go`);
 the real-browser macOS acceptance is manual until CI has a macOS job.
 

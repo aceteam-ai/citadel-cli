@@ -27,7 +27,9 @@ package platform
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -54,6 +56,9 @@ func (darwinHeadlessRunner) Discover() (BrowserInfo, error) {
 // refuses to launch beneath one that fails the check (a symlink, another
 // user's dir, or one group/other can write).
 func (darwinHeadlessRunner) PrepareBaseDir(baseDir string) error {
+	if baseDir == "" {
+		return errors.New("co-browse session directory is unavailable: cannot determine your home folder (set HOME)")
+	}
 	if err := ensureCobrowseBaseDir(baseDir); err != nil {
 		return fmt.Errorf("co-browse session directory is not private: %w", err)
 	}
@@ -107,13 +112,15 @@ func startHeadless(info BrowserInfo, profileDir, startURL, userAgent string, lo 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("launch %s: %w", info.Kind, err)
 	}
+	pgid := cmd.Process.Pid // Setpgid: the browser leads its own group
 	exited := make(chan struct{})
 	go func() {
 		_ = cmd.Wait()
+		// Reap helpers the moment the leader is gone, while the group id is
+		// still ours; stop never signals a group after this point.
+		_ = killProcessGroup(pgid)
 		close(exited)
 	}()
-
-	pgid := cmd.Process.Pid // Setpgid: the browser leads its own group
 	var once sync.Once
 	var stopErr error
 	proc := &cobrowseProc{
@@ -124,8 +131,7 @@ func startHeadless(info BrowserInfo, profileDir, startURL, userAgent string, lo 
 			once.Do(func() {
 				// Whole group, so renderer, GPU and helper processes go with
 				// the main process; then wait (bounded) for it to be reaped.
-				stopErr = killProcessGroup(pgid)
-				waitBounded(exited)
+				stopErr = stopProcessGroup(pgid, exited, killProcessGroup)
 			})
 			return stopErr
 		},
@@ -239,7 +245,7 @@ func killOrphanSessionProcs(dir string, browserPID, _ int) {
 }
 
 func systemMacBrowserProbe() macBrowserProbe {
-	home, _ := os.UserHomeDir()
+	home, _ := UserHomeDir()
 	return macBrowserProbe{
 		getenv: os.Getenv,
 		home:   home,
@@ -260,8 +266,13 @@ func findChromiumForOS() (string, error) {
 }
 
 func defaultCobrowseSessionsBaseDir() string {
-	cache, err := os.UserCacheDir()
-	return macDefaultBaseDir(cache, err, os.TempDir())
+	home, err := UserHomeDir()
+	dir, err := macDefaultBaseDir(home, err)
+	if err != nil {
+		log.Printf("[cobrowse] %v", err)
+		return "" // PrepareBaseDir refuses an empty base dir
+	}
+	return dir
 }
 
 func removeSessionDir(dir string) error {
