@@ -1,6 +1,15 @@
 # Seat registry foundations (incomplete)
 
 This package holds identity/environment and local registry work for #1748.
+The coordinator narrowed the initial scope to an owner-local login-directory
+registry: the entry created for a fresh private directory is the seat identity.
+Re-adding that directory is refused. This does not establish that two different
+directories use different vendor accounts. Cross-seat vendor-account dedup is
+deferred until an approved stable read-only vendor account ID exists. Email,
+directory paths and random identifiers are never substituted for that ID, and
+credential files remain out of scope. Overlapping/unsafe directory bindings
+remain refused as a separate privacy boundary.
+
 The CLI exposes explicit init/list/add/enable/disable/remove metadata commands. It
 neither reads vendor credentials nor executes a vendor
 command, logs in, selects an account, changes a live process, or rotates quota.
@@ -11,7 +20,8 @@ Provider credentials, shared configuration homes and executable-loader or shell
 startup overrides are not inherited. Local identities are excluded from JSON;
 the reporting projection has a domain-separated opaque reference and bounded
 seat metadata, never local owner/configuration/work paths or account digests.
-Salted account digests support local duplicate-account refusal.
+Salted account-digest and reconciliation helpers are retained only as unwired
+future-adapter foundations; they do not satisfy initial-scope vendor dedup.
 
 `reconcileProbeObservation` is an internal, currently unwired metadata handoff
 for future trusted status adapters. It requires the snapshot captured before
@@ -120,12 +130,19 @@ skip CA/updater/log startup after run-profile
 admission; the HPC positive list stays closed. Listing may establish the private
 persistent coordination lock but never initializes registry identity. Saved
 auth is explicitly labelled a registry declaration, not a fresh vendor probe.
-JSON output omits OS usernames, paths and account digests. Disable/remove change
-only the saved declaration, not any live process or vendor login. Add starts
-disabled with unknown auth; only declared entitlement, roots and ceiling are
-accepted. The owner is resolved, never supplied by a flag; observed plan, models,
-account and auth cannot be set by add. An existing directory is refused rather
-than adopted. Enable rechecks directory privacy but proves neither login nor
+JSON output omits OS usernames, paths and account digests.
+Both JSON and table output explicitly mark probe/admission holds. Every Codex
+row currently carries `vendor_identity_unknown`, including a row with a saved
+digest or signed-in declaration: no trusted live identity adapter exists to
+clear it. Other harness rows retain probe/admission-unwired holds. No saved
+metadata, local enable or directory count proves account uniqueness, usable
+capacity or launch authority.
+
+Disable/remove change only the saved declaration, not any live process or vendor
+login. Add starts disabled with unknown auth; only declared entitlement, roots
+and ceiling are accepted. The owner is resolved, never supplied by a flag;
+observed plan, models, account and auth cannot be set by add. An existing
+directory is refused rather than adopted. Enable rechecks directory privacy but proves neither login nor
 launch permission.
 
 Add prints POSIX-shell human login instructions, never runs them or captures

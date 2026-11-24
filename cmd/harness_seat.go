@@ -111,15 +111,27 @@ func withSeatCLIRegistry(cmd *cobra.Command, dir string, resolveOwner seatCLIOwn
 // node identity needed by the separate server projection. Paths, OS usernames
 // and account digests are excluded. Registry status is never called a probe.
 type seatCLIListRow struct {
-	ID          string                `json:"id"`
-	Harness     harnessseat.Harness   `json:"harness"`
-	Label       string                `json:"label"`
-	Entitlement string                `json:"entitlement"`
-	PlanType    string                `json:"plan_type,omitempty"`
-	Models      []string              `json:"models"`
-	DataCeiling string                `json:"data_ceiling"`
-	Enabled     bool                  `json:"enabled"`
-	Auth        harnessseat.AuthState `json:"auth"`
+	ID            string                `json:"id"`
+	Harness       harnessseat.Harness   `json:"harness"`
+	Label         string                `json:"label"`
+	Entitlement   string                `json:"entitlement"`
+	PlanType      string                `json:"plan_type,omitempty"`
+	Models        []string              `json:"models"`
+	DataCeiling   string                `json:"data_ceiling"`
+	Enabled       bool                  `json:"enabled"`
+	Auth          harnessseat.AuthState `json:"auth"`
+	ProbeHold     string                `json:"probe_hold"`
+	AdmissionHold string                `json:"admission_hold"`
+}
+
+// Initial scope identifies a seat by its owner-local directory, not a vendor
+// account. There is no verified read-only Codex account-id adapter yet. Even a
+// saved digest/auth declaration is not proof that may clear either hold.
+func seatCLIHoldReasons(seat harnessseat.Seat) (string, string) {
+	if seat.Harness == harnessseat.Codex {
+		return "vendor_identity_unknown", "vendor_identity_unknown"
+	}
+	return "probe_unwired", "harness_admission_unwired"
 }
 
 func newHarnessSeatRoot(resolveOwner seatCLIOwnerResolver) *cobra.Command {
@@ -164,7 +176,8 @@ func newHarnessSeatRootWithTerminal(resolveOwner seatCLIOwnerResolver, terminal 
 			}
 			rows := make([]seatCLIListRow, 0)
 			for _, s := range snapshot.Seats() {
-				rows = append(rows, seatCLIListRow{ID: s.ID, Harness: s.Harness, Label: s.Label, Entitlement: s.Entitlement, PlanType: s.PlanType, Models: append([]string{}, s.Models...), DataCeiling: s.DataCeiling, Enabled: s.Enabled, Auth: s.Auth})
+				probeHold, admissionHold := seatCLIHoldReasons(s)
+				rows = append(rows, seatCLIListRow{ID: s.ID, Harness: s.Harness, Label: s.Label, Entitlement: s.Entitlement, PlanType: s.PlanType, Models: append([]string{}, s.Models...), DataCeiling: s.DataCeiling, Enabled: s.Enabled, Auth: s.Auth, ProbeHold: probeHold, AdmissionHold: admissionHold})
 			}
 			if asJSON {
 				if err := json.NewEncoder(cmd.OutOrStdout()).Encode(struct {
@@ -176,11 +189,11 @@ func newHarnessSeatRootWithTerminal(resolveOwner seatCLIOwnerResolver, terminal 
 				return nil
 			}
 			out := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
-			if _, err := fmt.Fprintln(out, "Saved registry declarations (not probed)\nID\tHARNESS\tLABEL\tENABLED\tSAVED AUTH"); err != nil {
+			if _, err := fmt.Fprintln(out, "Saved registry declarations (not probed)\nID\tHARNESS\tLABEL\tENABLED\tSAVED AUTH\tPROBE HOLD\tADMISSION HOLD"); err != nil {
 				return errSeatCLIOutput
 			}
 			for _, row := range rows {
-				if _, err := fmt.Fprintf(out, "%s\t%s\t%s\t%t\t%s\n", row.ID, row.Harness, row.Label, row.Enabled, row.Auth); err != nil {
+				if _, err := fmt.Fprintf(out, "%s\t%s\t%s\t%t\t%s\t%s\t%s\n", row.ID, row.Harness, row.Label, row.Enabled, row.Auth, row.ProbeHold, row.AdmissionHold); err != nil {
 					return errSeatCLIOutput
 				}
 			}

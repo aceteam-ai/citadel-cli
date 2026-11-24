@@ -382,6 +382,13 @@ func TestHarnessSeatCLIAddThenEnableIsLocalDeclarationOnly(t *testing.T) {
 			if err != nil || json.Unmarshal([]byte(listed), &result) != nil || !result.Seats[0].Enabled || result.Seats[0].Auth != harnessseat.AuthUnknown {
 				t.Fatal("enable did not remain a local flag")
 			}
+			probeHold, admissionHold := "probe_unwired", "harness_admission_unwired"
+			if harness == "codex" {
+				probeHold, admissionHold = "vendor_identity_unknown", "vendor_identity_unknown"
+			}
+			if result.Seats[0].ProbeHold != probeHold || result.Seats[0].AdmissionHold != admissionHold {
+				t.Fatal("local enable incorrectly cleared probe/admission holds")
+			}
 			if entries, err := os.ReadDir(config); err != nil || len(entries) != 0 {
 				t.Fatal("enable populated vendor state")
 			}
@@ -499,5 +506,78 @@ func TestHarnessSeatCLIAddOutputFailurePreservesPublishedDeclaration(t *testing.
 	}
 	if entries, err := os.ReadDir(config); err != nil || len(entries) != 0 {
 		t.Fatal("output failure changed fresh vendor directory")
+	}
+}
+
+func TestHarnessSeatCLIListsCodexIdentityHoldEvenWithSavedDigest(t *testing.T) {
+	registry, owner := seatCLIState(t)
+	store, err := harnessseat.OpenSaltStore(registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	resolve := func(string) (string, error) { return owner.Home, nil }
+	before, err := store.InitializeRegistry(context.Background(), resolve)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seats := []harnessseat.Seat{}
+	for _, id := range []string{"unknown-seat", "saved-seat"} {
+		seat := harnessseat.Seat{Identity: harnessseat.Identity{ID: id, Harness: harnessseat.Codex, Owner: owner.Name, ConfigDir: filepath.Join(owner.Home, id)}, Label: id, Entitlement: "consumer", DataCeiling: "public", Auth: harnessseat.AuthUnknown}
+		if id == "saved-seat" {
+			seat.Auth = harnessseat.AuthSignedIn
+			seat.AccountDigest = strings.Repeat("a", 64)
+		}
+		seats = append(seats, seat)
+	}
+	if _, err := store.UpdateRegistry(context.Background(), before, seats); err != nil {
+		t.Fatal(err)
+	}
+	out, err := seatCLIForTest(t, owner, "seat", "list", "--json", "--registry-dir", registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		Seats []map[string]any `json:"seats"`
+	}
+	if json.Unmarshal([]byte(out), &result) != nil || len(result.Seats) != 2 {
+		t.Fatal("missing seat rows")
+	}
+	for _, row := range result.Seats {
+		if row["probe_hold"] != "vendor_identity_unknown" || row["admission_hold"] != "vendor_identity_unknown" {
+			t.Fatal("saved declaration incorrectly clears identity hold")
+		}
+	}
+	table, err := seatCLIForTest(t, owner, "seat", "list", "--registry-dir", registry)
+	if err != nil || !strings.Contains(table, "PROBE HOLD") || !strings.Contains(table, "ADMISSION HOLD") || strings.Count(table, "vendor_identity_unknown") != 4 {
+		t.Fatal("table omitted explicit probe/admission holds")
+	}
+}
+
+func TestHarnessSeatCLIRefusesReaddingSameDirectoryUnderDifferentID(t *testing.T) {
+	registry, owner := seatCLIState(t)
+	if _, err := seatCLIForTest(t, owner, "seat", "init", "--registry-dir", registry); err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(owner.Home, "fresh-seat")
+	args := []string{"seat", "add", "first-seat", "--harness", "codex", "--label", "Fixture", "--config-dir", config, "--registry-dir", registry}
+	if _, err := seatCLIForTest(t, owner, args...); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(filepath.Join(registry, "harness.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	args[2] = "second-seat"
+	if _, err := seatCLIForTest(t, owner, args...); err == nil {
+		t.Fatal("same local login directory registered twice")
+	}
+	after, err := os.ReadFile(filepath.Join(registry, "harness.yaml"))
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatal("directory refusal changed registry")
+	}
+	args[8] = filepath.Join(owner.Home, "another-fresh-seat")
+	if _, err := seatCLIForTest(t, owner, args...); err != nil {
+		t.Fatal("fresh local directory required an unavailable vendor identity")
 	}
 }

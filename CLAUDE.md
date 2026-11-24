@@ -38,6 +38,9 @@ declaration and prints, never executes, login instructions. `isHarnessSeatCLI`
 scopes the startup exemption after run-profile admission. See
 `internal/harnessseat/README.md` for the incomplete
 seat-registry boundary and focused tests.
+`seatCLIHoldReasons` keeps probe/admission holds explicit: initial seat identity
+is the local directory, not proof of a unique vendor account. A saved digest
+cannot clear the current Codex unknown-identity hold.
 
 `harnessseat.reconcileProbeObservation` owns the internal, unwired status-result
 metadata handoff: exact identity and snapshot fencing, salted account binding,
