@@ -321,8 +321,7 @@ func (m *CobrowseSessionManager) ShutdownSessions() error {
 		return m.StopAll()
 	}
 	m.mu.Lock()
-	all := m.sessions
-	m.sessions = make(map[string]*cobrowseSession)
+	all := m.takeAllLocked()
 	m.mu.Unlock()
 	var lastErr error
 	for _, s := range all {

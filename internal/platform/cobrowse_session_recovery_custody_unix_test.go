@@ -384,12 +384,25 @@ func TestTeardownSkipsStagesRecoveryCompleted(t *testing.T) {
 }
 
 // Confirmed-stop evidence never outlives a new session under the same handle:
-// a later start that fails after taking its slot must read unknown, not ended.
+// a later start that fails after taking its slot, with a helper still using the
+// dir, must read unknown, not ended.
 func TestCobrowseRecoveryEvidenceClearedByNewStart(t *testing.T) {
 	f := &fakeLauncher{}
 	f.install(t)
+	prevA, prevD := sessionRemoveAttempts, sessionRemoveDelay
+	sessionRemoveAttempts, sessionRemoveDelay = 1, time.Millisecond
+	t.Cleanup(func() { sessionRemoveAttempts, sessionRemoveDelay = prevA, prevD })
+	h := &fakeHelpers{euid: os.Geteuid(), procs: map[int]reapProc{}}
+	installFakeHelpers(t, h)
 	m := newCobrowseSessionManager(trustedBaseDir(t), 2)
 	id := "cb-0123456789abcdef0123456789abcdef"
+	helper := helperProc(4243, 9, h.euid, "chrome", "--type=renderer", "--user-data-dir="+filepath.Join(m.baseDir, id))
+	h.procs[helper.pid] = helper
+	h.onKill = func(int) {
+		h.mu.Lock()
+		h.procs[helper.pid] = helper
+		h.mu.Unlock()
+	}
 	m.mu.Lock()
 	m.markRecoveryDoneLocked(id)
 	m.mu.Unlock()
@@ -409,5 +422,145 @@ func TestCobrowseRecoveryEvidenceClearedByNewStart(t *testing.T) {
 	}
 	if yes, err := m.StopRecoverySession(id); yes || err != nil {
 		t.Fatalf("stale evidence confirmed a stop: %v %v", yes, err)
+	}
+}
+
+// A launch that fails after taking its slot is terminal only once no process
+// still names the session dir and the dir is gone. Until then the session
+// stays under custody, and a later custody stop retries the same check.
+func TestCobrowseRecoveryPostSlotLaunchFailure(t *testing.T) {
+	for _, mode := range []string{"confirmed", "survivor-then-retry"} {
+		t.Run(mode, func(t *testing.T) {
+			prevA, prevD := sessionRemoveAttempts, sessionRemoveDelay
+			sessionRemoveAttempts, sessionRemoveDelay = 1, time.Millisecond
+			t.Cleanup(func() { sessionRemoveAttempts, sessionRemoveDelay = prevA, prevD })
+			h := &fakeHelpers{euid: os.Geteuid(), procs: map[int]reapProc{}}
+			installFakeHelpers(t, h)
+			m := newCobrowseSessionManager(trustedBaseDir(t), 2)
+			id := "cb-0123456789abcdef0123456789abcdef"
+			profile := filepath.Join(m.baseDir, id)
+			helper := helperProc(4242, 7, h.euid, "chrome", "--type=gpu-process", "--user-data-dir="+profile)
+			prev := launchCobrowseProc
+			launchCobrowseProc = func(string, string, LaunchOptions) (*cobrowseProc, error) {
+				if mode != "confirmed" {
+					// A helper outlives the failed launch and never dies.
+					h.mu.Lock()
+					h.procs[helper.pid] = helper
+					h.onKill = func(int) {
+						h.mu.Lock()
+						h.procs[helper.pid] = helper
+						h.mu.Unlock()
+					}
+					h.mu.Unlock()
+				}
+				return nil, errors.New("synthetic launch failure after the slot was taken")
+			}
+			t.Cleanup(func() { launchCobrowseProc = prev })
+			if _, err := m.StartRecoverySessionWithID(id, "", nil); err == nil || errors.Is(err, ErrSessionNotLaunched) {
+				t.Fatalf("post-slot failure: %v", err)
+			}
+			if mode == "confirmed" {
+				if m.RecoveryState(id) != "ended" || m.RecoveryPresent(id) {
+					t.Fatal("a confirmed failed launch left no terminal evidence")
+				}
+				if yes, err := m.StopRecoverySession(id); !yes || err != nil {
+					t.Fatalf("journal stop: %v %v", yes, err)
+				}
+				return
+			}
+			if m.RecoveryState(id) != "unknown" || !m.RecoveryPresent(id) {
+				t.Fatal("an unconfirmed failed launch was released or marked ended")
+			}
+			if yes, err := m.StopRecoverySession(id); yes || err != nil {
+				t.Fatalf("unconfirmed retry stopped: %v %v", yes, err)
+			}
+			if err := m.Stop(id); !errors.Is(err, errRecoveryStopUnconfirmed) {
+				t.Fatalf("legacy stop of an unconfirmed failed launch: %v", err)
+			}
+			h.mu.Lock()
+			h.onKill = nil
+			delete(h.procs, helper.pid)
+			h.mu.Unlock()
+			if yes, err := m.StopRecoverySession(id); !yes || err != nil {
+				t.Fatalf("retry after the helper left: %v %v", yes, err)
+			}
+			if m.RecoveryPresent(id) || m.RecoveryState(id) != "ended" {
+				t.Fatal("confirmed retry kept custody or left no evidence")
+			}
+			if _, err := os.Lstat(profile); !os.IsNotExist(err) {
+				t.Fatal("session dir left behind")
+			}
+		})
+	}
+}
+
+// A legacy stop racing StopAll or the managed shutdown never reports success
+// for a recovery session the shutdown path holds but has not resolved, and a
+// session the managed shutdown leaves running stays unconfirmed.
+func TestCobrowseRecoveryLegacyStopRacesShutdown(t *testing.T) {
+	for _, mode := range []string{"stop-all", "shutdown-stop", "shutdown-keep"} {
+		t.Run(mode, func(t *testing.T) {
+			installFakeHelpers(t, &fakeHelpers{euid: os.Geteuid(), procs: map[int]reapProc{}})
+			f := newCustodyFixture(t, "")
+			f.s.encProfile = nil // throwaway, so the managed shutdown may keep it
+			exited := make(chan struct{})
+			entered, release := make(chan struct{}), make(chan struct{})
+			f.s.proc = &cobrowseProc{exited: exited, stop: func() error {
+				close(entered)
+				<-release
+				close(exited)
+				return nil
+			}}
+			if mode == "shutdown-keep" {
+				f.s.proc.browserScope = "cb-fixture.scope"
+			}
+			done := make(chan error, 1)
+			go func() {
+				if mode == "stop-all" {
+					done <- f.m.StopAll()
+					return
+				}
+				prevDetached, prevAdopt := detachedWorker.Load(), adoptionSupported
+				detachedWorker.Store(true)
+				adoptionSupported = true
+				f.m.mu.Lock()
+				f.m.useResolver = true
+				f.m.mu.Unlock()
+				err := f.m.ShutdownSessions()
+				detachedWorker.Store(prevDetached)
+				adoptionSupported = prevAdopt
+				done <- err
+			}()
+			if mode == "shutdown-keep" {
+				if err := <-done; err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				<-entered
+			}
+			// The shutdown path holds the session: a stop must not succeed.
+			if err := f.m.Stop(f.id); !errors.Is(err, errRecoveryStopUnconfirmed) {
+				t.Fatalf("legacy stop during %s: %v", mode, err)
+			}
+			if yes, err := f.m.StopRecoverySession(f.id); yes || err != nil {
+				t.Fatalf("journal stop during %s: %v %v", mode, yes, err)
+			}
+			if !f.m.RecoveryPresent(f.id) {
+				t.Fatal("held session not visible to a no-record stop")
+			}
+			if mode == "shutdown-keep" {
+				return
+			}
+			close(release)
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			if err := f.m.Stop(f.id); err != nil {
+				t.Fatalf("stop after the shutdown confirmed: %v", err)
+			}
+			if f.m.RecoveryState(f.id) != "ended" {
+				t.Fatal("confirmed shutdown stop left no evidence")
+			}
+		})
 	}
 }

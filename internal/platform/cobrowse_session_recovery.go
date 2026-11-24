@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"time"
 )
 
@@ -48,7 +49,8 @@ func (m *CobrowseSessionManager) RecoveryPresent(id string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	_, ok := m.sessions[id]
-	return ok
+	_, held := m.recoveryHeld[id]
+	return ok || held
 }
 
 // StopRecoverySession confirms browser exit, not merely removal from the session
@@ -104,11 +106,85 @@ func (m *CobrowseSessionManager) stopRecoveryScoped(id string) error {
 	}
 	m.mu.Lock()
 	_, present := m.sessions[id]
+	_, held := m.recoveryHeld[id]
 	m.mu.Unlock()
-	if !confirmed && present {
+	if !confirmed && (present || held) {
 		return errRecoveryStopUnconfirmed
 	}
 	return nil
+}
+
+// takeAllLocked empties the session map for a shutdown path. Recovery
+// sessions stay reachable in recoveryHeld until stopRemoved resolves them, so
+// a concurrent stop cannot mistake the gap for a confirmed stop.
+func (m *CobrowseSessionManager) takeAllLocked() map[string]*cobrowseSession {
+	all := m.sessions
+	m.sessions = make(map[string]*cobrowseSession)
+	for id, s := range all {
+		if recoveryScopedID(id) {
+			if m.recoveryHeld == nil {
+				m.recoveryHeld = make(map[string]*cobrowseSession)
+			}
+			m.recoveryHeld[id] = s
+		}
+	}
+	return all
+}
+
+// failedLaunchVerifiable reports whether this OS can prove no browser process
+// still uses a session dir: Linux reads /proc and macOS reads ps. Windows
+// cannot (reapProfileUsers is a no-op there).
+var failedLaunchVerifiable = runtime.GOOS == "linux" || runtime.GOOS == "darwin"
+
+// settleFailedRecoveryLaunch runs after a failed recovery launch was torn
+// down. If no process still uses the session dir and the dir is gone, the
+// handle is recorded as done, so the journal can terminalize it. If that
+// cannot be confirmed yet, the session stays in the map (holding its slot) so
+// a custody stop retries the check. Where it can never be confirmed (Windows,
+// or a container launch), nothing is recorded and the job stays unknown.
+func (m *CobrowseSessionManager) settleFailedRecoveryLaunch(s *cobrowseSession) {
+	if !s.failedLaunchCheckable() {
+		return
+	}
+	confirmed := s.confirmFailedLaunch()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, taken := m.sessions[s.id]; taken {
+		return
+	}
+	if confirmed {
+		m.markRecoveryDoneLocked(s.id)
+		return
+	}
+	s.mu.Lock()
+	s.launchFailed = true
+	s.state = SessionExited
+	s.mu.Unlock()
+	m.sessions[s.id] = s
+}
+
+// failedLaunchCheckable: the profile-user check covers host browsers only; a
+// container launch keeps its processes outside it.
+func (s *cobrowseSession) failedLaunchCheckable() bool {
+	s.mu.Lock()
+	profile, workDir := s.profile, s.workDir
+	s.mu.Unlock()
+	return failedLaunchVerifiable && profile != "" && (workDir == "" || workDir == profile)
+}
+
+// confirmFailedLaunch uses the custody stop's own confirmations: no process
+// (browser or helper) of this uid still names the session dir, and the dir is
+// removed with re-reap passes and confirmed absent.
+func (s *cobrowseSession) confirmFailedLaunch() bool {
+	if reapProfileUsers(s.profile, "") != nil {
+		return false
+	}
+	rerr, reapErr := removeProfileWorkDir(s.profile, &cobrowseProc{})
+	if rerr != nil || reapErr != nil {
+		return false
+	}
+	_, err := os.Lstat(s.profile)
+	return os.IsNotExist(err)
 }
 
 // stopRemoved stops a session already taken out of the map by a shutdown path.
@@ -121,6 +197,7 @@ func (m *CobrowseSessionManager) stopRemoved(s *cobrowseSession) error {
 	confirmed, err := s.recoveryStop()
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	delete(m.recoveryHeld, s.id)
 	if confirmed {
 		m.markRecoveryDoneLocked(s.id)
 		return nil
@@ -142,7 +219,12 @@ func (s *cobrowseSession) recoveryStop() (bool, error) {
 	s.mu.Lock()
 	proc := s.proc
 	enc := s.encProfile
+	launchFailed := s.launchFailed
 	s.mu.Unlock()
+	if proc == nil && launchFailed {
+		// A failed launch kept for retry: it never ran a session to seal.
+		return s.confirmFailedLaunch(), nil
+	}
 	if proc == nil || proc.exited == nil || proc.stop == nil {
 		return false, nil
 	}

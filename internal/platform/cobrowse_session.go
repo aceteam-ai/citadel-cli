@@ -253,6 +253,10 @@ type CobrowseSessionManager struct {
 	// a record after the session left the map. In memory only: a restart loses
 	// it and the record stays unknown (never falsely stopped).
 	recoveryDone map[string]struct{}
+	// recoveryHeld holds recovery sessions a shutdown path took out of the map
+	// and has not resolved yet (or deliberately left running for re-adoption).
+	// A concurrent stop treats them as present and unconfirmed, never stopped.
+	recoveryHeld map[string]*cobrowseSession
 	maxSessions  int
 	baseDir      string
 	sweepOnce    sync.Once
@@ -324,10 +328,13 @@ type cobrowseSession struct {
 	recoveryStopped   bool
 	recoveryPersisted bool
 	recoveryClosed    bool
-	teardownMu        sync.Mutex
-	mu                sync.Mutex
-	state             CobrowseSessionState
-	proc              *cobrowseProc
+	// launchFailed marks a recovery session kept after a failed launch whose
+	// cleanup could not yet be confirmed; a custody stop retries that check.
+	launchFailed bool
+	teardownMu   sync.Mutex
+	mu           sync.Mutex
+	state        CobrowseSessionState
+	proc         *cobrowseProc
 	// lastURL is the last page URL a probe read; status falls back to it when
 	// the DevTools endpoint is slow (citadel-cli#1663).
 	lastURL string
@@ -561,7 +568,8 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 	m.sweepOnce.Do(m.sweep)
 
 	m.mu.Lock()
-	if _, exists := m.sessions[id]; exists {
+	_, held := m.recoveryHeld[id]
+	if _, exists := m.sessions[id]; exists || held {
 		m.mu.Unlock()
 		if profile != nil {
 			_ = profile.Close()
@@ -609,6 +617,9 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 		delete(m.sessions, id)
 		m.mu.Unlock()
 		_ = s.teardown()
+		if recoveryScopedID(id) {
+			m.settleFailedRecoveryLaunch(s)
+		}
 		return CobrowseSessionStatus{}, err
 	}
 
@@ -914,8 +925,7 @@ func (m *CobrowseSessionManager) Stop(id string) error {
 func (m *CobrowseSessionManager) StopAll() error {
 	m.stopEgressSweep()
 	m.mu.Lock()
-	all := m.sessions
-	m.sessions = make(map[string]*cobrowseSession)
+	all := m.takeAllLocked()
 	m.mu.Unlock()
 
 	var lastErr error

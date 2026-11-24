@@ -74,8 +74,15 @@ worker's shutdown, the public-only sweep and an egress-guard failure) stops a
 recovery handle through the same custody stop (`stopRecoveryCustody`,
 `stopRemoved`). A confirmed stop is remembered in memory (`recoveryDone`), so a
 later `job_status` or `stop_by_job_id` can terminalize the record; an
-unconfirmed one keeps the session for retry. A restart loses that memory, and
-the record then stays `unknown`. The adapter accepts only the exact per-node
+unconfirmed one keeps the session for retry. A shutdown path holds the
+recovery sessions it took out of the map (`recoveryHeld`) until it resolves
+them, so a concurrent stop reports them unconfirmed, and a session the managed
+shutdown leaves running for re-adoption stays unconfirmed. A launch that fails
+after taking its slot is recorded done only when no process still names the
+session dir and the dir is confirmed removed (Linux and macOS, host browser);
+otherwise the session stays in the map for a custody stop to retry. On Windows
+or after a container launch failure this cannot be proven, so the job stays
+`unknown`. A restart loses that memory, and the record then stays `unknown`. The adapter accepts only the exact per-node
 stream of the configured node and its owning org.
 
 A stop intent is synced first. `stopped` requires successful teardown and observed
