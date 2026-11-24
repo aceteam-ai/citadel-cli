@@ -22,16 +22,18 @@ import (
 )
 
 var (
-	memoryInstallForce       bool
-	memoryUninstallConfirmed bool
-	memoryRecallScope        string
-	memoryRecallQuery        string
-	memoryCaptureNote        string
-	memoryCaptureName        string
-	memoryCaptureScope       string
-	memoryCaptureDesc        string
-	memoryRecallHookOwner    string
-	memoryCaptureHookOwner   string
+	memoryInstallForce        bool
+	memoryUninstallConfirmed  bool
+	memoryRecallScope         string
+	memoryRecallQuery         string
+	memoryCaptureNote         string
+	memoryCaptureName         string
+	memoryCaptureScope        string
+	memoryInstallCaptureScope string
+	memoryAllowGlobalCapture  bool
+	memoryCaptureDesc         string
+	memoryRecallHookOwner     string
+	memoryCaptureHookOwner    string
 )
 
 var memoryCmd = &cobra.Command{
@@ -140,7 +142,7 @@ func runMemoryInstall(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	if err := wireClaudeCode(home, cfg); err != nil {
+	if err := wireClaudeCode(home, cfg, memoryInstallCaptureScope, memoryAllowGlobalCapture); err != nil {
 		fmt.Fprintf(os.Stderr, "⚠ Claude Code wiring incomplete: %v\n", err)
 		os.Exit(1)
 	}
@@ -160,7 +162,17 @@ func memoryAuthorizationNeeded(cfg *memory.Config, force bool) (bool, error) {
 
 // wireClaudeCode registers the MCP server + recall/capture hooks in Claude
 // Code's user config. Idempotent and additive.
-func wireClaudeCode(home string, cfg *memory.Config) error {
+//
+// The SessionEnd capture hook writes transcript text, so it is installed only
+// with an explicit --capture-scope (see checkCaptureScope). Without one, any
+// previously installed capture hook is removed and only recall is wired.
+func wireClaudeCode(home string, cfg *memory.Config, captureScope string, allowGlobal bool) error {
+	captureScope = strings.TrimSpace(captureScope)
+	if captureScope != "" {
+		if err := checkCaptureScope(captureScope, allowGlobal); err != nil {
+			return err
+		}
+	}
 	self := citadelBinaryPath()
 	quotedSelf, err := quoteHookArg(self)
 	if err != nil {
@@ -179,25 +191,62 @@ func wireClaudeCode(home string, cfg *memory.Config) error {
 
 	settings := memory.ClaudeSettingsPath(home)
 	recallCmd := fmt.Sprintf("%s memory recall --no-auto-update", quotedSelf)
-	captureCmd := fmt.Sprintf("%s memory capture --no-auto-update", quotedSelf)
 
 	recallChanged, err := memory.MergeHook(settings, "UserPromptSubmit", recallCmd, memory.RecallMarker, 10)
 	if err != nil {
 		return fmt.Errorf("merge recall hook: %w", err)
 	}
-	captureChanged, err := memory.MergeHook(settings, "SessionEnd", captureCmd, memory.CaptureMarker, 15)
+	captureChanged, err := wireCaptureHook(settings, quotedSelf, captureScope, allowGlobal)
 	if err != nil {
-		return fmt.Errorf("merge capture hook: %w", err)
+		return err
 	}
 
 	fmt.Println()
 	color.New(color.FgGreen, color.Bold).Println("✅ Claude Code wired into AceTeam memory")
 	printWire("MCP server", memory.ClaudeJSONPath(home), memory.MCPServerName, mcpChanged)
 	printWire("recall hook (UserPromptSubmit)", settings, memory.RecallMarker, recallChanged)
-	printWire("capture hook (SessionEnd)", settings, memory.CaptureMarker, captureChanged)
+	if captureScope != "" {
+		printWire("capture hook (SessionEnd)", settings, memory.CaptureMarker, captureChanged)
+		color.New(color.FgYellow).Printf("⚠ Session-end capture writes up to %d characters of conversation text into memory scope %q.\n  Secrets are screened, but anyone who can read that scope can read the text.\n", captureExcerptLimit, captureScope)
+	} else {
+		fmt.Println("   - capture hook (SessionEnd)       not installed (no --capture-scope given)")
+		if captureChanged {
+			fmt.Println("     removed a previously installed capture hook that had no explicit scope")
+		}
+		fmt.Println("     Transcript capture is opt-in: rerun with --capture-scope <scope> to enable it.")
+	}
 	fmt.Println()
 	fmt.Println("Restart Claude Code (or start a new session) to load the changes.")
 	return nil
+}
+
+// wireCaptureHook installs the SessionEnd capture hook for an explicit scope,
+// or removes any existing Citadel-owned one when scope is empty.
+func wireCaptureHook(settings, quotedSelf, captureScope string, allowGlobal bool) (bool, error) {
+	if captureScope == "" {
+		// Fail closed for older installs whose hook carries no scope.
+		changed, err := memory.RemoveHook(settings, "SessionEnd", memory.CaptureMarker)
+		if err != nil {
+			return false, fmt.Errorf("remove unscoped capture hook: %w", err)
+		}
+		return changed, nil
+	}
+	if err := checkCaptureScope(captureScope, allowGlobal); err != nil {
+		return false, err
+	}
+	quotedScope, err := quoteHookArg(captureScope)
+	if err != nil {
+		return false, fmt.Errorf("quote capture scope: %w", err)
+	}
+	cmd := fmt.Sprintf("%s memory capture --no-auto-update --scope %s", quotedSelf, quotedScope)
+	if allowGlobal {
+		cmd += " --allow-global-capture"
+	}
+	changed, err := memory.MergeHook(settings, "SessionEnd", cmd, memory.CaptureMarker, 15)
+	if err != nil {
+		return false, fmt.Errorf("merge capture hook: %w", err)
+	}
+	return changed, nil
 }
 
 func printWire(label, path, detail string, changed bool) {
@@ -404,6 +453,12 @@ func runMemoryCapture(cmd *cobra.Command, args []string) {
 		os.Exit(0)
 	}
 
+	if err := checkCaptureScope(memoryCaptureScope, memoryAllowGlobalCapture); err != nil {
+		// Fail closed: never fall through to the server's default scope.
+		fmt.Fprintf(os.Stderr, "citadel memory capture: %v\n", err)
+		os.Exit(0)
+	}
+
 	note := memoryCaptureNote
 	if note == "" && len(args) > 0 {
 		note = strings.Join(args, " ")
@@ -411,7 +466,7 @@ func runMemoryCapture(cmd *cobra.Command, args []string) {
 	if note == "" {
 		// Best-effort: semantic text only. Raw transcript JSON, tool payloads,
 		// thinking, and metadata are intentionally excluded.
-		note = memory.TranscriptSummary(hook.TranscriptPath, 1500)
+		note = memory.TranscriptSummary(hook.TranscriptPath, captureExcerptLimit)
 	}
 	if strings.TrimSpace(note) == "" {
 		// Nothing durable to record; exit quietly.
@@ -427,8 +482,6 @@ func runMemoryCapture(cmd *cobra.Command, args []string) {
 	if name == "" {
 		name = memory.StableCaptureName(hook.SessionID, hook.TranscriptPath, note)
 	}
-	// Empty scope lets memory_write default to "global" (predictable), rather
-	// than an unstable cwd/worktree-basename scope. --scope narrows explicitly.
 	scope := memoryCaptureScope
 	desc := memoryCaptureDesc
 	if desc == "" {
@@ -442,6 +495,24 @@ func runMemoryCapture(cmd *cobra.Command, args []string) {
 		fmt.Fprintf(os.Stderr, "citadel memory capture: %v\n", err)
 	}
 	os.Exit(0)
+}
+
+// captureExcerptLimit bounds the transcript text one SessionEnd capture writes.
+const captureExcerptLimit = 1500
+
+// checkCaptureScope owns what scope a capture may write to. memory_write
+// defaults an empty scope to the broadly readable "global", and no private
+// per-user scope exists in the API, so the scope must be named explicitly and
+// "global" additionally needs the explicit allowGlobal opt-in.
+func checkCaptureScope(scope string, allowGlobal bool) error {
+	scope = strings.TrimSpace(scope)
+	if scope == "" {
+		return errors.New("no capture scope set; refusing to write (an empty scope would default to the shared global scope). Reinstall with 'citadel memory install --capture-scope <scope>'")
+	}
+	if strings.EqualFold(scope, "global") && !allowGlobal {
+		return errors.New("refusing to capture into the shared global scope without --allow-global-capture")
+	}
+	return nil
 }
 
 // --- helpers -----------------------------------------------------------------
@@ -542,6 +613,9 @@ func init() {
 	memoryCmd.AddCommand(memoryUninstallCmd)
 
 	memoryInstallCmd.Flags().BoolVar(&memoryInstallForce, "force", false, "Rotate the memory key (currently fails closed until backend revocation is available)")
+	memoryInstallCmd.Flags().StringVar(&memoryInstallCaptureScope, "capture-scope", "", "Install the SessionEnd transcript-capture hook, writing to this explicit memory scope (default: no capture hook)")
+	memoryInstallCmd.Flags().BoolVar(&memoryAllowGlobalCapture, "allow-global-capture", false, "Allow the capture hook to write into the shared 'global' scope (readable by others in the org)")
+	memoryCaptureCmd.Flags().BoolVar(&memoryAllowGlobalCapture, "allow-global-capture", false, "Allow writing into the shared 'global' scope")
 	memoryUninstallCmd.Flags().BoolVar(&memoryUninstallConfirmed, "confirmed-revoked", false, "Confirm the remote Memory key was revoked before deleting its only local copy")
 
 	memoryRecallCmd.Flags().StringVar(&memoryRecallScope, "scope", "", "Restrict search to a memory scope (project name or 'global'; default: all scopes)")
@@ -549,7 +623,7 @@ func init() {
 
 	memoryCaptureCmd.Flags().StringVar(&memoryCaptureNote, "note", "", "Note text to capture (default: bounded semantic transcript text)")
 	memoryCaptureCmd.Flags().StringVar(&memoryCaptureName, "name", "", "Memory slug (default: stable hash of the Claude session ID)")
-	memoryCaptureCmd.Flags().StringVar(&memoryCaptureScope, "scope", "", "Memory scope to write (project name or 'global'; default: global)")
+	memoryCaptureCmd.Flags().StringVar(&memoryCaptureScope, "scope", "", "Memory scope to write (required; 'global' also needs --allow-global-capture)")
 	memoryCaptureCmd.Flags().StringVar(&memoryCaptureDesc, "description", "", "Short description for the memory frontmatter")
 	memoryRecallCmd.Flags().StringVar(&memoryRecallHookOwner, "citadel-memory-hook-owner", "", "Citadel-managed hook ownership marker")
 	memoryCaptureCmd.Flags().StringVar(&memoryCaptureHookOwner, "citadel-memory-hook-owner", "", "Citadel-managed hook ownership marker")
