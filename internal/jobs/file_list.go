@@ -23,6 +23,8 @@ type FileListHandler struct {
 	// read may access in addition to the workspace (aceteam#10876 C6); see
 	// FileReadHandler.AuthorizedRoots. nil/empty means workspace-only.
 	AuthorizedRoots func() []string
+	// birthTime is an optional test seam. Production uses the platform helper.
+	birthTime func(string) (time.Time, bool)
 }
 
 // NewFileListHandler creates a new FileListHandler rooted at workspace.
@@ -77,6 +79,10 @@ func (h *FileListHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error
 	}
 
 	var results []fileEntry
+	birthTime := h.birthTime
+	if birthTime == nil {
+		birthTime = fileBirthTime
+	}
 	for _, entry := range entries {
 		name := entry.Name()
 		if isBotProfilesDir(filepath.Join(validated, name), entry) {
@@ -107,8 +113,8 @@ func (h *FileListHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error
 		}
 
 		createdAt := ""
-		if birthTime, ok := fileBirthTime(filepath.Join(validated, name)); ok {
-			createdAt = birthTime.UTC().Format(time.RFC3339Nano)
+		if created, ok := birthTime(filepath.Join(validated, name)); ok && !created.IsZero() {
+			createdAt = created.UTC().Format(time.RFC3339Nano)
 		}
 		results = append(results, fileEntry{
 			Name:       name,

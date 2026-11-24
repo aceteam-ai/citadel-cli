@@ -17,5 +17,8 @@ func fileBirthTime(path string) (time.Time, bool) {
 	if !ok {
 		return time.Time{}, false
 	}
+	if stat.Birthtimespec.Sec == 0 && stat.Birthtimespec.Nsec == 0 {
+		return time.Time{}, false
+	}
 	return time.Unix(stat.Birthtimespec.Sec, stat.Birthtimespec.Nsec), true
 }

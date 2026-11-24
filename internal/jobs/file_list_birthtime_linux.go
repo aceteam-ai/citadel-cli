@@ -13,5 +13,8 @@ func fileBirthTime(path string) (time.Time, bool) {
 	if err := unix.Statx(unix.AT_FDCWD, path, unix.AT_SYMLINK_NOFOLLOW, unix.STATX_BTIME, &stat); err != nil || stat.Mask&unix.STATX_BTIME == 0 {
 		return time.Time{}, false
 	}
+	if stat.Btime.Sec == 0 && stat.Btime.Nsec == 0 {
+		return time.Time{}, false
+	}
 	return time.Unix(stat.Btime.Sec, int64(stat.Btime.Nsec)), true
 }

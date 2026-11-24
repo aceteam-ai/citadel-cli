@@ -17,5 +17,8 @@ func fileBirthTime(path string) (time.Time, bool) {
 	if !ok {
 		return time.Time{}, false
 	}
+	if stat.CreationTime.HighDateTime == 0 && stat.CreationTime.LowDateTime == 0 {
+		return time.Time{}, false
+	}
 	return time.Unix(0, stat.CreationTime.Nanoseconds()), true
 }
