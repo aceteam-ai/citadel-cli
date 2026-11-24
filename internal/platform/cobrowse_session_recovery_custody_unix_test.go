@@ -272,3 +272,142 @@ func TestCobrowseRecoveryPostSealRemovalFailureIsRetryable(t *testing.T) {
 		})
 	}
 }
+
+// A start refused before a session slot is taken carries ErrSessionNotLaunched
+// (no browser can exist); a duplicate handle does not, because a browser
+// already holds it and recovery must keep custody of that one.
+func TestCobrowseRecoveryPreSlotRefusalsAreNotLaunched(t *testing.T) {
+	f := &fakeLauncher{}
+	f.install(t)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 1)
+	held := "cb-0123456789abcdef0123456789abcdef"
+	if _, err := m.StartRecoverySessionWithID(held, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	other := "cb-fedcba9876543210fedcba9876543210"
+	for name, start := range map[string]func() error{
+		"session-limit": func() error { _, err := m.StartRecoverySessionWithID(other, "", nil); return err },
+		"bad-url":       func() error { _, err := m.StartRecoverySessionWithID(other, "file:///etc/passwd", nil); return err },
+		"bad-handle":    func() error { _, err := m.StartRecoverySessionWithID("cb-short", "", nil); return err },
+	} {
+		if err := start(); !errors.Is(err, ErrSessionNotLaunched) {
+			t.Fatalf("%s: %v is not a not-launched refusal", name, err)
+		}
+	}
+	if err := func() error { _, err := m.StartRecoverySessionWithID(held, "", nil); return err }(); err == nil || errors.Is(err, ErrSessionNotLaunched) {
+		t.Fatalf("duplicate handle reported as not launched: %v", err)
+	}
+	if f.n != 1 {
+		t.Fatalf("a refused start launched a browser: %d launches", f.n)
+	}
+}
+
+// Every legacy stop path routes a recovery handle through recovery custody: a
+// confirmed stop leaves evidence the journal terminalizes on, and a stop that
+// cannot be confirmed keeps the session (nonterminal) for a retry.
+func TestCobrowseRecoveryLegacyStopPathsKeepCustody(t *testing.T) {
+	paths := map[string]func(m *CobrowseSessionManager, id string) bool{
+		"stop": func(m *CobrowseSessionManager, id string) bool { return m.Stop(id) == nil },
+		"stop-all": func(m *CobrowseSessionManager, id string) bool {
+			return m.StopAll() == nil
+		},
+		// The managed worker's shutdown branch (not its StopAll fallback): an
+		// unscoped recovery session is stopped under custody, not left running.
+		"shutdown": func(m *CobrowseSessionManager, id string) bool {
+			prevDetached, prevAdopt, prevResolver := detachedWorker.Load(), adoptionSupported, m.useResolver
+			detachedWorker.Store(true)
+			adoptionSupported, m.useResolver = true, true
+			defer func() {
+				detachedWorker.Store(prevDetached)
+				adoptionSupported, m.useResolver = prevAdopt, prevResolver
+			}()
+			return m.ShutdownSessions() == nil
+		},
+		"public-only": func(m *CobrowseSessionManager, id string) bool { return m.stopUnguarded(id) },
+		"guard-failure": func(m *CobrowseSessionManager, id string) bool {
+			failed := make(chan struct{})
+			close(failed)
+			m.watchGuard(id, failed, nil)
+			_, present := m.sessions[id]
+			return !present
+		},
+	}
+	for name, stop := range paths {
+		t.Run(name, func(t *testing.T) {
+			installFakeHelpers(t, &fakeHelpers{euid: os.Geteuid(), procs: map[int]reapProc{}})
+			// Unconfirmed: the staging dir sits under a regular file, so the
+			// seal and removal cannot be confirmed (root-independent).
+			f := newCustodyFixture(t, "")
+			blocker := filepath.Join(f.m.baseDir, "blocked")
+			if err := os.WriteFile(blocker, []byte("owned fixture"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			good := f.s.profile
+			f.s.profile = filepath.Join(blocker, "profile")
+			if stop(f.m, f.id) {
+				t.Fatal("unconfirmed custody stop reported success")
+			}
+			f.requireNonterminal(t, false, errors.New("unconfirmed"))
+			if f.m.RecoveryState(f.id) == "unknown" || len(f.enc.persisted) != 0 {
+				t.Fatal("unconfirmed stop lost the session or sealed")
+			}
+			// Confirmed on the same path once cleanup can finish.
+			f.s.profile = good
+			if !stop(f.m, f.id) {
+				t.Fatal("custody stop not confirmed after cleanup became possible")
+			}
+			f.requireTerminal(t, true, nil)
+			if f.m.RecoveryState(f.id) != "ended" {
+				t.Fatal("confirmed stop left no terminal evidence")
+			}
+			if yes, err := f.m.StopRecoverySession(f.id); !yes || err != nil {
+				t.Fatalf("journal stop after a legacy stop: %v %v", yes, err)
+			}
+			if f.stops != 1 || len(f.enc.persisted) != 1 || f.enc.closes != 1 {
+				t.Fatalf("stages: stops=%d persist=%d close=%d", f.stops, len(f.enc.persisted), f.enc.closes)
+			}
+		})
+	}
+}
+
+// Teardown never seals or closes again after recovery cleanup already did.
+func TestTeardownSkipsStagesRecoveryCompleted(t *testing.T) {
+	installFakeHelpers(t, &fakeHelpers{euid: os.Geteuid(), procs: map[int]reapProc{}})
+	f := newCustodyFixture(t, "")
+	f.s.recoveryStopped, f.s.recoveryPersisted, f.s.recoveryClosed = true, true, true
+	if err := f.s.teardown(); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.enc.persisted) != 0 || f.enc.closes != 0 {
+		t.Fatalf("teardown repeated recovery stages: persist=%d close=%d", len(f.enc.persisted), f.enc.closes)
+	}
+}
+
+// Confirmed-stop evidence never outlives a new session under the same handle:
+// a later start that fails after taking its slot must read unknown, not ended.
+func TestCobrowseRecoveryEvidenceClearedByNewStart(t *testing.T) {
+	f := &fakeLauncher{}
+	f.install(t)
+	m := newCobrowseSessionManager(trustedBaseDir(t), 2)
+	id := "cb-0123456789abcdef0123456789abcdef"
+	m.mu.Lock()
+	m.markRecoveryDoneLocked(id)
+	m.mu.Unlock()
+	if m.RecoveryState(id) != "ended" {
+		t.Fatal("fixture evidence missing")
+	}
+	prev := launchCobrowseProc
+	launchCobrowseProc = func(string, string, LaunchOptions) (*cobrowseProc, error) {
+		return nil, errors.New("synthetic launch failure after the slot was taken")
+	}
+	t.Cleanup(func() { launchCobrowseProc = prev })
+	if _, err := m.StartRecoverySessionWithID(id, "", nil); err == nil || errors.Is(err, ErrSessionNotLaunched) {
+		t.Fatalf("post-slot launch failure: %v", err)
+	}
+	if m.RecoveryState(id) != "unknown" {
+		t.Fatal("stale evidence made a failed relaunch look ended")
+	}
+	if yes, err := m.StopRecoverySession(id); yes || err != nil {
+		t.Fatalf("stale evidence confirmed a stop: %v %v", yes, err)
+	}
+}

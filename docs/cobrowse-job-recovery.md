@@ -42,7 +42,12 @@ cross-process execution fence. It does not introduce an unbounded wait for a loc
 A duplicate scoped start returns its existing running or terminal identity. It
 never invokes another launch. A changed scope or request conflicts. A stop before
 start writes a durable terminal tombstone, preventing any late delivery from
-launching. Records are bounded at 8,192 per node and the encoded journal at 8 MiB.
+launching. Before writing it, the engine checks whether a session already holds
+the derived handle; one that does is stopped first, and an unconfirmed stop
+writes nothing. A start the session manager refuses before taking a slot
+(`platform.ErrSessionNotLaunched`: an invalid handle, URL or address policy, or
+the session limit) is recorded `failed`. A duplicate handle is not such a
+refusal: a browser already holds it, so it stays `unknown` for a stop to find. Records are bounded at 8,192 per node and the encoded journal at 8 MiB.
 One reserved staging name bounds crash leftovers to one additional journal-sized
 file; lock descriptors are close-on-exec so a browser cannot inherit custody.
 Active and unknown records are never evicted. Terminal tombstones remain at least
@@ -63,6 +68,15 @@ unverifiable manager/registry state remains `unknown`, without a fresh launch.
 Only an observed browser-exit channel followed by confirmed display/profile
 cleanup supports `ended`. The older best-effort
 registry's expired label is not sufficient evidence.
+
+Every other stop path in the manager (user `stop`, `StopAll`, the managed
+worker's shutdown, the public-only sweep and an egress-guard failure) stops a
+recovery handle through the same custody stop (`stopRecoveryCustody`,
+`stopRemoved`). A confirmed stop is remembered in memory (`recoveryDone`), so a
+later `job_status` or `stop_by_job_id` can terminalize the record; an
+unconfirmed one keeps the session for retry. A restart loses that memory, and
+the record then stays `unknown`. The adapter accepts only the exact per-node
+stream of the configured node and its owning org.
 
 A stop intent is synced first. `stopped` requires successful teardown and observed
 browser exit, or a pre-delivery tombstone that never authorized launch. A missing

@@ -28,7 +28,7 @@ func TestCobrowseRecoveryTransportQueueEvidence(t *testing.T) {
 }
 func TestCobrowseRecoveryCapabilityFollowsConfiguredHandler(t *testing.T) {
 	enabled := true
-	a := newGatedLegacyHandlerAdapter(JobTypeCobrowseSession, jobs.NewCobrowseSessionHandlerForNode("4242"), func() bool { return enabled })
+	a := newGatedLegacyHandlerAdapter(JobTypeCobrowseSession, jobs.NewCobrowseSessionHandlerForNode("4242", "node-owner"), func() bool { return enabled })
 	r := &Runner{handlers: []JobHandler{a}}
 	if r.CobrowseJobRecoveryAvailable() != cobrowserecovery.Supported() {
 		t.Fatal("configured adapter not advertised")
@@ -51,7 +51,7 @@ func TestCobrowseRecoveryCapabilityFollowsConfiguredHandler(t *testing.T) {
 // recovery node binding; neither wiring replaces the other.
 func TestCobrowseSessionHandlerForKeepsFilesGateAndRecoveryBinding(t *testing.T) {
 	on := true
-	h := cobrowseSessionHandlerFor(LegacyHandlerOpts{CobrowseRecoveryNodeID: "node-fixture", FilesEnabled: func() bool { return on }})
+	h := cobrowseSessionHandlerFor(LegacyHandlerOpts{CobrowseRecoveryNodeID: "node-fixture", CobrowseRecoveryOrgID: "org-fixture", FilesEnabled: func() bool { return on }})
 	if h.Enabled == nil || !h.Enabled() {
 		t.Fatal("Files gate not wired")
 	}
@@ -60,5 +60,8 @@ func TestCobrowseSessionHandlerForKeepsFilesGateAndRecoveryBinding(t *testing.T)
 	}
 	if cobrowseSessionHandlerFor(LegacyHandlerOpts{FilesEnabled: func() bool { return on }}).CobrowseJobRecoveryAvailable() {
 		t.Fatal("unbound node advertised recovery")
+	}
+	if cobrowseSessionHandlerFor(LegacyHandlerOpts{CobrowseRecoveryNodeID: "node-fixture"}).CobrowseJobRecoveryAvailable() {
+		t.Fatal("node without a stream org advertised recovery")
 	}
 }

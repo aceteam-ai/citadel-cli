@@ -334,7 +334,7 @@ func (m *CobrowseSessionManager) ShutdownSessions() error {
 				"the session outlives a service stop for up to "+detachGrace().String()+" before it is swept")
 			continue
 		}
-		if err := s.teardown(); err != nil {
+		if err := m.stopRemoved(s); err != nil {
 			lastErr = err
 		}
 	}

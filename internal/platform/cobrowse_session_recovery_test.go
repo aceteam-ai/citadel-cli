@@ -54,7 +54,15 @@ func TestCobrowseRecoveryExitEvidenceAndSingleStop(t *testing.T) {
 	if err != nil || !confirmed || stops != 1 {
 		t.Fatalf("confirmed=%v err=%v calls=%d", confirmed, err, stops)
 	}
-	if m.RecoveryState(id) != "unknown" {
+	// The confirmed stop is remembered, so a retried journal transaction can
+	// terminalize; mere absence of a never-confirmed handle is not.
+	if m.RecoveryState(id) != "ended" {
+		t.Fatal("confirmed stop evidence lost")
+	}
+	if yes, err := m.StopRecoverySession(id); err != nil || !yes || stops != 1 {
+		t.Fatal("retried stop after confirmation not idempotent")
+	}
+	if m.RecoveryState("missing") != "unknown" {
 		t.Fatal("absence falsely terminal")
 	}
 	if yes, err := m.StopRecoverySession("missing"); err != nil || yes {

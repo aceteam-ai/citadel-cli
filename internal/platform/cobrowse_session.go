@@ -33,6 +33,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
@@ -245,12 +246,17 @@ func (m *CobrowseSessionManager) SetLaunchOptions(lo LaunchOptions) {
 // CobrowseSessionManager owns the map of concurrent, isolated browser sessions. Safe
 // for concurrent use.
 type CobrowseSessionManager struct {
-	mu          sync.Mutex
-	sessions    map[string]*cobrowseSession
-	maxSessions int
-	baseDir     string
-	sweepOnce   sync.Once
-	launchOpts  LaunchOptions
+	mu       sync.Mutex
+	sessions map[string]*cobrowseSession
+	// recoveryDone holds recovery handles whose browser exit and cleanup were
+	// confirmed, by whichever stop path ran it, so the journal can terminalize
+	// a record after the session left the map. In memory only: a restart loses
+	// it and the record stays unknown (never falsely stopped).
+	recoveryDone map[string]struct{}
+	maxSessions  int
+	baseDir      string
+	sweepOnce    sync.Once
+	launchOpts   LaunchOptions
 	// trackTargets, targetPolicy and targetEvent are set by
 	// EnableTargetTracking for newly created sessions.
 	trackTargets bool
@@ -497,22 +503,41 @@ func (m *CobrowseSessionManager) StartSessionWithID(id, startURL string, profile
 // 128-bit identity is distinct from local mode's reserved session ID format.
 // Both paths share the same duplicate and profile-custody checks below.
 func (m *CobrowseSessionManager) StartRecoverySessionWithID(id, startURL string, profile SessionProfile) (CobrowseSessionStatus, error) {
-	raw, err := hex.DecodeString(strings.TrimPrefix(id, "cb-"))
-	if len(id) != 35 || !strings.HasPrefix(id, "cb-") || err != nil || len(raw) != 16 || strings.ToLower(id) != id {
+	if !recoveryScopedID(id) {
 		if profile != nil {
 			_ = profile.Close()
 		}
-		return CobrowseSessionStatus{}, fmt.Errorf("invalid preassigned browser session ID")
+		return CobrowseSessionStatus{}, notLaunched(fmt.Errorf("invalid preassigned browser session ID"))
 	}
 	return m.startSession(id, startURL, profile)
 }
+
+// recoveryScopedID reports whether id is a pre-journaled recovery handle
+// ("cb-" plus 32 lowercase hex). Such a session is stopped only under recovery
+// custody, whichever path asks for the stop.
+func recoveryScopedID(id string) bool {
+	raw, err := hex.DecodeString(strings.TrimPrefix(id, "cb-"))
+	return len(id) == 35 && strings.HasPrefix(id, "cb-") && err == nil && len(raw) == 16 && strings.ToLower(id) == id
+}
+
+// ErrSessionNotLaunched marks a start refused before a session slot was taken,
+// so no browser process can exist for it. Recovery maps it to a failed (not
+// attempted) launch; any other start error may have left a process behind.
+var ErrSessionNotLaunched = errors.New("co-browse session was not launched")
+
+type notLaunchedError struct{ err error }
+
+func (e notLaunchedError) Error() string   { return e.err.Error() }
+func (e notLaunchedError) Unwrap() []error { return []error{e.err, ErrSessionNotLaunched} }
+
+func notLaunched(err error) error { return notLaunchedError{err} }
 
 func (m *CobrowseSessionManager) startSession(id, startURL string, profile SessionProfile) (status CobrowseSessionStatus, err error) {
 	if err := ValidateCobrowseURL(startURL); err != nil {
 		if profile != nil {
 			profile.Close()
 		}
-		return CobrowseSessionStatus{}, err
+		return CobrowseSessionStatus{}, notLaunched(err)
 	}
 	m.mu.Lock()
 	tracking, policy := m.trackTargets, m.targetPolicy
@@ -529,7 +554,7 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 			if profile != nil {
 				_ = profile.Close()
 			}
-			return CobrowseSessionStatus{}, err
+			return CobrowseSessionStatus{}, notLaunched(err)
 		}
 	}
 	// Reap orphans from a prior crashed process before the first launch of this one.
@@ -541,6 +566,8 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 		if profile != nil {
 			_ = profile.Close()
 		}
+		// Deliberately not ErrSessionNotLaunched: a browser already holds this
+		// handle, so recovery must keep custody of it rather than fail the job.
 		return CobrowseSessionStatus{}, fmt.Errorf("browser session ID already exists")
 	}
 	if len(m.sessions) >= m.maxSessions {
@@ -550,9 +577,9 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 		if profile != nil {
 			_ = profile.Close()
 		}
-		return CobrowseSessionStatus{}, fmt.Errorf(
+		return CobrowseSessionStatus{}, notLaunched(fmt.Errorf(
 			"too many co-browse sessions (%d running); stop one first or raise %s",
-			max, EnvCobrowseMaxSessions)
+			max, EnvCobrowseMaxSessions))
 	}
 
 	s := &cobrowseSession{
@@ -567,6 +594,9 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 		policy:     m.targetPolicy,
 	}
 	m.sessions[id] = s
+	// A new session under a handle voids any earlier confirmed-stop evidence
+	// for it: that evidence describes a previous browser, not this one.
+	delete(m.recoveryDone, id)
 	m.mu.Unlock()
 
 	proc, err := m.launch(s, startURL)
@@ -865,6 +895,9 @@ func (m *CobrowseSessionManager) setAttached(id string, attached bool) bool {
 // Stop tears down one session (browser + Xvfb) and removes its throwaway profile dir.
 // Safe to call for an unknown id (returns nil) so a double-stop is not an error.
 func (m *CobrowseSessionManager) Stop(id string) error {
+	if recoveryScopedID(id) {
+		return m.stopRecoveryScoped(id)
+	}
 	m.mu.Lock()
 	s, ok := m.sessions[id]
 	delete(m.sessions, id)
@@ -887,7 +920,7 @@ func (m *CobrowseSessionManager) StopAll() error {
 
 	var lastErr error
 	for _, s := range all {
-		if err := s.teardown(); err != nil {
+		if err := m.stopRemoved(s); err != nil {
 			lastErr = err
 		}
 	}
@@ -948,13 +981,18 @@ func (s *cobrowseSession) teardown() error {
 				if err == nil {
 					err = stageErr
 				}
+			} else if s.recoveryPersisted {
+				// Recovery cleanup already sealed this exact working copy.
 			} else if perr := enc.Persist(workDir); perr != nil && err == nil {
 				err = perr
 			}
 		}
 		// Close zeroes the unlocked key material and releases the profile's
-		// single-session lock, always — even when Persist failed above.
-		_ = enc.Close()
+		// single-session lock, always — even when Persist failed above —
+		// unless recovery cleanup already closed it.
+		if !s.recoveryClosed {
+			_ = enc.Close()
+		}
 	}
 	// Remove the plaintext working dir so a stopped session leaves no decrypted
 	// cookies (and no throwaway state) behind. The pidfile lives under it and goes

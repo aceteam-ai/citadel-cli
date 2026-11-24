@@ -2,6 +2,8 @@ package jobs
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 
@@ -35,12 +37,10 @@ func (h *CobrowseSessionHandler) recoverJob(action string, job *nexus.Job, mgr *
 		}
 	}
 	// SourceQueue is copied from transport custody, not caller payload. Require
-	// exactly one per-node segment, the exact local control identity and a nonempty
-	// routing org. Shared-node caller_org_id deliberately need not equal node org.
-	prefix := "jobs:v1:shell:org_"
-	tail := strings.TrimPrefix(job.SourceQueue, prefix)
-	parts := strings.Split(tail, ":node:")
-	if h.recoveryNodeID == "" || !strings.HasPrefix(job.SourceQueue, prefix) || len(parts) != 2 || parts[0] == "" || parts[1] != h.recoveryNodeID || strings.ContainsAny(parts[0], ":/\\ \t\r\n") {
+	// the exact per-node stream of this configured node and its owning org (as
+	// MODULE_SET external actions do). Shared-node caller_org_id deliberately
+	// need not equal the node org.
+	if !h.recoveryBound() || job.SourceQueue != fmt.Sprintf("jobs:v1:shell:org_%s:node:%s", h.recoveryOrgID, h.recoveryNodeID) {
 		return nil, cobrowserecovery.ErrConflict
 	}
 	scope := cobrowserecovery.Scope{JobID: id, Node: h.recoveryNodeID, Org: p["caller_org_id"], Owner: p["owner_user_id"]}
@@ -114,8 +114,15 @@ func (b *nodeRecoveryBrowser) Start(id string) (bool, error) {
 		profile = handle
 	}
 	_, err := b.manager.StartRecoverySessionWithID(id, p["url"], profile)
+	// A refusal before a session slot was taken (bad handle, address policy,
+	// session limit) cannot have left a browser: the launch was not attempted.
+	// Every other error may have, so it stays unknown for recovery.
+	if errors.Is(err, platform.ErrSessionNotLaunched) {
+		return false, err
+	}
 	return true, err
 }
+func (b *nodeRecoveryBrowser) Present(id string) bool { return b.manager.RecoveryPresent(id) }
 func (b *nodeRecoveryBrowser) Observe(id string) cobrowserecovery.State {
 	return cobrowserecovery.State(b.manager.RecoveryState(id))
 }
@@ -127,5 +134,16 @@ func (b *nodeRecoveryBrowser) Status(id string) (platform.CobrowseSessionStatus,
 // CobrowseJobRecoveryAvailable reports protocol support, not permission to start
 // a browser. Every request still requires the private journal and scoped checks.
 func (h *CobrowseSessionHandler) CobrowseJobRecoveryAvailable() bool {
-	return cobrowserecovery.Supported() && h.recoveryNodeID != ""
+	return cobrowserecovery.Supported() && h.recoveryBound()
+}
+
+// recoveryBound requires both halves of the per-node stream identity. Neither
+// may be empty or contain a stream separator.
+func (h *CobrowseSessionHandler) recoveryBound() bool {
+	for _, v := range []string{h.recoveryNodeID, h.recoveryOrgID} {
+		if v == "" || strings.ContainsAny(v, ":/\\ \t\r\n") {
+			return false
+		}
+	}
+	return true
 }

@@ -129,6 +129,7 @@ type nodeJobHandlerOpts struct {
 func buildNodeJobHandlers(opts nodeJobHandlerOpts) ([]worker.JobHandler, *worker.SwapManager) {
 	handlers := worker.CreateLegacyHandlersWithOpts(worker.LegacyHandlerOpts{
 		CobrowseRecoveryNodeID:    opts.NodeID,
+		CobrowseRecoveryOrgID:     opts.OrgID,
 		LogFn:                     opts.LogFn,
 		WorkspaceDir:              opts.WorkspaceDir,
 		ConfigDir:                 opts.ConfigDir,

@@ -236,8 +236,10 @@ var _ JobHandler = (*LegacyHandlerAdapter)(nil)
 
 // LegacyHandlerOpts configures optional behaviour for CreateLegacyHandlers.
 type LegacyHandlerOpts struct {
-	// CobrowseRecoveryNodeID binds recovery jobs to this configured control node.
+	// CobrowseRecoveryNodeID and CobrowseRecoveryOrgID bind recovery jobs to
+	// this configured control node's exact per-node stream.
 	CobrowseRecoveryNodeID string
+	CobrowseRecoveryOrgID  string
 	// LogFn routes job log output through a callback instead of stdout.
 	LogFn func(level, msg string)
 	// WorkspaceDir is the sandbox root for file-operation handlers.
@@ -714,7 +716,7 @@ func newMeetingJoinHandler(opts LegacyHandlerOpts) *jobs.MeetingJoinHandler {
 // handler, so file staging and set_file_input follow the same switch as
 // FILE_WRITE_BYTES (citadel-cli#1721).
 func cobrowseSessionHandlerFor(opts LegacyHandlerOpts) *jobs.CobrowseSessionHandler {
-	h := jobs.NewCobrowseSessionHandlerForNode(opts.CobrowseRecoveryNodeID)
+	h := jobs.NewCobrowseSessionHandlerForNode(opts.CobrowseRecoveryNodeID, opts.CobrowseRecoveryOrgID)
 	h.Enabled = opts.FilesEnabled
 	return h
 }

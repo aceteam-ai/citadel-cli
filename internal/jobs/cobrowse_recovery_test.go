@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -27,7 +28,12 @@ func (f *fixtureRecoveryBrowser) Start(id string) (bool, error) {
 	f.state = cobrowserecovery.Running
 	return true, nil
 }
-func (f *fixtureRecoveryBrowser) Observe(string) cobrowserecovery.State { return f.state }
+func (f *fixtureRecoveryBrowser) Observe(string) cobrowserecovery.State {
+	if f.state == "" {
+		return cobrowserecovery.Unknown
+	}
+	return f.state
+}
 func (f *fixtureRecoveryBrowser) Stop(string) (bool, error) {
 	f.stops++
 	f.state = cobrowserecovery.Ended
@@ -42,7 +48,7 @@ func recoveryFixture(t *testing.T) (*CobrowseSessionHandler, *nexus.Job, *fixtur
 	if !cobrowserecovery.Supported() {
 		t.Skip("Unix adapter")
 	}
-	h := NewCobrowseSessionHandlerForNode("4242")
+	h := NewCobrowseSessionHandlerForNode("4242", "node-owner")
 	root := t.TempDir()
 	h.recoveryRoot = func() string { return root }
 	f := &fixtureRecoveryBrowser{}
@@ -86,7 +92,7 @@ func TestCobrowseRecoveryHandlerLostReplyAndScopedReceipt(t *testing.T) {
 	}
 }
 func TestCobrowseRecoveryHandlerRejectsRoutingAndIncompleteScope(t *testing.T) {
-	for _, kind := range []string{"pool", "tag", "wrong-target", "wrong-stream-node", "empty-node", "payload-forged-queue", "missing-org", "missing-owner", "bad-start-id"} {
+	for _, kind := range []string{"pool", "tag", "wrong-target", "wrong-stream-node", "wrong-stream-org", "empty-node", "empty-node-org", "payload-forged-queue", "missing-org", "missing-owner", "bad-start-id"} {
 		t.Run(kind, func(t *testing.T) {
 			h, j, f := recoveryFixture(t)
 			switch kind {
@@ -98,8 +104,13 @@ func TestCobrowseRecoveryHandlerRejectsRoutingAndIncompleteScope(t *testing.T) {
 				h.recoveryNodeID = "9"
 			case "wrong-stream-node":
 				j.SourceQueue = "jobs:v1:shell:org_node-owner:node:8"
+			case "wrong-stream-org":
+				j.SourceQueue = "jobs:v1:shell:org_other-owner:node:4242"
 			case "empty-node":
 				h.recoveryNodeID = ""
+			case "empty-node-org":
+				h.recoveryOrgID = ""
+				j.SourceQueue = "jobs:v1:shell:org_:node:4242"
 			case "payload-forged-queue":
 				j.Payload["SourceQueue"] = j.SourceQueue
 				j.SourceQueue = ""
@@ -156,5 +167,28 @@ func TestCobrowseRecoveryHandlerStopBeforeStartAndNotFound(t *testing.T) {
 	b, e = h.Execute(JobContext{}, j)
 	if e != nil || !strings.Contains(string(b), `"state":"stopped"`) || f.starts != 0 {
 		t.Fatalf("late start: %s %v", b, e)
+	}
+}
+
+// A start the manager refuses before taking a session slot cannot have left a
+// browser, so the journal records it as failed (terminal) instead of unknown,
+// and a later stop does not wait forever for a session that never existed.
+func TestCobrowseRecoveryPreSlotRefusalIsFailedNotUnknown(t *testing.T) {
+	h, j, _ := recoveryFixture(t)
+	h.recoveryOps = nil
+	m := platform.NewCobrowseSessionManager(t.TempDir(), 1)
+	refused := errors.New("synthetic address policy refusal")
+	m.EnableTargetTracking(func(context.Context, string) error { return refused }, nil)
+	h.manager = m
+	if _, err := h.Execute(JobContext{}, j); err == nil {
+		t.Fatal("refused start reported success")
+	}
+	j.Payload["start_job_id"] = recoveryJobID
+	for _, action := range []string{"job_status", "stop_by_job_id"} {
+		j.Payload["action"] = action
+		b, err := h.Execute(JobContext{}, j)
+		if err != nil || !strings.Contains(string(b), `"state":"failed"`) {
+			t.Fatalf("%s after a refused start: %s %v", action, b, err)
+		}
 	}
 }

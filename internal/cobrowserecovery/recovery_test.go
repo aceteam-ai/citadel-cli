@@ -415,3 +415,43 @@ func TestObservedExitRequiresCleanupBeforeTerminal(t *testing.T) {
 		t.Fatal("ended replay launched again")
 	}
 }
+
+type presentOps struct {
+	fakeOps
+	present bool
+}
+
+func (o *presentOps) Present(string) bool { return o.present }
+
+// With no journal record, a stop tombstones only when no session holds the
+// derived handle. A held handle is stopped first; an unconfirmed stop writes
+// nothing, so a retry can still confirm it.
+func TestNoRecordStopChecksDerivedSession(t *testing.T) {
+	for _, mode := range []string{"present", "observed-running"} {
+		t.Run(mode, func(t *testing.T) {
+			e, _ := testEngine(t)
+			o := &presentOps{}
+			if mode == "present" {
+				o.present = true
+				o.state = Unknown
+			} else {
+				o.state = Running
+			}
+			r, err := e.Do("stop_by_job_id", testScope, "", o)
+			if err == nil || r.State == Stopped || o.stops != 1 {
+				t.Fatalf("unconfirmed stop of a held handle tombstoned: %+v %v stops=%d", r, err, o.stops)
+			}
+			if got := mustDo(t, e, "job_status", testScope, "", o); got.State != NotFound {
+				t.Fatalf("unconfirmed stop wrote a record: %+v", got)
+			}
+			o.confirmed = true
+			if got := mustDo(t, e, "stop_by_job_id", testScope, "", o); got.State != Stopped || o.stops != 2 {
+				t.Fatalf("confirmed stop: %+v stops=%d", got, o.stops)
+			}
+			o.present, o.state = false, Unknown
+			if got := mustDo(t, e, "start", testScope, digest(t, "https://example.test", ""), o); got.State != Stopped || o.starts != 0 {
+				t.Fatal("tombstone did not fence the late start")
+			}
+		})
+	}
+}

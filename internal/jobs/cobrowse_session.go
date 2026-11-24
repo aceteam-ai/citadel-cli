@@ -84,6 +84,7 @@ type CobrowseSessionHandler struct {
 	Enabled func() bool
 
 	recoveryNodeID string
+	recoveryOrgID  string
 	recoveryRoot   func() string
 	recoveryOps    func(*nexus.Job) recoveryBrowserOps
 }
@@ -93,12 +94,15 @@ func (h *CobrowseSessionHandler) filesAllowed() bool {
 }
 
 // NewCobrowseSessionHandler constructs an interactive browser-session handler.
-func NewCobrowseSessionHandler() *CobrowseSessionHandler { return NewCobrowseSessionHandlerForNode("") }
+func NewCobrowseSessionHandler() *CobrowseSessionHandler {
+	return NewCobrowseSessionHandlerForNode("", "")
+}
 
 // NewCobrowseSessionHandlerForNode enables scoped recovery only for a configured
-// node identity. Legacy paid starts without recovery scope retain their path.
-func NewCobrowseSessionHandlerForNode(nodeID string) *CobrowseSessionHandler {
-	return &CobrowseSessionHandler{recoveryNodeID: nodeID, recoveryRoot: network.GetNodeConfigDir}
+// node identity and the organization that owns this node's per-node stream.
+// Legacy paid starts without recovery scope retain their path.
+func NewCobrowseSessionHandlerForNode(nodeID, orgID string) *CobrowseSessionHandler {
+	return &CobrowseSessionHandler{recoveryNodeID: nodeID, recoveryOrgID: orgID, recoveryRoot: network.GetNodeConfigDir}
 }
 
 // NewCobrowseSessionHandlerWithManager uses an isolated session manager. Production

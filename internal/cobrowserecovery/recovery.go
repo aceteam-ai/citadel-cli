@@ -131,6 +131,24 @@ type Ops interface {
 	Stop(sessionID string) (confirmed bool, err error)
 }
 
+// Presence is optional on Ops: it reports whether any session holds the handle,
+// whatever its state. Observe alone cannot tell "absent" from "present but not
+// yet running", since both are Unknown.
+type Presence interface {
+	Present(sessionID string) bool
+}
+
+func live(ops Ops, sessionID string) bool {
+	if p, ok := ops.(Presence); ok && p.Present(sessionID) {
+		return true
+	}
+	switch ops.Observe(sessionID) {
+	case Running, Ended:
+		return true
+	}
+	return false
+}
+
 type Engine struct {
 	Store Store
 	Now   func() time.Time
@@ -179,6 +197,15 @@ func (e Engine) Do(action string, scope Scope, digest string, ops Ops) (Result, 
 		}
 		r = Record{Scope: scope}
 		if action == "stop_by_job_id" {
+			// With no record, a tombstone is safe only when no browser holds the
+			// derived handle (a lost journal, or a session started outside it).
+			// If one does, stop it first; an unconfirmed stop writes nothing.
+			derived := "cb-" + strings.ReplaceAll(scope.JobID, "-", "")
+			if live(ops, derived) {
+				if confirmed, stopErr := ops.Stop(derived); !confirmed || stopErr != nil {
+					return Result{JobID: scope.JobID, State: Unknown}, fmt.Errorf("co-browse stop unconfirmed; retry start_job_id")
+				}
+			}
 			r.State = Stopped
 			r.TerminalAt = now().UTC()
 			records[scope.JobID] = r

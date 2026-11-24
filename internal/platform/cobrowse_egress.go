@@ -270,6 +270,22 @@ const publicOnlyEndedDetail = "this node switched to public-only browsing; start
 // records nothing, when the session was already gone: whatever stopped it
 // keeps its own end reason.
 func (m *CobrowseSessionManager) stopUnguarded(id string) bool {
+	if recoveryScopedID(id) {
+		m.mu.Lock()
+		_, ok := m.sessions[id]
+		m.mu.Unlock()
+		if !ok {
+			return false
+		}
+		log.Printf("[cobrowse] stopping session %s: it has no egress guard and this node is now public-only", id)
+		// Recovery custody: an unconfirmed stop keeps the session for the
+		// next sweep and the journal's retry, and records no end reason yet.
+		if confirmed, _ := m.stopRecoveryCustody(id); !confirmed {
+			return false
+		}
+		m.recordEnded(id, EndedReasonPublicOnly, publicOnlyEndedDetail)
+		return true
+	}
 	m.mu.Lock()
 	s, ok := m.sessions[id]
 	delete(m.sessions, id)
