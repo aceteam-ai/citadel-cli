@@ -141,6 +141,8 @@ jobs:
   macos-cobrowse:
     name: macOS co-browse (unit)
     runs-on: macos-latest
+    # A hung job would otherwise hold Build + Test for the 6-hour default.
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v7
