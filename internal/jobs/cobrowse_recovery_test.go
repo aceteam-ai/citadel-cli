@@ -42,12 +42,12 @@ func recoveryFixture(t *testing.T) (*CobrowseSessionHandler, *nexus.Job, *fixtur
 	if !cobrowserecovery.Supported() {
 		t.Skip("Unix adapter")
 	}
-	h := NewCobrowseSessionHandlerForNode("1297")
+	h := NewCobrowseSessionHandlerForNode("4242")
 	root := t.TempDir()
 	h.recoveryRoot = func() string { return root }
 	f := &fixtureRecoveryBrowser{}
 	h.recoveryOps = func(*nexus.Job) recoveryBrowserOps { return f }
-	job := &nexus.Job{ID: recoveryJobID, Type: "COBROWSE_SESSION", SourceQueue: "jobs:v1:shell:org_node-owner:node:1297", Payload: map[string]string{"action": "start", "caller_org_id": recoveryOrg, "owner_user_id": recoveryOwner, "url": "https://example.test", "pin": "PIN-secret"}}
+	job := &nexus.Job{ID: recoveryJobID, Type: "COBROWSE_SESSION", SourceQueue: "jobs:v1:shell:org_node-owner:node:4242", Payload: map[string]string{"action": "start", "caller_org_id": recoveryOrg, "owner_user_id": recoveryOwner, "url": "https://example.test", "pin": "PIN-secret"}}
 	return h, job, f
 }
 func TestCobrowseRecoveryHandlerLostReplyAndScopedReceipt(t *testing.T) {
@@ -93,7 +93,7 @@ func TestCobrowseRecoveryHandlerRejectsRoutingAndIncompleteScope(t *testing.T) {
 			case "pool":
 				j.SourceQueue = "jobs:v1:shell:org_node-owner"
 			case "tag":
-				j.SourceQueue = "jobs:v1:shell:org_node-owner:tag:node:1297"
+				j.SourceQueue = "jobs:v1:shell:org_node-owner:tag:node:4242"
 			case "wrong-target":
 				h.recoveryNodeID = "9"
 			case "wrong-stream-node":

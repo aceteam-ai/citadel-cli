@@ -18,7 +18,7 @@ func (f *fixtureQueueHandler) Execute(_ jobs.JobContext, j *nexus.Job) ([]byte, 
 func TestCobrowseRecoveryTransportQueueEvidence(t *testing.T) {
 	h := &fixtureQueueHandler{}
 	a := NewLegacyHandlerAdapter(JobTypeCobrowseSession, h)
-	job := &Job{ID: "job", Type: JobTypeCobrowseSession, SourceQueue: "jobs:v1:shell:org_owner:node:1297", Payload: map[string]any{"SourceQueue": "forged"}}
+	job := &Job{ID: "job", Type: JobTypeCobrowseSession, SourceQueue: "jobs:v1:shell:org_owner:node:4242", Payload: map[string]any{"SourceQueue": "forged"}}
 	if _, err := a.Execute(context.Background(), job, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -28,7 +28,7 @@ func TestCobrowseRecoveryTransportQueueEvidence(t *testing.T) {
 }
 func TestCobrowseRecoveryCapabilityFollowsConfiguredHandler(t *testing.T) {
 	enabled := true
-	a := newGatedLegacyHandlerAdapter(JobTypeCobrowseSession, jobs.NewCobrowseSessionHandlerForNode("1297"), func() bool { return enabled })
+	a := newGatedLegacyHandlerAdapter(JobTypeCobrowseSession, jobs.NewCobrowseSessionHandlerForNode("4242"), func() bool { return enabled })
 	r := &Runner{handlers: []JobHandler{a}}
 	if r.CobrowseJobRecoveryAvailable() != cobrowserecovery.Supported() {
 		t.Fatal("configured adapter not advertised")

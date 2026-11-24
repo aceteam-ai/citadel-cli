@@ -14,7 +14,7 @@ import (
 	"github.com/google/uuid"
 )
 
-var testScope = Scope{"dfc2ce8c-2089-40bb-b4ed-057465aeeff5", "1297", "b21fb4bb-f292-4335-9acc-6d08e3cfdb82", "2b047249-f058-43f7-baea-8e687464b6a0"}
+var testScope = Scope{"dfc2ce8c-2089-40bb-b4ed-057465aeeff5", "4242", "b21fb4bb-f292-4335-9acc-6d08e3cfdb82", "2b047249-f058-43f7-baea-8e687464b6a0"}
 
 type fakeOps struct {
 	starts, stops     int

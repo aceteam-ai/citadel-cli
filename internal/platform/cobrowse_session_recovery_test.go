@@ -269,7 +269,7 @@ func TestCobrowseRecoveryJournalTerminalizesAfterCleanupRetry(t *testing.T) {
 	}
 	m := newCobrowseSessionManager(trustedBaseDir(t), 8)
 	m.Recover()
-	scope := cobrowserecovery.Scope{JobID: "08d55275-3b34-4514-a256-50cd3f5c92cd", Node: "1297", Org: "e91dd84f-52ef-4fdd-aa3b-c4a310cf518d", Owner: "f7176519-e74e-4b2d-b516-05d28685b03b"}
+	scope := cobrowserecovery.Scope{JobID: "08d55275-3b34-4514-a256-50cd3f5c92cd", Node: "4242", Org: "e91dd84f-52ef-4fdd-aa3b-c4a310cf518d", Owner: "f7176519-e74e-4b2d-b516-05d28685b03b"}
 	id := "cb-08d552753b344514a25650cd3f5c92cd"
 	profile := filepath.Join(m.baseDir, id)
 	if err := os.Mkdir(profile, 0700); err != nil {
