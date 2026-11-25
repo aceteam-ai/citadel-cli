@@ -240,8 +240,14 @@ func runLocalFlowBuiltin(ctx context.Context, bind templateRunBinding, params js
 		return nil, fmt.Errorf("local-flow-run: cannot lock container ledger: %w", err)
 	}
 	defer unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("local-flow-run: admission timed out: %w", err)
+	}
 	if err := reconcileLocalFlowContainers(plan, deps); err != nil {
 		return nil, fmt.Errorf("local-flow-run: prior container cleanup is pending: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("local-flow-run: admission timed out: %w", err)
 	}
 	// The ledger entry is the last step before launch: a refused run never
 	// consumes its run id.
@@ -640,7 +646,7 @@ func runLocalFlowContainer(ctx context.Context, plan *localFlowPlan, deps localF
 	if err != nil {
 		return nil, err
 	}
-	if err := recordLocalFlowContainer(plan.ledger, name); err != nil {
+	if err := recordLocalFlowContainer(plan.ledger, name, plan.runtime); err != nil {
 		return nil, fmt.Errorf("local-flow-run: cannot track container before launch: %w", err)
 	}
 	args, err := buildLocalFlowRunArgs(plan, deps.image, name)
@@ -690,6 +696,25 @@ func removeLocalFlowContainer(rt catalog.ContainerRuntime, name string, deps loc
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_, _, err := deps.exec(rt.EngineCommandContext(ctx, "rm", "-f", name), nil, 4096)
+	if err == nil {
+		return nil
+	}
+	// --rm can remove the container before the engine client reports failure.
+	// A successful inventory that lacks this exact name proves cleanup; an
+	// unavailable engine or truncated inventory leaves the debt in place.
+	listed, overflow, listErr := deps.exec(rt.EngineCommandContext(ctx, "ps", "-a", "--format", "{{.Names}}"), nil, 256*1024)
+	if listErr == nil && !overflow {
+		found := false
+		for _, candidate := range strings.Split(string(listed), "\n") {
+			if strings.TrimSpace(candidate) == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil
+		}
+	}
 	return err
 }
 
@@ -702,16 +727,20 @@ func localFlowContainerMarker(dir, name string) (string, error) {
 	return filepath.Join(dir, ".cleanup-"+name), nil
 }
 
-func recordLocalFlowContainer(dir, name string) error {
+func recordLocalFlowContainer(dir, name string, rt catalog.ContainerRuntime) error {
 	path, err := localFlowContainerMarker(dir, name)
 	if err != nil {
 		return err
+	}
+	if rt.EngineBin != "docker" && rt.EngineBin != "podman" {
+		return fmt.Errorf("unsupported local Flow container runtime")
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
-	return errors.Join(f.Sync(), f.Close(), syncLocalFlowRunDir(dir))
+	_, writeErr := io.WriteString(f, rt.EngineBin+"\n")
+	return errors.Join(writeErr, f.Sync(), f.Close(), syncLocalFlowRunDir(dir))
 }
 
 func clearLocalFlowContainer(dir, name string) error {
@@ -738,7 +767,22 @@ func reconcileLocalFlowContainers(plan *localFlowPlan, deps localFlowDeps) error
 		if !entry.Type().IsRegular() || !localFlowContainerNamePattern.MatchString(name) {
 			return fmt.Errorf("invalid cleanup marker")
 		}
-		if err := removeLocalFlowContainer(plan.runtime, name, deps); err != nil {
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.Size() > 16 {
+			return fmt.Errorf("invalid cleanup marker runtime")
+		}
+		marker, err := os.ReadFile(filepath.Join(plan.ledger, entry.Name()))
+		if err != nil {
+			return err
+		}
+		engine := strings.TrimSpace(string(marker))
+		if engine != "docker" && engine != "podman" {
+			return fmt.Errorf("invalid cleanup marker runtime")
+		}
+		if err := removeLocalFlowContainer(catalog.ContainerRuntime{EngineBin: engine, Bin: engine}, name, deps); err != nil {
 			return err
 		}
 		if err := clearLocalFlowContainer(plan.ledger, name); err != nil {
@@ -746,6 +790,46 @@ func reconcileLocalFlowContainers(plan *localFlowPlan, deps localFlowDeps) error
 		}
 	}
 	return nil
+}
+
+// sweepLocalFlowContainers runs independently of job admission. The caller
+// uses it once at worker startup and on a timer so a failed forced removal is
+// retried even when no later local Flow job arrives.
+func sweepLocalFlowContainers(deps localFlowDeps) error {
+	dir, err := deps.stateDir()
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	unlock, err := lockLocalFlowRunLedger(filepath.Join(dir, ".local-flow-containers.lock"))
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return reconcileLocalFlowContainers(&localFlowPlan{ledger: dir}, deps)
+}
+
+func runLocalFlowCleanupReconciler(ctx context.Context, deps localFlowDeps, interval time.Duration, report func(error)) {
+	tick := func() {
+		if err := sweepLocalFlowContainers(deps); err != nil {
+			report(err)
+		}
+	}
+	tick()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			tick()
+		}
+	}
 }
 
 // parseLocalFlowStdout accepts exactly {"output":{...},"usage":{"input_tokens":

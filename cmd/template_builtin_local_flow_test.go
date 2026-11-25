@@ -53,14 +53,16 @@ const lfLLMDigest = "sha256:3a73033a9ad67d7b7cdbb8d74dedceea4851bdb5fc78bcab563b
 // fakeLocalFlowEngine is a fake container runtime: it answers image inspect,
 // records run argv and stdin, and returns a canned engine reply.
 type fakeLocalFlowEngine struct {
-	mu           sync.Mutex
-	imagePresent bool
-	stdout       string
-	exitCode     int
-	runs         [][]string
-	stdins       [][]byte
-	removed      []string
-	removeErr    error
+	mu                  sync.Mutex
+	imagePresent        bool
+	stdout              string
+	exitCode            int
+	runs                [][]string
+	stdins              [][]byte
+	removed             []string
+	removeErr           error
+	containerPresent    bool
+	autoRemoveOnFailure bool
 }
 
 func (f *fakeLocalFlowEngine) exec(cmd *exec.Cmd, stdin []byte, limit int) ([]byte, bool, error) {
@@ -78,8 +80,15 @@ func (f *fakeLocalFlowEngine) exec(cmd *exec.Cmd, stdin []byte, limit int) ([]by
 		if f.removeErr != nil {
 			return nil, false, f.removeErr
 		}
+		f.containerPresent = false
+		return nil, false, nil
+	case "ps":
+		if f.containerPresent {
+			return []byte("citadel-local-flow-test\n"), false, nil
+		}
 		return nil, false, nil
 	case "run":
+		f.containerPresent = true
 		f.runs = append(f.runs, append([]string(nil), args...))
 		f.stdins = append(f.stdins, append([]byte(nil), stdin...))
 		out := []byte(f.stdout)
@@ -88,6 +97,9 @@ func (f *fakeLocalFlowEngine) exec(cmd *exec.Cmd, stdin []byte, limit int) ([]by
 			out = out[:limit]
 		}
 		if f.exitCode != 0 {
+			if f.autoRemoveOnFailure {
+				f.containerPresent = false
+			}
 			return out, overflow, fakeExitError(f.exitCode)
 		}
 		return out, overflow, nil
@@ -307,6 +319,123 @@ func TestLocalFlowFailedContainerCleanupIsReconciledBeforeNextRun(t *testing.T) 
 	}
 	if len(f.engine.removed) != 2 || f.engine.runCount() != 2 {
 		t.Fatalf("cleanup attempts = %d, runs = %d, want 2 each", len(f.engine.removed), f.engine.runCount())
+	}
+}
+
+func TestLocalFlowAlreadyRemovedContainerIsClean(t *testing.T) {
+	f := newLFFixture(t)
+	f.engine.exitCode = 2
+	f.engine.removeErr = errors.New("no such container")
+	f.engine.autoRemoveOnFailure = true
+	res, _ := f.execute(lfJob(t, lfParams(t, nil), lfOwnQueue))
+	if res.Status != worker.JobStatusFailure || res.Error == nil || !strings.Contains(res.Error.Error(), "engine failed") {
+		t.Fatalf("result = %s %v, want original engine failure", res.Status, res.Error)
+	}
+	marker := filepath.Join(f.ledger, ".cleanup-citadel-local-flow-test")
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("already removed container left cleanup debt: %v", err)
+	}
+}
+
+func TestLocalFlowCleanupRetriesAtWorkerStartupWithoutAnotherJob(t *testing.T) {
+	f := newLFFixture(t)
+	f.engine.exitCode = 2
+	f.engine.removeErr = errors.New("engine cleanup unavailable")
+	res, _ := f.execute(lfJob(t, lfParams(t, nil), lfOwnQueue))
+	if res.Status != worker.JobStatusFailure || res.Error == nil || !strings.Contains(res.Error.Error(), "cleanup pending") {
+		t.Fatalf("result = %s %v, want cleanup debt", res.Status, res.Error)
+	}
+	marker := filepath.Join(f.ledger, ".cleanup-citadel-local-flow-test")
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("missing cleanup marker before restart: %v", err)
+	}
+	// A new worker with the same durable ledger recovers without a dispatched job.
+	f.engine.removeErr = nil
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	restartDeps := f.deps()
+	restartDeps.runtime = func() catalog.ContainerRuntime { return catalog.ContainerRuntime{EngineBin: "podman", Bin: "podman"} }
+	restartDeps.exec = func(cmd *exec.Cmd, stdin []byte, limit int) ([]byte, bool, error) {
+		if len(cmd.Args) > 1 && cmd.Args[1] == "rm" && cmd.Args[0] != "docker" {
+			return nil, false, fmt.Errorf("cleanup switched from recorded docker runtime to %s", cmd.Args[0])
+		}
+		return f.engine.exec(cmd, stdin, limit)
+	}
+	go func() {
+		defer close(done)
+		runLocalFlowCleanupReconciler(ctx, restartDeps, time.Hour, func(err error) { t.Errorf("startup cleanup: %v", err) })
+	}()
+	deadline := time.After(2 * time.Second)
+	for {
+		if _, err := os.Stat(marker); errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		select {
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatal("startup reconciler did not remove the cleanup debt")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+	if f.engine.runCount() != 1 {
+		t.Fatalf("recovery launched a new run: %d", f.engine.runCount())
+	}
+}
+
+func TestLocalFlowCleanupRetriesOnTimerWithoutAnotherJob(t *testing.T) {
+	f := newLFFixture(t)
+	f.engine.exitCode = 2
+	f.engine.removeErr = errors.New("engine cleanup unavailable")
+	res, _ := f.execute(lfJob(t, lfParams(t, nil), lfOwnQueue))
+	if res.Status != worker.JobStatusFailure || res.Error == nil || !strings.Contains(res.Error.Error(), "cleanup pending") {
+		t.Fatalf("result = %s %v, want cleanup debt", res.Status, res.Error)
+	}
+	marker := filepath.Join(f.ledger, ".cleanup-citadel-local-flow-test")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	failures := make(chan error, 1)
+	go func() {
+		defer close(done)
+		runLocalFlowCleanupReconciler(ctx, f.deps(), 10*time.Millisecond, func(err error) {
+			select {
+			case failures <- err:
+			default:
+			}
+		})
+	}()
+	select {
+	case err := <-failures:
+		if !strings.Contains(err.Error(), "engine cleanup unavailable") {
+			t.Fatalf("first sweep error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("startup sweep did not attempt cleanup")
+	}
+	f.engine.mu.Lock()
+	f.engine.removeErr = nil
+	f.engine.mu.Unlock()
+	deadline := time.After(2 * time.Second)
+	for {
+		if _, err := os.Stat(marker); errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		select {
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatal("periodic sweep did not clear cleanup debt")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+	if f.engine.runCount() != 1 {
+		t.Fatalf("periodic recovery launched a new run: %d", f.engine.runCount())
 	}
 }
 
