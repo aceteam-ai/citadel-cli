@@ -8,6 +8,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 )
 
 func TestLegacyRemovalExcludesReplacementBackup(t *testing.T) {
@@ -33,8 +35,20 @@ func TestLegacyMutationLockCrossProcess(t *testing.T) {
 		return
 	}
 	root := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", root)
-	t.Setenv("APPDATA", root)
+	machine := t.TempDir()
+	restorePaths, err := network.OverrideStateDirectoriesForTesting(root, machine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := restorePaths(); err != nil {
+			t.Error(err)
+		}
+	})
+	if got := network.GetNodeConfigDir(); got != root {
+		t.Fatalf("lock root = %q; want convergent node dir %q", got, root)
+	}
+	t.Setenv("HOME", t.TempDir()) // Invoker HOME must not change the lock root.
 	cmd := exec.Command(os.Args[0], "-test.run=^TestLegacyMutationLockCrossProcess$")
 	cmd.Env = append(os.Environ(), "CITADEL_TEST_COMPOSE_LOCK_HELPER=1", "CITADEL_TEST_COMPOSE_LOCK_ROOT="+root)
 	stdin, err := cmd.StdinPipe()

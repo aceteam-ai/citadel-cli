@@ -24,33 +24,33 @@ package compose
 import (
 	"crypto/sha256"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 
 	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 )
 
 // The worker and the Control Center can mutate the same legacy service in
 // parallel within one process. Keep cleanup out of the backup window.
 var legacyCleanupMu sync.Mutex
 
-// The persistent advisory lock also covers separate Citadel processes running
-// as the same user. Never remove its file: replacing the inode would split the
-// lock between old and new holders.
+// The node config dir is machine-convergent across worker and interactive
+// callers, including distinct OS users. An inaccessible lock fails closed.
+// Never remove its file: replacing the inode would split concurrent holders.
 func withLegacyMutationLock(engineBin, serviceName string, fn func() error) error {
-	root, err := os.UserConfigDir()
-	if err != nil {
-		return fmt.Errorf("locate compose mutation lock: %w", err)
+	root := network.GetNodeConfigDir()
+	if root == "" || root == "." {
+		return fmt.Errorf("node config directory is unavailable for compose mutation lock")
 	}
 	return withLegacyMutationLockAt(root, engineBin, serviceName, fn)
 }
 
 func withLegacyMutationLockAt(root, engineBin, serviceName string, fn func() error) error {
 	key := sha256.Sum256([]byte(engineBin + "\x00" + serviceName))
-	return finetunesafety.WithExclusive(filepath.Join(root, "citadel", "compose-mutation", fmt.Sprintf("%x", key)), fn)
+	return finetunesafety.WithExclusive(filepath.Join(root, "compose-mutation", fmt.Sprintf("%x", key)), fn)
 }
 
 // RemoveLegacyProjectContainers force-removes all containers created under the
