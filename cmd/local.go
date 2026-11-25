@@ -128,7 +128,7 @@ var localE2EHook func(*localCobrowseOptions)
 
 func runLocalMCP(cmd *cobra.Command, args []string) error {
 	debugToStderr = true
-	opts := localCobrowseOptions{ownerDir: localStateDir, viewer: true}
+	opts := localCobrowseOptions{ownerDir: localStateDir, viewer: true, nodePermissions: viewerNodePermissions()}
 	if localE2EHook != nil {
 		localE2EHook(&opts)
 	}

@@ -107,11 +107,11 @@ func TestBuildAttachBanner_WithStatus(t *testing.T) {
 	start := time.Date(2026, 7, 15, 9, 12, 44, 0, time.UTC)
 	now := start.Add(90 * time.Minute)
 	holder := worklock.HolderRecord{PID: 100, StartTime: start, Version: "2.75.0"}
-	st := &attachStatus{Version: "2.75.0", NodeName: "gpu-1084", Health: "ok"}
+	st := &attachStatus{Version: "2.75.0", NodeName: "gpu-4321", Health: "ok"}
 
 	out := buildAttachBanner(holder, now, st)
 
-	for _, want := range []string{"Node: gpu-1084 (ok)", "uptime 1h 30m"} {
+	for _, want := range []string{"Node: gpu-4321 (ok)", "uptime 1h 30m"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("banner missing %q\n---\n%s", want, out)
 		}

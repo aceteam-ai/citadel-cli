@@ -160,7 +160,7 @@ exit 0`)
 }
 
 // TestServiceStartNativeOllama_PullsModel drives the full Execute path on the
-// observed node-1084 shape: ollama already running natively (fake pgrep exits
+// observed dev-node shape: ollama already running natively (fake pgrep exits
 // 0) and SERVICE_START carries a model. The model must be pulled — not ignored
 // — and the result message must say so.
 func TestServiceStartNativeOllama_PullsModel(t *testing.T) {
@@ -293,7 +293,7 @@ func TestServiceStartNativeNonOllama_ModelStillIgnored(t *testing.T) {
 // TestServiceStartNativeOllama_DeadEngineIsStartedNotShortCircuited is the
 // handler-level regression test for #649.
 //
-// On node 1297 a `pgrep -f ollama` match made SERVICE_START report "already
+// On a dev node a `pgrep -f ollama` match made SERVICE_START report "already
 // running" while the engine was dead and the API answered nothing; the platform
 // kept advertising the node as serving and every routed request timed out. The
 // short-circuit must now key on the engine ANSWERING, so a process match with a

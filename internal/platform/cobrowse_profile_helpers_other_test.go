@@ -5,6 +5,7 @@ package platform
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -34,7 +35,7 @@ func installFakeHelpers(t *testing.T, f *fakeHelpers) {
 	})
 	profileReapDelay, profileReapBudget, sessionRemoveDelay = time.Millisecond, 100*time.Millisecond, time.Millisecond
 	reapEUID = func() int { return f.euid }
-	listReapProcs = func() []reapProc {
+	listReapProcs = func() ([]reapProc, error) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		f.listed++
@@ -42,7 +43,7 @@ func installFakeHelpers(t *testing.T, f *fakeHelpers) {
 		for _, p := range f.procs {
 			out = append(out, p)
 		}
-		return out
+		return out, nil
 	}
 	lookupReapProc = func(pid int) (reapProc, bool) {
 		f.mu.Lock()
@@ -202,18 +203,18 @@ func TestTeardownCatchesRecreateAfterRemove(t *testing.T) {
 	f := &fakeHelpers{euid: os.Geteuid(), procs: map[int]reapProc{}}
 	m, st, _ := startOrdered(t, f, func(string) {})
 	listed := 0
-	listReapProcs = func() []reapProc {
+	listReapProcs = func() ([]reapProc, error) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		listed++
 		if listed == 1 {
-			return nil // main process just died, no helper visible yet
+			return nil, nil // main process just died, no helper visible yet
 		}
 		var out []reapProc
 		for _, p := range f.procs {
 			out = append(out, p)
 		}
-		return out
+		return out, nil
 	}
 	f.procs[10] = helperProc(10, 7, os.Geteuid(), "chrome", "--user-data-dir="+st.Profile)
 	f.onKill = func(int) { // dying helper recreates files
@@ -228,5 +229,37 @@ func TestTeardownCatchesRecreateAfterRemove(t *testing.T) {
 	}
 	if len(f.killed) != 1 {
 		t.Fatalf("killed = %v", f.killed)
+	}
+}
+
+// An unreadable /proc must not read as "no processes": a reap, a seal and a
+// failed recovery launch would otherwise treat a surviving browser as gone.
+func TestListProcForReapFailsClosedWithoutProc(t *testing.T) {
+	prevRoot, prevList := reapProcRoot, listReapProcs
+	t.Cleanup(func() { reapProcRoot, listReapProcs = prevRoot, prevList })
+	reapProcRoot = filepath.Join(t.TempDir(), "missing-proc")
+	if procs, err := listProcForReap(); err == nil {
+		t.Fatalf("listProcForReap with no /proc = %v, nil; want an error", procs)
+	}
+	listReapProcs = listProcForReap
+	if err := reapProfileUsers(t.TempDir(), ""); err == nil {
+		t.Fatal("reapProfileUsers must fail closed when the process list cannot be read")
+	}
+}
+
+// An empty directory at /proc (procfs unmounted) reads without error but lists
+// nothing, not even this process; that must also count as unknown.
+func TestListProcForReapRequiresSelfInListing(t *testing.T) {
+	prevRoot := reapProcRoot
+	t.Cleanup(func() { reapProcRoot = prevRoot })
+	reapProcRoot = t.TempDir()
+	if _, err := listProcForReap(); err == nil {
+		t.Fatal("an empty /proc directory must not read as an empty process list")
+	}
+	if err := os.Mkdir(filepath.Join(reapProcRoot, strconv.Itoa(os.Getpid())), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := listProcForReap(); err != nil {
+		t.Fatalf("a listing that includes this process must succeed: %v", err)
 	}
 }

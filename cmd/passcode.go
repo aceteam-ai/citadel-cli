@@ -126,7 +126,10 @@ func setNodePasscode(configDir, pin string) (*config.Permissions, error) {
 		return nil, fmt.Errorf("passcode must not be empty (use 'citadel passcode clear' to remove it)")
 	}
 
-	perms := config.LoadPermissions(configDir)
+	perms, err := config.LoadPermissionsStrict(configDir)
+	if err != nil {
+		return nil, fmt.Errorf("the node permissions file must be readable before the passcode can change: %w", err)
+	}
 	if err := perms.SetPasscode(pin); err != nil {
 		return nil, fmt.Errorf("set passcode: %w", err)
 	}
@@ -139,7 +142,10 @@ func setNodePasscode(configDir, pin string) (*config.Permissions, error) {
 // clearNodePasscode loads permissions from configDir, clears the passcode
 // hash, and persists the result.
 func clearNodePasscode(configDir string) (*config.Permissions, error) {
-	perms := config.LoadPermissions(configDir)
+	perms, err := config.LoadPermissionsStrict(configDir)
+	if err != nil {
+		return nil, fmt.Errorf("the node permissions file must be readable before the passcode can change: %w", err)
+	}
 	_ = perms.SetPasscode("") // empty pin only clears; SetPasscode never errors on this path
 	if err := config.SavePermissions(configDir, perms); err != nil {
 		return nil, fmt.Errorf("save permissions: %w", err)

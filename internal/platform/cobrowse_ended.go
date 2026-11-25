@@ -109,6 +109,8 @@ func PrepareSelfRestart(reason, detail string) {
 //   - Persistent (encrypted profile) sessions are sealed and stopped on EVERY OS
 //     while their key is still unlocked: the single-session lock is in memory,
 //     so a surviving one would let a second session open the same profile.
+//   - Public-only sessions are stopped on every OS: their egress guard runs in
+//     this process and cannot be re-armed for a browser that survives.
 //   - Where adoption is unsupported every session is stopped cleanly.
 //   - Other sessions are left running with their record stamped with the reason
 //     they will end for if they do not survive.
@@ -123,13 +125,20 @@ func (m *CobrowseSessionManager) prepareSelfRestart(reason, detail string) {
 	m.mu.Unlock()
 	for _, s := range all {
 		s.mu.Lock()
-		stop := !adoptionSupported || s.persistent || s.encProfile != nil
+		// A public-only session's egress guard dies with this process, so it
+		// is stopped too (citadel-cli#1867 C4b).
+		stop := !adoptionSupported || s.persistent || s.encProfile != nil || s.egress != ""
 		s.mu.Unlock()
 		if !stop {
 			_ = m.MarkSessionEnding(s, reason, detail)
 			continue
 		}
-		_ = m.Stop(s.id) // seals a persistent profile, closes its lock, removes the dir
+		// Stop seals a persistent profile, closes its lock, removes the dir. A
+		// recovery session whose custody stop was not confirmed keeps its live
+		// registry record, so the next process can re-adopt it.
+		if err := m.Stop(s.id); err != nil && recoveryScopedID(s.id) {
+			continue
+		}
 		m.recordEnded(s.id, reason, detail)
 	}
 }

@@ -78,6 +78,30 @@ func applyEgressRelayConfig(relayConfigDir string, config *DeviceConfig) string 
 	return result
 }
 
+// applyCobrowsePublicOnly applies a remote cobrowsePublicOnly request to the
+// permissions file in permissionsDir and returns the job-result line. Only
+// enabling is honored remotely (see DeviceConfig.CobrowsePublicOnly). A
+// permissions file that cannot be read or parsed is left as it is: rewriting it
+// from defaults would drop the operator's other settings, and an unreadable
+// file already makes remote sessions public-only.
+func applyCobrowsePublicOnly(permissionsDir string, enable bool) string {
+	if !enable {
+		return "\nCo-browse public-only egress can only be turned off on this computer ('citadel permission cobrowse-public-only disable'); remote request ignored"
+	}
+	perms, err := citadelconfig.LoadPermissionsStrict(permissionsDir)
+	if err != nil {
+		return fmt.Sprintf("\nWarning: co-browse public-only egress not saved, the permissions file could not be read (remote sessions are public-only until it is fixed): %v", err)
+	}
+	if perms.CobrowsePublicOnly {
+		return "\nCo-browse public-only egress already enabled"
+	}
+	perms.CobrowsePublicOnly = true
+	if err := citadelconfig.SavePermissions(permissionsDir, perms); err != nil {
+		return fmt.Sprintf("\nWarning: failed to persist co-browse public-only egress: %v", err)
+	}
+	return "\nCo-browse public-only egress enabled (applies from the next remote session start)"
+}
+
 // serviceNamePattern validates service names to prevent path traversal.
 // Only allows lowercase alphanumeric characters and hyphens.
 var serviceNamePattern = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
@@ -165,6 +189,14 @@ type DeviceConfig struct {
 	// the *Enabled flags.
 	NodePasscode *string `json:"nodePasscode,omitempty"`
 
+	// CobrowsePublicOnly turns on the public-only egress guard for remote
+	// co-browse sessions (citadel-cli#1867 C4b). Only `true` is applied: a
+	// remote request cannot loosen it, because any agent on the account could
+	// otherwise switch the guard off. `false` is reported as ignored; the
+	// operator turns it off locally with `citadel permission
+	// cobrowse-public-only disable`. Nil leaves the persisted value untouched.
+	CobrowsePublicOnly *bool `json:"cobrowsePublicOnly,omitempty"`
+
 	// DefaultServe is the platform-pushed opt-IN for the "default-serve"
 	// appliance-mode reconcile (citadel-cli#628): on a truly blank GPU node,
 	// `citadel work` startup auto-serves a VRAM-sized model exactly once,
@@ -229,12 +261,21 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 		configDir = filepath.Join(homeDir, "citadel-node")
 	}
 
+	// A PC connected from its setup page keeps its own permissions
+	// (citadel-cli#1867 C5): drop every request that would turn something on
+	// before anything below applies it. A no-op on every other node.
+	posturePermissionsDir := h.PermissionsDir
+	if posturePermissionsDir == "" {
+		posturePermissionsDir = platform.ConfigDir()
+	}
+	postureRefusals := applySetupPostureFilter(posturePermissionsDir, &config)
+
 	// Update manifest with new configuration
 	if err := h.updateManifest(configDir, &config); err != nil {
 		return nil, fmt.Errorf("failed to update manifest: %w", err)
 	}
 
-	result := fmt.Sprintf("Manifest updated successfully for device '%s'", config.DeviceName)
+	result := fmt.Sprintf("Manifest updated successfully for device '%s'", config.DeviceName) + postureRefusals
 
 	// Apply the meeting-capability opt-out (aceteam#5098) when the platform pushed
 	// an explicit value. This writes the same persisted meeting.yaml the Control
@@ -323,62 +364,77 @@ func (h *ConfigHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) 
 		if permissionsDir == "" {
 			permissionsDir = platform.ConfigDir()
 		}
-		perms := citadelconfig.LoadPermissions(permissionsDir)
-		if config.ConsoleEnabled != nil {
-			perms.Console = *config.ConsoleEnabled
-		}
-		if config.DesktopEnabled != nil {
-			perms.Desktop = *config.DesktopEnabled
-		}
-		if config.FilesEnabled != nil {
-			perms.Files = *config.FilesEnabled
-		}
-		if config.ShellEnabled != nil {
-			perms.Shell = *config.ShellEnabled
-		}
-		if config.NodePasscode != nil {
-			// The master PIN (aceteam-ai/citadel-cli#796) is set LOCALLY only, so
-			// it never transits AceTeam infra. When one is enrolled, SetPasscode
-			// refuses a non-empty set — surface that as an explicit, non-alarming
-			// message rather than a generic warning: the platform push is
-			// deliberately disabled for this node, not failing.
-			if err := perms.SetPasscode(*config.NodePasscode); err != nil {
-				if citadelconfig.VaultConfigured != nil && citadelconfig.VaultConfigured() {
-					result += "\nNode passcode push ignored: a local master PIN is enrolled (set it locally with 'citadel passcode rotate'; the platform passcode push is disabled)"
-				} else {
-					result += fmt.Sprintf("\nWarning: failed to set node passcode: %v", err)
-				}
-			}
-		}
-		if err := citadelconfig.SavePermissions(permissionsDir, perms); err != nil {
-			result += fmt.Sprintf("\nWarning: failed to persist permissions: %v", err)
+		// Strict: a lenient load reads a damaged file as the defaults, and the
+		// full save below would then rewrite every permission from defaults
+		// (including turning co-browse public-only off).
+		perms, perr := citadelconfig.LoadPermissionsStrict(permissionsDir)
+		if perr != nil {
+			result += fmt.Sprintf("\nWarning: permissions not changed, the node permissions file could not be read: %v", perr)
 		} else {
 			if config.ConsoleEnabled != nil {
-				result += fmt.Sprintf("\nConsole (terminal) access %s", enabledLabel(*config.ConsoleEnabled))
+				perms.Console = *config.ConsoleEnabled
 			}
 			if config.DesktopEnabled != nil {
-				result += fmt.Sprintf("\nDesktop (screen/VNC) access %s", enabledLabel(*config.DesktopEnabled))
+				perms.Desktop = *config.DesktopEnabled
 			}
 			if config.FilesEnabled != nil {
-				result += fmt.Sprintf("\nFiles (browse/host) access %s", enabledLabel(*config.FilesEnabled))
+				perms.Files = *config.FilesEnabled
 			}
 			if config.ShellEnabled != nil {
-				result += fmt.Sprintf("\nShell (remote command) access %s", enabledLabel(*config.ShellEnabled))
+				perms.Shell = *config.ShellEnabled
 			}
 			if config.NodePasscode != nil {
-				if perms.HasPasscode() {
-					result += "\nNode passcode set"
-				} else {
-					result += "\nNode passcode cleared (sensitive surfaces re-locked)"
+				// The master PIN (aceteam-ai/citadel-cli#796) is set LOCALLY only, so
+				// it never transits AceTeam infra. When one is enrolled, SetPasscode
+				// refuses a non-empty set — surface that as an explicit, non-alarming
+				// message rather than a generic warning: the platform push is
+				// deliberately disabled for this node, not failing.
+				if err := perms.SetPasscode(*config.NodePasscode); err != nil {
+					if citadelconfig.VaultConfigured != nil && citadelconfig.VaultConfigured() {
+						result += "\nNode passcode push ignored: a local master PIN is enrolled (set it locally with 'citadel passcode rotate'; the platform passcode push is disabled)"
+					} else {
+						result += fmt.Sprintf("\nWarning: failed to set node passcode: %v", err)
+					}
 				}
 			}
-			// Guardrail: an enabled surface with no passcode fails closed. Surface
-			// that in the job result so an operator who enabled without a passcode
-			// understands why access is still denied.
-			if (perms.Console || perms.Desktop || perms.Files || perms.Shell) && !perms.HasPasscode() {
-				result += "\nNote: a sensitive surface is enabled but no passcode is set — access stays denied until a passcode is set"
+			if err := citadelconfig.SavePermissions(permissionsDir, perms); err != nil {
+				result += fmt.Sprintf("\nWarning: failed to persist permissions: %v", err)
+			} else {
+				if config.ConsoleEnabled != nil {
+					result += fmt.Sprintf("\nConsole (terminal) access %s", enabledLabel(*config.ConsoleEnabled))
+				}
+				if config.DesktopEnabled != nil {
+					result += fmt.Sprintf("\nDesktop (screen/VNC) access %s", enabledLabel(*config.DesktopEnabled))
+				}
+				if config.FilesEnabled != nil {
+					result += fmt.Sprintf("\nFiles (browse/host) access %s", enabledLabel(*config.FilesEnabled))
+				}
+				if config.ShellEnabled != nil {
+					result += fmt.Sprintf("\nShell (remote command) access %s", enabledLabel(*config.ShellEnabled))
+				}
+				if config.NodePasscode != nil {
+					if perms.HasPasscode() {
+						result += "\nNode passcode set"
+					} else {
+						result += "\nNode passcode cleared (sensitive surfaces re-locked)"
+					}
+				}
+				// Guardrail: an enabled surface with no passcode fails closed. Surface
+				// that in the job result so an operator who enabled without a passcode
+				// understands why access is still denied.
+				if (perms.Console || perms.Desktop || perms.Files || perms.Shell) && !perms.HasPasscode() {
+					result += "\nNote: a sensitive surface is enabled but no passcode is set — access stays denied until a passcode is set"
+				}
 			}
 		}
+	}
+
+	if config.CobrowsePublicOnly != nil {
+		permissionsDir := h.PermissionsDir
+		if permissionsDir == "" {
+			permissionsDir = platform.ConfigDir()
+		}
+		result += applyCobrowsePublicOnly(permissionsDir, *config.CobrowsePublicOnly)
 	}
 
 	// Start services if autoStartServices is enabled

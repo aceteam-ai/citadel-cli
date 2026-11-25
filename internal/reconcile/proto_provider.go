@@ -63,7 +63,7 @@ type BridgeEndpointsProvider interface {
 type ProtoProvider struct {
 	Fetcher  DesiredStateFetcher
 	Reporter ActualStateReporter
-	// NodeID is the Headscale numeric node ID (e.g. "1084"): the fetch path
+	// NodeID is the Headscale numeric node ID (e.g. "4321"): the fetch path
 	// parameter AND the identity stamped into the report envelope. It must match
 	// `fabric_node_status.node_id`, which the backend keys by the Headscale
 	// numeric ID — the desired-state serve endpoint matches rows by a raw

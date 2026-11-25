@@ -94,7 +94,7 @@ func TestCaptureNote_ResultIsError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := CaptureNote(context.Background(), &Config{APIKey: testAPIKey, MCPURL: srv.URL, Scopes: []string{ScopeRead, ScopeWrite}}, "n", "fact", "", "")
+	_, err := CaptureNote(context.Background(), &Config{APIKey: testAPIKey, MCPURL: srv.URL, Scopes: []string{ScopeRead, ScopeWrite}}, "n", "fact", "", "proj")
 	if err == nil || !strings.Contains(err.Error(), "capture rejected") {
 		t.Fatalf("expected tool-level capture error, got %v", err)
 	}
@@ -122,5 +122,18 @@ func TestValidateCaptureContent_RejectsSecretsWithoutEcho(t *testing.T) {
 	}
 	if err := ValidateCaptureContent("Use a bounded retry and retain the primary error."); err != nil {
 		t.Fatalf("ordinary prose rejected: %v", err)
+	}
+}
+
+func TestCaptureNote_EmptyScopeRefusedWithoutRequest(t *testing.T) {
+	hit := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hit = true }))
+	defer srv.Close()
+	cfg := &Config{APIKey: testAPIKey, MCPURL: srv.URL, Scopes: []string{ScopeRead, ScopeWrite}}
+	if _, err := CaptureNote(context.Background(), cfg, "n", "fact", "", "  "); err == nil {
+		t.Fatal("empty scope accepted")
+	}
+	if hit {
+		t.Fatal("request sent despite empty scope")
 	}
 }

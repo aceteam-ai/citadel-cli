@@ -75,10 +75,11 @@ var (
 	workMaxRetries int
 
 	// Status server flags
-	workStatusPort int
-	workBaseURL    string
-	workAPIKey     string
-	workNodeName   string
+	workStatusPort    int
+	workStatusBindLAN bool
+	workBaseURL       string
+	workAPIKey        string
+	workNodeName      string
 
 	// SSH key sync flags
 	workSSHSync     bool
@@ -393,6 +394,12 @@ func runWork(cmd *cobra.Command, args []string) {
 		fmt.Fprintln(os.Stderr, "  IS supported by 'citadel module stop|start|restart', 'citadel run', and 'citadel stop'.")
 		os.Exit(1)
 	}
+	// Per-user Windows worker (citadel-cli#1867 C3): the launcher and the
+	// supervisor exit here, before any node state is touched or the worker lock
+	// is taken; the supervised worker continues as a normal worker.
+	if handleBackgroundModes() {
+		return
+	}
 	// `citadel work` ALWAYS runs as a worker regardless of the persisted session
 	// mode: it never reads or initializes session.yaml here, and never branches
 	// to runPresence. Presence is only the bare-`citadel` dispatch default
@@ -440,6 +447,14 @@ func runWork(cmd *cobra.Command, args []string) {
 		lock, lockErr := worklock.Acquire(network.GetStateDir(), Version, Log)
 		if lockErr != nil {
 			var running *worklock.ErrAlreadyRunning
+			if errors.As(lockErr, &running) && workSupervisorPID > 0 {
+				// Under the per-user supervisor (citadel-cli#1867), another worker
+				// already serving this node is the intended outcome, so exit 0 and
+				// let the supervisor stop, whatever the holder probe says (on
+				// Windows it cannot always read the holder, #1875).
+				fmt.Fprintf(os.Stderr, "Another citadel worker already serves this node (lock %s, PID %d); the background supervisor will stop.\n", running.Path, running.PID)
+				os.Exit(0)
+			}
 			if errors.As(lockErr, &running) {
 				// An ErrAlreadyRunning means the OS advisory lock is CONTENDED — a
 				// live process genuinely holds it (the kernel frees flock on death).
@@ -1616,6 +1631,10 @@ func runWork(cmd *cobra.Command, args []string) {
 		return reservationsFrom(list)
 	}
 
+	cobrowseRecoveryFn := func() bool {
+		rn := nodeRunner.Load()
+		return rn != nil && rn.CobrowseJobRecoveryAvailable()
+	}
 	jobTypesFn := func() []string {
 		rn := nodeRunner.Load()
 		if rn == nil {
@@ -1704,22 +1723,23 @@ func runWork(cmd *cobra.Command, args []string) {
 			// ConfigDir is normally "" on the heartbeat path (engines are probed,
 			// not read from the manifest). Model hotswap (#632) needs it to
 			// enumerate installed-but-stopped engines, so pass it only when enabled.
-			ConfigDir:        hotswapConfigDir(workConfigDir),
-			Services:         nil,
-			Capabilities:     statusCaps,
-			WorkerLiveness:   workerLivenessFn,
-			SwapStats:        swapStatsFn,
-			ReconcileHealth:  reconcileHealthFn,
-			PinnedServices:   manifestPinnedServices(workManifest),
-			ModelHotswap:     status.ModelHotswapEnabled(),
-			Reservations:     reservationsFn,
-			LaneActivity:     laneActivityFn,
-			PairingDisplay:   pairingDisplayFn,
-			CacheReport:      cacheReportFn,
-			JobTypes:         jobTypesFn,
-			AppPods:          appPodListings,
-			SandboxedModules: sandboxedModuleCapability,
-			NVRHealth:        nvrHealthFn,
+			ConfigDir:           hotswapConfigDir(workConfigDir),
+			Services:            nil,
+			Capabilities:        statusCaps,
+			WorkerLiveness:      workerLivenessFn,
+			SwapStats:           swapStatsFn,
+			ReconcileHealth:     reconcileHealthFn,
+			PinnedServices:      manifestPinnedServices(workManifest),
+			ModelHotswap:        status.ModelHotswapEnabled(),
+			Reservations:        reservationsFn,
+			LaneActivity:        laneActivityFn,
+			PairingDisplay:      pairingDisplayFn,
+			CacheReport:         cacheReportFn,
+			JobTypes:            jobTypesFn,
+			CobrowseJobRecovery: cobrowseRecoveryFn,
+			AppPods:             appPodListings,
+			SandboxedModules:    sandboxedModuleCapability,
+			NVRHealth:           nvrHealthFn,
 			// The status process may run as a different user than an interactive
 			// invoker. Advertise the same machine-level policy the worker enforces.
 			PermissionsProvider: loadNodePermissions,
@@ -1779,6 +1799,13 @@ func runWork(cmd *cobra.Command, args []string) {
 			Version:     Version,
 			Agent:       agentProviders,
 			SelfMeshIPs: selfMeshIPs,
+			// The control listener's SSH-key deployment honors the operator's
+			// live SSH permission, read strictly per request.
+			SSHDeployAllowed: nodeSSHDeployAllowed,
+			// Loopback + mesh by default; a LAN bind is an explicit opt-in.
+			BindLAN: statusBindLAN(workStatusBindLAN),
+			// Read-only /agent/* routes admit only a verified same-owner peer.
+			PeerVerifier: meshPeerVerifier(network.WhoIsPeer),
 		}
 
 		// Publish the gateway's self-signed leaf cert at GET /gateway-cert.pem so
@@ -1882,12 +1909,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				if certErr != nil {
 					fmt.Fprintf(os.Stderr, "   - ⚠️ Coordinator mTLS control listener NOT enabled (server cert: %v)\n", certErr)
 				} else {
-					controlPort := status.DefaultControlPort
-					if p := strings.TrimSpace(os.Getenv("CITADEL_CONTROL_PORT")); p != "" {
-						if parsed, perr := strconv.Atoi(p); perr == nil && parsed > 0 {
-							controlPort = parsed
-						}
-					}
+					controlPort := resolveControlPort()
 					serverCfg.CAVerifier = verifier
 					serverCfg.ControlServerCert = &ctrlCert
 					serverCfg.ControlPort = controlPort
@@ -1911,7 +1933,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		// control listener behind a coordinator cert (citadel-cli#1318, the
 		// #5028 rule); the plaintext listener serves fail-closed stubs.
 		if provisionHandler := initProvisionHandler(); provisionHandler != nil {
-			registerControlOnlyAPI(statusServer, provisionHandler, requireProvisionPermission)
+			registerProvisionControlAPI(statusServer, provisionHandler, nodePermissionsDir)
 		}
 
 		// Register workflow API routes (#259). The whole API lives only on the
@@ -1922,9 +1944,9 @@ func runWork(cmd *cobra.Command, args []string) {
 
 		// Register node-local RAG API routes (#589): /rag/index, /rag/query,
 		// /rag/status. Served only on the mTLS control listener behind a
-		// coordinator cert (citadel-cli#1318); the plaintext listener serves
-		// fail-closed stubs.
-		registerControlOnlyAPI(statusServer, rag.NewServer(rag.New(wsDir, "")), nil)
+		// coordinator cert (citadel-cli#1318) and the operator's live Files
+		// permission; the plaintext listener serves fail-closed stubs.
+		registerRAGControlAPI(statusServer, rag.NewServer(rag.New(wsDir, "")), nodePermissionsDir)
 
 		// Local semantic-search file watcher (citadel-cli#617-619): if the
 		// operator has authorized any search roots, watch them and keep the
@@ -2016,9 +2038,11 @@ func runWork(cmd *cobra.Command, args []string) {
 			fmt.Printf("   - SSH key sync: enabled (every %dm)\n", workSSHSyncMins)
 
 			// Initial sync
-			if err := nexus.SyncAuthorizedKeys(sshConfig); err != nil {
+			// Each sync re-reads the operator's SSH permission and is skipped
+			// while it is off or the permissions file is unreadable.
+			if ran, err := syncAuthorizedKeysIfAllowed(nodePermissionsDir(), sshConfig, nexus.SyncAuthorizedKeys); err != nil {
 				fmt.Fprintf(os.Stderr, "   - ⚠️ Initial SSH sync failed: %v\n", err)
-			} else {
+			} else if ran {
 				fmt.Println("   - ✅ SSH keys synchronized")
 			}
 
@@ -2031,7 +2055,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					if err := nexus.SyncAuthorizedKeys(sshConfig); err != nil {
+					if _, err := syncAuthorizedKeysIfAllowed(nodePermissionsDir(), sshConfig, nexus.SyncAuthorizedKeys); err != nil {
 						fmt.Fprintf(os.Stderr, "   - ⚠️ SSH sync failed: %v\n", err)
 					}
 				}
@@ -2066,6 +2090,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				PairingDisplay:      pairingDisplayFn,
 				CacheReport:         cacheReportFn,
 				JobTypes:            jobTypesFn,
+				CobrowseJobRecovery: cobrowseRecoveryFn,
 				AppPods:             appPodListings,
 				SandboxedModules:    sandboxedModuleCapability,
 				NVRHealth:           nvrHealthFn,
@@ -2182,7 +2207,7 @@ func runWork(cmd *cobra.Command, args []string) {
 							// logf (see newReconcileLoop) -- printing it again here on
 							// every single pass would reproduce the exact noise
 							// citadel-cli#742 exists to fix (4574 identical WARNs over
-							// 5 days on node 1297). Any OTHER pass-level error (fetch
+							// 5 days on a dev node). Any OTHER pass-level error (fetch
 							// failure, list failure, ...) still prints every time, same
 							// as before.
 							if passErr != nil && !errors.Is(passErr, reconcile.ErrFullWipeRefused) {
@@ -2354,8 +2379,9 @@ func runWork(cmd *cobra.Command, args []string) {
 
 			// Start config queue consumer for device configuration jobs
 			configConsumer, err := heartbeat.NewConfigConsumer(heartbeat.ConfigConsumerConfig{
-				RedisURL:      workRedisURL,
-				RedisPassword: workRedisPass,
+				RedisURL:       workRedisURL,
+				RedisPassword:  workRedisPass,
+				PermissionsDir: nodePermissionsDir(),
 			})
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "   - ⚠️ Failed to create config consumer: %v\n", err)
@@ -2370,9 +2396,10 @@ func runWork(cmd *cobra.Command, args []string) {
 
 			// Start config Pub/Sub subscriber for real-time config updates
 			configSubscriber, err := heartbeat.NewConfigSubscriber(heartbeat.ConfigSubscriberConfig{
-				RedisURL:      workRedisURL,
-				RedisPassword: workRedisPass,
-				NodeID:        nodeName,
+				RedisURL:       workRedisURL,
+				RedisPassword:  workRedisPass,
+				NodeID:         nodeName,
+				PermissionsDir: nodePermissionsDir(),
 			})
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "   - ⚠️ Failed to create config subscriber: %v\n", err)
@@ -2650,6 +2677,11 @@ func runWork(cmd *cobra.Command, args []string) {
 		// exposed service under /expose/<name>/ can be gated by mesh identity or a
 		// signed link token. Harmless when nothing is exposed.
 		gw.SetMeshResolver(gatewayMeshResolver{})
+		// /v1/* callers: same-host (loopback) or a verified same-owner mesh peer;
+		// the operator's platform-infra allowlist (platform-exposure.json) adds
+		// named platform logins. See internal/gateway/v1_auth.go.
+		gw.SetV1AllowedLogins(platformAllowedLoginsCached())
+		warnGatewayLANBind("--gateway-bind", workGatewayBind)
 		if key, err := config.LoadOrCreateExposeSigningKey(platform.ConfigDir()); err != nil {
 			Log("warning: gateway link-token signing disabled: %v", err)
 		} else {
@@ -3974,7 +4006,9 @@ type DeviceConfig struct {
 	// BrowserSlots is the shared concurrent browser-session count for this node
 	// (citadel-cli#1760). 0 keeps the default; CITADEL_COBROWSE_MAX_SESSIONS
 	// still overrides it.
-	BrowserSlots int `yaml:"browser_slots"`
+	BrowserSlots      int    `yaml:"browser_slots"`
+	BrowserAppliance  bool   `yaml:"browser_appliance"`
+	BrowserWindowSize string `yaml:"browser_window_size"`
 }
 
 // getDeviceConfigFromFile reads device authentication config from the
@@ -4305,6 +4339,7 @@ func init() {
 
 	// Status flags
 	workCmd.Flags().IntVar(&workStatusPort, "status-port", 0, "Enable status HTTP server on port (0 = disabled)")
+	workCmd.Flags().BoolVar(&workStatusBindLAN, "status-bind-lan", false, "Serve the plaintext status server on ALL interfaces (default: loopback plus the mesh listener only; or set CITADEL_STATUS_BIND_LAN=1)")
 	workCmd.Flags().StringVar(&workBaseURL, "base-url", "", "AceTeam API base URL (default: https://aceteam.ai, or set ACETEAM_URL env)")
 	workCmd.Flags().StringVar(&workAPIKey, "api-key", "", "API key for authentication (or set CITADEL_API_KEY env)")
 	workCmd.Flags().StringVar(&workNodeName, "node-name", "", "Node name for status reporting (default: hostname)")
@@ -4361,7 +4396,7 @@ func init() {
 	workCmd.Flags().BoolVar(&workGateway, "gateway", true, "Start the HTTPS gateway in-process (enabled by default; use --no-gateway to disable)")
 	workCmd.Flags().BoolVar(&workNoGateway, "no-gateway", false, "Disable the HTTPS gateway")
 	workCmd.Flags().IntVar(&workGatewayPort, "gateway-port", 8443, "HTTPS gateway port (default: 8443)")
-	workCmd.Flags().StringVar(&workGatewayBind, "gateway-bind", "0.0.0.0", "Gateway bind address")
+	workCmd.Flags().StringVar(&workGatewayBind, "gateway-bind", defaultGatewayBind, "Gateway bind host. Default is loopback; the mesh listener is always added. A non-loopback value is an explicit LAN opt-in and is logged loudly")
 	workCmd.Flags().IntVar(&workGatewayVNC, "gateway-vnc-port", 6080, "VNC websockify port for gateway proxy")
 	workCmd.Flags().IntVar(&workGatewayEmbedding, "gateway-embedding-port", 8102, "Local TEI embedding service port (/v1/embeddings upstream)")
 	workCmd.Flags().BoolVar(&workGatewayNoTLS, "gateway-no-tls", false, "Disable TLS on the gateway (for testing only)")

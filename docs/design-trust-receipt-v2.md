@@ -63,7 +63,7 @@ the signing store as *deliberately separate* from `nodeidentity.Default()`. Both
 are accurate descriptions of intent; together they mean the verifier can never
 find a `fabric_node_certs` row matching a real receipt's
 `public_key_fingerprint`. The cross-repo golden fixture (test key on both sides)
-would pass green while proof-plan item 6 (a real turn on node 1297 producing
+would pass green while proof-plan item 6 (a real turn on a dev node producing
 `verified: true`) fails. §4 has the mechanism and the options; it is an S3
 prerequisite and Jason-gated (it touches which key is registered).
 
@@ -641,7 +641,7 @@ load-bearing). When §3.3's port lands: a Python-generated
 (proof-plan item 4), with a "reorder one key" mutation.
 
 **Proof-plan item 6 is the real acceptance**, and it is blocked on §4: one
-streaming agent turn on node 1297 with both gates on producing an
+streaming agent turn on a dev node with both gates on producing an
 `execution_envelopes` row with `attestation.verified: true` and
 `content_bound: true`. Green fixtures without that row are not done.
 
@@ -676,7 +676,7 @@ explicit, time-boxed special case — open question §11.5).
 4. aceteam golden-adoption PR (fixture copied in; hand-built v2 sample retired
    or kept alongside).
 5. Citadel release; `CITADEL_GROUNDING_GUARDRAIL=1` + `CITADEL_SIGN_AEP_RECEIPTS=1`
-   on node 1297 (DoR §7.6, owner's shell); proof-plan item 6 observed.
+   on a dev node (DoR §7.6, owner's shell); proof-plan item 6 observed.
 6. S9 (aceteam-aep#141) ports `CanonicalizeV2` + the §3.5 preimage into
    `verify-bundle`, against the same fixture.
 

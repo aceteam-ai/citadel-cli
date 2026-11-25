@@ -65,7 +65,9 @@ type Config struct {
 	Port int
 
 	// ListenAddress overrides the listen address.
-	// If empty, listens on all interfaces (0.0.0.0).
+	// If empty, listens on loopback only (127.0.0.1); the mesh listener is added
+	// separately via AddListener. A non-loopback host is an explicit operator
+	// opt-in to a LAN bind and is logged loudly by Start.
 	ListenAddress string
 
 	// TLSConfig is the TLS configuration with certificates.
@@ -255,6 +257,10 @@ type Server struct {
 	// proxy-to-loopback read surface. Registered from Start alongside the cache
 	// routes.
 	borrowCfg *BorrowServeConfig
+
+	// v1Allowed is the optional platform-infra allowlist for /v1/* callers
+	// (SetV1AllowedLogins). Nil means same-owner mesh peers only.
+	v1Allowed V1AllowedLogins
 }
 
 // NewServer creates a new gateway server.
@@ -601,7 +607,10 @@ func (s *Server) Start(ctx context.Context) error {
 
 	listenAddr := s.config.ListenAddress
 	if listenAddr == "" {
-		listenAddr = fmt.Sprintf("0.0.0.0:%d", s.config.Port)
+		listenAddr = fmt.Sprintf("127.0.0.1:%d", s.config.Port)
+	}
+	if !listenAddrIsLoopback(listenAddr) {
+		log.Printf("[Gateway] WARNING: listening on %s, which is reachable beyond this host. routes proxied to loopback upstreams (status, services, screenshot and others) are reachable by LAN callers; only /v1/* requires a verified mesh identity. Prefer the default loopback+mesh bind.", listenAddr)
 	}
 
 	s.httpServer = &http.Server{
@@ -810,6 +819,10 @@ func (s *Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, target *
 	// Forward the original request headers
 	upstreamConn.Write([]byte(reqLine))
 	r.Header.Set("Host", target.Host)
+	// Overwrite, never trust, a client-supplied value: the upstream treats
+	// X-Forwarded-For as a statement by this gateway (same as the HTTP
+	// ReverseProxy Director above).
+	r.Header.Set("X-Forwarded-For", r.RemoteAddr)
 	r.Header.Write(upstreamConn)
 	upstreamConn.Write([]byte("\r\n"))
 
@@ -865,7 +878,23 @@ func (s *Server) BuildHandler() http.Handler {
 	if s.metering != nil {
 		handler = s.metering.WrapHandler(handler)
 	}
-	return s.loggingMiddleware(s.permissionMiddleware(handler))
+	// v1AuthMiddleware is outermost after logging so an unauthenticated /v1
+	// caller is refused before any capability, passcode or metering work.
+	return s.loggingMiddleware(s.v1AuthMiddleware(s.permissionMiddleware(handler)))
+}
+
+// listenAddrIsLoopback reports whether a host:port listen address binds
+// loopback only. An empty host or an unspecified address (0.0.0.0, ::) is not.
+func listenAddrIsLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // loggingMiddleware logs all requests.

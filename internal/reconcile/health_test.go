@@ -11,7 +11,7 @@ import (
 // TestHealthTrackerThrottlesRepeatedRefusal is the core citadel-cli#742
 // assertion: a refused loop running N times must log loudly once (the
 // false->true transition) plus periodic summaries, not N identical warnings.
-// Node 1297 logged 4574 identical WARNs over 5+ days before this fix.
+// A dev node logged 4574 identical WARNs over 5+ days before this fix.
 func TestHealthTrackerThrottlesRepeatedRefusal(t *testing.T) {
 	var logs []string
 	tracker := NewHealthTracker(func(format string, args ...any) {

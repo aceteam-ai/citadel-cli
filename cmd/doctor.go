@@ -70,6 +70,7 @@ type doctorReport struct {
 	servicesChecked     bool
 	updateDiagnostics   []service.WorkerUpdateDiagnostic
 	updateDiagnosisNote string
+	browserReadiness    []browserReadinessCheck
 }
 
 // ok reports whether doctor found a problem worth a non-zero exit. Engine
@@ -82,10 +83,20 @@ func (r doctorReport) ok() bool {
 	delegationOK := !r.cgroupHealth.Applicable || r.cgroupHealth.OK
 	gpuOK := !r.gpuHealth.Applicable || r.gpuHealth.OK
 	servicesOK := !r.servicesChecked || managedServicesHealthy(r.serviceHealth)
+	for _, check := range r.browserReadiness {
+		if check.fatal {
+			return false
+		}
+	}
 	return engineOK && delegationOK && gpuOK && servicesOK
 }
 
 func (r doctorReport) problem() string {
+	for _, check := range r.browserReadiness {
+		if check.fatal {
+			return check.name + ": " + check.detail
+		}
+	}
 	if !r.dockerHealth.OK && !r.dockerOptional {
 		return r.dockerHealth.String()
 	}
@@ -150,6 +161,7 @@ func runPodmanGPUProbe(rt catalog.ContainerRuntime, lookPath func(string) (strin
 func runDoctorChecks() doctorReport {
 	r := runDoctorChecksFor(platform.IsDarwin(), currentManagedServiceHealth)
 	r.updateDiagnostics, r.updateDiagnosisNote = currentManagedUpdateDiagnostics()
+	r.browserReadiness = cobrowseReadiness(nodePermissionsDir(), productionBrowserReadinessProbes())
 	return r
 }
 
@@ -210,6 +222,12 @@ func runDoctorChecksFor(isDarwin bool, serviceHealthFn func() ([]managedServiceH
 // renderDoctorReport prints a human-readable report to w.
 func renderDoctorReport(w io.Writer, r doctorReport) {
 	headerColor.Fprintln(w, "--- 🩺 Citadel Doctor ---")
+	if len(r.browserReadiness) > 0 {
+		headerColor.Fprintln(w, "\nCO-BROWSE READINESS")
+		for _, check := range r.browserReadiness {
+			fmt.Fprintf(w, "  [%s] %s: %s\n", check.status, check.name, check.detail)
+		}
+	}
 
 	headerColor.Fprintln(w, "\nDOCKER / ENGINE")
 	switch {

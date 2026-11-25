@@ -15,15 +15,38 @@ import (
 type Lock struct {
 	f    *os.File
 	path string
+	// offset is the locked byte (see recordFreeLockOffset).
+	offset uint32
 }
+
+// recordFreeLockOffset is the byte AcquireFile and IsHeldFile lock. Windows
+// byte-range locks are mandatory: while one handle holds byte 0, every other
+// handle, even in the same process, is refused a read of it, so a probe that
+// locks the record's own byte can never read the holder PID. Locking a byte far
+// past the record keeps the record readable. The worker lock (Acquire, IsHeld)
+// stays on byte 0 so old and new binaries still exclude each other; never use
+// AcquireFile for citadel-work.lock.
+const recordFreeLockOffset = 1 << 30
 
 // Acquire takes an exclusive, non-blocking lock on the worker lock file derived
 // from stateDir using LockFileEx with LOCKFILE_FAIL_IMMEDIATELY. Windows advisory
 // locks are released by the OS when the owning handle is closed or the process
 // exits, so a crashed worker never leaves a blocking lock.
 func Acquire(stateDir, version string, logf func(format string, args ...any)) (*Lock, error) {
-	path := LockPathForStateDir(stateDir)
+	return acquireAt(LockPathForStateDir(stateDir), version, logf, 0)
+}
 
+// AcquireFile is Acquire for an explicit lock file path, for a single-instance
+// guard other than the worker lock (the per-user supervisor's lock). Same
+// semantics: exclusive, non-blocking, released by the OS on process death.
+//
+// On Windows it locks recordFreeLockOffset, not byte 0, so IsHeldFile can read
+// the holder's record.
+func AcquireFile(path, version string, logf func(format string, args ...any)) (*Lock, error) {
+	return acquireAt(path, version, logf, recordFreeLockOffset)
+}
+
+func acquireAt(path, version string, logf func(format string, args ...any), offset uint32) (*Lock, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("worklock: create lock dir: %w", err)
 	}
@@ -34,8 +57,8 @@ func Acquire(stateDir, version string, logf func(format string, args ...any)) (*
 	}
 
 	handle := windows.Handle(f.Fd())
-	var overlapped windows.Overlapped
-	// Lock the first byte exclusively, failing immediately if held.
+	overlapped := windows.Overlapped{Offset: offset}
+	// Lock one byte exclusively, failing immediately if held.
 	lockErr := windows.LockFileEx(
 		handle,
 		windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY,
@@ -63,7 +86,7 @@ func Acquire(stateDir, version string, logf func(format string, args ...any)) (*
 		_ = f.Sync()
 	}
 
-	return &Lock{f: f, path: path}, nil
+	return &Lock{f: f, path: path, offset: offset}, nil
 }
 
 // IsHeld reports whether a live citadel worker currently holds the single-instance
@@ -73,8 +96,15 @@ func Acquire(stateDir, version string, logf func(format string, args ...any)) (*
 // detects contention, the probe is unlocked immediately, and only a live citadel
 // holder PID is reported as held. A missing/stale/reused lock reports not held.
 func IsHeld(stateDir string) (held bool, holderPID int) {
-	path := LockPathForStateDir(stateDir)
+	return isHeldAt(LockPathForStateDir(stateDir), 0)
+}
 
+// IsHeldFile is IsHeld for a lock taken with AcquireFile.
+func IsHeldFile(path string) (held bool, holderPID int) {
+	return isHeldAt(path, recordFreeLockOffset)
+}
+
+func isHeldAt(path string, offset uint32) (held bool, holderPID int) {
 	f, err := os.OpenFile(path, os.O_RDONLY, 0o600)
 	if err != nil {
 		return false, 0
@@ -84,7 +114,7 @@ func IsHeld(stateDir string) (held bool, holderPID int) {
 	rec := readRecord(f)
 
 	handle := windows.Handle(f.Fd())
-	var overlapped windows.Overlapped
+	overlapped := windows.Overlapped{Offset: offset}
 	lockErr := windows.LockFileEx(
 		handle,
 		windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY,
@@ -92,7 +122,7 @@ func IsHeld(stateDir string) (held bool, holderPID int) {
 	)
 	if lockErr == nil {
 		// Acquired the probe lock: no one else holds it. Release immediately.
-		var unlockOverlapped windows.Overlapped
+		unlockOverlapped := windows.Overlapped{Offset: offset}
 		_ = windows.UnlockFileEx(handle, 0, 1, 0, &unlockOverlapped)
 		return false, 0
 	}
@@ -122,7 +152,7 @@ func (l *Lock) Release() {
 		return
 	}
 	handle := windows.Handle(l.f.Fd())
-	var overlapped windows.Overlapped
+	overlapped := windows.Overlapped{Offset: l.offset}
 	_ = windows.UnlockFileEx(handle, 0, 1, 0, &overlapped)
 	_ = l.f.Close()
 	_ = os.Remove(l.path)

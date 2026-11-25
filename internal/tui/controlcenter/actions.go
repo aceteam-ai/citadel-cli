@@ -2038,7 +2038,11 @@ type builtinServiceDef struct {
 // always-visible Actions panel from the saved state. Keeping the refresh in the
 // save seam prevents a successful write from leaving the N/5 summary stale.
 func (cc *ControlCenter) saveBuiltinPermissions(perms *config.Permissions, name string, enabled bool) error {
-	if err := cc.permissions.Save(perms); err != nil {
+	save := func() error { return cc.permissions.Save(perms) }
+	if cc.permissions.SaveToggle != nil {
+		save = func() error { return cc.permissions.SaveToggle(name, enabled) }
+	}
+	if err := save(); err != nil {
 		return err
 	}
 

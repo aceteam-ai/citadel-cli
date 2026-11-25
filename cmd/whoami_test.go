@@ -105,13 +105,13 @@ func TestRenderIdentity_UnregisteredDegradesGracefully(t *testing.T) {
 
 func TestRenderIdentity_PlatformNodeIDShownWhenPresent(t *testing.T) {
 	id := registeredOnlineIdentity()
-	id.PlatformNodeID = "1297"
+	id.PlatformNodeID = "4321"
 
 	var buf bytes.Buffer
 	renderIdentity(&buf, id)
 	out := buf.String()
 
-	if !strings.Contains(out, "1297") {
+	if !strings.Contains(out, "4321") {
 		t.Errorf("expected platform node ID to be rendered when present:\n%s", out)
 	}
 	if strings.Contains(out, "not available locally") {
@@ -129,10 +129,10 @@ func TestResolvePlatformNodeID(t *testing.T) {
 		sshSyncID    string
 		want         string
 	}{
-		{"fabric node id present, wins over ssh sync fallback", "1297", "999", "1297"},
+		{"fabric node id present, wins over ssh sync fallback", "4321", "999", "4321"},
 		{"fabric node id absent, falls back to ssh sync", "", "999", "999"},
 		{"both absent", "", "", ""},
-		{"fabric node id present, ssh sync absent", "1297", "", "1297"},
+		{"fabric node id present, ssh sync absent", "4321", "", "4321"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

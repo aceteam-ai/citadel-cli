@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -35,18 +36,43 @@ type setupFixture struct {
 	exe    string
 	opened []string
 	full   int
+
+	// The "Connect this PC to AceTeam" seams; see local_setup_enroll_test.go.
+	enroller *setupEnroller
+	mu       sync.Mutex
+	enrollFn func(context.Context, enrollOptions) (*enrollResult, error)
+	runs     int
+	optsFn   func() enrollOptions
+	already  func(string) (string, string)
+	check    func(string) error
+
+	// C5 seams; see local_setup_posture_test.go. nodeDir is the fixture's
+	// node config dir; connected is what the toggles see.
+	nodeDir     string
+	meetingDir  string
+	connected   bool
+	quarantined int
+	disconnect  disconnectDeps
+	worker      setupWorkerDeps
 }
 
 func newSetupFixture(t *testing.T) *setupFixture {
 	t.Helper()
 	f := &setupFixture{t: t, home: t.TempDir(), exe: `C:\Users\demo\AppData\Local\Citadel\citadel.exe`}
+	f.nodeDir = filepath.Join(f.home, "node")
+	f.meetingDir = filepath.Join(f.home, "meeting")
 	env := harnessEnv{goos: "linux", home: f.home}
 	d := localSetupDeps{
 		stateDir: func() string { return filepath.Join(f.home, "state") },
 		env:      func() harnessEnv { return env },
 		exe:      f.exe,
-		openURL:  func(u string) error { f.opened = append(f.opened, u); return nil },
-		now:      func() time.Time { return time.Date(2026, 11, 10, 9, 0, 0, 0, time.UTC) },
+		openURL: func(u string) error {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			f.opened = append(f.opened, u)
+			return nil
+		},
+		now: func() time.Time { return time.Date(2026, 11, 10, 9, 0, 0, 0, time.UTC) },
 		doctor: func(full bool) []localviewer.SetupCheck {
 			if full {
 				f.full++
@@ -54,10 +80,98 @@ func newSetupFixture(t *testing.T) *setupFixture {
 			return []localviewer.SetupCheck{
 				{Status: "ok", What: "Browser", Detail: "Microsoft Edge at C:\\edge.exe"},
 				{Status: "FAIL", What: "Viewer port", Detail: "cannot listen. Fix: check security software"},
+				{Status: "ok", What: "Network", Detail: "Citadel makes no calls of its own (no account)"},
 			}
 		},
+		enroll: func(ctx context.Context, o enrollOptions) (*enrollResult, error) {
+			f.mu.Lock()
+			f.runs++
+			run := f.enrollFn
+			f.mu.Unlock()
+			return run(ctx, o)
+		},
+		enrollOptions: func() enrollOptions {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			return f.optsFn()
+		},
+		enrollAlready: func(dir string) (string, string) {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			return f.already(dir)
+		},
+		enrollCheck: func(dir string) error {
+			f.mu.Lock()
+			check := f.check
+			f.mu.Unlock()
+			if check == nil {
+				return nil
+			}
+			return check(dir)
+		},
+		posture: func(dir string) error { return writeSetupPosture(dir, f.meetingDir) },
+		quarantine: func() {
+			f.mu.Lock()
+			f.quarantined++
+			f.mu.Unlock()
+		},
+		nodePerms: func(busy func() bool) *localviewer.NodePermissionHooks {
+			return newNodePermissionHooks(nodePermissionDeps{
+				dir: func() string { return f.nodeDir },
+				connected: func() bool {
+					f.mu.Lock()
+					defer f.mu.Unlock()
+					return f.connected
+				},
+				workspace: func() string { return filepath.Join(f.home, "citadel-node", "workspace") },
+				busy:      busy,
+				via:       "setup_page",
+			})
+		},
+		disconnect: func() localviewer.SetupActionResult {
+			f.mu.Lock()
+			d := f.disconnect
+			f.mu.Unlock()
+			return disconnectThisPC(d)
+		},
+		worker: func(offered func() bool) setupWorkerDeps {
+			f.mu.Lock()
+			w := f.worker
+			f.mu.Unlock()
+			w.offered = offered
+			return w
+		},
 	}
-	f.srv = newLocalSetupServer(d)
+	// Nothing reaches this machine: every C5 side effect is a refusing fake
+	// unless a test replaces it.
+	nothing := errors.New("fixture: not set up")
+	f.disconnect = disconnectDeps{
+		stopWorker:        func() (bool, error) { return false, nothing },
+		disableAutostart:  func() (bool, error) { return false, nothing },
+		logout:            func() (logoutOutcome, error) { return logoutOutcome{}, nothing },
+		removeCredentials: func() (bool, error) { return false, nothing },
+	}
+	f.worker = setupWorkerDeps{
+		goos: "windows",
+		registered: func() bool {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			return f.connected
+		},
+		postureHolds:    func() bool { return setupPostureHolds(f.nodeDir) },
+		releaseNetwork:  func() error { return nothing },
+		enableAutostart: func() error { return nothing },
+		start:           func(context.Context) error { return nothing },
+	}
+	// The default enrollment never touches the network: it reports a code
+	// and waits to be canceled.
+	f.enrollFn = waitingFakeEnroll
+	f.optsFn = func() enrollOptions {
+		return enrollOptions{AuthServiceURL: "https://auth.example.test", ConfigDir: f.nodeDir}
+	}
+	f.already = func(string) (string, string) { return "", "" }
+	f.srv, f.enroller = newLocalSetupServer(d)
+	t.Cleanup(func() { f.enroller.Shutdown(5 * time.Second) })
 	if err := f.srv.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -139,6 +253,26 @@ func TestSetupRoutesAreGuarded(t *testing.T) {
 		{"doctor without bearer", "POST", "/api/setup/doctor", "{}", with("X-Citadel-CSRF", ""), true},
 		{"open-viewer without bearer", "POST", "/api/setup/open-viewer", "{}", with("X-Citadel-CSRF", ""), true},
 		{"wrong host", "GET", "/api/setup/state", "", f.good(), true},
+		// Connect this PC to AceTeam (#1867 C2); TestSetupEnrollRoutesAreGuarded
+		// covers every route and case, with positive controls.
+		{"enroll start with foreign origin", "POST", "/api/setup/enroll/start", `{"confirm":true}`, with("Origin", "http://attacker.test"), true},
+		{"enroll start without bearer", "POST", "/api/setup/enroll/start", `{"confirm":true}`, with("X-Citadel-CSRF", ""), true},
+		{"enroll start without cookie", "POST", "/api/setup/enroll/start", `{"confirm":true}`, f.good(), false},
+		{"enroll start cross-site", "POST", "/api/setup/enroll/start", `{"confirm":true}`, with("Sec-Fetch-Site", "cross-site"), true},
+		{"enroll state without bearer", "GET", "/api/setup/enroll/state", "", with("X-Citadel-CSRF", ""), true},
+		{"enroll cancel with foreign origin", "POST", "/api/setup/enroll/cancel", `{"confirm":true}`, with("Origin", "http://attacker.test"), true},
+		{"enroll qr without cookie", "GET", "/api/setup/enroll/qr", "", f.good(), false},
+		// Posture, grant, worker and Disconnect (#1867 C5).
+		{"node permissions without bearer", "GET", "/api/node-permissions", "", with("X-Citadel-CSRF", ""), true},
+		{"grant without cookie", "POST", "/api/node-permissions", `{"confirm":true,"surface":"files","enabled":true}`, f.good(), false},
+		{"grant with foreign origin", "POST", "/api/node-permissions", `{"confirm":true,"surface":"files","enabled":true}`, with("Origin", "http://attacker.test"), true},
+		{"grant cross-site", "POST", "/api/node-permissions", `{"confirm":true,"surface":"shell","enabled":true,"confirm_shell":true}`, with("Sec-Fetch-Site", "cross-site"), true},
+		{"grant without bearer", "POST", "/api/node-permissions", `{"confirm":true,"surface":"files","enabled":true}`, with("X-Citadel-CSRF", ""), true},
+		{"worker start with foreign origin", "POST", "/api/setup/worker/start", `{"confirm":true}`, with("Origin", "http://attacker.test"), true},
+		{"worker start without bearer", "POST", "/api/setup/worker/start", `{"confirm":true}`, with("X-Citadel-CSRF", ""), true},
+		{"disconnect without cookie", "POST", "/api/setup/disconnect", `{"confirm":true}`, f.good(), false},
+		{"disconnect cross-site", "POST", "/api/setup/disconnect", `{"confirm":true}`, with("Sec-Fetch-Site", "cross-site"), true},
+		{"disconnect without origin", "POST", "/api/setup/disconnect", `{"confirm":true}`, with("Origin", ""), true},
 	}
 	for _, c := range cases {
 		req, _ := http.NewRequest(c.method, f.base+c.path, strings.NewReader(c.body))
@@ -162,6 +296,9 @@ func TestSetupRoutesAreGuarded(t *testing.T) {
 	}
 	if _, err := os.Stat(codex); err == nil {
 		t.Fatal("a refused request wrote the config")
+	}
+	if n := f.runCount(); n != 0 {
+		t.Fatalf("a refused request started %d enrollment(s)", n)
 	}
 	// The viewer routes do not exist on the setup server, and the old mint
 	// route is not served here.
@@ -266,6 +403,8 @@ func (f *setupFixture) state() (st struct {
 	SessionsNote string                     `json:"sessions_note"`
 	MaxSessions  int                        `json:"max_sessions"`
 	GenericEntry string                     `json:"generic_entry"`
+	// DisconnectAvailable shows Disconnect this PC (#1867 C5).
+	DisconnectAvailable bool `json:"disconnect_available"`
 }) {
 	f.t.Helper()
 	r := f.do("GET", "/api/setup/state", "", f.good(), true)
@@ -280,8 +419,13 @@ func TestSetupStateRendersDoctorAppsLimitAndGenericEntry(t *testing.T) {
 	f := newSetupFixture(t)
 	_ = os.MkdirAll(filepath.Join(f.home, ".codex"), 0o700)
 	st := f.state()
-	if len(st.Checks) != 2 || st.Checks[1].Status != "FAIL" || !strings.Contains(st.Checks[1].Detail, "Fix:") {
+	if len(st.Checks) != 3 || st.Checks[1].Status != "FAIL" || !strings.Contains(st.Checks[1].Detail, "Fix:") {
 		t.Fatalf("doctor results: %+v", st.Checks)
+	}
+	// The page has a Connect to AceTeam button, so its "no calls" line says
+	// that button is the exception (#1867 C2).
+	if !strings.HasSuffix(st.Checks[2].Detail, setupNetworkCheckSuffix) {
+		t.Fatalf("network check on the setup page: %q", st.Checks[2].Detail)
 	}
 	states := map[string]string{}
 	for _, a := range st.Apps {

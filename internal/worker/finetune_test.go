@@ -95,9 +95,9 @@ func fineTuneFixture(t *testing.T) (FineTuneConfig, *Job, *fineTuneControlFake, 
 	}
 	control := &fineTuneControlFake{}
 	reservation := &fineTuneReservationFake{}
-	cfg := FineTuneConfig{NodeID: "1297", WorkspaceDir: workspace, OutputRoot: filepath.Join(t.TempDir(), "adapters"), SafetyDir: filepath.Join(t.TempDir(), "safety"), CacheDir: filepath.Join(t.TempDir(), "cache"), Control: control, Reservation: reservation}
-	job := &Job{ID: "job-1", Type: JobTypeFineTuneStart, SourceQueue: "jobs:v1:shell:org_o:node:1297", Payload: map[string]any{
-		"node_id": "1297", "dataset_node_id": "1297", "dataset_node_path": "train.jsonl", "model": "Qwen/Qwen3-0.6B", "method": "qlora",
+	cfg := FineTuneConfig{NodeID: "4321", WorkspaceDir: workspace, OutputRoot: filepath.Join(t.TempDir(), "adapters"), SafetyDir: filepath.Join(t.TempDir(), "safety"), CacheDir: filepath.Join(t.TempDir(), "cache"), Control: control, Reservation: reservation}
+	job := &Job{ID: "job-1", Type: JobTypeFineTuneStart, SourceQueue: "jobs:v1:shell:org_o:node:4321", Payload: map[string]any{
+		"node_id": "4321", "dataset_node_id": "4321", "dataset_node_path": "train.jsonl", "model": "Qwen/Qwen3-0.6B", "method": "qlora",
 		"hyperparameters": map[string]any{"epochs": 2, "learning_rate": 0.0002, "batch_size": 4, "lora_r": 16, "lora_alpha": 32, "lora_dropout": 0.05, "max_seq_length": 2048},
 	}}
 	return cfg, job, control, reservation

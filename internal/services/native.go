@@ -251,8 +251,8 @@ func portAnswers(serviceName string, port int, timeout time.Duration) bool {
 //   - Health / advertise / start-short-circuit paths must NOT use this. `pgrep
 //     -f` is a substring match against the whole command line, so `ollama run`,
 //     an `ollama` mentioned in some other process's argv, or a `journalctl -u
-//     ollama` all satisfy it while the server is down. That is exactly how node
-//     1297 reported "Service ollama is already running" with `systemctl
+//     ollama` all satisfy it while the server is down. That is exactly how a dev
+//     node reported "Service ollama is already running" with `systemctl
 //     is-active ollama` saying `inactive` and the API answering nothing.
 //   - Stop / teardown paths must NOT use the serving probe. A wedged engine that
 //     has stopped answering is still a process holding VRAM; treating it as

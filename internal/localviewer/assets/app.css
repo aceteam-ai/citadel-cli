@@ -48,3 +48,4 @@ button.danger { color: #b3261e; }
 #unlock input[type=password] { padding: .35rem .5rem; border: 1px solid #ccc; border-radius: 6px; min-width: 18rem; }
 .refused { color: #b3261e; }
 [hidden] { display: none !important; }
+#enroll-qr { image-rendering: pixelated; border: 1px solid #ddd; }

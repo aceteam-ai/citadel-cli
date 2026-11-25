@@ -136,7 +136,7 @@ runs. Per this repo's own CLAUDE.md ("Worker Mode" section) the default
 production path is the AceTeam Redis **API proxy** (`WSSource`/`APISource`),
 and `willRetry`'s comment is explicit that `MaxAttempts == 0` there — **"the
 AceTeam Redis API proxy does not expose a per-message delivery count to the
-node."** So on the path a real node (e.g. node 1297, where aceteam#8254 was
+node."** So on the path a real node (e.g. a dev node, where aceteam#8254 was
 observed) actually runs, whether repeated Nack drives a job to the DLQ is
 decided **server-side, by the API proxy, and is not established by anything in
 this repo** — do not carry the RedisSource-specific DLQ mechanism forward as

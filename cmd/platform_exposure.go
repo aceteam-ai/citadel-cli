@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/gateway"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/status"
 )
 
 // These seams keep tests off the live mesh and the machine's node config.
@@ -65,13 +67,40 @@ func platformTarget(port int, override string) (string, error) {
 		return "", fmt.Errorf("invalid platform port %d", port)
 	}
 	if override == "" {
+		if ownServerPort(port) {
+			return "", errOwnServerTarget
+		}
 		return net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), nil
 	}
 	addr, err := netip.ParseAddrPort(override)
 	if err != nil || addr.Port() == 0 || !(addr.Addr().IsLoopback() || addr.Addr().IsPrivate()) {
 		return "", fmt.Errorf("forward_target must be a loopback or private IP:port")
 	}
+	if (addr.Addr().IsLoopback() || addr.Addr().IsUnspecified()) && ownServerPort(int(addr.Port())) {
+		return "", errOwnServerTarget
+	}
 	return addr.String(), nil
+}
+
+var errOwnServerTarget = errors.New("platform exposure target is this node's own status or control server port")
+
+// ownServerPort reports whether port is the node's status or mTLS control
+// port, read from the same sources the servers use (the --status-port flag
+// value and resolveControlPort). A platform exposure must never forward
+// mesh traffic to loopback on one of them.
+func ownServerPort(port int) bool {
+	return (workStatusPort > 0 && port == workStatusPort) || port == resolveControlPort()
+}
+
+// resolveControlPort owns the mTLS control listener's port: the
+// CITADEL_CONTROL_PORT override when valid, else status.DefaultControlPort.
+func resolveControlPort() int {
+	if p := strings.TrimSpace(os.Getenv("CITADEL_CONTROL_PORT")); p != "" {
+		if parsed, err := strconv.Atoi(p); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	return status.DefaultControlPort
 }
 
 type platformExposure struct {

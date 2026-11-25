@@ -9,7 +9,7 @@
 //     VRAM/RAM and current top resource holders, so a "did not become ready"
 //     failure stops being silent about WHY -- regardless of whether the true
 //     cause is VRAM contention (the issue's own framing), host-RAM pressure
-//     (the design doc's leading suspect for the original node-1084 incident
+//     (the design doc's leading suspect for the original incident
 //     -- see the doc's §1a/§7 Q1), or something else entirely (a crashed or
 //     restart-looping container). Changes only an error STRING; never a
 //     success/failure outcome.

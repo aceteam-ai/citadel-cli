@@ -126,6 +126,9 @@ type sessionRecord struct {
 	ContainerStart string `json:"container_start,omitempty"`
 	ControlPort    int    `json:"control_port,omitempty"`
 	Tracking       bool   `json:"tracking,omitempty"`
+	// Egress records a public-only session. Its guard lives in the process
+	// that launched it, so such a record is never adopted.
+	Egress string `json:"egress,omitempty"`
 
 	// State is live, suspended or expired. Generation increases on every
 	// re-adopt or ownership change so a later owner can order its claims.
@@ -368,6 +371,7 @@ func (s *cobrowseSession) persistRecord() {
 		ScopeUser:    proc.scopeUser,
 		Handoff:      s.explicitHandoff,
 		Tracking:     s.tracking,
+		Egress:       s.egress,
 		State:        RecordLive,
 		Generation:   s.generation,
 		PendingEnd:   s.pendingEnd,
@@ -415,6 +419,12 @@ func verifyAdoptable(baseDir, dir string, rec sessionRecord) error {
 	}
 	if rec.Persistent {
 		return fmt.Errorf("persistent profile sessions are sealed, not adopted")
+	}
+	if rec.Egress != "" {
+		// The browser still points at the old process's loopback guard port.
+		// Whatever binds that port next would become its proxy, so such a
+		// browser is never taken over (citadel-cli#1867 C4b).
+		return fmt.Errorf("public-only sessions lose their egress guard on restart and are not adopted")
 	}
 	if rec.BrowserStart == 0 {
 		return fmt.Errorf("browser start time not recorded")
@@ -505,18 +515,33 @@ func recordUID(rec sessionRecord) int {
 	return os.Getuid()
 }
 
-// adoptedProc builds a cobrowseProc around already-running processes. Its
-// exited channel closes when the browser's identity stops matching.
+// adoptedProc builds a cobrowseProc around already-running processes. Only
+// known absence or a verified identity change closes its exited channel.
 func adoptedProc(rec sessionRecord) *cobrowseProc {
+	ticker := time.NewTicker(2 * time.Second)
+	return adoptedProcWithObservations(rec, ticker.C, ticker.Stop)
+}
+
+// The observation source is injectable so fake-process tests exercise the real
+// adapter without native processes or timing-dependent sleeps. The observer
+// owns stopObservations; a closed observation source is not exit evidence.
+func adoptedProcWithObservations(rec sessionRecord, observations <-chan time.Time, stopObservations func()) *cobrowseProc {
 	exited := make(chan struct{})
-	gone := func(pid int, start uint64) bool {
-		st, alive, err := procIdentity(pid)
-		return err != nil || !alive || st != start
+	identity, kill := procIdentity, pidKiller
+	gone := func(pid int, start uint64) (bool, error) {
+		st, alive, err := identity(pid)
+		if os.IsNotExist(err) {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return !alive || st != start, nil
 	}
 	go func() {
-		for {
-			time.Sleep(2 * time.Second)
-			if gone(rec.BrowserPID, rec.BrowserStart) {
+		defer stopObservations()
+		for range observations {
+			if absent, err := gone(rec.BrowserPID, rec.BrowserStart); err == nil && absent {
 				reapChild(rec.BrowserPID)
 				close(exited)
 				return
@@ -536,13 +561,32 @@ func adoptedProc(rec sessionRecord) *cobrowseProc {
 		xvfbScope:    rec.XvfbScope,
 		scopeUser:    rec.ScopeUser,
 		stop: func() error {
-			stopRecordScopes(rec)
-			var last error
-			for _, t := range []struct {
+			targets := []struct {
 				pid   int
 				start uint64
-			}{{rec.BrowserPID, rec.BrowserStart}, {rec.XvfbPID, rec.XvfbStart}} {
-				if t.pid <= 0 || gone(t.pid, t.start) {
+			}{{rec.BrowserPID, rec.BrowserStart}, {rec.XvfbPID, rec.XvfbStart}}
+			// Inspect every recorded target before any destructive action. A
+			// browser with unknown identity must not be killed, and an unknown
+			// companion must not be skipped as if cleanup had already finished.
+			for _, target := range targets {
+				if target.pid > 0 {
+					if _, err := gone(target.pid, target.start); err != nil {
+						return fmt.Errorf("process identity unconfirmed: %w", err)
+					}
+				}
+			}
+			stopRecordScopes(rec)
+			var last error
+			for _, t := range targets {
+				if t.pid <= 0 {
+					continue
+				}
+				absent, err := gone(t.pid, t.start)
+				if err != nil {
+					last = fmt.Errorf("process identity unconfirmed: %w", err)
+					continue
+				}
+				if absent {
 					continue
 				}
 				// A surviving child of ours stays a zombie until reaped, and
@@ -558,7 +602,7 @@ func adoptedProc(rec sessionRecord) *cobrowseProc {
 						}
 					}
 				}(t.pid)
-				if err := pidKiller(t.pid); err != nil {
+				if err := kill(t.pid); err != nil {
 					last = err
 				}
 				close(done)
@@ -672,6 +716,9 @@ func (m *CobrowseSessionManager) recoverSessions() {
 			s.startChooserWatch(s.proc.debugPort)
 		}
 		log.Printf("[cobrowse] re-adopted session %s (generation %d)", rec.ID, s.generation)
+		// Adopted sessions never have a guard; sweep them if public-only
+		// turns on.
+		m.startEgressSweep()
 	}
 	if len(expired) > expiredMaxRecords {
 		sort.Slice(expired, func(i, j int) bool { return expired[i].EndedAt > expired[j].EndedAt })

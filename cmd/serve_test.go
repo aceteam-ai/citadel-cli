@@ -24,7 +24,7 @@ func TestServeFlags(t *testing.T) {
 		defValue string
 	}{
 		{"port", "8443"},
-		{"bind", "0.0.0.0"},
+		{"bind", "127.0.0.1"},
 		{"cert-dir", ""},
 		{"status-port", "8080"},
 		{"terminal-port", "7860"},
@@ -83,5 +83,22 @@ func TestServeHelpOutput(t *testing.T) {
 	// Check Example is set
 	if serveCmd.Example == "" {
 		t.Error("serve command Example is empty")
+	}
+}
+
+func TestServeBindLANOptIn(t *testing.T) {
+	f := serveCmd.Flags().Lookup("bind")
+	if f == nil {
+		t.Fatal("--bind flag not found")
+	}
+	defer func() { _ = f.Value.Set(f.DefValue) }()
+	if err := f.Value.Set("0.0.0.0"); err != nil {
+		t.Fatal(err)
+	}
+	if got := gatewayListenAddr(serveBind, 8443); got != "0.0.0.0:8443" {
+		t.Fatalf("opt-in listen addr = %q", got)
+	}
+	if gatewayBindIsLoopback(serveBind) {
+		t.Fatal("0.0.0.0 must not count as loopback (it is the LAN opt-in)")
 	}
 }

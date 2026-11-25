@@ -158,7 +158,9 @@ func NewServer(cfg Config, session Session) *Server {
 		ReadBufferSize:  4096,
 		WriteBufferSize: 64 * 1024,
 		// Mesh-only exposure: the tsnet listener is the trust boundary, so accept
-		// any origin (CLI/native clients send none).
+		// any origin (CLI/native clients send none). The localhost listener is
+		// stricter: Start wraps the route in guardLocalhost, which refuses any
+		// Origin and any Host other than loopback:<port> before this runs.
 		CheckOrigin: func(r *http.Request) bool { return true },
 	}
 	return s
@@ -225,7 +227,7 @@ func (s *Server) Start() error {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc(StreamPath, s.handleStream)
+	mux.HandleFunc(StreamPath, s.guardLocalhost(s.handleStream))
 	mux.HandleFunc(HealthPath, s.handleHealth)
 
 	s.httpServer = &http.Server{

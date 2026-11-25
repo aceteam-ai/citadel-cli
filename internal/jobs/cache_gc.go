@@ -167,7 +167,7 @@ func deleteHFHubModelDir(modelName string) (string, error) {
 func deleteGGUFDirFile(cacheRoot, cacheDirName, relFile string) error {
 	dir := filepath.Clean(filepath.Join(cacheRoot, cacheDirName))
 	candidate := filepath.Clean(filepath.Join(dir, filepath.FromSlash(relFile)))
-	if candidate != dir && !strings.HasPrefix(candidate, dir+string(filepath.Separator)) {
+	if candidate == dir || !strings.HasPrefix(candidate, dir+string(filepath.Separator)) {
 		return fmt.Errorf("invalid gguf file path %q for cache dir %s", relFile, cacheDirName)
 	}
 	if err := os.Remove(candidate); err != nil {
@@ -207,6 +207,9 @@ func defaultCacheGCDeleteEntry(cacheRoot string, e cacheindex.Entry) error {
 		// chain silently, refuse a native entry outside ollama's own dir.
 		if e.CacheDir != services.EngineCacheDirs["ollama"].Dir {
 			return fmt.Errorf("refusing to run ollama rm for native cache dir %q (only %q is ollama's)", e.CacheDir, services.EngineCacheDirs["ollama"].Dir)
+		}
+		if !validModelArgument(e.Model) {
+			return ErrUnsafeModelArgument
 		}
 		out, err := BuildOllamaRmCommand(e.Model).CombinedOutput()
 		if err != nil {

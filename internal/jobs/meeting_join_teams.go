@@ -10,7 +10,7 @@
 //
 // The selectors / JS snippets below were VERIFIED against a real, live Teams
 // meeting on 2026-08-01 (light-meetings anonymous web join, driven through the
-// meeting-service container on node 1297) — see the VERIFIED block below for the
+// meeting-service container on a dev node) — see the VERIFIED block below for the
 // captured DOM shapes and exactly what was and was not exercised (e.g. the
 // mic/cam-off toggles could not be tested on a device-less container). Teams
 // renders its pre-join and in-call UI inside a heavy, frequently-changing Fluent
@@ -50,7 +50,7 @@ const (
 // VERIFIED against a live Teams meeting (issue #7000 / citadel #660)
 //
 // The selectors / JS below were tuned against a REAL teams.microsoft.com meeting
-// driven through the meeting-service container on node 1297. An anonymous /meet/
+// driven through the meeting-service container on a dev node. An anonymous /meet/
 // <id>?p=<passcode> link redirects Teams to its "light meetings" web experience
 // (…/light-meetings/launch?…&anon=true&lightExperience=true) whose pre-join and
 // in-call DOM is stable and data-tid/id-addressable (no iframes, no shadow DOM).

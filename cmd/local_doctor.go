@@ -21,6 +21,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/cobrowseprofile"
 	"github.com/aceteam-ai/citadel-cli/internal/localaudit"
 	"github.com/aceteam-ai/citadel-cli/internal/localcobrowse"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	"github.com/aceteam-ai/citadel-cli/internal/update"
 	"github.com/spf13/cobra"
@@ -42,6 +43,9 @@ type localDoctorDeps struct {
 	// it. Nil means not checked (non-Windows).
 	binaryOwner func() (update.OwnerInfo, string, error)
 	harnesses   []harnessConfigStatus
+	// userWorker reports the per-user background worker (citadel-cli#1867 C3).
+	// Nil means not checked (non-Windows). It must only read state.
+	userWorker func() userWorkerState
 	// exe is how fix lines refer to citadel (the full path, quoted if needed).
 	exe string
 }
@@ -87,6 +91,11 @@ func realLocalDoctorDeps(skipLaunch bool) localDoctorDeps {
 				info, err := update.ExecutableOwnership(exe)
 				return info, exe, err
 			}
+			d.userWorker = func() userWorkerState { return readUserWorkerState(exe, network.GetNodeConfigDir()) }
+		}
+		if runtime.GOOS == "darwin" {
+			// The worker is a LaunchAgent (citadel-cli#1903 M3).
+			d.userWorker = func() userWorkerState { return readUserWorkerState(exe, network.GetNodeConfigDir()) }
 		}
 	}
 	if !skipLaunch {
@@ -257,6 +266,15 @@ func collectLocalDoctor(d localDoctorDeps) (checks []localDoctorCheck, failed bo
 	}
 	if pointed == 0 {
 		warn("Harness", fmt.Sprintf("no agent app is configured yet. Fix: %s local config copilot (or claude-code, claude-desktop, codex, opencode)", d.exe))
+	}
+
+	if d.userWorker != nil {
+		uw := d.userWorker()
+		if uw.Agent != nil {
+			agentChecks(uw, d.exe, ok, warn)
+		} else {
+			windowsWorkerChecks(uw, d.exe, ok, warn)
+		}
 	}
 
 	ok("Network", "Citadel makes no calls of its own (no account, no update check, no telemetry). The co-browse browser connects only to public addresses, through Citadel's local guard, with background updates off")

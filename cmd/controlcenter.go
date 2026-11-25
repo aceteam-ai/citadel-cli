@@ -277,6 +277,9 @@ func runControlCenter() {
 			Save: func(p *config.Permissions) error {
 				return saveNodePermissions(p)
 			},
+			SaveToggle: func(name string, enabled bool) error {
+				return toggleNodePermission(nodePermissionsDir(), name, enabled)
+			},
 		},
 		OnConnect:       ccOnNetworkConnect,
 		ConnectToPeerFn: ccConnectToPeer,
@@ -2422,6 +2425,10 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		ConfigDir:           "",
 		Services:            nil,
 		PermissionsProvider: loadNodePermissions,
+		CobrowseJobRecovery: func() bool {
+			runner := ccNodeRunner.Load()
+			return runner != nil && runner.CobrowseJobRecoveryAvailable()
+		},
 		JobTypes: func() []string {
 			runner := ccNodeRunner.Load()
 			if runner == nil {

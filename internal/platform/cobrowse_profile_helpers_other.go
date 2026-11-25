@@ -24,10 +24,15 @@ type reapProc struct {
 	start uint64
 	uid   int
 	args  []string
+	// cmd is the raw command line when the source has no argv boundaries (macOS
+	// ps output). It is matched as a string so a profile path containing a
+	// space still matches; empty when args are exact (Linux /proc).
+	cmd string
 }
 
 // Seams so tests need no real /proc, browser or signals.
 var (
+	reapProcRoot   = "/proc"
 	listReapProcs  = listProcForReap
 	lookupReapProc = readProcForReap
 	reapEUID       = os.Geteuid
@@ -75,22 +80,33 @@ func splitCmdline(raw []byte) []string {
 	return fields
 }
 
-func listProcForReap() []reapProc {
-	ents, err := os.ReadDir("/proc")
+func listProcForReap() ([]reapProc, error) {
+	ents, err := os.ReadDir(reapProcRoot)
 	if err != nil {
-		return nil
+		// An unreadable /proc is unknown, not "no processes": callers must not
+		// seal a profile or settle a recovery launch on an empty list.
+		return nil, fmt.Errorf("list processes: %w", err)
 	}
 	var out []reapProc
+	self, sawSelf := os.Getpid(), false
 	for _, e := range ents {
 		pid, err := strconv.Atoi(e.Name())
 		if err != nil {
 			continue
 		}
+		if pid == self {
+			sawSelf = true
+		}
 		if p, ok := readProcForReap(pid); ok {
 			out = append(out, p)
 		}
 	}
-	return out
+	// A real procfs always lists the scanning process. An empty or foreign
+	// directory at the mount point (procfs unmounted) is unknown, not "none".
+	if !sawSelf {
+		return nil, fmt.Errorf("list processes: %s does not list this process; procfs may not be mounted", reapProcRoot)
+	}
+	return out, nil
 }
 
 // usesProfile reports whether some "--flag=value" argument names profileDir or
@@ -110,6 +126,15 @@ func usesProfile(args []string, profileDir string) bool {
 		}
 	}
 	return false
+}
+
+// reapUsesProfile reports whether a process names profileDir: by raw command
+// line where the source has one, else by argv.
+func reapUsesProfile(p reapProc, profileDir string) bool {
+	if p.cmd != "" {
+		return macCmdlineUsesProfile(p.cmd, profileDir)
+	}
+	return usesProfile(p.args, profileDir)
 }
 
 // reapProfileUsers kills and waits out browser helpers still using profileDir
@@ -133,15 +158,20 @@ func reapProfileUsers(profileDir, scope string) error {
 	deadline := time.Now().Add(profileReapBudget)
 	for {
 		var alive []int
-		for _, c := range listReapProcs() {
-			if c.pid == os.Getpid() || c.uid != reapEUID() || !usesProfile(c.args, profileDir) {
+		procs, lerr := listReapProcs()
+		if lerr != nil {
+			// Fail closed: a process list that could not be read proves nothing.
+			return fmt.Errorf("cannot list processes to check for browser helpers using %s: %w", profileDir, lerr)
+		}
+		for _, c := range procs {
+			if c.pid == os.Getpid() || c.uid != reapEUID() || !reapUsesProfile(c, profileDir) {
 				continue
 			}
 			if scope != "" && !reapInScope(c.pid, scope) {
 				continue
 			}
 			alive = append(alive, c.pid)
-			if cur, ok := lookupReapProc(c.pid); ok && cur.start == c.start && cur.uid == c.uid && usesProfile(cur.args, profileDir) {
+			if cur, ok := lookupReapProc(c.pid); ok && cur.start == c.start && cur.uid == c.uid && reapUsesProfile(cur, profileDir) {
 				_ = signalReapProc(c.pid)
 			}
 		}

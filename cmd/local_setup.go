@@ -5,7 +5,9 @@
 // guard and every secret; this file owns what the page shows and does: the
 // doctor results, the agent apps (cmd.harnesses) and the Connect action, which
 // is mergeHarnessConfig, the same merge and backup as `local config --write`.
-// The consent is the click on the page. Nothing here makes an outbound call.
+// The consent is the click on the page. The only outbound call is the optional
+// "Connect this PC to AceTeam" enrollment (setupEnroller, local_setup_enroll.go),
+// and only after that button is clicked.
 package cmd
 
 import (
@@ -16,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -161,6 +164,28 @@ type localSetupDeps struct {
 	exe      string
 	openURL  func(string) error
 	now      func() time.Time
+	// enroll and enrollOptions run "Connect this PC to AceTeam"; nil enroll
+	// hides it. enrollOptions is called at click time.
+	enroll        func(ctx context.Context, opts enrollOptions) (*enrollResult, error)
+	enrollOptions func() enrollOptions
+	// enrollAlready names this PC's existing registration.
+	enrollAlready func(configDir string) (nodeName, orgName string)
+	// enrollCheck refuses a node config dir outside this user's own folder
+	// (productionSetupNodeDirCheck); it runs before each start.
+	enrollCheck func(configDir string) error
+	// posture writes the co-browse-only permissions after a successful
+	// enrollment from this page (writeSetupPosture).
+	posture func(configDir string) error
+	// quarantine stops the worker and removes autostart after a failed
+	// posture save (setupPostureQuarantine).
+	quarantine func()
+	// nodePerms builds the Files and Shell toggles; busy refuses a change
+	// while an enrollment or action runs. Nil hides them.
+	nodePerms func(busy func() bool) *localviewer.NodePermissionHooks
+	// disconnect is Disconnect this PC (nil hides it); worker builds the
+	// worker start's deps (nil hides it).
+	disconnect func() localviewer.SetupActionResult
+	worker     func(offered func() bool) setupWorkerDeps
 }
 
 func realLocalSetupDeps() (localSetupDeps, error) {
@@ -174,6 +199,24 @@ func realLocalSetupDeps() (localSetupDeps, error) {
 		exe:      exe,
 		openURL:  platform.OpenURL,
 		now:      time.Now,
+		// The node config dir (where the grant is saved) is resolved per
+		// click by productionEnrollOptions; the page's own token stays in
+		// stateDir's private SetupDirName.
+		enroll:        productionEnroll,
+		enrollOptions: productionEnrollOptions,
+		enrollAlready: setupAlreadyInfo,
+		enrollCheck:   productionSetupNodeDirCheck,
+		quarantine:    setupPostureQuarantine,
+		posture: func(dir string) error {
+			return writeSetupPosture(dir, platform.ConfigDir())
+		},
+		nodePerms: func(busy func() bool) *localviewer.NodePermissionHooks {
+			return newNodePermissionHooks(productionNodePermissionDeps("setup_page", busy))
+		},
+		disconnect: func() localviewer.SetupActionResult { return disconnectThisPC(productionDisconnectDeps()) },
+		worker: func(offered func() bool) setupWorkerDeps {
+			return productionSetupWorkerDeps(runtime.GOOS, exe, offered)
+		},
 		doctor: func(full bool) []localviewer.SetupCheck {
 			checks, _ := collectLocalDoctor(realLocalDoctorDeps(!full))
 			out := make([]localviewer.SetupCheck, len(checks))
@@ -204,53 +247,112 @@ func newCachedSetupDoctor(run func(full bool) []localviewer.SetupCheck) func(ful
 }
 
 // newLocalSetupServer builds the setup page's server. It uses its own private
-// dir so it never replaces a running co-browse owner's token file.
-func newLocalSetupServer(d localSetupDeps) *localviewer.Server {
+// dir so it never replaces a running co-browse owner's token file. The
+// enroller is nil when d has no enroll function.
+func newLocalSetupServer(d localSetupDeps) (*localviewer.Server, *setupEnroller) {
 	dir := d.stateDir()
-	return localviewer.New(localviewer.Config{
-		TokenDir:    dir,
-		PrivateDir:  localviewer.SetupDirName,
-		OpenURL:     d.openURL,
-		Now:         d.now,
+	setup := &localviewer.SetupConfig{
+		Doctor: newCachedSetupDoctor(func(full bool) []localviewer.SetupCheck {
+			checks := d.doctor(full)
+			if d.enroll != nil {
+				checks = setupPageChecks(checks)
+			}
+			return checks
+		}),
+		Apps:        func() []localviewer.SetupApp { return setupApps(d.env()) },
 		MaxSessions: localcobrowse.DefaultMaxSessions,
-		Setup: &localviewer.SetupConfig{
-			Doctor:      newCachedSetupDoctor(d.doctor),
-			Apps:        func() []localviewer.SetupApp { return setupApps(d.env()) },
-			MaxSessions: localcobrowse.DefaultMaxSessions,
-			Connect: func(name, path string) (localviewer.SetupConnectResult, error) {
-				return setupConnect(name, path, d.exe, d.env(), d.now())
-			},
-			Sessions: func() ([]localviewer.SetupSession, error) {
-				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-				defer cancel()
-				s, _, err := localviewer.RequestSummary(ctx, dir, nil)
-				return s, err
-			},
-			OpenViewer: func() error {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				_, file, err := localviewer.RequestLaunch(ctx, dir, nil)
-				if err != nil {
-					return err
-				}
-				if file == "" {
-					return errors.New("the viewer could not write its one-time launch file")
-				}
-				return d.openURL(file)
-			},
-			GenericEntry: genericEntry(d.exe),
+		Connect: func(name, path string) (localviewer.SetupConnectResult, error) {
+			return setupConnect(name, path, d.exe, d.env(), d.now())
 		},
-	})
+		Sessions: func() ([]localviewer.SetupSession, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			s, _, err := localviewer.RequestSummary(ctx, dir, nil)
+			return s, err
+		},
+		OpenViewer: func() error {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, file, err := localviewer.RequestLaunch(ctx, dir, nil)
+			if err != nil {
+				return err
+			}
+			if file == "" {
+				return errors.New("the viewer could not write its one-time launch file")
+			}
+			return d.openURL(file)
+		},
+		GenericEntry: genericEntry(d.exe),
+	}
+	var enroller *setupEnroller
+	if d.enroll != nil && d.enrollOptions != nil {
+		enroller = newSetupEnroller(d.enrollOptions, d.enroll, d.openURL, d.enrollAlready)
+		enroller.check = d.enrollCheck
+		enroller.posture = d.posture
+		enroller.quarantine = d.quarantine
+		enroller.hooks(setup)
+	}
+	// exclusive runs a Disconnect or worker start alone: never during an
+	// enrollment, and no enrollment starts while it runs.
+	exclusive := func(run func() (localviewer.SetupActionResult, error)) func() (localviewer.SetupActionResult, error) {
+		return func() (localviewer.SetupActionResult, error) {
+			if enroller != nil {
+				if err := enroller.beginAction(); err != nil {
+					return localviewer.SetupActionResult{}, err
+				}
+				defer enroller.endAction()
+			}
+			return run()
+		}
+	}
+	if d.disconnect != nil {
+		setup.Disconnect = exclusive(func() (localviewer.SetupActionResult, error) {
+			res := d.disconnect()
+			if enroller != nil && disconnectLoggedOut(res) {
+				enroller.resetAfterDisconnect()
+			}
+			return res, nil
+		})
+	}
+	if enroller != nil && d.posture != nil {
+		setup.RetryPosture = exclusive(enroller.retryPosture)
+	}
+	if d.worker != nil && enroller != nil {
+		setup.StartWorker = exclusive(func() (localviewer.SetupActionResult, error) {
+			return startSetupWorker(d.worker(enroller.workerOffered))
+		})
+	}
+	var nodePerms *localviewer.NodePermissionHooks
+	if d.nodePerms != nil {
+		var busy func() bool
+		if enroller != nil {
+			busy = enroller.Busy
+		}
+		nodePerms = d.nodePerms(busy)
+	}
+	return localviewer.New(localviewer.Config{
+		TokenDir:        dir,
+		PrivateDir:      localviewer.SetupDirName,
+		OpenURL:         d.openURL,
+		Now:             d.now,
+		MaxSessions:     localcobrowse.DefaultMaxSessions,
+		Setup:           setup,
+		NodePermissions: nodePerms,
+	}), enroller
 }
 
 // runLocalSetup serves the setup page, opens it, and blocks until ctx ends
-// (a signal, or the console window closing).
+// (a signal, or the console window closing). A running enrollment is then
+// canceled and given a bounded wait to roll back before the page closes.
 func runLocalSetup(ctx context.Context, d localSetupDeps, out io.Writer) error {
-	srv := newLocalSetupServer(d)
+	srv, enroller := newLocalSetupServer(d)
 	if err := srv.Start(); err != nil {
 		return err
 	}
 	defer srv.Close()
+	if enroller != nil {
+		defer enroller.Shutdown(setupEnrollShutdownWait)
+	}
 	if err := srv.Open(); err != nil {
 		link := srv.MintURL()
 		fmt.Fprintln(out, "Could not open a browser. Open this link (it works once, for two minutes):")
@@ -266,9 +368,10 @@ var localSetupCmd = &cobra.Command{
 	Short: "Open the guided setup page in your browser",
 	Long: `Opens a setup page in your default browser: a plain-language check of this
 computer, a Connect button for each agent app Citadel finds, and your live
-browser sessions. It runs on 127.0.0.1 only, behind a one-time link, and makes
-no network calls. On Windows it also opens when you double-click citadel.exe.
-Close this window to stop it.`,
+browser sessions. It runs on 127.0.0.1 only, behind a one-time link. It also
+has an optional button to connect this PC to AceTeam; it connects to AceTeam
+only when you click that button. On Windows it also opens when you double-click
+citadel.exe. Close this window to stop it.`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runLocalSetupCommand(cmd.OutOrStdout())

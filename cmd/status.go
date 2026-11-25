@@ -869,7 +869,7 @@ func printGPUInfo(w *tabwriter.Writer) {
 // unmanaged alike — with its owner and a reclaimable flag (issue #427). This is
 // the operator-facing view of the same snapshot the fabric pulls via /resources
 // and the RESOURCE_SNAPSHOT job: leftover test/dev services that silently pin
-// the GPU (the tei-gte leftover found on node 1054) show up here labeled "not
+// the GPU (as a leftover embedding service once did) show up here labeled "not
 // managed by citadel", so an operator can free them by hand.
 func printResourcesInfo(w *tabwriter.Writer) {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)

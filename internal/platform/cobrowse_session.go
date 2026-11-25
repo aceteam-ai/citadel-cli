@@ -33,6 +33,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
@@ -133,6 +134,10 @@ type CobrowseSessionStatus struct {
 	// and would append instead of replace. Reported only by non-tracking
 	// sessions, like FileUploadPageFence.
 	InputEdit string `json:"input_edit,omitempty"`
+	// Egress is EgressPublicOnly when every browser connection goes through an
+	// egress guard that refuses loopback, private, link-local and mesh
+	// addresses (citadel-cli#1867 C4b); absent when the session has no guard.
+	Egress string `json:"egress,omitempty"`
 	// PageText and PasswordField are page content signals for the platform's
 	// login-wall detection (aceteam#13773). Set only by WithPageSignals on a
 	// node-wide session's start and single-session status result; omitted on
@@ -241,12 +246,21 @@ func (m *CobrowseSessionManager) SetLaunchOptions(lo LaunchOptions) {
 // CobrowseSessionManager owns the map of concurrent, isolated browser sessions. Safe
 // for concurrent use.
 type CobrowseSessionManager struct {
-	mu          sync.Mutex
-	sessions    map[string]*cobrowseSession
-	maxSessions int
-	baseDir     string
-	sweepOnce   sync.Once
-	launchOpts  LaunchOptions
+	mu       sync.Mutex
+	sessions map[string]*cobrowseSession
+	// recoveryDone holds recovery handles whose browser exit and cleanup were
+	// confirmed, by whichever stop path ran it, so the journal can terminalize
+	// a record after the session left the map. In memory only: a restart loses
+	// it and the record stays unknown (never falsely stopped).
+	recoveryDone map[string]struct{}
+	// recoveryHeld holds recovery sessions a shutdown path took out of the map
+	// and has not resolved yet (or deliberately left running for re-adoption).
+	// A concurrent stop treats them as present and unconfirmed, never stopped.
+	recoveryHeld map[string]*cobrowseSession
+	maxSessions  int
+	baseDir      string
+	sweepOnce    sync.Once
+	launchOpts   LaunchOptions
 	// trackTargets, targetPolicy and targetEvent are set by
 	// EnableTargetTracking for newly created sessions.
 	trackTargets bool
@@ -256,9 +270,15 @@ type CobrowseSessionManager struct {
 	// attach (SetFilesAllowed). Nil denies, so a manager nobody wired never lets
 	// a viewer attach (local mode is one).
 	filesAllowed func() bool
+	// egressRequired is this manager's public-only source (SetEgressRequired).
+	// Nil falls back to the node source for the node-wide manager only.
+	egressRequired func() bool
 	// useResolver is set on the process-wide manager only, so its registry
 	// follows registryDirResolver; other managers keep a sibling of baseDir.
 	useResolver bool
+	// egressSweepStop ends the running unguarded-session sweep
+	// (startEgressSweep); nil when none runs. Guarded by mu.
+	egressSweepStop chan struct{}
 }
 
 // SessionProfile is an encrypted, PIN-unlocked persistent profile bound to one
@@ -290,6 +310,9 @@ type cobrowseSession struct {
 	id        string
 	profile   string
 	startedAt time.Time
+	// egress is EgressPublicOnly when the browser runs behind its own egress
+	// guard (set once at launch, guarded by mu); empty otherwise.
+	egress string
 	// workDir is where the browser profile working copy lives: profile itself
 	// for host runners, <profile>/profile for a container session. Guarded by mu;
 	// empty means profile.
@@ -297,12 +320,21 @@ type cobrowseSession struct {
 
 	// encProfile is the encrypted persistent profile for this session, or nil for a
 	// throwaway session. When set, teardown persists (only if the browser ran) and
-	// always Closes it.
+	// closes it on legacy teardown; recovery retains it until cleanup can finish.
 	encProfile SessionProfile
 
-	mu    sync.Mutex
-	state CobrowseSessionState
-	proc  *cobrowseProc
+	// Recovery cleanup keeps custody through retryable persistence/removal
+	// failures. These stages are protected by teardownMu, not execution authority.
+	recoveryStopped   bool
+	recoveryPersisted bool
+	recoveryClosed    bool
+	// launchFailed marks a recovery session kept after a failed launch whose
+	// cleanup could not yet be confirmed; a custody stop retries that check.
+	launchFailed bool
+	teardownMu   sync.Mutex
+	mu           sync.Mutex
+	state        CobrowseSessionState
+	proc         *cobrowseProc
 	// lastURL is the last page URL a probe read; status falls back to it when
 	// the DevTools endpoint is slow (citadel-cli#1663).
 	lastURL string
@@ -474,12 +506,45 @@ func (m *CobrowseSessionManager) StartSessionWithID(id, startURL string, profile
 	return m.startSession(id, startURL, profile)
 }
 
+// StartRecoverySessionWithID consumes a pre-journaled recovery handle. Its
+// 128-bit identity is distinct from local mode's reserved session ID format.
+// Both paths share the same duplicate and profile-custody checks below.
+func (m *CobrowseSessionManager) StartRecoverySessionWithID(id, startURL string, profile SessionProfile) (CobrowseSessionStatus, error) {
+	if !recoveryScopedID(id) {
+		if profile != nil {
+			_ = profile.Close()
+		}
+		return CobrowseSessionStatus{}, notLaunched(fmt.Errorf("invalid preassigned browser session ID"))
+	}
+	return m.startSession(id, startURL, profile)
+}
+
+// recoveryScopedID reports whether id is a pre-journaled recovery handle
+// ("cb-" plus 32 lowercase hex). Such a session is stopped only under recovery
+// custody, whichever path asks for the stop.
+func recoveryScopedID(id string) bool {
+	raw, err := hex.DecodeString(strings.TrimPrefix(id, "cb-"))
+	return len(id) == 35 && strings.HasPrefix(id, "cb-") && err == nil && len(raw) == 16 && strings.ToLower(id) == id
+}
+
+// ErrSessionNotLaunched marks a start refused before a session slot was taken,
+// so no browser process can exist for it. Recovery maps it to a failed (not
+// attempted) launch; any other start error may have left a process behind.
+var ErrSessionNotLaunched = errors.New("co-browse session was not launched")
+
+type notLaunchedError struct{ err error }
+
+func (e notLaunchedError) Error() string   { return e.err.Error() }
+func (e notLaunchedError) Unwrap() []error { return []error{e.err, ErrSessionNotLaunched} }
+
+func notLaunched(err error) error { return notLaunchedError{err} }
+
 func (m *CobrowseSessionManager) startSession(id, startURL string, profile SessionProfile) (status CobrowseSessionStatus, err error) {
 	if err := ValidateCobrowseURL(startURL); err != nil {
 		if profile != nil {
 			profile.Close()
 		}
-		return CobrowseSessionStatus{}, err
+		return CobrowseSessionStatus{}, notLaunched(err)
 	}
 	m.mu.Lock()
 	tracking, policy := m.trackTargets, m.targetPolicy
@@ -496,13 +561,23 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 			if profile != nil {
 				_ = profile.Close()
 			}
-			return CobrowseSessionStatus{}, err
+			return CobrowseSessionStatus{}, notLaunched(err)
 		}
 	}
 	// Reap orphans from a prior crashed process before the first launch of this one.
 	m.sweepOnce.Do(m.sweep)
 
 	m.mu.Lock()
+	_, held := m.recoveryHeld[id]
+	if _, exists := m.sessions[id]; exists || held {
+		m.mu.Unlock()
+		if profile != nil {
+			_ = profile.Close()
+		}
+		// Deliberately not ErrSessionNotLaunched: a browser already holds this
+		// handle, so recovery must keep custody of it rather than fail the job.
+		return CobrowseSessionStatus{}, fmt.Errorf("browser session ID already exists")
+	}
 	if len(m.sessions) >= m.maxSessions {
 		max := m.maxSessions
 		m.mu.Unlock()
@@ -510,17 +585,11 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 		if profile != nil {
 			_ = profile.Close()
 		}
-		return CobrowseSessionStatus{}, fmt.Errorf(
+		return CobrowseSessionStatus{}, notLaunched(fmt.Errorf(
 			"too many co-browse sessions (%d running); stop one first or raise %s",
-			max, EnvCobrowseMaxSessions)
+			max, EnvCobrowseMaxSessions))
 	}
-	if _, taken := m.sessions[id]; taken {
-		m.mu.Unlock()
-		if profile != nil {
-			_ = profile.Close()
-		}
-		return CobrowseSessionStatus{}, fmt.Errorf("co-browse session %s already exists", id)
-	}
+
 	s := &cobrowseSession{
 		id:         id,
 		profile:    filepath.Join(m.baseDir, id),
@@ -533,6 +602,9 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 		policy:     m.targetPolicy,
 	}
 	m.sessions[id] = s
+	// A new session under a handle voids any earlier confirmed-stop evidence
+	// for it: that evidence describes a previous browser, not this one.
+	delete(m.recoveryDone, id)
 	m.mu.Unlock()
 
 	proc, err := m.launch(s, startURL)
@@ -545,6 +617,9 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 		delete(m.sessions, id)
 		m.mu.Unlock()
 		_ = s.teardown()
+		if recoveryScopedID(id) {
+			m.settleFailedRecoveryLaunch(s)
+		}
 		return CobrowseSessionStatus{}, err
 	}
 
@@ -572,6 +647,18 @@ func (m *CobrowseSessionManager) startSession(id, startURL string, profile Sessi
 		return CobrowseSessionStatus{}, fmt.Errorf("session %s was stopped during launch", id)
 	}
 	m.mu.Unlock()
+
+	if s.egressGuarded() && startURL != "" && !strings.EqualFold(startURL, "about:blank") {
+		// The browser launched on about:blank and passed its route check; only
+		// now is the start URL requested (once).
+		nctx, ncancel := context.WithTimeout(context.Background(), egressFirstNavigateWait)
+		err := egressFirstNavigate(nctx, s, startURL)
+		ncancel()
+		if err != nil {
+			_ = m.Stop(id)
+			return CobrowseSessionStatus{}, fmt.Errorf("public-only session could not open its start page: %w", err)
+		}
+	}
 
 	st := s.status()
 	if startURL != "" && !strings.EqualFold(startURL, "about:blank") {
@@ -626,15 +713,24 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	if err := os.MkdirAll(s.profile, 0o700); err != nil {
 		return nil, fmt.Errorf("create session profile dir: %w", err)
 	}
+	// Public-only is read live per session start (citadel-cli#1867 C4b). It is
+	// decided before the container choice: a guarded session runs on the host.
+	publicOnly := m.egressRequiredNow()
 	// A container session mounts only <session>/profile, so the profile working
 	// copy lives there; everything else stays out of the container's reach.
 	useContainer := false
 	workDir := s.profile
 	if ch, ok := activeBrowserRunner.(containerChooser); ok && ch.useContainer(m.useResolver) {
-		useContainer = true
-		workDir = filepath.Join(s.profile, containerProfileSubdir)
-		if err := os.MkdirAll(workDir, 0o700); err != nil {
-			return nil, fmt.Errorf("create container profile dir: %w", err)
+		if publicOnly {
+			egressContainerNote.Do(func() {
+				log.Printf("[cobrowse] public-only sessions run on the host browser behind the egress guard, not in the browser-runtime container")
+			})
+		} else {
+			useContainer = true
+			workDir = filepath.Join(s.profile, containerProfileSubdir)
+			if err := os.MkdirAll(workDir, 0o700); err != nil {
+				return nil, fmt.Errorf("create container profile dir: %w", err)
+			}
 		}
 	}
 	s.mu.Lock()
@@ -670,21 +766,45 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 	m.mu.Unlock()
 	lo.Detach = m.useResolver && detachedWorker.Load()
 	lo.UseContainer = useContainer
-	proc, err := launchCobrowseProc(s.profile, startURL, lo)
+	var guard *browserurl.EgressGuard
+	if publicOnly {
+		g, err := startEgressForLaunch(s.id, &lo)
+		if err != nil {
+			return nil, err
+		}
+		guard = g
+	}
+	// A guarded browser opens on about:blank: nothing may load before the route
+	// check below proves its traffic goes through the guard. startSession
+	// navigates to the start URL afterwards, exactly once.
+	launchURL := startURL
+	if guard != nil {
+		launchURL = "about:blank"
+		if enc != nil {
+			// A restored profile could reopen its last tabs at startup,
+			// before the route check; drop the saved session state.
+			if err := clearSessionRestore(workDir); err != nil {
+				guard.Close()
+				return nil, err
+			}
+		}
+	}
+	proc, err := launchCobrowseProc(s.profile, launchURL, lo)
 	if err != nil {
+		if guard != nil {
+			guard.Close()
+		}
 		return nil, err
+	}
+	var guardStopped <-chan struct{}
+	if guard != nil {
+		guardStopped = guardProc(proc, guard, s.id)
 	}
 	// Best-effort pidfile so a future process can reap this browser + Xvfb if THIS
 	// process is SIGKILLed before graceful teardown. A write failure is non-fatal:
 	// the session still runs and graceful stop still reaps it in-process.
 	writeSessionPidfile(s.profile, os.Getpid(), proc.browserPID, proc.xvfbPID, currentProcessStartToken())
 
-	// Configure the page policy before the session is visible to status or
-	// actions, so no page is ever accepted without it.
-	if s.tracking {
-		dropTargetSet(proc.debugPort)
-		targetSetFor(proc.debugPort).configure(s.id, tpolicy, tevent)
-	}
 	// Learn the browser's CDP id before the session is visible and before the
 	// chooser watcher exists, on every OS, so the watcher can always verify it.
 	if proc.browserID == "" && proc.debugPort > 0 {
@@ -692,14 +812,40 @@ func (m *CobrowseSessionManager) launch(s *cobrowseSession, startURL string) (*c
 			proc.browserID = id
 		}
 	}
+	// Public-only: prove the browser really sends traffic through its guard
+	// before the session becomes usable (a managed proxy policy could route
+	// it elsewhere). Stopping the proc also closes the guard. This runs
+	// before the page set below exists, so the canary's short-lived tab is
+	// never tracked (or picked as the active page).
+	if guard != nil {
+		if err := egressRouteCheck(proc, guard); err != nil {
+			dropTargetSet(proc.debugPort)
+			_ = proc.stop()
+			return nil, err
+		}
+	}
+	// Configure the page policy before the session is visible to status or
+	// actions, so no page is ever accepted without it.
+	if s.tracking {
+		dropTargetSet(proc.debugPort)
+		targetSetFor(proc.debugPort).configure(s.id, tpolicy, tevent)
+	}
 	s.mu.Lock()
 	s.proc = proc
 	s.state = SessionRunning
 	s.persistent = enc != nil
+	if guard != nil {
+		s.egress = EgressPublicOnly
+	}
 	s.mu.Unlock()
 	s.startChooserWatch(proc.debugPort)
 	// Durable registry record so a restart by exec can re-adopt this session.
 	s.persistRecord()
+	if guard != nil {
+		go m.watchGuard(s.id, guard.Failed(), guardStopped)
+	} else {
+		m.startEgressSweep()
+	}
 	return proc, nil
 }
 
@@ -760,6 +906,9 @@ func (m *CobrowseSessionManager) setAttached(id string, attached bool) bool {
 // Stop tears down one session (browser + Xvfb) and removes its throwaway profile dir.
 // Safe to call for an unknown id (returns nil) so a double-stop is not an error.
 func (m *CobrowseSessionManager) Stop(id string) error {
+	if recoveryScopedID(id) {
+		return m.stopRecoveryScoped(id)
+	}
 	m.mu.Lock()
 	s, ok := m.sessions[id]
 	delete(m.sessions, id)
@@ -774,14 +923,14 @@ func (m *CobrowseSessionManager) Stop(id string) error {
 // display orphans across a worker restart. Best-effort: a failure on one session does
 // not skip the rest; the last error is returned.
 func (m *CobrowseSessionManager) StopAll() error {
+	m.stopEgressSweep()
 	m.mu.Lock()
-	all := m.sessions
-	m.sessions = make(map[string]*cobrowseSession)
+	all := m.takeAllLocked()
 	m.mu.Unlock()
 
 	var lastErr error
 	for _, s := range all {
-		if err := s.teardown(); err != nil {
+		if err := m.stopRemoved(s); err != nil {
 			lastErr = err
 		}
 	}
@@ -790,34 +939,28 @@ func (m *CobrowseSessionManager) StopAll() error {
 
 // teardown kills the session's processes (if launched), persists the encrypted
 // profile (only if the browser actually ran), Closes the profile, and removes the
-// plaintext working dir. Every cleanup path routes through here, so the profile is
-// always Closed exactly-effectively-once (Close is idempotent) — the unlocked key
-// and the single-session lock cannot leak.
+// plaintext working dir on legacy cleanup paths, so the profile is
+// always Closed exactly-effectively-once (Close is idempotent). Scoped recovery
+// instead uses finishRecoveryCleanup to retain custody across retryable failure.
 func (s *cobrowseSession) teardown() error {
+	s.teardownMu.Lock()
+	defer s.teardownMu.Unlock()
 	s.mu.Lock()
 	proc := s.proc
 	s.proc = nil
 	profile := s.profile
-	workDir := s.workDir
-	if workDir == "" {
-		workDir = profile
-	}
+	workDir := sealDir(profile, s.workDir)
 	enc := s.encProfile
 	s.encProfile = nil
 	regDir := s.regDir
 	s.mu.Unlock()
-	s.stopChooserWatch()
-	// No stage may start from here on; one already running has finished.
-	// Staged user files go first, so a persistent profile's sealed copy can
-	// never contain them.
-	s.closeStaging()
-	_ = s.removeStagingDir()
+	s.quiesceStaging()
 	// A stopped session leaves no registry record: it did not "end" unexpectedly.
 	if regDir != "" {
 		deleteRecord(regDir, s.id)
 	}
 
-	var err, reapErr error
+	var err error
 	if enc != nil && proc != nil {
 		// A persistent profile is sealed from what the browser wrote to disk.
 		// Chromium keeps recent cookie and login writes in memory and commits
@@ -831,15 +974,8 @@ func (s *cobrowseSession) teardown() error {
 	}
 	if proc != nil {
 		dropTargetSet(proc.debugPort)
-		// The main process is dead; its helpers may not be yet, and they
-		// recreate files under the profile. Nothing is sealed until they are
-		// gone (citadel-cli#1836); a survivor fails closed below.
-		reapErr = reapProfileUsers(profile, proc.browserScope)
 	}
-	// Again after the browser is gone (it may have held a staged file open),
-	// and always before Persist seals anything. A dir that cannot be removed
-	// is never sealed.
-	stageErr := s.removeStagingDir()
+	reapErr, stageErr := s.settleBeforeSeal(proc)
 	if enc != nil {
 		// Persist ONLY if the browser ran (proc != nil): a failed launch never
 		// produced new state, and sealing an empty/partial working dir would
@@ -855,30 +991,26 @@ func (s *cobrowseSession) teardown() error {
 				if err == nil {
 					err = stageErr
 				}
+			} else if s.recoveryPersisted {
+				// Recovery cleanup already sealed this exact working copy.
 			} else if perr := enc.Persist(workDir); perr != nil && err == nil {
 				err = perr
 			}
 		}
 		// Close zeroes the unlocked key material and releases the profile's
-		// single-session lock, always — even when Persist failed above.
-		_ = enc.Close()
+		// single-session lock, always — even when Persist failed above —
+		// unless recovery cleanup already closed it.
+		if !s.recoveryClosed {
+			_ = enc.Close()
+		}
 	}
 	// Remove the plaintext working dir so a stopped session leaves no decrypted
 	// cookies (and no throwaway state) behind. The pidfile lives under it and goes
 	// too. For a persistent profile the durable state now lives only as ciphertext.
 	if profile != "" {
-		rerr := removeSessionDir(profile)
-		// A helper can recreate the tree after a removal that succeeded, so
-		// with a browser involved re-reap and re-check until the dir is gone.
-		for i := 0; proc != nil && i < 3; i++ {
-			if r := reapProfileUsers(profile, proc.browserScope); r != nil && reapErr == nil {
-				reapErr = r
-			}
-			if _, serr := os.Lstat(profile); os.IsNotExist(serr) {
-				rerr = nil
-				break
-			}
-			rerr = removeSessionDir(profile)
+		rerr, r := removeProfileWorkDir(profile, proc)
+		if r != nil && reapErr == nil {
+			reapErr = r
 		}
 		if rerr != nil && enc != nil && err == nil {
 			// A persistent session's working dir holds decrypted cookies; a
@@ -890,6 +1022,58 @@ func (s *cobrowseSession) teardown() error {
 		err = reapErr
 	}
 	return err
+}
+
+// sealDir is the directory a persistent profile is sealed from: the
+// session's workDir (the container profile subdirectory for a container
+// session), else the session dir itself.
+func sealDir(profile, workDir string) string {
+	if workDir == "" {
+		return profile
+	}
+	return workDir
+}
+
+// quiesceStaging is the first step of every stop: no chooser is filled and no
+// stage may start from here on (one already running has finished), and staged
+// user files are removed first, so a persistent profile's sealed copy can never
+// contain them. The removal here is best effort; settleBeforeSeal checks again.
+func (s *cobrowseSession) quiesceStaging() {
+	s.stopChooserWatch()
+	s.closeStaging()
+	_ = s.removeStagingDir()
+}
+
+// settleBeforeSeal runs after the browser process stopped and before anything
+// is sealed. The main process is dead; its helpers may not be yet, and they
+// recreate files under the profile, so nothing is sealed until they are gone
+// (citadel-cli#1836). The staging dir is removed again (the browser may have
+// held a staged file open). A non-nil result from either means the profile
+// must not be sealed.
+func (s *cobrowseSession) settleBeforeSeal(proc *cobrowseProc) (reapErr, stageErr error) {
+	if proc != nil {
+		reapErr = reapProfileUsers(s.profile, proc.browserScope)
+	}
+	return reapErr, s.removeStagingDir()
+}
+
+// removeProfileWorkDir removes the plaintext session dir. A helper can recreate
+// the tree after a removal that succeeded, so with a browser involved it
+// re-reaps and re-checks until the dir is gone. reapErr is the first reap
+// failure seen here.
+func removeProfileWorkDir(profile string, proc *cobrowseProc) (rerr, reapErr error) {
+	rerr = removeSessionDir(profile)
+	for i := 0; proc != nil && i < 3; i++ {
+		if r := reapProfileUsers(profile, proc.browserScope); r != nil && reapErr == nil {
+			reapErr = r
+		}
+		if _, serr := os.Lstat(profile); os.IsNotExist(serr) {
+			rerr = nil
+			break
+		}
+		rerr = removeSessionDir(profile)
+	}
+	return rerr, reapErr
 }
 
 // status computes the live queryable state, detecting a crashed browser via the
@@ -983,6 +1167,7 @@ func (s *cobrowseSession) statusBase() (CobrowseSessionStatus, int) {
 		Profile:    s.profile,
 		Driver:     driverFor(s.humanDrivingLocked()),
 		Generation: s.generation,
+		Egress:     s.egress,
 	}
 	if !s.tracking {
 		st.FileUploadPageFence = FileUploadPageFenceV1

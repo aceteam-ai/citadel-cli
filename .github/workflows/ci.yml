@@ -121,7 +121,7 @@ jobs:
     name: Build + Test
     runs-on: ubuntu-latest
     if: always()
-    needs: [check, test]
+    needs: [check, test, macos-cobrowse]
     steps:
       - name: All build and test jobs succeeded
         env:
@@ -134,6 +134,48 @@ jobs:
               exit 1
             fi
           done
+
+  # macOS co-browse gate (citadel-cli#1903, #1909). Runs the darwin-tagged
+  # host-runner, session-dir and local-mode tests on GitHub-hosted macos-latest.
+  # It is a Build + Test dependency (#1913), so a red run blocks merging.
+  macos-cobrowse:
+    name: macOS co-browse (unit)
+    runs-on: macos-latest
+    # A hung job would otherwise hold Build + Test for the 6-hour default.
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet (local-mode packages)
+        run: go vet ./internal/platform/ ./internal/localcobrowse/ ./internal/localviewer/ ./internal/localaudit/ ./internal/cobrowsestream/ ./internal/cobrowseprofile/ ./internal/nodevault/ ./internal/browserurl/
+
+      # The macOS host runner (#1635): discovery, the owner start-time token,
+      # the verified process-group kill and the session-dir trust checks. The
+      # darwin-tagged tests only run here. A pattern with no matching test yet
+      # passes, so this step is live as each macOS slice lands.
+      - name: macOS runner and session dirs (darwin-only paths)
+        run: go test ./internal/platform/ -count=1 -run '^(TestMac|TestDarwin|TestValidatePrivateSessionDir|TestBuildChromeArgs|TestCobrowse|TestSweep|TestOrphan)'
+
+      - name: Local co-browse service, owner lock, viewer and audit log
+        run: go test ./internal/localcobrowse/... ./internal/localviewer/ ./internal/localaudit/ -count=1
+
+      - name: Saved-logins profile store and at-rest passphrase
+        run: |
+          go test ./internal/cobrowseprofile/ -count=1
+          go test ./internal/nodevault/ -count=1 -run '^(TestAtRest|TestSetPassphrase|TestUnlockAtRest|TestChangePassphrase|TestWeakSecret|TestRemoveKeeps|TestNonFinitePolicy|TestSavePolicyRejects)'
+
+      - name: Egress guard (darwin route data)
+        run: go test ./internal/browserurl/ -count=1
+
+      - name: citadel local mcp and doctor
+        run: go test ./cmd/ -count=1 -run '^(TestHarnessPaths|TestRenderBlocks|TestMerge|TestRunLocalConfig|TestDetectHarness|TestLocalDoctor|TestLocalAudit|TestLocalMCP|TestLocalMode|TestLocalViewer|TestNewLocalMCPTools|TestLocalToolNamesDoNotCollide|TestNoLocalMCPToolCanApprove|TestLocalPassphrase|TestLocalProfileStore|TestLocalStoreDirsArePrivate|TestSignalDuringClose)'
 
   # Windows co-browse gate (aceteam#13503 local mode, citadel-cli#1548). The
   # jobs above only cross-compile for Windows, so before this no co-browse code
@@ -179,6 +221,17 @@ jobs:
 
       - name: Self-update recovery and swap (Windows-only paths)
         run: go test ./internal/update/ -count=1 -v -run '^(TestRecoverInterruptedSwap_NoLockNoArtifactsIsSilent|TestRecoverInterruptedSwap_RefusesMissingValidatedLock|TestRecoverInterruptedSwap_ExposedWrapperIsWindowsScoped|TestRecoveryOwnerAuthority)$'
+
+      # #1867 setup-page enrollment and the per-user worker (#1873, #1876):
+      # the node-dir trust check, the HKCU Run value, the supervisor and the
+      # worker lock's Windows byte-range record. A pattern with no matching
+      # test yet passes, so this step is live as each slice lands.
+      - name: Setup-page enrollment and per-user worker (Windows-only paths)
+        run: |
+          go test ./cmd/ -count=1 -run '^(TestSetupEnroll|TestCheckSetupNodeDir|TestSetupRoutesAreGuarded|TestSetupVerificationURL|TestSetupPageChecks|TestBackgroundArgv|TestSupervisedByUserSupervisor|TestStopUserWorker|TestWatchStopFile|TestOpenBackgroundLog|TestLocalDoctorReportsUserWorker|TestAgentUpdateIsService)'
+          go test ./internal/network/ -count=1 -run '^TestCheckMachineConfigDir'
+          go test ./internal/service/ -count=1 -run '^(TestSupervisor|TestBuildRunValue|TestParseRunValue|TestRunValueRegistryRoundTrip|TestAutostartStatus)'
+          go test ./internal/worklock/ -count=1 -run '^TestAcquireFile'
 
       - name: Unit tests (Windows-portable subset)
         run: >-

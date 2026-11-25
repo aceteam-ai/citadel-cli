@@ -82,6 +82,11 @@ type CobrowseSessionHandler struct {
 	// a handler built without a permission source never writes a user file.
 	// Other session actions are not affected.
 	Enabled func() bool
+
+	recoveryNodeID string
+	recoveryOrgID  string
+	recoveryRoot   func() string
+	recoveryOps    func(*nexus.Job) recoveryBrowserOps
 }
 
 func (h *CobrowseSessionHandler) filesAllowed() bool {
@@ -89,7 +94,16 @@ func (h *CobrowseSessionHandler) filesAllowed() bool {
 }
 
 // NewCobrowseSessionHandler constructs an interactive browser-session handler.
-func NewCobrowseSessionHandler() *CobrowseSessionHandler { return &CobrowseSessionHandler{} }
+func NewCobrowseSessionHandler() *CobrowseSessionHandler {
+	return NewCobrowseSessionHandlerForNode("", "")
+}
+
+// NewCobrowseSessionHandlerForNode enables scoped recovery only for a configured
+// node identity and the organization that owns this node's per-node stream.
+// Legacy paid starts without recovery scope retain their path.
+func NewCobrowseSessionHandlerForNode(nodeID, orgID string) *CobrowseSessionHandler {
+	return &CobrowseSessionHandler{recoveryNodeID: nodeID, recoveryOrgID: orgID, recoveryRoot: network.GetNodeConfigDir}
+}
 
 // NewCobrowseSessionHandlerWithManager uses an isolated session manager. Production
 // uses NewCobrowseSessionHandler and the node-wide tracked manager.
@@ -171,6 +185,10 @@ func (h *CobrowseSessionHandler) execute(ctx JobContext, job *nexus.Job, mgr *pl
 	// Log the action and profile name only; the "pin" field is a secret and is
 	// never logged here or passed anywhere but nodevault's Unlock.
 	ctx.Log("info", "     - [Job %s] browser-session action: %s", job.ID, action)
+
+	if action == "job_status" || action == "stop_by_job_id" || (action == "start" && hasRecoveryScope(job)) {
+		return h.recoverJob(action, job, mgr)
+	}
 
 	switch action {
 	case "capabilities":

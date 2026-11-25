@@ -94,7 +94,7 @@ func runFineTuneYieldScenario(t *testing.T, cfg FineTuneConfig, training, demand
 	}
 	demandHandler := NewMockJobHandler(demand.Type, false)
 	runner := NewRunner(source, []JobHandler{NewFineTuneHandler(cfg), demandHandler}, RunnerConfig{
-		NodeID: "1297", MaxConcurrency: 2, State: NewWorkerState(), ActivityFn: func(string, string) {},
+		NodeID: "4321", MaxConcurrency: 2, State: NewWorkerState(), ActivityFn: func(string, string) {},
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -249,7 +249,7 @@ func TestFineTuneQueuedBeforeExecuteStillPreemptsBeforeDemand(t *testing.T) {
 	}
 	demandHandler := NewMockJobHandler(demand.Type, false)
 	runner := NewRunner(source, []JobHandler{blocker, NewFineTuneHandler(cfg), demandHandler}, RunnerConfig{
-		NodeID: "1297", MaxConcurrency: 2, State: NewWorkerState(), ActivityFn: func(string, string) {},
+		NodeID: "4321", MaxConcurrency: 2, State: NewWorkerState(), ActivityFn: func(string, string) {},
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)

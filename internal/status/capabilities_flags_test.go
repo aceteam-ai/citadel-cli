@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -298,5 +299,33 @@ func TestPopulateServicesRetainsOnlyLiveServingVLLM(t *testing.T) {
 	populateServices(caps, "linux", func() int { return 0 })
 	if slices.Contains(caps.AvailableServices, "vllm") {
 		t.Fatal("cached engine was treated as serving")
+	}
+}
+
+func TestCobrowseRecoveryCapabilityJSONAndLiveProvider(t *testing.T) {
+	enabled := true
+	c := NewCollector(CollectorConfig{CobrowseJobRecovery: func() bool { return enabled }})
+	for _, want := range []bool{true, false} {
+		enabled = want
+		st, err := c.Collect()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.Capabilities.CobrowseJobRecovery == nil || *st.Capabilities.CobrowseJobRecovery != want {
+			t.Fatal("stale recovery capability")
+		}
+		b, _ := json.Marshal(st.Capabilities)
+		if !strings.Contains(string(b), `"cobrowse_job_recovery":`+strconv.FormatBool(want)) {
+			t.Fatalf("wrong wire key: %s", b)
+		}
+	}
+	cached := true
+	c = NewCollector(CollectorConfig{Capabilities: &NodeCapabilities{CobrowseJobRecovery: &cached}})
+	st, err := c.Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Capabilities.CobrowseJobRecovery != nil {
+		t.Fatal("cached capability survived missing live provider")
 	}
 }

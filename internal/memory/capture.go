@@ -10,11 +10,15 @@ import (
 )
 
 // CaptureNote persists a durable note to the memory substrate via memory_write.
-// name is a kebab-case slug; scope defaults to "global" server-side when empty.
+// name is a kebab-case slug; scope is required: an empty scope would default to the shared
+// "global" scope server-side, so it is refused here.
 // Returns the tool output (best-effort).
 func CaptureNote(ctx context.Context, cfg *Config, name, content, description, scope string) (string, error) {
 	if err := cfg.ValidateCredential(); err != nil {
 		return "", err
+	}
+	if strings.TrimSpace(scope) == "" {
+		return "", fmt.Errorf("empty scope; refusing to write into the server default")
 	}
 	if strings.TrimSpace(content) == "" {
 		return "", fmt.Errorf("empty content; nothing to capture")
@@ -36,9 +40,7 @@ func CaptureNote(ctx context.Context, cfg *Config, name, content, description, s
 	if description != "" {
 		args["description"] = description
 	}
-	if scope != "" {
-		args["scope"] = scope
-	}
+	args["scope"] = scope
 	return client.CallTool(ctx, "memory_write", args)
 }
 

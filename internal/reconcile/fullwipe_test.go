@@ -135,7 +135,7 @@ func TestRefuseFullWipeSurfacesReportFailure(t *testing.T) {
 // fabric_node_module_desired row for this node at all) must not be treated as
 // "misconfigured". Before this fix EVERY node hit this path forever, because
 // nothing writes that durable store yet: the guard fired and errored on every
-// single pass (4574+ times over 5+ days, observed on node 1297). It must now
+// single pass (4574+ times over 5+ days, observed on a dev node). It must now
 // succeed as a no-op converge (nothing installed, nothing uninstalled) while
 // still reporting the observed actual state, exactly like a legitimate
 // converged pass.
@@ -145,7 +145,7 @@ func TestRefuseFullWipeSkipsNeverManagedNode(t *testing.T) {
 		InstalledModule{Name: "b", Source: "src-b", Health: HealthRunning},
 	)
 	provider := &FakeProvider{Desired: DesiredState{Revision: "0"}} // never managed
-	rec := NewReconciler(provider, ops, "node-1297")
+	rec := NewReconciler(provider, ops, "node-4321")
 	rec.RefuseFullWipe = true
 
 	plan, _, err := rec.ReconcileOnce(context.Background())

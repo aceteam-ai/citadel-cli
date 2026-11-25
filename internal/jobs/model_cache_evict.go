@@ -61,6 +61,9 @@ func (h *ModelCacheEvictHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 	case "ollama":
 		return h.evictOllama(ctx, job.ID, modelName)
 	case "vllm":
+		if !validHFRepoID(modelName) {
+			return nil, ErrUnsafeModelPath
+		}
 		return h.evictHuggingFace(ctx, job.ID, modelName, engine)
 	case "llamacpp":
 		// Routed separately from vllm (citadel #906 / #682 P1): llamacpp's
@@ -77,6 +80,9 @@ func (h *ModelCacheEvictHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte
 
 // evictOllama runs `ollama rm <model>` to remove the model from the local cache.
 func (h *ModelCacheEvictHandler) evictOllama(ctx JobContext, jobID, modelName string) ([]byte, error) {
+	if !validModelArgument(modelName) {
+		return nil, ErrUnsafeModelArgument
+	}
 	ctx.Log("info", "     - [Job %s] Evicting model '%s' from ollama cache", jobID, modelName)
 
 	cmd := exec.Command("ollama", "rm", modelName)
@@ -134,15 +140,18 @@ func (h *ModelCacheEvictHandler) evictHuggingFace(ctx JobContext, jobID, modelNa
 // file(s) to remove.
 func (h *ModelCacheEvictHandler) evictLlamaCppGGUF(ctx JobContext, jobID, modelName string) ([]byte, error) {
 	dir := llamaCppCacheDir()
-	base := filepath.Base(modelName)
+	// A repo-style "org/name" value names its file by the last element; that
+	// element must still be one plain file name directly under dir.
+	base := modelName
+	if i := strings.LastIndexByte(base, '/'); i >= 0 {
+		base = base[i+1:]
+	}
+	if !validModelPathComponent(base) {
+		return nil, ErrUnsafeModelPath
+	}
 	candidate := filepath.Join(dir, base)
-
-	// filepath.Base already collapses any path traversal in modelName down to
-	// a bare filename, but guard explicitly anyway: refuse rather than
-	// silently resolve outside dir on an unexpected input shape (e.g.
-	// modelName == ".." or "").
-	if base == "." || base == ".." || base == string(filepath.Separator) || filepath.Dir(candidate) != filepath.Clean(dir) {
-		return nil, fmt.Errorf("invalid model name %q for llamacpp eviction", modelName)
+	if filepath.Dir(candidate) != filepath.Clean(dir) {
+		return nil, ErrUnsafeModelPath
 	}
 
 	ctx.Log("info", "     - [Job %s] Evicting GGUF file '%s' from llamacpp cache", jobID, base)
