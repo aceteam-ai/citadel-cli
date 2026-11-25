@@ -33,8 +33,8 @@ func TestLegacyMutationLockCrossProcess(t *testing.T) {
 		return
 	}
 	root := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", root)
-	t.Setenv("LOCALAPPDATA", root)
+	t.Setenv("XDG_CONFIG_HOME", root)
+	t.Setenv("APPDATA", root)
 	cmd := exec.Command(os.Args[0], "-test.run=^TestLegacyMutationLockCrossProcess$")
 	cmd.Env = append(os.Environ(), "CITADEL_TEST_COMPOSE_LOCK_HELPER=1", "CITADEL_TEST_COMPOSE_LOCK_ROOT="+root)
 	stdin, err := cmd.StdinPipe()

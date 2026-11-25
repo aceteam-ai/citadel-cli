@@ -41,7 +41,7 @@ var legacyCleanupMu sync.Mutex
 // as the same user. Never remove its file: replacing the inode would split the
 // lock between old and new holders.
 func withLegacyMutationLock(engineBin, serviceName string, fn func() error) error {
-	root, err := os.UserCacheDir()
+	root, err := os.UserConfigDir()
 	if err != nil {
 		return fmt.Errorf("locate compose mutation lock: %w", err)
 	}
