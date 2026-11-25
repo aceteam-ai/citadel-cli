@@ -15,6 +15,69 @@ import (
 )
 
 // These wiring regressions use isolated fixture state and injected GPU/runtime observations.
+func TestBootNativeCUDAAdmission(t *testing.T) {
+	for _, kind := range []string{"native", ""} {
+		for _, tc := range []struct {
+			name        string
+			gpu         int
+			serving     bool
+			wantStarts  int
+			wantRunning int
+		}{
+			{name: "absent", gpu: 0},
+			{name: "unknown", gpu: -1, wantStarts: 1},
+			{name: "present", gpu: 1, wantStarts: 1},
+			{name: "already serving", gpu: 0, serving: true, wantRunning: 1},
+		} {
+			t.Run(kind+"/"+tc.name, func(t *testing.T) {
+				dir := writeManifestWithServices(t, []Service{{Name: "vllm", Type: kind}})
+				bin := t.TempDir()
+				// Auto-detection may inspect the synthetic executable's presence,
+				// but the injected launcher must never execute it.
+				if err := os.WriteFile(filepath.Join(bin, "vllm"), []byte("#!/bin/sh\nexit 97\n"), 0700); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("PATH", bin)
+				before, err := os.ReadFile(filepath.Join(dir, "citadel.yaml"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				starts := 0
+				running := startManagedServicesForHost(context.Background(), func() int { return tc.gpu }, func(name string) bool { return tc.serving }, func(name, configDir string) error {
+					starts++
+					return fmt.Errorf("synthetic native launch refused")
+				})
+				if starts != tc.wantStarts || len(running) != tc.wantRunning {
+					t.Fatalf("starts=%d running=%d; want %d/%d", starts, len(running), tc.wantStarts, tc.wantRunning)
+				}
+				after, err := os.ReadFile(filepath.Join(dir, "citadel.yaml"))
+				if err != nil || string(after) != string(before) {
+					t.Fatal("native admission changed manifest", err)
+				}
+				if _, err := os.Stat(filepath.Join(dir, "logs")); !os.IsNotExist(err) {
+					t.Fatal("native admission created logs", err)
+				}
+			})
+		}
+	}
+}
+
+func TestBootNativeCPUDoesNotProbeGPU(t *testing.T) {
+	for _, name := range []string{"ollama", "llamacpp"} {
+		t.Run(name, func(t *testing.T) {
+			writeManifestWithServices(t, []Service{{Name: name, Type: "native"}})
+			starts := 0
+			startManagedServicesForHost(context.Background(), func() int { t.Fatal("CPU engine probed for CUDA admission"); return 0 }, func(string) bool { return false }, func(string, string) error {
+				starts++
+				return fmt.Errorf("synthetic native launch refused")
+			})
+			if starts != 1 {
+				t.Fatalf("CPU launch attempts=%d", starts)
+			}
+		})
+	}
+}
+
 func TestBootSkipsCUDAEnginesWithOneClearLineEach(t *testing.T) {
 	names := []string{"bonsai", "unlimited-ocr", "vllm", "sglang", "diffusers", "omnivoice"}
 	var manifest []Service

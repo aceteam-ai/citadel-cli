@@ -3074,6 +3074,12 @@ func startManagedServices(ctx context.Context, gpuCount ...func() int) []started
 	if len(gpuCount) > 0 {
 		probe = gpuCount[0]
 	}
+	return startManagedServicesForHost(ctx, probe, internalServices.IsNativeServiceServing, startNativeService)
+}
+
+// Native observations and launch are injected together so boot admission can
+// be tested without probing an endpoint or starting an engine.
+func startManagedServicesForHost(ctx context.Context, probe func() int, nativeServing func(string) bool, nativeStart func(string, string) error) []startedService {
 	sampled, count := false, -1
 	once := func() int {
 		if !sampled {
@@ -3141,7 +3147,13 @@ func startManagedServices(ctx context.Context, gpuCount ...func() int) []started
 			fmt.Printf("   - Starting %s (native)...\n", service.Name)
 			warnIfOllamaPolicyIgnoredNative(service)
 			if err := withLocalServiceStartGuard(configDir, service.Name, func() error {
-				return startNativeService(service.Name, configDir)
+				if nativeServing(service.Name) {
+					return nil
+				}
+				if reason := services.CUDAStartRefusal(service.Name, runtime.GOOS, once); reason != "" {
+					return fmt.Errorf("cannot start %s", reason)
+				}
+				return nativeStart(service.Name, configDir)
 			}); err != nil {
 				failed++
 				fmt.Fprintf(os.Stderr, "     Error: %s: %v\n", service.Name, err)
