@@ -6,67 +6,73 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
+	"github.com/aceteam-ai/citadel-cli/internal/compose/composefake"
 	"github.com/aceteam-ai/citadel-cli/services"
 )
 
 // startService on a running TEI whose compose is the pre-pin citadel template
-// refreshes the file and runs compose up exactly once; the next start takes
-// the already-running shortcut. A failed up restores the pre-pin file. The
-// container engine is a fake script on an isolated PATH that reports the
-// container as running and records its arguments.
+// refreshes the file and replaces the container once; the next start takes the
+// already-running shortcut. A failed replacement or preflight leaves the old
+// container running under its own name and restores the file. startService's
+// own probes see a fake script on an isolated PATH that reports the container
+// running; the replacement runs against the composefake engine.
 func TestStartServiceAppliesRefreshedTEITemplateOnce(t *testing.T) {
 	old := prePinTEICompose(t)
 	for _, tc := range []struct {
 		name     string
-		fail     bool
+		fail     string // composefake failure step
 		starts   int
 		wantUps  int
 		wantFile string
 	}{
 		{name: "refresh applied once", starts: 2, wantUps: 1, wantFile: services.ServiceMap["tei"]},
-		{name: "failed up restores file", fail: true, starts: 1, wantUps: 1, wantFile: old},
+		{name: "failed replacement keeps old container", fail: "up-start", starts: 1, wantUps: 1, wantFile: old},
+		{name: "preflight failure touches nothing", fail: "config", starts: 1, wantFile: old},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeManagedCompose{}
+			installFakeManagedCompose(t, f)
 			_, path := writeNodeFixture(t, "tei", old, "")
-			bin := t.TempDir()
-			logPath := filepath.Join(bin, "calls.log")
-			composeExit := "0"
-			if tc.fail {
-				composeExit = "1"
+			prev := f.addRunning("citadel-tei", path)
+			if tc.fail != "" {
+				f.Fail[tc.fail] = 1
 			}
-			script := fmt.Sprintf("#!/bin/sh\necho \"$*\" >> %q\ncase \"$1\" in\n  inspect) echo running ;;\n  compose) exit %s ;;\nesac\nexit 0\n", logPath, composeExit)
+			bin := t.TempDir()
+			script := "#!/bin/sh\ncase \"$1\" in\n  inspect) echo running ;;\nesac\nexit 0\n"
 			if err := os.WriteFile(filepath.Join(bin, "docker"), []byte(script), 0755); err != nil {
 				t.Fatal(err)
 			}
 			t.Setenv("PATH", bin)
 			t.Setenv("CITADEL_CONTAINER_RUNTIME", "docker")
-			t.Setenv("CITADEL_NODE_DIR", "")
-			t.Setenv("CITADEL_WORKSPACE", t.TempDir())
-			t.Setenv("CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE", "")
 			for i := 0; i < tc.starts; i++ {
 				err := startService("tei", path)
-				if (err != nil) != tc.fail {
-					t.Fatalf("start %d: %v (want failure=%v)", i, err, tc.fail)
+				if (err != nil) != (tc.fail != "") {
+					t.Fatalf("start %d: %v (want failure=%v)", i, err, tc.fail != "")
 				}
 			}
-			calls, _ := os.ReadFile(logPath)
-			ups := 0
-			for _, line := range strings.Split(string(calls), "\n") {
-				if strings.HasPrefix(line, "compose ") && strings.Contains(line, " up -d") {
-					ups++
-					if !strings.Contains(line, path) || strings.Contains(line, "--force-recreate") {
-						t.Fatalf("compose up = %q, want an unforced up from %s", line, path)
-					}
-				}
-			}
-			if ups != tc.wantUps {
-				t.Fatalf("compose ups = %d, want %d; calls:\n%s", ups, tc.wantUps, calls)
+			if f.ups() != tc.wantUps {
+				t.Fatalf("compose ups = %d, want %d: %v", f.ups(), tc.wantUps, f.Calls)
 			}
 			if got, _ := os.ReadFile(path); string(got) != tc.wantFile {
 				t.Fatalf("compose after start:\n%s", got)
+			}
+			all := f.Containers()
+			if len(all) != 1 || all[0].Name != "citadel-tei" || all[0].State != "running" {
+				t.Fatalf("containers = %+v; want exactly one running citadel-tei", all)
+			}
+			if tc.fail != "" {
+				if all[0] != prev {
+					t.Fatalf("old container not intact after failure: %+v, was %+v", all[0], prev)
+				}
+				if tc.fail == "config" && (f.Count("stop") != 0 || f.Count("rename") != 0) {
+					t.Fatalf("preflight failure touched the container: %v", f.Calls)
+				}
+				return
+			}
+			if all[0].ID == prev.ID || all[0].Config != composefake.FileHash(path) || f.Count("rm", "-f", prev.ID) != 1 {
+				t.Fatalf("replacement = %+v; want a new container and the backup removed: %v", all[0], fmt.Sprint(f.Calls))
 			}
 		})
 	}

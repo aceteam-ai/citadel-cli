@@ -118,7 +118,7 @@ func enginePortRecreator(service, composePath string, wantHostPort int) (bool, e
 	var recreated bool
 	err := withLocalServiceStartGuard(configDir, service, func() error {
 		var recreateErr error
-		recreated, recreateErr = managedComposeRecreatorUnchecked(service, composePath, wantHostPort)
+		recreated, recreateErr = managedComposeRecreatorUnchecked(service, composePath, wantHostPort, nil)
 		return recreateErr
 	})
 	return recreated, err
@@ -131,8 +131,9 @@ type managedComposeDeps struct {
 	containerState func(engineBin, containerName string) (string, bool)
 	publishedPort  func(engineBin, containerName string) (int, bool)
 	serviceFor     func(configDir, service string) Service
-	removeLegacy   func(engineBin, service string)
-	run            func(cmd *exec.Cmd) ([]byte, error)
+	// exec runs every command of a container replacement
+	// (compose.ReplaceRunningService).
+	exec compose.Exec
 }
 
 var managedCompose = managedComposeDeps{
@@ -140,8 +141,46 @@ var managedCompose = managedComposeDeps{
 	containerState: containerStateFor,
 	publishedPort:  runningPublishedHostPort,
 	serviceFor:     manifestServiceAt,
-	removeLegacy:   func(engineBin, service string) { compose.RemoveLegacyProjectContainers(engineBin, service) },
-	run:            func(cmd *exec.Cmd) ([]byte, error) { return cmd.CombinedOutput() },
+	exec:           compose.DefaultExec,
+}
+
+// replaceManagedService applies composePath to serviceName's container through
+// compose.ReplaceRunningService, so a previously running container stays
+// recoverable until its replacement runs. Every start-path recreate uses it:
+// the boot sweep, startService's running branch and the all-services restart.
+// restore puts back the previous compose file if the replacement fails.
+func replaceManagedService(rt catalog.ContainerRuntime, serviceName, composePath string, upArgs, env []string, restore func() error) (compose.ReplaceOutcome, error) {
+	containerName := "citadel-" + serviceName
+	if isEmbeddedService(serviceName) {
+		containerName = embeddedContainerName(serviceName)
+	}
+	return compose.ReplaceRunningService(compose.ReplaceSpec{
+		Runtime:       rt,
+		Service:       serviceName,
+		ContainerName: containerName,
+		ComposeArgs: func() ([]string, func(), error) {
+			return prepareComposeFileArgs(serviceName, composePath, rt.EngineBin)
+		},
+		UpArgs:      upArgs,
+		Env:         env,
+		Preflight:   func() error { return composeLimitsPreflight(rt, serviceName, composePath) },
+		RestoreFile: restore,
+		Exec:        managedCompose.exec,
+		Log:         func(format string, args ...any) { Log(format, args...) },
+	})
+}
+
+// composeLimitsPreflight refuses a start whose declared cpu/memory/pids limits
+// the runtime cannot enforce, before any container is touched.
+func composeLimitsPreflight(rt catalog.ContainerRuntime, serviceName, composePath string) error {
+	required, err := compose.RequiredLimitControllersFromFiles(composePath, sandboxOverridePathFor(composePath))
+	if err != nil {
+		return fmt.Errorf("cannot inspect %s resource limits: %w", serviceName, err)
+	}
+	if err := rt.PreflightLimitControllers(required...); err != nil {
+		return fmt.Errorf("cannot start %s: %w", serviceName, err)
+	}
+	return nil
 }
 
 // containerStateFor returns a container's State.Status and whether it exists.
@@ -181,11 +220,15 @@ func manifestServiceAt(configDir, service string) Service {
 //     hash changed, so a comment-only template change does not restart a live
 //     engine. On Podman the up is forced, because podman-compose does not
 //     compare config hashes.
+//   - replaceManagedService keeps the old container recoverable; restore (the
+//     sweep's rollback of the file) runs before any recovery up.
 //
-// The caller holds reservation.lock (the sweep does).
-func managedComposeRecreatorUnchecked(service, composePath string, wantHostPort int) (bool, error) {
+// It reports true only when a new container replaced the old one. The caller
+// holds reservation.lock (the sweep does).
+func managedComposeRecreatorUnchecked(service, composePath string, wantHostPort int, restore func() error) (bool, error) {
 	configDir := filepath.Dir(filepath.Dir(composePath))
-	if serviceStartDisabled(managedCompose.serviceFor(configDir, service)) {
+	svc := managedCompose.serviceFor(configDir, service)
+	if serviceStartDisabled(svc) {
 		return false, nil
 	}
 	rt := managedCompose.runtime()
@@ -203,44 +246,22 @@ func managedComposeRecreatorUnchecked(service, composePath string, wantHostPort 
 	if state, exists := managedCompose.containerState(rt.EngineBin, containerName); !exists || state != "running" {
 		return false, nil
 	}
-	force := false
+	var upArgs []string
 	if wantHostPort > 0 {
 		if current, ok := managedCompose.publishedPort(rt.EngineBin, containerName); ok && current != wantHostPort {
 			Log("compose-refresh: %s: host port moved %d -> %d; force-recreating", service, current, wantHostPort)
-			force = true
+			upArgs = []string{"--force-recreate"}
 		}
 	}
-	if !force {
-		Log("compose-refresh: %s: applying the refreshed compose to the running container", service)
+	if upArgs == nil && rt.EngineBin == "podman" {
+		upArgs = []string{"--force-recreate"}
 	}
-	if err := runManagedComposeUp(rt, service, composePath, force, composeEnvForServiceValues(service, managedCompose.serviceFor(configDir, service))); err != nil {
+	Log("compose-refresh: %s: applying the refreshed compose to the running container", service)
+	outcome, err := replaceManagedService(rt, service, composePath, upArgs, composeEnvForServiceValues(service, svc), restore)
+	if err != nil {
 		return false, err
 	}
-	return true, nil
-}
-
-// runManagedComposeUp runs `compose up -d` for one service from composePath with
-// the same file arguments a start uses (sandbox, GPU and env-file overrides, the
-// --node-dir project, the Podman CDI and non-Linux GPU rewrites). force adds
-// --force-recreate; Podman always forces (see managedComposeRecreatorUnchecked).
-// A container still under the legacy per-service project (#528) is removed
-// first, because a no-`-p` up conflicts on its pinned container_name.
-func runManagedComposeUp(rt catalog.ContainerRuntime, service, composePath string, force bool, env []string) error {
-	args, cleanup, err := prepareComposeUpArgs(service, composePath, rt.EngineBin)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-	managedCompose.removeLegacy(rt.EngineBin, service)
-	if force || rt.EngineBin == "podman" {
-		args = append(args, "--force-recreate")
-	}
-	cmd := exec.Command(rt.Bin, rt.ComposeArgs(args...)...)
-	cmd.Env = env
-	if out, err := managedCompose.run(cmd); err != nil {
-		return fmt.Errorf("%s compose failed: %s", rt.Bin, composeFailureMessage(service, out))
-	}
-	return nil
+	return outcome == compose.ReplaceReplaced, nil
 }
 
 // hostBinding is one published host binding of a running container: the host

@@ -151,6 +151,9 @@ type ServiceHandler struct {
 	// status.OpenAICompatServing respectively.
 	dockerServiceRunningFn  func(svcName string) bool
 	externalEngineServingFn func(ctx context.Context, engineType string, port int) ([]string, bool)
+	// composeExec runs the commands of a running-service replacement
+	// (replaceRunningEmbedded); nil means compose.DefaultExec.
+	composeExec compose.Exec
 }
 
 // NewServiceHandler creates a ServiceHandler rooted at configDir.
@@ -620,80 +623,101 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 				return nil, ramErr
 			}
 		}
-		// Transitional (#528): remove any container still under the legacy
-		// "citadel-<name>" compose project (created by pre-fix TUI/config-apply
-		// starts that passed `-p citadel-<name>`). The no-`-p` up below would
-		// otherwise conflict on the pinned container_name -- a cross-project name
-		// conflict that --force-recreate does NOT resolve.
-		compose.RemoveLegacyProjectContainers(rt.EngineBin, svc.Name)
-		// Include the least-privilege sandbox override when present (untrusted/
-		// Tier-2 modules) so a remotely-started module also runs hardened -- the
-		// override would otherwise be bypassed by this start site.
-		// Args are the compose args WITHOUT the leading "compose": rt.ComposeCommand
-		// supplies the correct front-end prefix (docker/podman) below.
-		composeArgs := []string{"-f", actualComposePath}
-		if sandboxOverridePath != "" {
-			composeArgs = append(composeArgs, "-f", sandboxOverridePath)
-		}
-		// citadel#831 RAM ceiling override (empty when not applicable — see the
-		// ramOverridePath assignment above and applyRAMIsolation).
-		if ramOverridePath != "" {
-			composeArgs = append(composeArgs, "-f", ramOverridePath)
-		}
-		// Catalog GPU device-reservation override (<name>.gpu.yml,
-		// aceteam-ai/citadel-cli#1245) for a module whose compose ships the NVIDIA
-		// reservation separately (e.g. voice-clone). Docker only — see
-		// catalog.GPUDeviceOverrideFileArg for why Podman is a follow-up. A no-op
-		// for every service that ships no .gpu.yml.
-		composeArgs = append(composeArgs, catalog.GPUDeviceOverrideFileArg(
-			filepath.Dir(composePath),
-			strings.TrimSuffix(filepath.Base(composePath), filepath.Ext(filepath.Base(composePath))),
-			rt.EngineBin)...)
-		// Pass the sibling config env (<name>.env) explicitly: docker compose
-		// only auto-loads a file literally named ".env", so without --env-file
-		// the persisted model selection (#530) and any catalog install-time
-		// config would be invisible to interpolation. Mirrors cmd/service.go
-		// composeFileArgs, so a model set via job is also served after a plain
-		// `citadel work` boot and vice versa.
-		composeArgs = append(composeArgs, compose.EnvFileArgs(composePath)...)
-		// --force-recreate so the compose port mapping is always applied to the
-		// running container. Without it, `up` will ADOPT an existing container
-		// with the same container_name (e.g. one left by a prior failed/portless
-		// attempt) and leave it untouched, so the newly-declared host port never
-		// gets published (the container comes up with NetworkSettings.Ports == {}).
-		// Same treatment as llamacpp_inference.go's restart path. See citadel-cli#415.
-		composeArgs = append(composeArgs, "up", "-d", "--force-recreate")
-		// Preflight (citadel #767): skip the exec ONLY when the engine CLI is
-		// missing (that exec would fail immediately anyway) and report a
-		// friendly diagnosis instead of the raw
-		// `exec: "docker": executable file not found in $PATH`-style error
-		// (this handler drives the resolved runtime, see rt.ComposeCommand
-		// below). A daemon that failed to answer the preflight's probe is a
-		// WARNING, not a refusal: it may just be slow, and the compose-up call
-		// below already surfaces the engine's own error if it truly is
-		// unreachable -- see platform.PreflightDockerStart.
-		if refuseErr, warning := platform.PreflightDockerStart(rt.EngineBin); refuseErr != nil {
-			err = fmt.Errorf("docker compose up failed: %s", refuseErr)
-		} else {
-			if warning != "" {
-				ctx.Log("warn", "     - docker preflight: %s", warning)
+		// A running embedded service is replaced so its previous container stays
+		// recoverable until the new one runs (compose.ReplaceRunningService). A
+		// template-only refresh uses a plain up, so compose recreates only when
+		// the service config changed; a model or trust change, or Podman, forces.
+		if _, embedded := embeddedservices.ServiceMap[svc.Name]; embedded && h.dockerServiceRunning(svc.Name) {
+			force := modelChanged || trustChanged || rt.EngineBin == "podman"
+			outcome, rErr := h.replaceRunningEmbedded(rt, svc, composePath, sandboxOverridePath, force,
+				func() error { return templateRefresh.Rollback(composePath, svc.Name) })
+			switch {
+			case rErr != nil:
+				err = fmt.Errorf("docker compose up failed: %s", rErr)
+			case outcome == compose.ReplaceUnchanged:
+				return json.Marshal(serviceResult{
+					Name: svc.Name, Running: true, Kind: kind,
+					Action: "start", Message: svc.Name + " is already running with its current configuration",
+				})
+			default:
+				startOllamaPreload(svc.Name, svc.OllamaKeepAlive, svc.OllamaPreload, func(f string, a ...any) { ctx.Log("info", "     - "+f, a...) })
 			}
-			cmd := rt.ComposeCommand(composeArgs...)
-			// Inject the #1023 CITADEL_<SVC>_BIND entry (from the manifest bind:)
-			// and the #1209 OLLAMA_MAX_LOADED_MODELS entry (from the manifest
-			// ollama_max_loaded_models:) so the compose substitution/passthrough
-			// resolve. An invalid value fails the start loudly rather than
-			// silently falling through to the compose/engine default.
-			if env, bindErr := h.composeEnvForEngineStart(svc.Name, svc.Bind, svc.OllamaMaxLoadedModels, svc.OllamaKeepAlive, svc.Threads); bindErr != nil {
-				err = fmt.Errorf("docker compose up failed: %s", bindErr)
+		} else {
+			// Transitional (#528): remove any container still under the legacy
+			// "citadel-<name>" compose project (created by pre-fix TUI/config-apply
+			// starts that passed `-p citadel-<name>`). The no-`-p` up below would
+			// otherwise conflict on the pinned container_name -- a cross-project name
+			// conflict that --force-recreate does NOT resolve.
+			compose.RemoveLegacyProjectContainers(rt.EngineBin, svc.Name)
+			// Include the least-privilege sandbox override when present (untrusted/
+			// Tier-2 modules) so a remotely-started module also runs hardened -- the
+			// override would otherwise be bypassed by this start site.
+			// Args are the compose args WITHOUT the leading "compose": rt.ComposeCommand
+			// supplies the correct front-end prefix (docker/podman) below.
+			composeArgs := []string{"-f", actualComposePath}
+			if sandboxOverridePath != "" {
+				composeArgs = append(composeArgs, "-f", sandboxOverridePath)
+			}
+			// citadel#831 RAM ceiling override (empty when not applicable — see the
+			// ramOverridePath assignment above and applyRAMIsolation).
+			if ramOverridePath != "" {
+				composeArgs = append(composeArgs, "-f", ramOverridePath)
+			}
+			// Catalog GPU device-reservation override (<name>.gpu.yml,
+			// aceteam-ai/citadel-cli#1245) for a module whose compose ships the NVIDIA
+			// reservation separately (e.g. voice-clone). Docker only — see
+			// catalog.GPUDeviceOverrideFileArg for why Podman is a follow-up. A no-op
+			// for every service that ships no .gpu.yml.
+			composeArgs = append(composeArgs, catalog.GPUDeviceOverrideFileArg(
+				filepath.Dir(composePath),
+				strings.TrimSuffix(filepath.Base(composePath), filepath.Ext(filepath.Base(composePath))),
+				rt.EngineBin)...)
+			// Pass the sibling config env (<name>.env) explicitly: docker compose
+			// only auto-loads a file literally named ".env", so without --env-file
+			// the persisted model selection (#530) and any catalog install-time
+			// config would be invisible to interpolation. Mirrors cmd/service.go
+			// composeFileArgs, so a model set via job is also served after a plain
+			// `citadel work` boot and vice versa.
+			composeArgs = append(composeArgs, compose.EnvFileArgs(composePath)...)
+			// --force-recreate so the compose port mapping is always applied to the
+			// running container. Without it, `up` will ADOPT an existing container
+			// with the same container_name (e.g. one left by a prior failed/portless
+			// attempt) and leave it untouched, so the newly-declared host port never
+			// gets published (the container comes up with NetworkSettings.Ports == {}).
+			// Same treatment as llamacpp_inference.go's restart path. See citadel-cli#415.
+			composeArgs = append(composeArgs, "up", "-d", "--force-recreate")
+			// Preflight (citadel #767): skip the exec ONLY when the engine CLI is
+			// missing (that exec would fail immediately anyway) and report a
+			// friendly diagnosis instead of the raw
+			// `exec: "docker": executable file not found in $PATH`-style error
+			// (this handler drives the resolved runtime, see rt.ComposeCommand
+			// below). A daemon that failed to answer the preflight's probe is a
+			// WARNING, not a refusal: it may just be slow, and the compose-up call
+			// below already surfaces the engine's own error if it truly is
+			// unreachable -- see platform.PreflightDockerStart.
+			if refuseErr, warning := platform.PreflightDockerStart(rt.EngineBin); refuseErr != nil {
+				err = fmt.Errorf("docker compose up failed: %s", refuseErr)
 			} else {
-				cmd.Env = env
-				out, cmdErr := cmd.CombinedOutput()
-				if cmdErr != nil {
-					err = fmt.Errorf("docker compose up failed: %s", strings.TrimSpace(string(out)))
+				if warning != "" {
+					ctx.Log("warn", "     - docker preflight: %s", warning)
+				}
+				cmd := rt.ComposeCommand(composeArgs...)
+				// Inject the #1023 CITADEL_<SVC>_BIND entry (from the manifest bind:)
+				// and the #1209 OLLAMA_MAX_LOADED_MODELS entry (from the manifest
+				// ollama_max_loaded_models:) so the compose substitution/passthrough
+				// resolve. An invalid value fails the start loudly rather than
+				// silently falling through to the compose/engine default.
+				if env, bindErr := h.composeEnvForEngineStart(svc.Name, svc.Bind, svc.OllamaMaxLoadedModels, svc.OllamaKeepAlive, svc.Threads); bindErr != nil {
+					err = fmt.Errorf("docker compose up failed: %s", bindErr)
 				} else {
-					// citadel-cli#1560: best-effort async preload; never blocks or fails the start.
-					startOllamaPreload(svc.Name, svc.OllamaKeepAlive, svc.OllamaPreload, func(f string, a ...any) { ctx.Log("info", "     - "+f, a...) })
+					cmd.Env = env
+					out, cmdErr := cmd.CombinedOutput()
+					if cmdErr != nil {
+						err = fmt.Errorf("docker compose up failed: %s", strings.TrimSpace(string(out)))
+					} else {
+						// citadel-cli#1560: best-effort async preload; never blocks or fails the start.
+						startOllamaPreload(svc.Name, svc.OllamaKeepAlive, svc.OllamaPreload, func(f string, a ...any) { ctx.Log("info", "     - "+f, a...) })
+					}
 				}
 			}
 		}
@@ -1632,6 +1656,55 @@ func (h *ServiceHandler) materializeEmbeddedService(name string) (manifestServic
 		return manifestService{}, err
 	}
 	return svc, nil
+}
+
+// replaceRunningEmbedded applies composePath to a running embedded service
+// through compose.ReplaceRunningService: docker preflight, limit controllers,
+// `compose config` and image presence are checked before the container is
+// touched, a legacy-project container is renamed aside rather than removed, and
+// a failed replacement restores the previous container and file.
+func (h *ServiceHandler) replaceRunningEmbedded(rt catalog.ContainerRuntime, svc manifestService, composePath, sandboxOverridePath string, force bool, restore func() error) (compose.ReplaceOutcome, error) {
+	if refuseErr, _ := platform.PreflightDockerStart(rt.EngineBin); refuseErr != nil {
+		return compose.ReplaceUnchanged, refuseErr
+	}
+	env, envErr := h.composeEnvForEngineStart(svc.Name, svc.Bind, svc.OllamaMaxLoadedModels, svc.OllamaKeepAlive, svc.Threads)
+	if envErr != nil {
+		return compose.ReplaceUnchanged, envErr
+	}
+	var upArgs []string
+	if force {
+		upArgs = []string{"--force-recreate"}
+	}
+	base := strings.TrimSuffix(filepath.Base(composePath), filepath.Ext(filepath.Base(composePath)))
+	exec := h.composeExec
+	if exec == nil {
+		exec = compose.DefaultExec
+	}
+	return compose.ReplaceRunningService(compose.ReplaceSpec{
+		Runtime:       rt,
+		Service:       svc.Name,
+		ContainerName: compose.ContainerName(svc.Name, strings.TrimSpace(os.Getenv("CITADEL_NODE_DIR"))),
+		ComposeArgs: func() ([]string, func(), error) {
+			actual, cleanup := composePath, func() {}
+			if rt.EngineBin == "podman" {
+				var err error
+				if actual, cleanup, err = compose.MaterializePodmanGPUCompose(composePath); err != nil {
+					return nil, func() {}, fmt.Errorf("cannot translate %s GPU reservation for Podman: %w", svc.Name, err)
+				}
+			}
+			args := []string{"-f", actual}
+			if sandboxOverridePath != "" {
+				args = append(args, "-f", sandboxOverridePath)
+			}
+			args = append(args, catalog.GPUDeviceOverrideFileArg(filepath.Dir(composePath), base, rt.EngineBin)...)
+			return append(args, compose.EnvFileArgs(composePath)...), cleanup, nil
+		},
+		UpArgs:      upArgs,
+		Env:         env,
+		RestoreFile: restore,
+		Exec:        exec,
+		Log:         func(format string, args ...any) { clilog.Writef("info", format, args...) },
+	})
 }
 
 // prepareEmbeddedComposeForStart covers services already present in a manifest.

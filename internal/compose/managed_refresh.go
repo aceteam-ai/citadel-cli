@@ -88,9 +88,14 @@ func CaptureStartRefresh(path string, reconcile func() error) (StartRefresh, err
 }
 
 // Rollback restores the previous compose content when nothing else replaced
-// the refreshed file in the meantime. It is a no-op for an unchanged refresh.
+// the refreshed file in the meantime. It is a no-op for an unchanged refresh
+// and for a file already restored, so a replacement and its caller may both
+// call it.
 func (r StartRefresh) Rollback(path, name string) error {
 	if !r.Changed {
+		return nil
+	}
+	if current, ok := readRegularCompose(path); ok && current == r.Previous {
 		return nil
 	}
 	_, err := composerefresh.ReplaceManagedCompose(path, name, r.Current, r.Previous)

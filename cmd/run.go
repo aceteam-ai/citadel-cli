@@ -323,6 +323,8 @@ func restartAllServices() {
 //     read another node's container on a shared engine, citadel#856);
 //   - an external vLLM owns the endpoint.
 //
+// It reports true once it has taken over the restart, including a failed
+// replacement, which leaves the previous container running when it was.
 // The caller holds the service start guard and has skipped stopped services.
 func restartByRecreatingManagedService(rt catalog.ContainerRuntime, service Service, composePath string) (bool, error) {
 	if !isEmbeddedService(service.Name) || composeProjectOverride() != "" || refuseManagedVLLMStart(service.Name) != nil {
@@ -338,11 +340,12 @@ func restartByRecreatingManagedService(rt catalog.ContainerRuntime, service Serv
 	if _, exists := managedCompose.containerState(rt.EngineBin, embeddedContainerName(service.Name)); !exists {
 		return false, nil
 	}
-	if err := runManagedComposeUp(rt, service.Name, composePath, true, composeEnvForServiceValues(service.Name, service)); err != nil {
-		if rbErr := refresh.Rollback(composePath, service.Name); rbErr != nil {
-			fmt.Printf("   ⚠️  could not restore the previous %s compose: %v\n", service.Name, rbErr)
-		}
-		return false, err
+	// replaceManagedService keeps the old container recoverable and restores the
+	// previous file if the replacement fails; the error is the restart's error.
+	if _, err := replaceManagedService(rt, service.Name, composePath, []string{"--force-recreate"},
+		composeEnvForServiceValues(service.Name, service),
+		func() error { return refresh.Rollback(composePath, service.Name) }); err != nil {
+		return true, err
 	}
 	return true, nil
 }

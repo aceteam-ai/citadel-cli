@@ -55,7 +55,11 @@ type Logf func(format string, args ...any)
 // port moved) and leave a stopped or absent one alone. It returns
 // (recreated, err); an error makes the Sweep restore the previous file. A nil
 // PortRecreator disables all recreation (pure file-refresh mode).
-type PortRecreator func(service, composePath string, wantHostPort int) (bool, error)
+//
+// restore writes the previous file back; a recreator that recovers a failed
+// replacement from the previous file calls it first. The Sweep restores the file
+// after any error either way, so calling it is optional and idempotent.
+type PortRecreator func(service, composePath string, wantHostPort int, restore func() error) (bool, error)
 
 // RecreateOnUpgradeDisabled reports whether the operator opted out of
 // automatic recreation after a template refresh
@@ -275,13 +279,14 @@ func Sweep(opts Options) (Result, error) {
 			opts.log("compose-refresh: %s: compose file refreshed, but a running container is not recreated automatically; run `citadel stop %s && citadel run %s` to apply (or unset CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE)", name, name, name)
 			continue
 		}
-		recreated, err := opts.Recreator(name, destPath, wantPort)
+		restore := func() error { return writeCompose(destPath, string(prevContent)) }
+		recreated, err := opts.Recreator(name, destPath, wantPort, restore)
 		if err != nil {
 			// The recreate `up` failed on the new template. Restore the prior file
 			// and its recorded hash so the service is not left with a template that
 			// can't come up, and so the next boot retries.
 			opts.log("compose-refresh: %s: recreate failed, rolling back compose file: %v", name, err)
-			if rbErr := writeCompose(destPath, string(prevContent)); rbErr != nil {
+			if rbErr := restore(); rbErr != nil {
 				opts.log("compose-refresh: %s: rollback write failed: %v", name, rbErr)
 			}
 			res.Refreshed = res.Refreshed[:len(res.Refreshed)-1]

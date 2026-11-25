@@ -324,7 +324,7 @@ func TestSweep_RecreatorCalledOnceForEachRewrittenFile(t *testing.T) {
 			"llamacpp": {sha(embeddedV1): true},
 			"tei":      {sha(teiOld): true},
 		},
-		Recreator: func(service, composePath string, wantHostPort int) (bool, error) {
+		Recreator: func(service, composePath string, wantHostPort int, _ func() error) (bool, error) {
 			calls[service]++
 			ports[service] = wantHostPort
 			if got, _ := os.ReadFile(composePath); service == "tei" && string(got) != teiNew {
@@ -391,7 +391,7 @@ func TestSweep_RecreateFailureRollsBackFile(t *testing.T) {
 	writeFile(t, composePath, embeddedV1)
 
 	opts := baseOpts(dir, "v2.57.0")
-	opts.Recreator = func(service, composePath string, wantHostPort int) (bool, error) {
+	opts.Recreator = func(service, composePath string, wantHostPort int, _ func() error) (bool, error) {
 		return false, errThrow("compose up failed: boom")
 	}
 

@@ -215,18 +215,6 @@ func startService(serviceName, composeFilePath string) (retErr error) {
 
 	containerName := "citadel-" + serviceName
 
-	// forceRecreateForBindDrift is set when an already-running #1025 engine is
-	// found still published on all interfaces while its materialized template is
-	// loopback-only (aceteam-ai/citadel-cli#1030). It appends --force-recreate to
-	// the compose-up below so the loopback bind actually applies. See the running
-	// pre-flight branch and shouldRecreateForEngineBindDrift.
-	forceRecreateForBindDrift := false
-	// applyRefreshedTemplate is set when the reconcile above rewrote this
-	// service's citadel-managed compose and its container is running: the
-	// compose-up below then applies the new file (compose recreates only when
-	// the service config changed). See runningStartAction.
-	applyRefreshedTemplate := false
-
 	// Resolve the container runtime once (podman rootless preferred over docker;
 	// see catalog.SelectContainerRuntime) and drive every sub-command below
 	// through it, so module containers run under the hardened runtime when
@@ -310,17 +298,19 @@ func startService(serviceName, composeFilePath string) (retErr error) {
 					templateRefresh.Changed, recreateOnUpgradeEnabled(), serviceStartDisabled(manifestSvc),
 				) {
 				case runningRecreateForBindDrift:
+					// Recreate the still-running container so the loopback publish
+					// applies; the old container stays recoverable until then.
 					fmt.Printf("   ♻️  Container %s is published on all interfaces; recreating to apply the loopback bind...\n", containerName)
-					forceRecreateForBindDrift = true
-					// Fall through to the compose-up below with --force-recreate.
+					return replaceRunningForStart(rt, serviceName, composeFilePath, []string{"--force-recreate"}, composeProcessEnv, templateRefresh, manifestSvc)
 				case runningApplyRefreshedTemplate:
 					fmt.Printf("   ♻️  Container %s is running an older citadel template; applying the refreshed compose...\n", containerName)
-					applyRefreshedTemplate = true
-					// A running container under the legacy per-service project
-					// (#528) would make the no-`-p` up below conflict on its
-					// container_name; it is being recreated anyway.
-					removeLegacyCitadelProject(serviceName)
-					// Fall through to the compose-up below.
+					var upArgs []string
+					if rt.EngineBin == "podman" {
+						// podman-compose does not compare config hashes; force the
+						// one-time recreate the refreshed template needs.
+						upArgs = []string{"--force-recreate"}
+					}
+					return replaceRunningForStart(rt, serviceName, composeFilePath, upArgs, composeProcessEnv, templateRefresh, manifestSvc)
 				default:
 					if templateRefresh.Changed {
 						fmt.Printf("   ⚠️  %s compose was refreshed but the running container keeps its old config (CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE is set); run `citadel stop %s && citadel run %s` to apply\n", serviceName, serviceName, serviceName)
@@ -377,17 +367,6 @@ func startService(serviceName, composeFilePath string) (retErr error) {
 		return argsErr
 	}
 	defer cleanupComposeArgs()
-	if forceRecreateForBindDrift {
-		// Recreate the still-running container in place so the loopback publish
-		// applies. Graceful (compose stops then recreates) and on the sanctioned
-		// compose path -- unlike a bare `docker rm -f`, which SIGKILLs a live
-		// engine and bypasses compose's stop.
-		composeUpArgs = append(composeUpArgs, "--force-recreate")
-	} else if applyRefreshedTemplate && rt.EngineBin == "podman" {
-		// podman-compose does not compare config hashes; force the one-time
-		// recreate the refreshed template needs.
-		composeUpArgs = append(composeUpArgs, "--force-recreate")
-	}
 	args := rt.ComposeArgs(composeUpArgs...)
 	composeCmd := exec.Command(rt.Bin, args...)
 	// Supply the citadel-owned host ports so compose files that defer their host
@@ -406,6 +385,26 @@ func startService(serviceName, composeFilePath string) (retErr error) {
 		return fmt.Errorf("%s compose failed: %s", rt.Bin, composeFailureMessage(serviceName, output))
 	}
 	startOllamaPreload(serviceName, manifestSvc)
+	return nil
+}
+
+// replaceRunningForStart applies composeFilePath to serviceName's running
+// container for startService through replaceManagedService: the limit
+// preflight, compose config and image checks run before the container is
+// touched, the old container stays recoverable until its replacement runs, and
+// a failure restores the previous file (and the old container).
+func replaceRunningForStart(rt catalog.ContainerRuntime, serviceName, composeFilePath string, upArgs, env []string, refresh compose.StartRefresh, svc Service) error {
+	outcome, err := replaceManagedService(rt, serviceName, composeFilePath, upArgs, env,
+		func() error { return refresh.Rollback(composeFilePath, serviceName) })
+	if err != nil {
+		return fmt.Errorf("cannot apply the %s compose: %w", serviceName, err)
+	}
+	if outcome == compose.ReplaceUnchanged {
+		fmt.Printf("   ✅ Container %s already runs the current compose.\n", serviceName)
+		return nil
+	}
+	fmt.Printf("   ✅ Container %s replaced from the current compose.\n", serviceName)
+	startOllamaPreload(serviceName, svc)
 	return nil
 }
 
@@ -533,9 +532,14 @@ func managedContainerRunningForStart(engineBin, containerName string) bool {
 // catalog.GPUDeviceOverrideFileArg for why Podman is a follow-up. A no-op for
 // every service that ships no .gpu.yml override.
 func startServiceComposeArgs(composeFilePath, actualComposePath, engineBin string) []string {
+	return append(startServiceComposeFileArgs(composeFilePath, actualComposePath, engineBin), "up", "-d")
+}
+
+// startServiceComposeFileArgs is startServiceComposeArgs without the `up -d`
+// verb, so the same project and file arguments drive `config`, `pull` and `up`.
+func startServiceComposeFileArgs(composeFilePath, actualComposePath, engineBin string) []string {
 	args := composeFileArgs(composeFilePath, actualComposePath)
 	args = append(args, gpuDeviceOverrideArgsFor(composeFilePath, engineBin)...)
-	args = append(args, "up", "-d")
 	return composeArgsWithProject(args)
 }
 
@@ -549,6 +553,15 @@ func startServiceComposeArgs(composeFilePath, actualComposePath, engineBin strin
 // refresh recreate (runManagedComposeUp) share it so both apply one file the
 // same way.
 func prepareComposeUpArgs(serviceName, composeFilePath, engineBin string) ([]string, func(), error) {
+	args, cleanup, err := prepareComposeFileArgs(serviceName, composeFilePath, engineBin)
+	if err != nil {
+		return nil, cleanup, err
+	}
+	return append(args, "up", "-d"), cleanup, nil
+}
+
+// prepareComposeFileArgs is prepareComposeUpArgs without the `up -d` verb.
+func prepareComposeFileArgs(serviceName, composeFilePath, engineBin string) ([]string, func(), error) {
 	actualComposePath := composeFilePath
 	var cleanups []func()
 	cleanup := func() {
@@ -581,7 +594,7 @@ func prepareComposeUpArgs(serviceName, composeFilePath, engineBin string) ([]str
 			}
 		}
 	}
-	return startServiceComposeArgs(composeFilePath, actualComposePath, engineBin), cleanup, nil
+	return startServiceComposeFileArgs(composeFilePath, actualComposePath, engineBin), cleanup, nil
 }
 
 // gpuDeviceOverrideArgsFor resolves the ["-f", <name>.gpu.yml] argument for the

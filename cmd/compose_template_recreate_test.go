@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"crypto/sha256"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
+	"github.com/aceteam-ai/citadel-cli/internal/compose"
+	"github.com/aceteam-ai/citadel-cli/internal/compose/composefake"
 	"github.com/aceteam-ai/citadel-cli/internal/composerefresh"
 	"github.com/aceteam-ai/citadel-cli/services"
 )
@@ -33,14 +34,13 @@ func prePinTEICompose(t *testing.T) string {
 	return old
 }
 
+// fakeManagedCompose installs a composefake engine behind managedCompose, so
+// tests assert on container state as well as on the commands run.
 type fakeManagedCompose struct {
-	engine       string
-	state        map[string]string // container -> State.Status; absent = no container
-	ports        map[string]int
-	runs         [][]string
-	runErr       error
-	stateHit     int
-	legacyCleans int
+	engineBin string
+	ports     map[string]int
+	stateHit  int
+	*composefake.Engine
 }
 
 func installFakeManagedCompose(t *testing.T, f *fakeManagedCompose) {
@@ -48,31 +48,39 @@ func installFakeManagedCompose(t *testing.T, f *fakeManagedCompose) {
 	t.Setenv("CITADEL_NODE_DIR", "")
 	t.Setenv("CITADEL_WORKSPACE", t.TempDir())
 	t.Setenv("CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE", "")
-	prev := managedCompose
-	t.Cleanup(func() { managedCompose = prev })
-	if f.engine == "" {
-		f.engine = "docker"
+	prev, prevDelay := managedCompose, compose.ReplaceSettleDelay
+	compose.ReplaceSettleDelay = 0
+	t.Cleanup(func() { managedCompose, compose.ReplaceSettleDelay = prev, prevDelay })
+	if f.engineBin == "" {
+		f.engineBin = "docker"
+	}
+	if f.Engine == nil {
+		f.Engine = composefake.New("tei", "citadel-tei", "tei:pinned")
 	}
 	managedCompose = managedComposeDeps{
 		runtime: func() catalog.ContainerRuntime {
-			return catalog.ContainerRuntime{EngineBin: f.engine, Bin: f.engine, ComposePrefix: []string{"compose"}}
+			return catalog.ContainerRuntime{EngineBin: f.engineBin, Bin: f.engineBin, ComposePrefix: []string{"compose"}}
 		},
 		containerState: func(_, name string) (string, bool) {
 			f.stateHit++
-			s, ok := f.state[name]
-			return s, ok
+			c, ok := f.Named(name)
+			return c.State, ok
 		},
 		publishedPort: func(_, name string) (int, bool) {
 			p, ok := f.ports[name]
 			return p, ok
 		},
-		serviceFor:   manifestServiceAt,
-		removeLegacy: func(string, string) { f.legacyCleans++ },
-		run: func(cmd *exec.Cmd) ([]byte, error) {
-			f.runs = append(f.runs, append([]string(nil), cmd.Args...))
-			return []byte("compose output"), f.runErr
-		},
+		serviceFor: manifestServiceAt,
+		exec:       f.Exec,
 	}
+}
+
+// ups counts compose up invocations.
+func (f *fakeManagedCompose) ups() int { return f.Count("compose", "up", "-d") }
+
+// addRunning places the service's current container, created from path.
+func (f *fakeManagedCompose) addRunning(project, path string) composefake.Container {
+	return *f.Add(composefake.Container{Name: f.ContainerName, State: "running", Project: project, Service: f.Service, Config: composefake.FileHash(path)})
 }
 
 // writeNodeFixture lays out a canonical fixture node (sandboxed HOME, global
@@ -102,40 +110,57 @@ func TestManagedComposeRecreatorAppliesRefreshedFileToRunningContainerOnly(t *te
 		name      string
 		engine    string
 		desired   string
-		state     map[string]string
-		wantRuns  int
+		state     string // "" = no container
+		wantUps   int
 		wantForce bool
 	}{
-		{name: "running docker", state: map[string]string{"citadel-tei": "running"}, wantRuns: 1},
-		{name: "running podman forces", engine: "podman", state: map[string]string{"citadel-tei": "running"}, wantRuns: 1, wantForce: true},
-		{name: "exited", state: map[string]string{"citadel-tei": "exited"}},
-		{name: "absent", state: map[string]string{}},
-		{name: "operator stopped", desired: "stopped", state: map[string]string{"citadel-tei": "running"}},
+		{name: "running docker", state: "running", wantUps: 1},
+		{name: "running podman forces", engine: "podman", state: "running", wantUps: 1, wantForce: true},
+		{name: "exited", state: "exited"},
+		{name: "absent"},
+		{name: "operator stopped", desired: "stopped", state: "running"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			f := &fakeManagedCompose{engine: tc.engine, state: tc.state}
+			f := &fakeManagedCompose{engineBin: tc.engine}
 			installFakeManagedCompose(t, f)
-			_, path := writeNodeFixture(t, "tei", services.ServiceMap["tei"], tc.desired)
-			recreated, err := managedComposeRecreatorUnchecked("tei", path, 0)
+			_, path := writeNodeFixture(t, "tei", prePinTEICompose(t), tc.desired)
+			var old composefake.Container
+			if tc.state != "" {
+				old = f.addRunning("services", path)
+				if tc.state != "running" {
+					_, _, _ = f.Exec(exec.Command("docker", "stop", old.ID))
+				}
+			}
+			if err := os.WriteFile(path, []byte(services.ServiceMap["tei"]), 0600); err != nil {
+				t.Fatal(err)
+			}
+			before := f.Containers()
+			recreated, err := managedComposeRecreatorUnchecked("tei", path, 0, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(f.runs) != tc.wantRuns || recreated != (tc.wantRuns == 1) {
-				t.Fatalf("runs = %v, recreated = %v; want %d run(s)", f.runs, recreated, tc.wantRuns)
-			}
-			if f.legacyCleans != len(f.runs) {
-				t.Fatalf("legacy-project cleanups = %d, want one per up (%d)", f.legacyCleans, len(f.runs))
+			if f.ups() != tc.wantUps || recreated != (tc.wantUps == 1) {
+				t.Fatalf("ups = %d, recreated = %v; want %d; calls %v", f.ups(), recreated, tc.wantUps, f.Calls)
 			}
 			if tc.desired == "stopped" && f.stateHit != 0 {
 				t.Fatal("stopped service was inspected")
 			}
-			if tc.wantRuns == 0 {
+			if tc.wantUps == 0 {
+				if after := f.Containers(); fmt.Sprint(after) != fmt.Sprint(before) {
+					t.Fatalf("containers changed without a recreate: %+v -> %+v", before, after)
+				}
 				return
 			}
-			args := f.runs[0]
-			if !hasArg(args, path) || !hasArg(args, "up") || !hasArg(args, "-d") || hasArg(args, "--force-recreate") != tc.wantForce {
-				t.Fatalf("compose argv = %v, want up -d from %s (force=%v)", args, path, tc.wantForce)
+			if (f.Count("up", "--force-recreate") == 1) != tc.wantForce {
+				t.Fatalf("force = %v, want %v: %v", !tc.wantForce, tc.wantForce, f.Calls)
+			}
+			c, ok := f.Named("citadel-tei")
+			if !ok || c.ID == old.ID || c.State != "running" || c.Config != composefake.FileHash(path) {
+				t.Fatalf("container after recreate = %+v; want a new one running the refreshed file", c)
+			}
+			if f.Count("rename") != 0 || f.Count("rm") != 0 {
+				t.Fatalf("same-project container renamed or removed by hand: %v", f.Calls)
 			}
 		})
 	}
@@ -146,14 +171,15 @@ func TestManagedComposeRecreatorForcesWhenHostPortMoved(t *testing.T) {
 		port      int
 		wantForce bool
 	}{{port: 8080, wantForce: true}, {port: 8200}} {
-		f := &fakeManagedCompose{state: map[string]string{"citadel-llamacpp": "running"}, ports: map[string]int{"citadel-llamacpp": tc.port}}
+		f := &fakeManagedCompose{Engine: composefake.New("llamacpp", "citadel-llamacpp", "llamacpp:x"), ports: map[string]int{"citadel-llamacpp": tc.port}}
 		installFakeManagedCompose(t, f)
 		_, path := writeNodeFixture(t, "llamacpp", services.ServiceMap["llamacpp"], "")
-		if _, err := managedComposeRecreatorUnchecked("llamacpp", path, 8200); err != nil {
+		f.addRunning("services", path)
+		if _, err := managedComposeRecreatorUnchecked("llamacpp", path, 8200, nil); err != nil {
 			t.Fatal(err)
 		}
-		if len(f.runs) != 1 || hasArg(f.runs[0], "--force-recreate") != tc.wantForce {
-			t.Fatalf("port %d: runs = %v, want force=%v", tc.port, f.runs, tc.wantForce)
+		if f.ups() != 1 || (f.Count("up", "--force-recreate") == 1) != tc.wantForce {
+			t.Fatalf("port %d: calls = %v, want force=%v", tc.port, f.Calls, tc.wantForce)
 		}
 	}
 }
@@ -164,27 +190,28 @@ func TestManagedComposeRecreatorForcesWhenHostPortMoved(t *testing.T) {
 func TestBootRefreshRecreatesRunningTEIOnceAndNeverInALoop(t *testing.T) {
 	old := prePinTEICompose(t)
 	for _, tc := range []struct {
-		name     string
-		compose  string
-		optOut   bool
-		wantRuns int
+		name    string
+		compose string
+		optOut  bool
+		wantUps int
 	}{
-		{name: "pre-pin template", compose: old, wantRuns: 1},
+		{name: "pre-pin template", compose: old, wantUps: 1},
 		{name: "operator edited", compose: old + "\n# operator change\n"},
 		{name: "opted out", compose: old, optOut: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := &fakeManagedCompose{state: map[string]string{"citadel-tei": "running"}}
+			f := &fakeManagedCompose{}
 			installFakeManagedCompose(t, f)
 			if tc.optOut {
 				t.Setenv("CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE", "1")
 			}
 			dir, path := writeNodeFixture(t, "tei", tc.compose, "")
+			f.addRunning("services", path)
 			for i := 0; i < 2; i++ {
 				refreshManagedComposeFilesWithSweep(dir, composerefresh.Sweep, func() int { return 0 })
 			}
-			if len(f.runs) != tc.wantRuns {
-				t.Fatalf("compose ups = %v, want %d", f.runs, tc.wantRuns)
+			if f.ups() != tc.wantUps {
+				t.Fatalf("compose ups = %d, want %d: %v", f.ups(), tc.wantUps, f.Calls)
 			}
 			got, _ := os.ReadFile(path)
 			if edited := tc.compose != old; edited != (string(got) == tc.compose) {
@@ -194,15 +221,31 @@ func TestBootRefreshRecreatesRunningTEIOnceAndNeverInALoop(t *testing.T) {
 	}
 }
 
-// A failed recreate restores the previous file so the next start retries.
-func TestBootRefreshRecreateFailureRestoresPreviousTEIFile(t *testing.T) {
+// A failed boot recreate restores the previous file and leaves the service
+// running: a legacy-project container comes back under its own name and ID; a
+// same-project container compose already removed is started again from the
+// previous file.
+func TestBootRefreshRecreateFailureKeepsServiceRunning(t *testing.T) {
 	old := prePinTEICompose(t)
-	f := &fakeManagedCompose{state: map[string]string{"citadel-tei": "running"}, runErr: errors.New("boom")}
-	installFakeManagedCompose(t, f)
-	dir, path := writeNodeFixture(t, "tei", old, "")
-	refreshManagedComposeFilesWithSweep(dir, composerefresh.Sweep, func() int { return 0 })
-	if got, _ := os.ReadFile(path); string(got) != old || len(f.runs) != 1 {
-		t.Fatalf("runs = %d; file not rolled back:\n%s", len(f.runs), got)
+	for _, project := range []string{"citadel-tei", "services"} {
+		t.Run(project, func(t *testing.T) {
+			f := &fakeManagedCompose{}
+			installFakeManagedCompose(t, f)
+			dir, path := writeNodeFixture(t, "tei", old, "")
+			prev := f.addRunning(project, path)
+			f.Fail["up-start"] = 1
+			refreshManagedComposeFilesWithSweep(dir, composerefresh.Sweep, func() int { return 0 })
+			if got, _ := os.ReadFile(path); string(got) != old {
+				t.Fatalf("file not rolled back:\n%s", got)
+			}
+			all := f.Containers()
+			if len(all) != 1 || all[0].Name != "citadel-tei" || all[0].State != "running" || all[0].Config != composefake.FileHash(path) {
+				t.Fatalf("containers after failed recreate = %+v; want the service running its previous file", all)
+			}
+			if project == "citadel-tei" && (all[0].ID != prev.ID || all[0].Project != "citadel-tei") {
+				t.Fatalf("legacy container not restored: %+v (was %+v)", all[0], prev)
+			}
+		})
 	}
 }
 
@@ -284,43 +327,65 @@ func TestRunningStartAction(t *testing.T) {
 
 func TestRestartRecreatesOnlyKnownManagedTemplates(t *testing.T) {
 	old := prePinTEICompose(t)
+	current := services.ServiceMap["tei"]
 	for _, tc := range []struct {
 		name        string
 		compose     string
-		state       map[string]string
+		project     string // "" = no container
 		override    bool
-		runErr      error
+		fail        bool
 		wantHandled bool
 		wantFile    string
 	}{
-		{name: "pre-pin running", compose: old, state: map[string]string{"citadel-tei": "running"}, wantHandled: true, wantFile: services.ServiceMap["tei"]},
-		{name: "current exited", compose: services.ServiceMap["tei"], state: map[string]string{"citadel-tei": "exited"}, wantHandled: true, wantFile: services.ServiceMap["tei"]},
-		{name: "operator edited", compose: old + "\n# edit\n", state: map[string]string{"citadel-tei": "running"}, wantFile: old + "\n# edit\n"},
-		{name: "no container", compose: services.ServiceMap["tei"], state: map[string]string{}, wantFile: services.ServiceMap["tei"]},
-		{name: "node-dir override", compose: services.ServiceMap["tei"], state: map[string]string{"citadel-tei": "running"}, override: true, wantFile: services.ServiceMap["tei"]},
-		{name: "recreate fails", compose: old, state: map[string]string{"citadel-tei": "running"}, runErr: errors.New("boom"), wantFile: old},
+		{name: "pre-pin legacy running", compose: old, project: "citadel-tei", wantHandled: true, wantFile: current},
+		{name: "current same project", compose: current, project: "services", wantHandled: true, wantFile: current},
+		{name: "operator edited", compose: old + "\n# edit\n", project: "services", wantFile: old + "\n# edit\n"},
+		{name: "no container", compose: current, wantFile: current},
+		{name: "node-dir override", compose: current, project: "services", override: true, wantFile: current},
+		{name: "legacy replacement fails", compose: old, project: "citadel-tei", fail: true, wantHandled: true, wantFile: old},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := &fakeManagedCompose{state: tc.state, runErr: tc.runErr}
+			f := &fakeManagedCompose{}
 			installFakeManagedCompose(t, f)
 			dir, path := writeNodeFixture(t, "tei", tc.compose, "")
+			var prev composefake.Container
+			if tc.project != "" {
+				prev = f.addRunning(tc.project, path)
+			}
 			if tc.override {
 				t.Setenv("CITADEL_NODE_DIR", dir)
 			}
+			if tc.fail {
+				f.Fail["up-start"] = 1
+			}
 			svc := Service{Name: "tei", ComposeFile: "services/tei.yml"}
 			handled, err := restartByRecreatingManagedService(managedCompose.runtime(), svc, path)
-			if (err != nil) != (tc.runErr != nil) || handled != tc.wantHandled {
-				t.Fatalf("handled = %v, err = %v; want handled=%v", handled, err, tc.wantHandled)
-			}
-			wantRuns := 0
-			if tc.wantHandled || tc.runErr != nil {
-				wantRuns = 1
-			}
-			if len(f.runs) != wantRuns || (wantRuns == 1 && !hasArg(f.runs[0], "--force-recreate")) {
-				t.Fatalf("runs = %v, want %d forced recreate(s)", f.runs, wantRuns)
+			if (err != nil) != tc.fail || handled != tc.wantHandled {
+				t.Fatalf("handled = %v, err = %v; want handled=%v fail=%v", handled, err, tc.wantHandled, tc.fail)
 			}
 			if got, _ := os.ReadFile(path); string(got) != tc.wantFile {
 				t.Fatalf("file after restart:\n%s", got)
+			}
+			c, _ := f.Named("citadel-tei")
+			switch {
+			case !tc.wantHandled:
+				if len(f.Calls) > 0 && f.ups() > 0 {
+					t.Fatalf("unhandled restart ran compose up: %v", f.Calls)
+				}
+				if tc.project != "" && c != prev {
+					t.Fatalf("container changed: %+v", c)
+				}
+			case tc.fail:
+				if c.ID != prev.ID || c.State != "running" || len(f.Containers()) != 1 {
+					t.Fatalf("after a failed restart the old container is not back: %+v", f.Containers())
+				}
+			default:
+				if c.ID == prev.ID || c.State != "running" || len(f.Containers()) != 1 || f.Count("up", "--force-recreate") != 1 {
+					t.Fatalf("restart did not leave exactly one new running container: %+v %v", f.Containers(), f.Calls)
+				}
+				if tc.project == "citadel-tei" && f.Count("rm", "-f", prev.ID) != 1 {
+					t.Fatalf("legacy backup not removed: %v", f.Calls)
+				}
 			}
 		})
 	}
