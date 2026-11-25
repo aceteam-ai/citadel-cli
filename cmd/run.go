@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -193,15 +194,24 @@ func runSingleService(serviceName string) {
 // Admission covers the initial bootstrap, embedded compose materialization,
 // registration, desired-status write, and actual start. The old split path
 // wrote the first three before checking an active fine-tune hold.
-func runSingleServiceApply(configDir, serviceName string, startFn func(string, string) error) error {
+func runSingleServiceApply(configDir, serviceName string, startFn func(string, string) error, gpuCount ...func() int) error {
 	return withLocalServiceStartGuardSource(configDir, serviceName, func(source nodeDirSource) error {
-		return runSingleServiceApplyLocked(configDir, source, serviceName, startFn)
+		return runSingleServiceApplyLocked(configDir, source, serviceName, startFn, gpuCount...)
 	})
 }
 
 // Caller holds the global pointer lock followed by this node's reservation
 // lock. Every read and write stays on the captured node directory.
-func runSingleServiceApplyLocked(configDir string, source nodeDirSource, serviceName string, startFn func(string, string) error) error {
+func runSingleServiceApplyLocked(configDir string, source nodeDirSource, serviceName string, startFn func(string, string) error, gpuCount ...func() int) error {
+	probe := platform.NvidiaGPUCountForCompose
+	if len(gpuCount) > 0 {
+		probe = gpuCount[0]
+	}
+	// Refuse before bootstrap, compose publication, registration or clearing a
+	// durable stopped marker. The pointer and reservation guards are still held.
+	if reason := services.CUDAStartRefusal(serviceName, runtime.GOOS, probe); reason != "" {
+		return fmt.Errorf("cannot start %s", reason)
+	}
 	manifest, _, err := findOrCreateManifestLockedAt(configDir, source)
 	if err != nil {
 		return fmt.Errorf("initialize configuration: %w", err)

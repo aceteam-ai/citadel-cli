@@ -4,6 +4,7 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -13,7 +14,7 @@ import (
 	"github.com/aceteam-ai/citadel-cli/services"
 )
 
-// These wiring regressions execute in GitHub CI. Local cmd execution is held.
+// These wiring regressions use isolated fixture state and injected GPU/runtime observations.
 func TestBootSkipsCUDAEnginesWithOneClearLineEach(t *testing.T) {
 	names := []string{"bonsai", "unlimited-ocr", "vllm", "sglang", "diffusers", "omnivoice"}
 	var manifest []Service
@@ -62,6 +63,102 @@ func TestCLIStartCUDAAbsenceFailsBeforeCompose(t *testing.T) {
 		if err := startService("bonsai", "", func() int { return count }); err == nil || !strings.Contains(err.Error(), "has no compose_file") {
 			t.Fatal("unknown/present probe suppressed normal start", count, err)
 		}
+	}
+}
+
+func TestCLIExplicitRunCUDARefusalPreservesDurableState(t *testing.T) {
+	for _, name := range []string{"bonsai", "unlimited-ocr", "vllm", "sglang", "diffusers", "omnivoice"} {
+		for _, state := range []string{"fresh", "unregistered", "stopped"} {
+			t.Run(name+"/"+state, func(t *testing.T) {
+				t.Setenv("CITADEL_NODE_DIR", "")
+				var configDir string
+				if state == "fresh" {
+					home := t.TempDir()
+					useCmdFixtureHome(t, home)
+					configDir = filepath.Join(home, "citadel-node")
+				} else {
+					var configured []Service
+					if state == "stopped" {
+						configured = []Service{{Name: name, Type: "docker", ComposeFile: "services/" + name + ".yml", DesiredStatus: "stopped"}}
+					}
+					configDir = writeManifestWithServices(t, configured)
+				}
+				composePath := filepath.Join(configDir, "services", name+".yml")
+				if state == "stopped" {
+					if err := os.WriteFile(composePath, []byte("# keep the existing compose unchanged\n"), 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				paths := []string{filepath.Join(configDir, "citadel.yaml"), composePath, filepath.Join(os.Getenv("HOME"), ".citadel-cli", "config.yaml")}
+				before := make(map[string][]byte)
+				for _, path := range paths {
+					data, err := os.ReadFile(path)
+					if err != nil && !os.IsNotExist(err) {
+						t.Fatal(err)
+					}
+					if err == nil {
+						before[path] = data
+					}
+				}
+				t.Setenv("PATH", t.TempDir())
+				resolved, err := localServiceConfigDir()
+				if err != nil || resolved != configDir {
+					t.Fatalf("resolve run target: %q %v", resolved, err)
+				}
+				started, probes := false, 0
+				err = runSingleServiceApply(resolved, name, func(serviceName, path string) error {
+					started = true
+					return startService(serviceName, path, func() int { return 0 })
+				}, func() int { probes++; return 0 })
+				if err == nil || !strings.Contains(err.Error(), "requires an NVIDIA GPU, not starting") || started || probes != 1 {
+					t.Errorf("refused run: err=%v started=%t probes=%d", err, started, probes)
+				}
+				for _, path := range paths {
+					got, err := os.ReadFile(path)
+					want, existed := before[path]
+					if existed {
+						if err != nil || string(got) != string(want) {
+							t.Errorf("refusal mutated %s (%v)", filepath.Base(path), err)
+						}
+					} else if !os.IsNotExist(err) {
+						t.Errorf("refusal created %s (%v)", filepath.Base(path), err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestCLIExplicitRunUnknownOrPresentGPUKeepsStart(t *testing.T) {
+	for _, count := range []int{-1, 1} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			t.Setenv("CITADEL_NODE_DIR", "")
+			configDir := writeManifestWithServices(t, nil)
+			t.Setenv("PATH", t.TempDir())
+			started, probes := false, 0
+			err := runSingleServiceApply(configDir, "bonsai", func(string, string) error { started = true; return nil }, func() int { probes++; return count })
+			if err != nil || !started || probes != 1 {
+				t.Fatalf("normal run: err=%v started=%t probes=%d", err, started, probes)
+			}
+		})
+	}
+}
+
+func TestCLIExplicitRunCPUServiceDoesNotProbeGPU(t *testing.T) {
+	t.Setenv("CITADEL_NODE_DIR", "")
+	configDir := writeManifestWithServices(t, []Service{{Name: "kokoro", Type: "docker", ComposeFile: "services/kokoro.yml", DesiredStatus: "stopped"}})
+	t.Setenv("PATH", t.TempDir())
+	started := false
+	err := runSingleServiceApply(configDir, "kokoro", func(string, string) error { started = true; return nil }, func() int {
+		t.Fatal("CPU-capable service probed for CUDA admission")
+		return 0
+	})
+	if err != nil || !started {
+		t.Fatalf("CPU start refused: err=%v started=%t", err, started)
+	}
+	manifest, _, err := findAndReadManifest()
+	if err != nil || len(manifest.Services) != 1 || manifest.Services[0].DesiredStatus != "" {
+		t.Fatalf("explicit CPU start did not clear stopped marker: %v", err)
 	}
 }
 

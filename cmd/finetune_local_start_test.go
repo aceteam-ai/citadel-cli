@@ -498,7 +498,7 @@ func TestFineTunePointerFlipBeforeAdmissionRefusesAndAtStartIsSerialized(t *test
 			close(entered)
 			<-finish
 			return nil
-		})
+		}, func() int { return 1 }) // Synthetic GPU presence; no native probe.
 	}()
 	select {
 	case <-entered:
