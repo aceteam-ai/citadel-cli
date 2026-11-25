@@ -141,11 +141,15 @@ func replaceManagedService(rt catalog.ContainerRuntime, serviceName, composePath
 	if isEmbeddedService(serviceName) {
 		containerName = embeddedContainerName(serviceName)
 	}
+	project := composeProjectOverride()
+	if project == "" {
+		project = filepath.Base(filepath.Dir(composePath))
+	}
 	return compose.ReplaceRunningService(compose.ReplaceSpec{
 		Runtime:       rt,
 		Service:       serviceName,
 		ContainerName: containerName,
-		Project:       filepath.Base(filepath.Dir(composePath)),
+		Project:       project,
 		ComposeArgs: func() ([]string, func(), error) {
 			return prepareComposeFileArgs(serviceName, composePath, rt.EngineBin)
 		},
