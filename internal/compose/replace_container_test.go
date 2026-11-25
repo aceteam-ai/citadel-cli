@@ -47,6 +47,7 @@ func (f *replaceFixture) spec(preflight func() error) ReplaceSpec {
 		Runtime:       catalog.ContainerRuntime{EngineBin: "docker", Bin: "docker", ComposePrefix: []string{"compose"}},
 		Service:       "tei",
 		ContainerName: "citadel-tei",
+		Project:       "services",
 		ComposeArgs: func() ([]string, func(), error) {
 			return []string{"-f", f.path}, func() {}, nil
 		},
@@ -111,6 +112,25 @@ func TestReplaceLegacyFailureRestoresOldContainerRunning(t *testing.T) {
 	}
 }
 
+func TestReplaceRenameFailureReportsRestartFailure(t *testing.T) {
+	for _, restartFails := range []bool{false, true} {
+		f := newReplaceFixture(t)
+		old := f.addOld("citadel-tei", "running")
+		f.refresh(t)
+		f.engine.Fail["rename"] = 1
+		if restartFails {
+			f.engine.Fail["start"] = 1
+		}
+		outcome, err := ReplaceRunningService(f.spec(nil))
+		if err == nil || outcome != map[bool]ReplaceOutcome{false: ReplaceUnchanged, true: ReplaceFailed}[restartFails] {
+			t.Fatalf("restartFails=%v: outcome=%v, err=%v", restartFails, outcome, err)
+		}
+		if got, ok := f.engine.Named("citadel-tei"); !ok || got.ID != old.ID || (got.State == "running") == restartFails || f.file(t) != oldCompose {
+			t.Fatalf("restartFails=%v: prior state not reported correctly: %+v", restartFails, got)
+		}
+	}
+}
+
 func TestReplaceLegacyStoppedContainerIsNotStartedOnFailure(t *testing.T) {
 	f := newReplaceFixture(t)
 	old := f.addOld("citadel-tei", "exited")
@@ -158,16 +178,59 @@ func TestReplacePreflightFailureTouchesNothing(t *testing.T) {
 					t.Fatalf("%s ran before preflight passed: %v", verb, f.engine.Calls)
 				}
 			}
-			if f.restored != 0 {
-				t.Fatal("RestoreFile ran on a preflight failure; the caller owns that")
+			if f.restored != 1 || f.file(t) != oldCompose {
+				t.Fatal("previous compose file was not restored after preflight failure")
 			}
 		})
 	}
 }
 
+func TestReplaceInspectUncertainFailsClosed(t *testing.T) {
+	for _, failure := range []string{"inspect", "inspect-malformed"} {
+		t.Run(failure, func(t *testing.T) {
+			f := newReplaceFixture(t)
+			old := f.addOld("citadel-tei", "running")
+			f.refresh(t)
+			f.engine.Fail[failure] = 1
+			outcome, err := ReplaceRunningService(f.spec(nil))
+			if err == nil || outcome != ReplaceUnchanged {
+				t.Fatalf("outcome = %v, %v; want refusal", outcome, err)
+			}
+			if all := f.engine.Containers(); len(all) != 1 || all[0] != old || f.engine.Count("up") != 0 {
+				t.Fatalf("uncertain inspect changed service: %+v %v", all, f.engine.Calls)
+			}
+		})
+	}
+}
+
+func TestReplaceBackupPreflightFailureDoesNotMutate(t *testing.T) {
+	f := newReplaceFixture(t)
+	backup := *f.engine.Add(stoppedContainer(BackupContainerName("citadel-tei"), "citadel-tei"))
+	f.refresh(t)
+	f.engine.Fail["config"] = 1
+	if _, err := ReplaceRunningService(f.spec(nil)); err == nil {
+		t.Fatal("preflight should fail")
+	}
+	if got, ok := f.engine.Named(backup.Name); !ok || got != backup || f.engine.Count("rename") != 0 || f.file(t) != oldCompose {
+		t.Fatalf("backup or file changed before preflight: %+v %v", got, f.engine.Calls)
+	}
+}
+
+func TestReplaceForeignSameServiceNeverRemovesBackup(t *testing.T) {
+	f := newReplaceFixture(t)
+	foreign := *f.engine.Add(composefake.Container{Name: "citadel-tei", State: "running", Project: "foreign", Service: "tei"})
+	backup := *f.engine.Add(stoppedContainer(BackupContainerName("citadel-tei"), "citadel-tei"))
+	if _, err := ReplaceRunningService(f.spec(nil)); err == nil {
+		t.Fatal("foreign project accepted")
+	}
+	if all := f.engine.Containers(); len(all) != 2 || all[0] != foreign || all[1] != backup || f.engine.Count("rm") != 0 {
+		t.Fatalf("foreign project caused backup deletion: %+v", all)
+	}
+}
+
 func TestReplaceMissingImageIsPulledOnlyWhenAbsent(t *testing.T) {
 	f := newReplaceFixture(t)
-	f.addOld("services", "running")
+	f.addOld("citadel-tei", "running")
 	f.refresh(t)
 	if _, err := ReplaceRunningService(f.spec(nil)); err != nil {
 		t.Fatal(err)
@@ -175,70 +238,31 @@ func TestReplaceMissingImageIsPulledOnlyWhenAbsent(t *testing.T) {
 	if f.engine.Count("pull") != 0 {
 		t.Fatalf("present image was pulled: %v", f.engine.Calls)
 	}
-	f.engine.Images = map[string]bool{}
-	f.refresh(t)
-	if _, err := ReplaceRunningService(f.spec(nil)); err != nil {
+	g := newReplaceFixture(t)
+	g.addOld("citadel-tei", "running")
+	g.engine.Images = map[string]bool{}
+	g.refresh(t)
+	if _, err := ReplaceRunningService(g.spec(nil)); err != nil {
 		t.Fatal(err)
 	}
-	if f.engine.Count("pull", "tei") != 1 {
-		t.Fatalf("missing image was not pulled once: %v", f.engine.Calls)
+	if g.engine.Count("pull", "tei") != 1 {
+		t.Fatalf("missing image was not pulled once: %v", g.engine.Calls)
 	}
 }
 
-func TestReplaceSameProjectNeverRenamesAndReportsHonestly(t *testing.T) {
+func TestReplaceSameProjectFailsClosed(t *testing.T) {
 	f := newReplaceFixture(t)
 	old := f.addOld("services", "running")
-	// Unchanged file: compose keeps the container.
-	outcome, err := ReplaceRunningService(f.spec(nil))
-	if err != nil || outcome != ReplaceUnchanged {
-		t.Fatalf("unchanged config = %v, %v; want unchanged", outcome, err)
-	}
-	if c, _ := f.engine.Named("citadel-tei"); c.ID != old.ID {
-		t.Fatal("unchanged config replaced the container")
-	}
 	f.refresh(t)
-	outcome, err = ReplaceRunningService(f.spec(nil))
-	if err != nil || outcome != ReplaceReplaced {
-		t.Fatalf("changed config = %v, %v; want replaced", outcome, err)
-	}
-	if f.engine.Count("rename") != 0 || f.engine.Count("stop") != 0 || f.engine.Count("rm") != 0 {
-		t.Fatalf("same-project container was renamed, stopped or removed by hand: %v", f.engine.Calls)
-	}
-}
-
-func TestReplaceSameProjectFailureRunsServiceAgainFromPreviousFile(t *testing.T) {
-	for _, step := range []string{"up", "up-start", "exit-after-start"} {
-		t.Run(step, func(t *testing.T) {
-			f := newReplaceFixture(t)
-			old := f.addOld("services", "running")
-			f.refresh(t)
-			f.engine.Fail[step] = 1
-			outcome, err := ReplaceRunningService(f.spec(nil))
-			if err == nil || outcome != ReplaceRestored {
-				t.Fatalf("outcome = %v, %v; want restored with an error", outcome, err)
-			}
-			c, ok := f.engine.Named("citadel-tei")
-			if !ok || c.State != "running" || c.Config != composefake.FileHash(f.path) || f.file(t) != oldCompose {
-				t.Fatalf("service after failure = %+v (file %q); want running the previous file", c, f.file(t))
-			}
-			if step == "up" && c.ID != old.ID {
-				t.Fatal("a failure before any change replaced the old container")
-			}
-			if len(f.engine.Containers()) != 1 {
-				t.Fatalf("partial containers left: %+v", f.engine.Containers())
-			}
-		})
-	}
-}
-
-func TestReplaceUnrecoveredFailureIsReported(t *testing.T) {
-	f := newReplaceFixture(t)
-	f.addOld("services", "running")
-	f.refresh(t)
-	f.engine.Fail["up-start"] = 2
 	outcome, err := ReplaceRunningService(f.spec(nil))
-	if err == nil || outcome != ReplaceFailed {
-		t.Fatalf("outcome = %v, %v; want failed", outcome, err)
+	if err == nil || outcome != ReplaceUnchanged || !strings.Contains(err.Error(), "same-project") {
+		t.Fatalf("outcome = %v, %v; want safe refusal", outcome, err)
+	}
+	if all := f.engine.Containers(); len(all) != 1 || all[0] != old || f.file(t) != oldCompose {
+		t.Fatalf("same-project container or file changed: %+v", all)
+	}
+	if f.engine.Count("up") != 0 || f.engine.Count("stop") != 0 || f.engine.Count("rm") != 0 {
+		t.Fatalf("same-project container touched: %v", f.engine.Calls)
 	}
 }
 
@@ -290,8 +314,8 @@ func TestReplaceRemovesBackupLeftByFailedCleanup(t *testing.T) {
 	if _, ok := f.engine.Named(BackupContainerName("citadel-tei")); !ok {
 		t.Fatal("fixture: backup removal did not fail")
 	}
-	if _, err := ReplaceRunningService(f.spec(nil)); err != nil {
-		t.Fatalf("second replacement refused: %v", err)
+	if _, err := ReplaceRunningService(f.spec(nil)); err == nil || !strings.Contains(err.Error(), "same-project") {
+		t.Fatalf("second replacement should preserve the running service: %v", err)
 	}
 	all := f.engine.Containers()
 	if len(all) != 1 || all[0].Name != "citadel-tei" || all[0].ID == old.ID || all[0].State != "running" {
@@ -336,7 +360,7 @@ func TestReplaceStoppedSameProjectRemovedIsNotRestored(t *testing.T) {
 
 func TestReplaceInspectsContainersOnly(t *testing.T) {
 	f := newReplaceFixture(t)
-	f.addOld("services", "running")
+	f.addOld("citadel-tei", "running")
 	f.refresh(t)
 	if _, err := ReplaceRunningService(f.spec(nil)); err != nil {
 		t.Fatal(err)

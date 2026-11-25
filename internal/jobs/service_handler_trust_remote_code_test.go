@@ -289,8 +289,11 @@ func TestServiceStartTrustRemoteCodeFlow(t *testing.T) {
 	if !strings.Contains(string(out), "docker compose up failed") {
 		t.Errorf("expected compose-up failure with neutered PATH, got: %s", out)
 	}
-	if v, ok := compose.ReadEnvVar(envPath, "VLLM_TRUST_REMOTE_CODE"); !ok || v != "1" {
-		t.Fatalf("trust_remote_code not persisted by SERVICE_START: %q, %v", v, ok)
+	if _, ok := compose.ReadEnvVar(envPath, "VLLM_TRUST_REMOTE_CODE"); ok {
+		t.Fatal("failed SERVICE_START kept trust_remote_code enabled")
+	}
+	if err := compose.UpsertEnvVar(envPath, "VLLM_TRUST_REMOTE_CODE", "1"); err != nil {
+		t.Fatal(err)
 	}
 
 	// Plain restart: no trust_remote_code in the payload must not clear the
@@ -318,8 +321,8 @@ func TestServiceStartTrustRemoteCodeFlow(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Execute SERVICE_START with trust_remote_code=false: %v", err)
 	}
-	if v, ok := compose.ReadEnvVar(envPath, "VLLM_TRUST_REMOTE_CODE"); !ok || v != "" {
-		t.Errorf("explicit trust_remote_code=false did not clear the opt-in: %q, %v", v, ok)
+	if v, ok := compose.ReadEnvVar(envPath, "VLLM_TRUST_REMOTE_CODE"); !ok || v != "1" {
+		t.Errorf("failed explicit opt-out did not restore the prior flag: %q, %v", v, ok)
 	}
 
 	// A node that never opted in must never see the var at all -- the

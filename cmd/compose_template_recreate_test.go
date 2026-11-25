@@ -127,7 +127,7 @@ func TestManagedComposeRecreatorAppliesRefreshedFileToRunningContainerOnly(t *te
 			_, path := writeNodeFixture(t, "tei", prePinTEICompose(t), tc.desired)
 			var old composefake.Container
 			if tc.state != "" {
-				old = f.addRunning("services", path)
+				old = f.addRunning("citadel-tei", path)
 				if tc.state != "running" {
 					_, _, _ = f.Exec(exec.Command("docker", "stop", old.ID))
 				}
@@ -159,8 +159,8 @@ func TestManagedComposeRecreatorAppliesRefreshedFileToRunningContainerOnly(t *te
 			if !ok || c.ID == old.ID || c.State != "running" || c.Config != composefake.FileHash(path) {
 				t.Fatalf("container after recreate = %+v; want a new one running the refreshed file", c)
 			}
-			if f.Count("rename") != 0 || f.Count("rm") != 0 {
-				t.Fatalf("same-project container renamed or removed by hand: %v", f.Calls)
+			if f.Count("rename") != 1 || f.Count("rm") != 1 {
+				t.Fatalf("legacy backup was not used and cleaned up: %v", f.Calls)
 			}
 		})
 	}
@@ -174,13 +174,30 @@ func TestManagedComposeRecreatorForcesWhenHostPortMoved(t *testing.T) {
 		f := &fakeManagedCompose{Engine: composefake.New("llamacpp", "citadel-llamacpp", "llamacpp:x"), ports: map[string]int{"citadel-llamacpp": tc.port}}
 		installFakeManagedCompose(t, f)
 		_, path := writeNodeFixture(t, "llamacpp", services.ServiceMap["llamacpp"], "")
-		f.addRunning("services", path)
+		f.addRunning("citadel-llamacpp", path)
 		if _, err := managedComposeRecreatorUnchecked("llamacpp", path, 8200, nil); err != nil {
 			t.Fatal(err)
 		}
 		if f.ups() != 1 || (f.Count("up", "--force-recreate") == 1) != tc.wantForce {
 			t.Fatalf("port %d: calls = %v, want force=%v", tc.port, f.Calls, tc.wantForce)
 		}
+	}
+}
+
+func TestManagedComposeRecreatorRecoversBackupOnly(t *testing.T) {
+	f := &fakeManagedCompose{}
+	installFakeManagedCompose(t, f)
+	_, path := writeNodeFixture(t, "tei", services.ServiceMap["tei"], "")
+	backup := *f.Add(composefake.Container{
+		Name: compose.BackupContainerName("citadel-tei"), State: "exited",
+		Project: "citadel-tei", Service: "tei", Config: composefake.FileHash(path),
+	})
+	recreated, err := managedComposeRecreatorUnchecked("tei", path, 0, nil)
+	if err != nil || !recreated {
+		t.Fatalf("backup-only recovery = %v, %v", recreated, err)
+	}
+	if c, ok := f.Named("citadel-tei"); !ok || c.ID == backup.ID || c.State != "running" {
+		t.Fatalf("backup-only recovery left no running replacement: %+v", f.Containers())
 	}
 }
 
@@ -206,7 +223,7 @@ func TestBootRefreshRecreatesRunningTEIOnceAndNeverInALoop(t *testing.T) {
 				t.Setenv("CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE", "1")
 			}
 			dir, path := writeNodeFixture(t, "tei", tc.compose, "")
-			f.addRunning("services", path)
+			f.addRunning("citadel-tei", path)
 			for i := 0; i < 2; i++ {
 				refreshManagedComposeFilesWithSweep(dir, composerefresh.Sweep, func() int { return 0 })
 			}
@@ -338,7 +355,7 @@ func TestRestartRecreatesOnlyKnownManagedTemplates(t *testing.T) {
 		wantFile    string
 	}{
 		{name: "pre-pin legacy running", compose: old, project: "citadel-tei", wantHandled: true, wantFile: current},
-		{name: "current same project", compose: current, project: "services", wantHandled: true, wantFile: current},
+		{name: "current same project", compose: current, project: "services", fail: true, wantHandled: true, wantFile: current},
 		{name: "operator edited", compose: old + "\n# edit\n", project: "services", wantFile: old + "\n# edit\n"},
 		{name: "no container", compose: current, wantFile: current},
 		{name: "node-dir override", compose: current, project: "services", override: true, wantFile: current},

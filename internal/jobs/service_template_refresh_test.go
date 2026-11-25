@@ -86,7 +86,7 @@ func TestServiceStartRecreatesRunningTEIOnceAfterTemplateRefresh(t *testing.T) {
 		{name: "opted out", compose: old, optOut: true, wantFile: embeddedservices.ServiceMap["tei"]},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			h, engine, path, prev := teiStartFixture(t, tc.compose, "services")
+			h, engine, path, prev := teiStartFixture(t, tc.compose, "citadel-tei")
 			if tc.optOut {
 				t.Setenv("CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE", "1")
 			}

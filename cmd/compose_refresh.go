@@ -145,6 +145,7 @@ func replaceManagedService(rt catalog.ContainerRuntime, serviceName, composePath
 		Runtime:       rt,
 		Service:       serviceName,
 		ContainerName: containerName,
+		Project:       filepath.Base(filepath.Dir(composePath)),
 		ComposeArgs: func() ([]string, func(), error) {
 			return prepareComposeFileArgs(serviceName, composePath, rt.EngineBin)
 		},
@@ -230,7 +231,13 @@ func managedComposeRecreatorUnchecked(service, composePath string, wantHostPort 
 	if isEmbeddedService(service) {
 		containerName = embeddedContainerName(service)
 	}
-	if state, exists := managedCompose.containerState(rt.EngineBin, containerName); !exists || state != "running" {
+	if state, exists := managedCompose.containerState(rt.EngineBin, containerName); !exists {
+		// An interrupted legacy replacement may leave only the renamed backup.
+		// Let ReplaceRunningService recover it rather than skipping the sweep.
+		if _, backupExists := managedCompose.containerState(rt.EngineBin, compose.BackupContainerName(containerName)); !backupExists {
+			return false, nil
+		}
+	} else if state != "running" {
 		return false, nil
 	}
 	var upArgs []string

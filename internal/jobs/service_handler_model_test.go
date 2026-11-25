@@ -155,14 +155,15 @@ func TestPersistServiceModel_InvalidModel(t *testing.T) {
 
 // TestServiceStartModelFlow drives the full Execute path with PATH neutered
 // (no docker binary reachable) so nothing real is launched: the compose up
-// fails safely AFTER the persistence step, which is what we assert. It then
-// re-drives a plain SERVICE_START without a model — the restart path — and
-// verifies the previously persisted model is untouched and still fed to
-// compose via --env-file.
+// fails safely after persistence. The failed attempt must restore the old
+// selection so the same requested model still counts as a change on retry.
 func TestServiceStartModelFlow(t *testing.T) {
 	t.Setenv("PATH", t.TempDir()) // no docker, no native binaries
 	h, dir := newModelTestHandler(t)
 	envPath := filepath.Join(dir, "services", "vllm.env")
+	if err := compose.UpsertEnvVar(envPath, "VLLM_MODEL", "previous/model"); err != nil {
+		t.Fatal(err)
+	}
 
 	// SERVICE_START with a model: persists it before attempting the up.
 	out, err := h.Execute(JobContext{}, &nexus.Job{
@@ -176,8 +177,8 @@ func TestServiceStartModelFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute SERVICE_START with model: %v", err)
 	}
-	// The up itself must have failed (docker unreachable) — proving the test
-	// never started anything — but the model is already durable.
+	// The up itself must have failed (docker unreachable), leaving the old
+	// selection durable so this request can be retried.
 	if !strings.Contains(string(out), "docker compose up failed") {
 		t.Errorf("expected compose-up failure with neutered PATH, got: %s", out)
 	}
@@ -189,8 +190,8 @@ func TestServiceStartModelFlow(t *testing.T) {
 	if strings.Contains(string(out), "exec:") {
 		t.Errorf("failure detail must not leak the raw exec error, got: %s", out)
 	}
-	if v, ok := compose.ReadEnvVar(envPath, "VLLM_MODEL"); !ok || v != "Qwen/Qwen2.5-0.5B-Instruct" {
-		t.Fatalf("model not persisted by SERVICE_START: %q, %v", v, ok)
+	if v, ok := compose.ReadEnvVar(envPath, "VLLM_MODEL"); !ok || v != "previous/model" {
+		t.Fatalf("failed SERVICE_START did not restore model: %q, %v", v, ok)
 	}
 
 	// Restart path: a plain SERVICE_START without a model must leave the
@@ -202,7 +203,7 @@ func TestServiceStartModelFlow(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Execute plain SERVICE_START: %v", err)
 	}
-	if v, _ := compose.ReadEnvVar(envPath, "VLLM_MODEL"); v != "Qwen/Qwen2.5-0.5B-Instruct" {
+	if v, _ := compose.ReadEnvVar(envPath, "VLLM_MODEL"); v != "previous/model" {
 		t.Errorf("plain restart clobbered persisted model: %q", v)
 	}
 	composePath := filepath.Join(dir, "services", "vllm.yml")

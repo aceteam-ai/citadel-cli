@@ -177,6 +177,12 @@ func (e *Engine) engineLocked(args []string) ([]byte, []byte, error) {
 	}
 	switch args[0] {
 	case "inspect":
+		if e.failLocked("inspect") {
+			return errOut("container engine unavailable")
+		}
+		if e.failLocked("inspect-malformed") {
+			return []byte("incomplete"), nil, nil
+		}
 		c := e.findLocked(args[len(args)-1])
 		if c == nil {
 			return errOut("no such container")

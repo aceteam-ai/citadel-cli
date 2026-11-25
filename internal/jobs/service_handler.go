@@ -512,7 +512,31 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 				}
 			}()
 		}
+		// Model and trust values are persisted before replacement. Keep the
+		// original env file so a failed start retries the requested change and
+		// the running container's previous settings remain authoritative.
+		var restoreEnv func() error
+		if model != "" || trustRemoteCode != trustRemoteCodeUnspecified {
+			composePath, pathErr := h.resolveComposePath(svc)
+			if pathErr != nil {
+				return nil, pathErr
+			}
+			var snapshotErr error
+			restoreEnv, snapshotErr = snapshotServiceEnv(compose.SiblingEnvPath(composePath))
+			if snapshotErr != nil {
+				return nil, snapshotErr
+			}
+		}
 		modelChanged := false
+		trustChanged := false
+		defer func() {
+			if restoreEnv == nil || (!modelChanged && !trustChanged) || (err == nil && retErr == nil) {
+				return
+			}
+			if rbErr := restoreEnv(); rbErr != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("restore previous service settings: %w", rbErr))
+			}
+		}()
 		if model != "" {
 			envVar, changed, mErr := h.persistServiceModel(ctx, svc, model)
 			if mErr != nil {
@@ -1456,6 +1480,30 @@ func (h *ServiceHandler) persistServiceModel(ctx JobContext, svc manifestService
 	return envVar, true, nil
 }
 
+// snapshotServiceEnv preserves the exact pre-start settings, including whether
+// the sibling env file existed. The file may contain credentials; never log or
+// return its contents.
+func snapshotServiceEnv(path string) (func() error, error) {
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return func() error {
+			err := os.Remove(path)
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read previous service settings: %w", err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("cannot snapshot previous service settings: %v", err)
+	}
+	return func() error { return os.WriteFile(path, data, info.Mode().Perm()) }, nil
+}
+
 // serviceTrustRemoteCodeEnvVar maps a managed engine to the compose
 // interpolation variable that opts it into --trust-remote-code (#848).
 // Deliberately its own map (not folded into serviceModelEnvVar): engines
@@ -1684,6 +1732,7 @@ func (h *ServiceHandler) replaceRunningEmbedded(rt catalog.ContainerRuntime, svc
 		Runtime:       rt,
 		Service:       svc.Name,
 		ContainerName: compose.ContainerName(svc.Name, strings.TrimSpace(os.Getenv("CITADEL_NODE_DIR"))),
+		Project:       filepath.Base(filepath.Dir(composePath)),
 		ComposeArgs: func() ([]string, func(), error) {
 			actual, cleanup := composePath, func() {}
 			if rt.EngineBin == "podman" {

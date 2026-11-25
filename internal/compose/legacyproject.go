@@ -16,15 +16,20 @@
 // up` conflicts on the pinned container_name ("citadel-<name>") because the
 // existing container belongs to another compose project (--force-recreate does
 // NOT resolve a cross-project name conflict; compose refuses to adopt it).
-// RemoveLegacyProjectContainers force-removes every container labeled with the
-// legacy per-service project so both up and down converge under the default
-// project. Call it before a compose up and after a compose down.
+// RemoveLegacyProjectContainers removes legacy per-service containers so both
+// up and down converge under the default project. A replacement backup is
+// excluded while its new container is being verified.
 package compose
 
 import (
 	"os/exec"
 	"strings"
+	"sync"
 )
+
+// The worker and the Control Center can mutate the same legacy service in
+// parallel within one process. Keep cleanup out of the backup window.
+var legacyCleanupMu sync.Mutex
 
 // RemoveLegacyProjectContainers force-removes all containers created under the
 // legacy per-service compose project "citadel-<serviceName>". engineBin is the
@@ -35,19 +40,34 @@ func RemoveLegacyProjectContainers(engineBin, serviceName string) []string {
 	if engineBin == "" || serviceName == "" {
 		return nil
 	}
+	legacyCleanupMu.Lock()
+	defer legacyCleanupMu.Unlock()
 	legacyProject := "citadel-" + serviceName
 	out, err := exec.Command(engineBin, "ps", "-aq",
-		"--filter", "label=com.docker.compose.project="+legacyProject).Output()
+		"--filter", "label=com.docker.compose.project="+legacyProject,
+		"--format", "{{.ID}} {{.Names}}").Output()
 	if err != nil {
 		return nil
 	}
-	ids := strings.Fields(strings.TrimSpace(string(out)))
+	ids := legacyRemovalIDs(out, BackupContainerName("citadel-"+serviceName))
 	if len(ids) == 0 {
 		return nil
 	}
 	args := append([]string{"rm", "-f"}, ids...)
 	if err := exec.Command(engineBin, args...).Run(); err != nil {
 		return nil
+	}
+	return ids
+}
+
+func legacyRemovalIDs(out []byte, backupName string) []string {
+	var ids []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 || fields[1] == backupName {
+			continue
+		}
+		ids = append(ids, fields[0])
 	}
 	return ids
 }
