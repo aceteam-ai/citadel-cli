@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
@@ -16,6 +17,53 @@ import (
 // version the editor loaded. A distinct job type makes older nodes fail closed
 // instead of ignoring the preconditions on FILE_WRITE.
 type FileWriteIfUnchangedHandler struct{ WorkspaceDir string }
+
+type conditionalSaveLock struct {
+	identity os.FileInfo
+	mu       sync.Mutex
+	users    int
+}
+
+var conditionalSaveLocks struct {
+	sync.Mutex
+	entries []*conditionalSaveLock
+}
+
+// lockConditionalSave serializes all conditional writes to the same opened
+// file, including writes through hard links or different handler instances.
+// Entries live only while a writer holds or waits on the file lock.
+func lockConditionalSave(identity os.FileInfo) func() {
+	conditionalSaveLocks.Lock()
+	var entry *conditionalSaveLock
+	for _, candidate := range conditionalSaveLocks.entries {
+		if os.SameFile(identity, candidate.identity) {
+			entry = candidate
+			break
+		}
+	}
+	if entry == nil {
+		entry = &conditionalSaveLock{identity: identity}
+		conditionalSaveLocks.entries = append(conditionalSaveLocks.entries, entry)
+	}
+	entry.users++
+	conditionalSaveLocks.Unlock()
+
+	entry.mu.Lock()
+	return func() {
+		entry.mu.Unlock()
+		conditionalSaveLocks.Lock()
+		entry.users--
+		if entry.users == 0 {
+			for index, candidate := range conditionalSaveLocks.entries {
+				if candidate == entry {
+					conditionalSaveLocks.entries = append(conditionalSaveLocks.entries[:index], conditionalSaveLocks.entries[index+1:]...)
+					break
+				}
+			}
+		}
+		conditionalSaveLocks.Unlock()
+	}
+}
 
 func (h *FileWriteIfUnchangedHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, error) {
 	path := job.Payload["path"]
@@ -40,6 +88,14 @@ func (h *FileWriteIfUnchangedHandler) Execute(ctx JobContext, job *nexus.Job) ([
 		return nil, fmt.Errorf("cannot open file for conditional save: %w", err)
 	}
 	defer file.Close()
+	identity, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("cannot stat file for conditional save: %w", err)
+	}
+	unlock := lockConditionalSave(identity)
+	defer unlock()
+	// Another editor may have completed while this request waited for the
+	// file lock. Validate the open descriptor again inside the critical section.
 	info, err := file.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("cannot stat file for conditional save: %w", err)

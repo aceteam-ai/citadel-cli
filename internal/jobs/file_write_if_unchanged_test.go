@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -53,6 +54,86 @@ func TestFileWriteIfUnchanged_SavesAndRejectsStaleVersions(t *testing.T) {
 				t.Fatalf("stale write changed file to %q", got)
 			}
 		})
+	}
+}
+
+func TestFileWriteIfUnchanged_CompetingSavesSerializeByFileIdentity(t *testing.T) {
+	ws := setupWorkspace(t)
+	path := writeTestFile(t, ws, "note.md", "draft")
+	secondPath := path
+	if runtime.GOOS != "windows" {
+		secondPath = filepath.Join(ws, "same-file.md")
+		if err := os.Link(path, secondPath); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstContent := "a longer first edit"
+	secondContent := "short"
+	firstPayload := conditionalPayload(t, path, "draft", firstContent)
+	secondPayload := conditionalPayload(t, secondPath, "draft", secondContent)
+	firstAtWrite := make(chan struct{})
+	secondAtWrite := make(chan struct{})
+	firstRelease := make(chan struct{})
+	secondRelease := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			close(firstRelease)
+			close(secondRelease)
+		})
+	}
+	defer release()
+	firstResult := make(chan error, 1)
+	secondResult := make(chan error, 1)
+	first := &FileWriteIfUnchangedHandler{WorkspaceDir: ws}
+	second := &FileWriteIfUnchangedHandler{WorkspaceDir: ws}
+	go func() {
+		_, err := first.Execute(JobContext{LogFn: func(string, string) {
+			close(firstAtWrite)
+			<-firstRelease
+		}}, makeJob(firstPayload))
+		firstResult <- err
+	}()
+	select {
+	case <-firstAtWrite:
+	case err := <-firstResult:
+		t.Fatalf("first save failed before its final check: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("first save did not reach the write boundary")
+	}
+	go func() {
+		_, err := second.Execute(JobContext{LogFn: func(string, string) {
+			close(secondAtWrite)
+			<-secondRelease
+		}}, makeJob(secondPayload))
+		secondResult <- err
+	}()
+	secondPassedCheck := false
+	select {
+	case <-secondAtWrite:
+		secondPassedCheck = true
+	case <-time.After(250 * time.Millisecond):
+	}
+	release()
+	var firstErr, secondErr error
+	select {
+	case firstErr = <-firstResult:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first save did not finish")
+	}
+	select {
+	case secondErr = <-secondResult:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second save did not finish")
+	}
+	if secondPassedCheck {
+		t.Error("second save passed the precondition while the first held the file lock")
+	}
+	if firstErr != nil || secondErr == nil || !strings.Contains(secondErr.Error(), "file changed since load") {
+		t.Fatalf("want one success and one conflict, got first=%v second=%v", firstErr, secondErr)
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != firstContent {
+		t.Fatalf("winning save is not intact: %q (%v)", got, err)
 	}
 }
 
