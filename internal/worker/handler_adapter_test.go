@@ -579,6 +579,7 @@ func TestCreateLegacyHandlersWithOpts_FileHandlers(t *testing.T) {
 	fileTypes := []string{
 		JobTypeFileRead,
 		JobTypeFileWrite,
+		JobTypeFileWriteIfUnchanged,
 		JobTypeFileEdit,
 		JobTypeFileList,
 		JobTypeFileSearch,

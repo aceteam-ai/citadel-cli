@@ -590,6 +590,7 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 				newGatedLegacyHandlerAdapter(JobTypeFileReadBytes, readBytesHandler, gate),
 				newGatedLegacyHandlerAdapter(JobTypeFileReadRangeV1, readBytesRangeHandler, gate),
 				newGatedLegacyHandlerAdapter(JobTypeFileWrite, jobs.NewFileWriteHandler(opts.WorkspaceDir), gate),
+				newGatedLegacyHandlerAdapter(JobTypeFileWriteIfUnchanged, &jobs.FileWriteIfUnchangedHandler{WorkspaceDir: opts.WorkspaceDir}, gate),
 				newGatedLegacyHandlerAdapter(JobTypeFileEdit, jobs.NewFileEditHandler(opts.WorkspaceDir), gate),
 				newGatedLegacyHandlerAdapter(JobTypeFileList, listHandler, gate),
 				newGatedLegacyHandlerAdapter(JobTypeFileSearch, searchHandler, gate),

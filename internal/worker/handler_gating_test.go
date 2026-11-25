@@ -44,7 +44,7 @@ func TestFreshNode_RefusesSensitiveJobs(t *testing.T) {
 	}
 
 	fileJobs := []string{
-		JobTypeFileRead, JobTypeFileReadBytes, JobTypeFileReadRangeV1, JobTypeFileWrite,
+		JobTypeFileRead, JobTypeFileReadBytes, JobTypeFileReadRangeV1, JobTypeFileWrite, JobTypeFileWriteIfUnchanged,
 		JobTypeFileEdit, JobTypeFileList,
 		JobTypeFileSearch, JobTypeFileIndex, JobTypeFileSemanticSearch,
 	}
