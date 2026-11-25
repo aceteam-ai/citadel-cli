@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -65,5 +67,37 @@ func TestFileWriteIfUnchanged_EmptyFileAndOutsidePath(t *testing.T) {
 	unsafe["path"] = t.TempDir() + "/escape.txt"
 	if _, err := handler.Execute(JobContext{}, makeJob(unsafe)); err == nil {
 		t.Fatal("expected outside-workspace refusal")
+	}
+}
+
+func TestWriteConditionalContentUsesOpenedDescriptorAfterPathSwap(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("open-file rename and symlink behavior differs on Windows")
+	}
+	ws := setupWorkspace(t)
+	path := writeTestFile(t, ws, "note.md", "draft")
+	outside := filepath.Join(t.TempDir(), "outside.md")
+	if err := os.WriteFile(outside, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if err := os.Rename(path, path+".moved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, path); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeConditionalContent(file, []byte("saved")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(outside); err != nil || string(got) != "secret" {
+		t.Fatalf("outside file changed: %q %v", got, err)
+	}
+	if got, err := os.ReadFile(path + ".moved"); err != nil || string(got) != "saved" {
+		t.Fatalf("opened file was not saved: %q %v", got, err)
 	}
 }

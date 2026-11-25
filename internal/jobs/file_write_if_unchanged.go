@@ -33,7 +33,9 @@ func (h *FileWriteIfUnchangedHandler) Execute(ctx JobContext, job *nexus.Job) ([
 	if err != nil {
 		return nil, fmt.Errorf("path validation failed: %w", err)
 	}
-	file, err := os.Open(validated)
+	// Keep the same descriptor for verification and write. Reopening by path
+	// after validation would let a concurrent symlink swap redirect the write.
+	file, err := os.OpenFile(validated, os.O_RDWR, 0)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open file for conditional save: %w", err)
 	}
@@ -66,10 +68,17 @@ func (h *FileWriteIfUnchangedHandler) Execute(ctx JobContext, job *nexus.Job) ([
 		return nil, fmt.Errorf("file changed since load")
 	}
 	ctx.Log("info", "     - [Job %s] FILE_WRITE_IF_UNCHANGED %s (%d bytes)", job.ID, validated, len(content))
-	if err := os.WriteFile(validated, []byte(content), info.Mode().Perm()); err != nil {
+	if err := writeConditionalContent(file, []byte(content)); err != nil {
 		return nil, fmt.Errorf("failed to save file: %w", err)
 	}
 	return json.Marshal(map[string]any{"path": validated, "bytes_written": len(content)})
+}
+
+func writeConditionalContent(file *os.File, content []byte) error {
+	if _, err := file.WriteAt(content, 0); err != nil {
+		return err
+	}
+	return file.Truncate(int64(len(content)))
 }
 
 var _ JobHandler = (*FileWriteIfUnchangedHandler)(nil)
