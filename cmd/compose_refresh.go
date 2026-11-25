@@ -10,16 +10,15 @@
 // that were provisioned by an older binary and would otherwise keep stale,
 // hardcoded-port composes forever.
 //
-// Recreate-on-boot policy (see PR for rationale): the primary upgrade path is a
-// hands-off auto-update that re-execs the binary in place (syscall.Exec) WITHOUT
-// tearing down service containers, so the prior container keeps running on its
-// old host port and startManagedServices no-ops on it (it's already running).
-// Refreshing only the FILE would therefore never self-heal an auto-updated node
-// -- exactly the population #426 targets. So auto force-recreate on a *port
-// change* is the DEFAULT: it fires only when a managed service is running AND
-// its published host port actually differs from the new template (i.e. the
-// broken/colliding state, not healthy inference). Operators who prefer to move
-// live containers by hand can opt out with
+// Recreate-on-boot policy: the primary upgrade path is a hands-off auto-update
+// that re-execs the binary in place (syscall.Exec) WITHOUT tearing down service
+// containers, and startManagedServices no-ops on an already-running container.
+// Refreshing only the FILE would therefore never reach an auto-updated node's
+// running container -- the old host port, command or image would keep running.
+// So the sweep hands every file it rewrote to managedComposeRecreatorUnchecked,
+// which applies it to a RUNNING container (and only a running one) once. The
+// version stamp keeps that from repeating. Operators who prefer to move live
+// containers by hand can opt out with
 // CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE=1|true|yes, which downgrades to
 // file-refresh + a remediation hint.
 package cmd
@@ -57,7 +56,7 @@ func refreshManagedComposeFilesWithSweep(configDir string, sweep func(composeref
 	var recreator composerefresh.PortRecreator
 	if recreateOnUpgradeEnabled() {
 		// The sweep owns reservation.lock; avoid a nested lock in its callback.
-		recreator = enginePortRecreatorUnchecked
+		recreator = managedComposeRecreatorUnchecked
 	}
 	var res composerefresh.Result
 	err := withLocalServiceMutationLock(configDir, func() error {
@@ -100,42 +99,93 @@ func refreshManagedComposeFilesWithSweep(configDir string, sweep func(composeref
 		Log("compose-refresh: preserved hand-edited composes: %s", strings.Join(res.Preserved, ", "))
 	}
 	if len(res.Recreated) > 0 {
-		Log("compose-refresh: force-recreated (host port moved): %s", strings.Join(res.Recreated, ", "))
+		Log("compose-refresh: applied refreshed composes to running containers: %s", strings.Join(res.Recreated, ", "))
 	}
 }
 
-// recreateOnUpgradeEnabled reports whether boot-time auto force-recreate of a
-// port-moved service is active. It is ON by default because the primary upgrade
-// path (auto-update re-exec) leaves prior containers running on their old host
-// port, so file-refresh alone would never self-heal the collision #426 targets.
-// Operators can opt out with CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE.
+// recreateOnUpgradeEnabled reports whether a refreshed managed template is
+// applied to its running container automatically. It is ON by default; see the
+// file header. composerefresh.RecreateOnUpgradeDisabled owns the opt-out.
 func recreateOnUpgradeEnabled() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE"))) {
-	case "1", "true", "yes", "on":
-		return false
-	default:
-		return true
-	}
+	return !composerefresh.RecreateOnUpgradeDisabled()
 }
 
-// enginePortRecreator inspects the running container's published host port and,
-// if it differs from wantHostPort, force-recreates the service from composePath
-// with the citadel host-port env injected. Returns (recreated, err). When the
-// container is not running or already publishes the wanted port, it is left
-// untouched (recreated=false).
+// enginePortRecreator is managedComposeRecreatorUnchecked behind the local
+// service start guard, for callers that do not already hold reservation.lock.
 func enginePortRecreator(service, composePath string, wantHostPort int) (bool, error) {
 	configDir := filepath.Dir(filepath.Dir(composePath))
 	var recreated bool
 	err := withLocalServiceStartGuard(configDir, service, func() error {
 		var recreateErr error
-		recreated, recreateErr = enginePortRecreatorUnchecked(service, composePath, wantHostPort)
+		recreated, recreateErr = managedComposeRecreatorUnchecked(service, composePath, wantHostPort)
 		return recreateErr
 	})
 	return recreated, err
 }
 
-func enginePortRecreatorUnchecked(service, composePath string, wantHostPort int) (bool, error) {
-	rt := catalog.SelectContainerRuntime()
+// managedComposeDeps are the runtime seams the refresh recreate uses, so tests
+// drive it with fakes instead of a container engine.
+type managedComposeDeps struct {
+	runtime        func() catalog.ContainerRuntime
+	containerState func(engineBin, containerName string) (string, bool)
+	publishedPort  func(engineBin, containerName string) (int, bool)
+	serviceFor     func(configDir, service string) Service
+	run            func(cmd *exec.Cmd) ([]byte, error)
+}
+
+var managedCompose = managedComposeDeps{
+	runtime:        catalog.SelectContainerRuntime,
+	containerState: containerStateFor,
+	publishedPort:  runningPublishedHostPort,
+	serviceFor:     manifestServiceAt,
+	run:            func(cmd *exec.Cmd) ([]byte, error) { return cmd.CombinedOutput() },
+}
+
+// containerStateFor returns a container's State.Status and whether it exists.
+func containerStateFor(engineBin, containerName string) (string, bool) {
+	out, err := exec.Command(engineBin, "inspect", "--format", "{{.State.Status}}", containerName).Output()
+	if err != nil {
+		return "", false
+	}
+	return strings.TrimSpace(string(out)), true
+}
+
+// manifestServiceAt reads one service entry from the manifest in configDir
+// without consulting the global node pointer. A missing entry is the zero
+// Service.
+func manifestServiceAt(configDir, service string) Service {
+	manifest, err := readManifestAt(configDir)
+	if err != nil {
+		return Service{}
+	}
+	for _, s := range manifest.Services {
+		if s.Name == service {
+			return s
+		}
+	}
+	return Service{}
+}
+
+// managedComposeRecreatorUnchecked applies a compose file the refresh sweep just
+// rewrote to that service's RUNNING container. It is the sweep's
+// composerefresh.PortRecreator, so it runs at most once per template change.
+//
+//   - A stopped, exited or absent container is left alone: the next start uses
+//     the new file. A service marked `desired_status: stopped` is never touched.
+//   - When the container's published host port differs from wantHostPort (a
+//     port-managed service whose publish moved), it is force-recreated.
+//   - Otherwise `compose up -d` lets compose recreate it only if its config
+//     hash changed, so a comment-only template change does not restart a live
+//     engine. On Podman the up is forced, because podman-compose does not
+//     compare config hashes.
+//
+// The caller holds reservation.lock (the sweep does).
+func managedComposeRecreatorUnchecked(service, composePath string, wantHostPort int) (bool, error) {
+	configDir := filepath.Dir(filepath.Dir(composePath))
+	if serviceStartDisabled(managedCompose.serviceFor(configDir, service)) {
+		return false, nil
+	}
+	rt := managedCompose.runtime()
 	// citadel#860: this sweep only ever runs from citadel work's boot path
 	// (refreshManagedComposeFiles, cmd/work.go), which refuses --node-dir/
 	// CITADEL_NODE_DIR outright before reaching here -- so this is a
@@ -147,30 +197,44 @@ func enginePortRecreatorUnchecked(service, composePath string, wantHostPort int)
 	if isEmbeddedService(service) {
 		containerName = embeddedContainerName(service)
 	}
-
-	current, running := runningPublishedHostPort(rt.EngineBin, containerName)
-	if !running {
-		// Nothing running from the old file; the refreshed file will be used on
-		// the next start. Don't disturb anything.
+	if state, exists := managedCompose.containerState(rt.EngineBin, containerName); !exists || state != "running" {
 		return false, nil
 	}
-	if current == wantHostPort {
-		return false, nil
+	force := false
+	if wantHostPort > 0 {
+		if current, ok := managedCompose.publishedPort(rt.EngineBin, containerName); ok && current != wantHostPort {
+			Log("compose-refresh: %s: host port moved %d -> %d; force-recreating", service, current, wantHostPort)
+			force = true
+		}
 	}
-
-	Log("compose-refresh: %s: host port moved %d -> %d; force-recreating", service, current, wantHostPort)
-	composeArgs := composeFileArgs(composePath, composePath)
-	composeArgs = append(composeArgs, "up", "-d", "--force-recreate")
-	args := rt.ComposeArgs(composeArgs...)
-	cmd := exec.Command(rt.Bin, args...)
-	// Include the #1023 CITADEL_<SVC>_BIND entry (best-effort) so a port-move
-	// recreate of a `bind: all` engine comes up on the operator's chosen
-	// interface, not the compose loopback default.
-	cmd.Env = composeEnvForService(service)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return false, fmt.Errorf("%s", strings.TrimSpace(string(out)))
+	if !force {
+		Log("compose-refresh: %s: applying the refreshed compose to the running container", service)
+	}
+	if err := runManagedComposeUp(rt, service, composePath, force, composeEnvForServiceValues(service, managedCompose.serviceFor(configDir, service))); err != nil {
+		return false, err
 	}
 	return true, nil
+}
+
+// runManagedComposeUp runs `compose up -d` for one service from composePath with
+// the same file arguments a start uses (sandbox, GPU and env-file overrides, the
+// --node-dir project, the Podman CDI and non-Linux GPU rewrites). force adds
+// --force-recreate; Podman always forces (see managedComposeRecreatorUnchecked).
+func runManagedComposeUp(rt catalog.ContainerRuntime, service, composePath string, force bool, env []string) error {
+	args, cleanup, err := prepareComposeUpArgs(service, composePath, rt.EngineBin)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	if force || rt.EngineBin == "podman" {
+		args = append(args, "--force-recreate")
+	}
+	cmd := exec.Command(rt.Bin, rt.ComposeArgs(args...)...)
+	cmd.Env = env
+	if out, err := managedCompose.run(cmd); err != nil {
+		return fmt.Errorf("%s compose failed: %s", rt.Bin, composeFailureMessage(service, out))
+	}
+	return nil
 }
 
 // hostBinding is one published host binding of a running container: the host
