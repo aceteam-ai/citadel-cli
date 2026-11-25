@@ -58,8 +58,8 @@ duplicate keys.
 5. A graph whose canonical digest differs from `package_digest`, oversized
    graph or input, wrong top-level keys, or a node type outside the engine's
    allowlist.
-6. A `LocalInference` model not served by a running engine on this node, by
-   exact name, or models spread across more than one engine port.
+6. Any `LocalInference` (LLM) node, with the fixed reason
+   `llm_unavailable_without_base_url` (see Network below).
 7. No usable receipt signer (`jobs.ErrReceiptSigningUnavailable`).
 8. No pinned image, or the pinned image not present locally. The node never
    pulls (`--pull never`).
@@ -78,12 +78,24 @@ values, and the digest-pinned image last with nothing after it. Commands go
 through the `catalog.ContainerRuntime` seam. stdout is capped; a killed or
 timed-out run removes its named container.
 
-Network: a deterministic graph runs with `--network none`. The engine's
-inference client dials `http://127.0.0.1:<port>` by design, so a graph with a
-`LocalInference` node runs with `--network host`. That gives the pinned engine
-image every host loopback listener. It is the one deviation the engine
-contract forces; changing the client to a socket or a proxied address would
-remove it.
+## Network
+
+Every run uses `--network none`; `buildLocalFlowRunArgs` refuses any other
+mode, and host networking is never used. The engine's inference client
+currently dials a hardcoded `http://127.0.0.1:<port>`, which only host
+networking could reach from inside the container. So a graph with any
+`LocalInference` node is refused before launch with
+`llm_unavailable_without_base_url`, and only deterministic graphs run.
+
+Planned path for LLM graphs (follow-ups, not built here):
+
+1. aceteam#13130's engine reads its model endpoint from an environment
+   variable instead of hardcoding 127.0.0.1.
+2. Citadel runs the container on a per-run bridge network and starts a per-run
+   forwarder bound to that network's gateway address. The forwarder passes
+   only `POST /v1/chat/completions` for the run's allowed model to the local
+   engine, which stays loopback-only. The engine endpoint variable points at
+   the forwarder; nothing else on the host is reachable.
 
 ## Run-id ledger
 
@@ -104,13 +116,14 @@ own duplicate check cannot work here because `/runs` is fresh per run.
   receipt, which the platform verifier already treats as event-style.
   `input_sha256` is the hash of `binding` in Python-compatible canonical JSON:
   template key, version and content hash, node, organization, job, run id,
-  Flow version, package digest, input digest, engine image, network mode and
-  models. `output_sha256` is the hash of the ordered output digests, as for
+  Flow version, package digest, input digest, engine image and network mode. `output_sha256` is the hash of the ordered output digests, as for
   other templates. Signing is not gated on an environment flag and never fails
   open; a signing failure removes the attempt's output.
 
 ## Activation gates (not met in this change)
 
+- LLM graphs: the engine endpoint variable and the per-run bridge forwarder
+  above.
 - A release publishes the aceteam#13130 image and sets `localFlowPinnedImage`
   to `repository@sha256:...`.
 - aceteam#13130 merges with the contract above, or this builtin follows it.

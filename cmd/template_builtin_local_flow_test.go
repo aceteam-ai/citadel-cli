@@ -16,7 +16,6 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/aep"
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
-	"github.com/aceteam-ai/citadel-cli/internal/gateway"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 )
@@ -28,8 +27,6 @@ const (
 	lfTestRunID   = "0f3c2b8e-5a41-4d6b-9c7e-1a2b3c4d5e6f"
 	lfTestVersion = "flowver-test-1"
 	lfTestImage   = "registry.invalid/local-flow@sha256:" + "1111111111111111111111111111111111111111111111111111111111111111"
-	lfTestModel   = "synthetic-model"
-	lfTestPort    = 18001
 )
 
 // lfDeterministicGraph is canonical already; its digest is pinned below
@@ -63,6 +60,7 @@ type fakeLocalFlowEngine struct {
 	removeErr           error
 	containerPresent    bool
 	autoRemoveOnFailure bool
+	badNetwork          []string
 }
 
 func (f *fakeLocalFlowEngine) exec(cmd *exec.Cmd, stdin []byte, limit int) ([]byte, bool, error) {
@@ -89,6 +87,14 @@ func (f *fakeLocalFlowEngine) exec(cmd *exec.Cmd, stdin []byte, limit int) ([]by
 		return nil, false, nil
 	case "run":
 		f.containerPresent = true
+		for i, a := range args {
+			if (a == "--network" || a == "--net") && (i+1 >= len(args) || args[i+1] != "none") {
+				f.badNetwork = append(f.badNetwork, strings.Join(args, " "))
+			}
+			if strings.HasPrefix(a, "--network=") || strings.HasPrefix(a, "--net=") {
+				f.badNetwork = append(f.badNetwork, strings.Join(args, " "))
+			}
+		}
 		f.runs = append(f.runs, append([]string(nil), args...))
 		f.stdins = append(f.stdins, append([]byte(nil), stdin...))
 		out := []byte(f.stdout)
@@ -121,7 +127,6 @@ func (f *fakeLocalFlowEngine) runCount() int {
 type lfFixture struct {
 	t       *testing.T
 	engine  *fakeLocalFlowEngine
-	served  []gateway.ChatUpstream
 	image   string
 	ledger  string
 	limits  error
@@ -139,7 +144,12 @@ func newLFFixture(t *testing.T) *lfFixture {
 	}
 	prev := localFlowDepsFactory
 	localFlowDepsFactory = f.deps
-	t.Cleanup(func() { localFlowDepsFactory = prev })
+	t.Cleanup(func() {
+		localFlowDepsFactory = prev
+		if len(f.engine.badNetwork) != 0 {
+			t.Errorf("engine ran with a network other than none: %v", f.engine.badNetwork)
+		}
+	})
 	return f
 }
 
@@ -147,7 +157,6 @@ func (f *lfFixture) deps() localFlowDeps {
 	return localFlowDeps{
 		image:           f.image,
 		runtime:         func() catalog.ContainerRuntime { return catalog.ContainerRuntime{EngineBin: "docker", Bin: "docker"} },
-		engines:         func(context.Context) []gateway.ChatUpstream { return f.served },
 		preflightLimits: func(catalog.ContainerRuntime) error { return f.limits },
 		stateDir:        func() (string, error) { return f.ledger, nil },
 		exec:            f.engine.exec,
@@ -461,7 +470,7 @@ func TestLocalFlowDeterministicRunOnOwnedNode(t *testing.T) {
 		t.Fatalf("engine runs = %d, want 1", f.engine.runCount())
 	}
 	args := f.engine.runs[0]
-	assertLocalFlowHardenedArgs(t, args, "none")
+	assertLocalFlowHardenedArgs(t, args)
 	if !containsString(args, "CITADEL_LOCAL_MODELS=[]") || !containsString(args, fmt.Sprintf("CITADEL_LOCAL_GATEWAY_PORT=%d", localFlowUnusedGatewayPort)) {
 		t.Fatalf("deterministic env wrong: %v", args)
 	}
@@ -492,7 +501,7 @@ func TestLocalFlowDeterministicRunOnOwnedNode(t *testing.T) {
 	for key, want := range map[string]string{
 		"node_id": lfTestNode, "organization_id": lfTestOrg, "job_id": "job-test-1", "run_id": lfTestRunID,
 		"flow_version_id": lfTestVersion, "package_digest": lfDeterministicDigest, "engine_image": lfTestImage,
-		"template_content_hash": localFlowPinnedContentHash, "network": "none",
+		"template_content_hash": localFlowPinnedContentHash, "network": localFlowNetwork,
 		"input_sha256": "sha256:" + sha256Hex("{}"),
 	} {
 		if binding[key] != want {
@@ -522,46 +531,46 @@ func TestLocalFlowDeterministicRunOnOwnedNode(t *testing.T) {
 	}
 }
 
-func TestLocalFlowLocalLLMRunOnOwnedNode(t *testing.T) {
-	f := newLFFixture(t)
-	f.served = []gateway.ChatUpstream{
-		{Engine: "ollama", Port: 11434, Models: []string{"other-model"}},
-		{Engine: "vllm", Port: lfTestPort, Models: []string{lfTestModel}},
+func TestLocalFlowRefusesLLMGraphWithoutNetwork(t *testing.T) {
+	// Any LocalInference node is refused before launch with a fixed reason:
+	// the engine cannot reach a model without host networking, which this node
+	// never grants.
+	for _, input := range []string{`{"prompt":"synthetic question"}`, `{}`} {
+		f := newLFFixture(t)
+		res, _ := f.execute(lfJob(t, lfParams(t, map[string]string{
+			"graph_json": lfLLMGraph, "package_digest": lfLLMDigest, "input_json": input,
+		}), lfOwnQueue))
+		if res.Status != worker.JobStatusFailure || !strings.Contains(res.Error.Error(), localFlowLLMUnavailable) {
+			t.Fatalf("result = %s %v, want %s", res.Status, res.Error, localFlowLLMUnavailable)
+		}
+		if f.engine.runCount() != 0 {
+			t.Fatal("engine started for an LLM graph")
+		}
+		if entries, _ := os.ReadDir(f.ledger); len(entries) != 0 {
+			t.Fatal("a refused LLM run consumed its run id")
+		}
 	}
-	f.engine.stdout = `{"output":{"label":"x","response":"Local answer."},"usage":{"input_tokens":3,"output_tokens":2}}`
-	res, _ := f.execute(lfJob(t, lfParams(t, map[string]string{
-		"graph_json": lfLLMGraph, "package_digest": lfLLMDigest, "input_json": `{"prompt":"synthetic question"}`,
-	}), lfOwnQueue))
-	if res.Status != worker.JobStatusSuccess {
-		t.Fatalf("status = %s, error = %v", res.Status, res.Error)
-	}
-	args := f.engine.runs[0]
-	assertLocalFlowHardenedArgs(t, args, "host")
-	if !containsString(args, fmt.Sprintf("CITADEL_LOCAL_GATEWAY_PORT=%d", lfTestPort)) || !containsString(args, `CITADEL_LOCAL_MODELS=["synthetic-model"]`) {
-		t.Fatalf("LLM env wrong: %v", args)
-	}
-	usage := res.Output["usage"].(map[string]any)
-	if usage["prompt_tokens"] != float64(3) || usage["completion_tokens"] != float64(2) || usage["total_tokens"] != float64(5) {
-		t.Fatalf("usage = %v", usage)
-	}
-	assertLocalFlowReceiptVerifies(t, res.Output["aep_receipt"].(map[string]any), f.signer)
 }
 
-func TestLocalFlowUnknownTokenCountsStayUnknown(t *testing.T) {
-	f := newLFFixture(t)
-	f.served = []gateway.ChatUpstream{{Engine: "vllm", Port: lfTestPort, Models: []string{lfTestModel}}}
-	f.engine.stdout = `{"output":{"label":"x","response":"r"},"usage":{"input_tokens":null,"output_tokens":null}}`
-	res, _ := f.execute(lfJob(t, lfParams(t, map[string]string{"graph_json": lfLLMGraph, "package_digest": lfLLMDigest, "input_json": `{"prompt":"q"}`}), lfOwnQueue))
-	if res.Status != worker.JobStatusSuccess {
-		t.Fatalf("status = %s, error = %v", res.Status, res.Error)
+func TestLocalFlowArgvNeverUsesHostNetwork(t *testing.T) {
+	// Through the argv seam: a plan that names any network other than none is
+	// a bug and must not produce an argv.
+	for _, mode := range []string{"host", "bridge", "container:x", ""} {
+		plan := &localFlowPlan{binding: localFlowBinding{Network: mode}}
+		if args, err := buildLocalFlowRunArgs(plan, lfTestImage, "citadel-local-flow-test"); err == nil {
+			t.Fatalf("network %q produced argv %v", mode, args)
+		}
 	}
-	usage := res.Output["usage"].(map[string]any)
-	if usage["tokens_known"] != false || usage["input_tokens"] != nil {
-		t.Fatalf("unknown tokens reported as known: %v", usage)
+	plan := &localFlowPlan{binding: localFlowBinding{Network: localFlowNetwork}}
+	args, err := buildLocalFlowRunArgs(plan, lfTestImage, "citadel-local-flow-test")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, ok := usage["prompt_tokens"]; ok {
-		t.Fatalf("unknown prompt tokens reported as a number: %v", usage)
+	joined := " " + strings.Join(args, " ") + " "
+	if strings.Contains(joined, "--network host") || strings.Contains(joined, "--net host") || strings.Contains(joined, "=host") {
+		t.Fatalf("argv uses host networking: %v", args)
 	}
+	assertLocalFlowHardenedArgs(t, args)
 }
 
 // Every refusal below must happen before the engine container starts.
@@ -618,14 +627,9 @@ func TestLocalFlowRefusesBeforeExecution(t *testing.T) {
 			c, _, _ := canonicalLocalFlowObject(g, localFlowMaxGraphBytes, "graph")
 			return lfJob(t, lfParams(t, map[string]string{"graph_json": g, "package_digest": "sha256:" + sha256Hex(string(c))}), lfOwnQueue)
 		}, want: "unsupported node"},
-		{name: "unsupported model", setup: func(f *lfFixture) {
-			f.served = []gateway.ChatUpstream{{Engine: "vllm", Port: lfTestPort, Models: []string{"synthetic-model-large"}}}
-		}, job: func(t *testing.T) *worker.Job {
+		{name: "LLM node without a model endpoint", job: func(t *testing.T) *worker.Job {
 			return lfJob(t, lfParams(t, map[string]string{"graph_json": lfLLMGraph, "package_digest": lfLLMDigest}), lfOwnQueue)
-		}, want: "not served"},
-		{name: "missing local LLM engine", job: func(t *testing.T) *worker.Job {
-			return lfJob(t, lfParams(t, map[string]string{"graph_json": lfLLMGraph, "package_digest": lfLLMDigest}), lfOwnQueue)
-		}, want: "not served"},
+		}, want: localFlowLLMUnavailable},
 		{name: "no pinned engine image", setup: func(f *lfFixture) { f.image = "" }, job: func(t *testing.T) *worker.Job {
 			return lfJob(t, lfParams(t, nil), lfOwnQueue)
 		}, want: "no engine image is pinned"},
@@ -741,11 +745,11 @@ func TestTemplateQueueOrgRequiresTheExactNodeStream(t *testing.T) {
 	}
 }
 
-func assertLocalFlowHardenedArgs(t *testing.T, args []string, network string) {
+func assertLocalFlowHardenedArgs(t *testing.T, args []string) {
 	t.Helper()
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
-		"run --rm -i", "--pull never", "--network " + network, "--cap-drop ALL",
+		"run --rm -i", "--pull never", "--network none", "--cap-drop ALL",
 		"--security-opt no-new-privileges", "--read-only", "--user " + localFlowContainerUser,
 		"--cpus " + localFlowCPUs, "--memory " + localFlowMemory, "--pids-limit 256",
 		"--mount " + localFlowRunsTmpfs,
@@ -821,7 +825,6 @@ func TestLocalFlowShippedArtifact(t *testing.T) {
 	}
 	deps := liveLocalFlowDeps()
 	deps.image = image
-	deps.engines = func(context.Context) []gateway.ChatUpstream { return nil }
 	deps.stateDir = func() (string, error) { return filepath.Join(t.TempDir(), "runs"), nil }
 	outDir := t.TempDir()
 	bind := templateRunBinding{

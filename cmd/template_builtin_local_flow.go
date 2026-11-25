@@ -9,9 +9,10 @@ package cmd
 //
 // Every refusal happens before the container starts: the pinned template, the
 // exact params, the node and organization binding, the package digest, the
-// node-type allowlist, the served models, the pinned engine image, cgroup
-// limit delegation and the run-id ledger. There is no fallback: a refused run
-// never executes on hosted infrastructure or another node.
+// node-type allowlist, the LLM-node refusal, the pinned engine image, cgroup
+// limit delegation and the run-id ledger. The container never has a network.
+// There is no fallback: a refused run never executes on hosted infrastructure
+// or another node.
 
 import (
 	"bytes"
@@ -25,7 +26,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -33,12 +33,17 @@ import (
 	"crypto/rand"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
-	"github.com/aceteam-ai/citadel-cli/internal/gateway"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 )
 
 const (
+	// localFlowNetwork is the only container network mode. Host networking is
+	// never used (see docs/local-flow-run.md for the planned bridge path).
+	localFlowNetwork = "none"
+	// localFlowLLMUnavailable is the fixed refusal for any graph with an LLM node.
+	localFlowLLMUnavailable = "llm_unavailable_without_base_url"
+
 	localFlowBuiltinName     = "local-flow-run"
 	localFlowTemplateKey     = "local-flow-run"
 	localFlowTemplateVersion = 1
@@ -61,9 +66,9 @@ const (
 	// The engine enforces its own 60 s execution timeout; the node bound adds
 	// container start and stop.
 	localFlowWallTimeout = 2 * time.Minute
-	// localFlowUnusedGatewayPort is passed when the graph has no LocalInference
-	// node. The CLI requires a syntactically valid port in every run, but a
-	// deterministic run has no network at all, so nothing can dial it.
+	// localFlowUnusedGatewayPort is always passed: the CLI requires a
+	// syntactically valid port in every run, but the container has no network
+	// and no LLM node is admitted, so nothing can dial it.
 	localFlowUnusedGatewayPort = 9
 	// localFlowRunRetention bounds the run-id ledger; a run id older than this
 	// is no longer refused as a duplicate by this node.
@@ -150,8 +155,6 @@ var localFlowPinnedContentHash = func() string {
 type localFlowDeps struct {
 	image   string
 	runtime func() catalog.ContainerRuntime
-	// engines lists the node's serving engines and models, as the gateway does.
-	engines func(ctx context.Context) []gateway.ChatUpstream
 	// preflightLimits proves cpu/memory/pids limits are enforceable.
 	preflightLimits func(rt catalog.ContainerRuntime) error
 	// stateDir is the run-id ledger directory (node config dir, not workspace).
@@ -177,7 +180,6 @@ func liveLocalFlowDeps() localFlowDeps {
 	return localFlowDeps{
 		image:   localFlowPinnedImage,
 		runtime: catalog.SelectContainerRuntime,
-		engines: func(context.Context) []gateway.ChatUpstream { return newLocalChatLister()() },
 		preflightLimits: func(rt catalog.ContainerRuntime) error {
 			return rt.PreflightLimitControllers("cpu", "memory", "pids")
 		},
@@ -198,28 +200,24 @@ func liveLocalFlowDeps() localFlowDeps {
 // identity the run is bound to appears here; the platform recomputes the hash
 // from the reported object with json.dumps(sort_keys=True, separators=(",",":")).
 type localFlowBinding struct {
-	Schema              string   `json:"schema"`
-	TemplateKey         string   `json:"template_key"`
-	TemplateVersion     int      `json:"template_version"`
-	TemplateContentHash string   `json:"template_content_hash"`
-	NodeID              string   `json:"node_id"`
-	OrganizationID      string   `json:"organization_id"`
-	JobID               string   `json:"job_id"`
-	RunID               string   `json:"run_id"`
-	FlowVersionID       string   `json:"flow_version_id"`
-	PackageDigest       string   `json:"package_digest"`
-	InputSHA256         string   `json:"input_sha256"`
-	EngineImage         string   `json:"engine_image"`
-	Network             string   `json:"network"`
-	Models              []string `json:"models"`
+	Schema              string `json:"schema"`
+	TemplateKey         string `json:"template_key"`
+	TemplateVersion     int    `json:"template_version"`
+	TemplateContentHash string `json:"template_content_hash"`
+	NodeID              string `json:"node_id"`
+	OrganizationID      string `json:"organization_id"`
+	JobID               string `json:"job_id"`
+	RunID               string `json:"run_id"`
+	FlowVersionID       string `json:"flow_version_id"`
+	PackageDigest       string `json:"package_digest"`
+	InputSHA256         string `json:"input_sha256"`
+	EngineImage         string `json:"engine_image"`
+	Network             string `json:"network"`
 }
 
 type localFlowPlan struct {
 	binding  localFlowBinding
 	request  []byte
-	port     int
-	models   []string
-	network  string
 	runtime  catalog.ContainerRuntime
 	ledger   string
 	claimRun func() error
@@ -384,22 +382,16 @@ func admitLocalFlowRun(ctx context.Context, bind templateRunBinding, params json
 	if err != nil {
 		return nil, err
 	}
-	models, err := localFlowGraphModels(graph)
+	hasLLM, err := localFlowGraphHasLLM(graph)
 	if err != nil {
 		return nil, err
 	}
-
-	netMode := "none"
-	port := localFlowUnusedGatewayPort
-	if len(models) > 0 {
-		port, err = resolveLocalFlowModels(ctx, models, deps)
-		if err != nil {
-			return nil, err
-		}
-		// aceteam#13130's client dials http://127.0.0.1:<port>, so only the host
-		// network namespace reaches the node's engine. Deterministic graphs keep
-		// no network at all.
-		netMode = "host"
+	if hasLLM {
+		// aceteam#13130's client dials a hardcoded 127.0.0.1, which only host
+		// networking could reach; this node never grants that. LLM graphs wait
+		// for the engine to take its endpoint from the environment and for the
+		// per-run bridge forwarder (docs/local-flow-run.md).
+		return nil, localFlowRefuse("%s: this node cannot run a LocalInference node until the engine accepts a model endpoint", localFlowLLMUnavailable)
 	}
 
 	request, err := buildLocalFlowRequest(graphCanon, inputCanon, vals["package_digest"], vals["run_id"])
@@ -447,13 +439,9 @@ func admitLocalFlowRun(ctx context.Context, bind templateRunBinding, params json
 			PackageDigest:       vals["package_digest"],
 			InputSHA256:         "sha256:" + sha256Hex(string(inputCanon)),
 			EngineImage:         deps.image,
-			Network:             netMode,
-			Models:              models,
+			Network:             localFlowNetwork,
 		},
 		request: request,
-		port:    port,
-		models:  models,
-		network: netMode,
 		runtime: rt,
 		ledger:  ledger,
 	}
@@ -491,91 +479,39 @@ func canonicalLocalFlowObject(raw string, maxBytes int, name string) ([]byte, ma
 	return canonical, obj, nil
 }
 
-// localFlowGraphModels checks the graph's top-level shape and node types and
-// returns the sorted, unique models its LocalInference nodes name.
-func localFlowGraphModels(graph map[string]any) ([]string, error) {
+// localFlowGraphHasLLM checks the graph's top-level shape and node types and
+// reports whether any inner node is a LocalInference (LLM) node.
+func localFlowGraphHasLLM(graph map[string]any) (bool, error) {
 	if len(graph) != 4 {
-		return nil, localFlowRefuse("unsupported graph")
+		return false, localFlowRefuse("unsupported graph")
 	}
 	for _, key := range []string{"input_node", "inner_nodes", "output_node", "edges"} {
 		if _, ok := graph[key]; !ok {
-			return nil, localFlowRefuse("unsupported graph")
+			return false, localFlowRefuse("unsupported graph")
 		}
 	}
 	inner, ok := graph["inner_nodes"].([]any)
 	if !ok || len(inner) > localFlowMaxInnerNodes {
-		return nil, localFlowRefuse("unsupported graph")
+		return false, localFlowRefuse("unsupported graph")
 	}
 	if edges, ok := graph["edges"].([]any); !ok || len(edges) > localFlowMaxEdges {
-		return nil, localFlowRefuse("unsupported graph")
+		return false, localFlowRefuse("unsupported graph")
 	}
-	seen := map[string]struct{}{}
+	hasLLM := false
 	for _, n := range inner {
 		node, ok := n.(map[string]any)
 		if !ok {
-			return nil, localFlowRefuse("unsupported graph")
+			return false, localFlowRefuse("unsupported graph")
 		}
 		typ, _ := node["type"].(string)
 		if _, ok := localFlowNodeTypes[typ]; !ok {
-			return nil, localFlowRefuse("unsupported node type in the Flow package")
+			return false, localFlowRefuse("unsupported node type in the Flow package")
 		}
-		if typ != "LocalInference" {
-			continue
+		if typ == "LocalInference" {
+			hasLLM = true
 		}
-		p, ok := node["params"].(map[string]any)
-		if !ok {
-			return nil, localFlowRefuse("unsupported graph")
-		}
-		model, ok := p["model"].(string)
-		if !ok || model == "" || len(model) > 128 {
-			return nil, localFlowRefuse("unsupported model")
-		}
-		seen[model] = struct{}{}
 	}
-	if len(seen) > localFlowMaxModels {
-		return nil, localFlowRefuse("unsupported model")
-	}
-	models := make([]string, 0, len(seen))
-	for m := range seen {
-		models = append(models, m)
-	}
-	sort.Strings(models)
-	return models, nil
-}
-
-// resolveLocalFlowModels requires every model to be served by this node, by
-// exact name, on one engine port (the engine client dials a single port).
-func resolveLocalFlowModels(ctx context.Context, models []string, deps localFlowDeps) (int, error) {
-	if deps.engines == nil {
-		return 0, localFlowRefuse("no local model engine is available on this node")
-	}
-	engines := deps.engines(ctx)
-	port := 0
-	for _, model := range models {
-		found := 0
-		for _, e := range engines {
-			if e.Port <= 0 || e.Port > 65535 {
-				continue
-			}
-			for _, served := range e.Models {
-				if strings.TrimSpace(served) == model {
-					found = e.Port
-					break
-				}
-			}
-			if found != 0 {
-				break
-			}
-		}
-		if found == 0 {
-			return 0, localFlowRefuse("a LocalInference model is not served by a running engine on this node")
-		}
-		if port != 0 && port != found {
-			return 0, localFlowRefuse("the Flow package's models are served by more than one engine")
-		}
-		port = found
-	}
-	return port, nil
+	return hasLLM, nil
 }
 
 func buildLocalFlowRequest(graphCanon, inputCanon []byte, digest, runID string) ([]byte, error) {
@@ -610,21 +546,15 @@ func localFlowImagePresent(ctx context.Context, rt catalog.ContainerRuntime, dep
 // last: no command or argument follows it, so the image's own entrypoint is
 // the only thing that runs.
 func buildLocalFlowRunArgs(plan *localFlowPlan, image, name string) ([]string, error) {
-	models, err := json.Marshal(plan.models)
-	if err != nil {
-		return nil, err
-	}
-	if plan.models == nil {
-		models = []byte("[]")
-	}
-	if plan.network != "none" && plan.network != "host" {
-		return nil, fmt.Errorf("local-flow-run: unsupported network %q", plan.network)
+	// The only network mode is none; a plan naming anything else is a bug.
+	if plan.binding.Network != localFlowNetwork {
+		return nil, fmt.Errorf("local-flow-run: unsupported network %q", plan.binding.Network)
 	}
 	return []string{
 		"run", "--rm", "-i",
 		"--name", name,
 		"--pull", "never",
-		"--network", plan.network,
+		"--network", localFlowNetwork,
 		"--cap-drop", "ALL",
 		"--security-opt", "no-new-privileges",
 		"--read-only",
@@ -635,8 +565,8 @@ func buildLocalFlowRunArgs(plan *localFlowPlan, image, name string) ([]string, e
 		"--mount", localFlowRunsTmpfs,
 		"--mount", localFlowTmpTmpfs,
 		"-e", "CITADEL_LOCAL_RUNS_DIR=/runs",
-		"-e", "CITADEL_LOCAL_GATEWAY_PORT=" + strconv.Itoa(plan.port),
-		"-e", "CITADEL_LOCAL_MODELS=" + string(models),
+		"-e", "CITADEL_LOCAL_GATEWAY_PORT=" + strconv.Itoa(localFlowUnusedGatewayPort),
+		"-e", "CITADEL_LOCAL_MODELS=[]",
 		image,
 	}, nil
 }
