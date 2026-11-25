@@ -72,7 +72,7 @@ func bindEnvEntries(bindEnv map[string]string) []string {
 
 // composeEnvForService returns composeEnv() plus the manifest-derived
 // CITADEL_<SVC>_BIND entry (best-effort). Used by the boot-time port-drift
-// recreate path (enginePortRecreator), which knows the service name but not its
+// recreate path (managedComposeRecreatorUnchecked), which knows the service name but not its
 // resolved bind. An unrecognized bind value is logged and dropped here (the
 // compose `:-` default then applies) rather than failing a best-effort recreate;
 // startService/serviceStart, the paths where an operator can act on the error,

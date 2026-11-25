@@ -111,19 +111,6 @@ func recreateOnUpgradeEnabled() bool {
 	return !composerefresh.RecreateOnUpgradeDisabled()
 }
 
-// enginePortRecreator is managedComposeRecreatorUnchecked behind the local
-// service start guard, for callers that do not already hold reservation.lock.
-func enginePortRecreator(service, composePath string, wantHostPort int) (bool, error) {
-	configDir := filepath.Dir(filepath.Dir(composePath))
-	var recreated bool
-	err := withLocalServiceStartGuard(configDir, service, func() error {
-		var recreateErr error
-		recreated, recreateErr = managedComposeRecreatorUnchecked(service, composePath, wantHostPort, nil)
-		return recreateErr
-	})
-	return recreated, err
-}
-
 // managedComposeDeps are the runtime seams the refresh recreate uses, so tests
 // drive it with fakes instead of a container engine.
 type managedComposeDeps struct {
@@ -185,7 +172,7 @@ func composeLimitsPreflight(rt catalog.ContainerRuntime, serviceName, composePat
 
 // containerStateFor returns a container's State.Status and whether it exists.
 func containerStateFor(engineBin, containerName string) (string, bool) {
-	out, err := exec.Command(engineBin, "inspect", "--format", "{{.State.Status}}", containerName).Output()
+	out, err := exec.Command(engineBin, "container", "inspect", "--format", "{{.State.Status}}", containerName).Output()
 	if err != nil {
 		return "", false
 	}

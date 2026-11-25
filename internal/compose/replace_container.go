@@ -146,7 +146,9 @@ func composeVerb(args []string) string {
 }
 
 func (r replacer) inspect(name string) containerInfo {
-	out, err := r.engine("inspect", "--format", inspectFormat, name)
+	// `container inspect`, never a bare `inspect`, which also matches an image,
+	// network or volume of the same name.
+	out, err := r.engine("container", "inspect", "--format", inspectFormat, name)
 	if err != nil {
 		return containerInfo{}
 	}
@@ -177,14 +179,33 @@ func (r replacer) inspect(name string) containerInfo {
 //     Only a container whose project and service labels are the legacy ones is
 //     renamed; one owned by anything else is refused untouched.
 //  3. A same-project container cannot be hidden from compose (labels are
-//     immutable), so compose replaces it itself: it creates the new container
-//     before removing the old one.
+//     immutable), so compose replaces it itself, and the old container cannot
+//     be kept: compose v2 creates the new container first but removes the old
+//     one before starting the new one, and podman-compose 1.0.6 removes the old
+//     one first and can exit 0 when the new one fails to run. A create failure
+//     leaves it running; any later failure has already removed it.
 //  4. `up -d`, then the container under the pinned name must be ours and still
 //     running after ReplaceSettleDelay. Only then is the backup removed.
 //  5. On failure: a partial new container is removed, the backup is renamed
-//     back and started if it had been running, the file is restored, and a
-//     previously running same-project service whose container compose already
-//     removed is brought back with a forced `up` from the restored file.
+//     back and started if it had been running, and the file is restored. For a
+//     same-project service that was running, the real recovery is a forced
+//     `up` from the restored previous file, checked to be running. A stopped
+//     same-project container compose removed is reported as removed
+//     (ReplaceFailed), not restored.
+//
+// A backup left by an earlier run is handled first. With the pinned name free
+// it is renamed back. When the pinned name already holds our running
+// replacement (an earlier run whose backup removal failed), the backup is
+// removed. Any other combination is refused with an actionable error.
+//
+// Race: the legacy cleanup some other paths still run
+// (RemoveLegacyProjectContainers, from the Control Center service actions,
+// module update and device-config apply) force-removes every container labelled
+// with the legacy project, the renamed backup included. If one runs between the
+// rename and the restore, the backup is lost and a failed replacement cannot
+// bring it back; the error then reports that the previous state was not
+// restored. The worker's serialized job lane and the local start guard do not
+// cover the Control Center.
 //
 // Commands go through Spec.Runtime's EngineCommand/ComposeCommand seam. A crash
 // between the rename and the restore leaves the stopped backup behind. A call
@@ -200,15 +221,25 @@ func ReplaceRunningService(spec ReplaceSpec) (ReplaceOutcome, error) {
 	backupName := BackupContainerName(spec.ContainerName)
 
 	old := r.inspect(spec.ContainerName)
-	if leftover := r.inspect(backupName); leftover.legacy(spec.Service) {
-		if old.exists {
-			return ReplaceUnchanged, fmt.Errorf("both %s and an earlier backup %s exist; remove one before retrying", spec.ContainerName, backupName)
+	if leftover := r.inspect(backupName); leftover.exists {
+		switch {
+		case !leftover.legacy(spec.Service):
+			return ReplaceUnchanged, fmt.Errorf("container %s exists but is not a citadel backup of service %s; remove or rename it before retrying", backupName, spec.Service)
+		case !old.exists:
+			r.logf("compose: %s: restoring backup %s left by an interrupted replacement", spec.Service, backupName)
+			if _, err := r.engine("rename", leftover.id, spec.ContainerName); err != nil {
+				return ReplaceUnchanged, err
+			}
+			old = r.inspect(spec.ContainerName)
+		case old.ours(spec.Service) && old.running():
+			// An earlier replacement succeeded but could not remove its backup.
+			r.logf("compose: %s: removing backup %s left by an earlier replacement; %s is running", spec.Service, backupName, spec.ContainerName)
+			if _, err := r.engine("rm", "-f", leftover.id); err != nil {
+				return ReplaceUnchanged, fmt.Errorf("remove leftover backup %s (run `%s rm -f %s`): %w", backupName, spec.Runtime.EngineBin, backupName, err)
+			}
+		default:
+			return ReplaceUnchanged, fmt.Errorf("both %s (%s) and an earlier backup %s exist; check which one should run, then remove the other with `%s rm -f <name>`", spec.ContainerName, nonEmpty(old.state, "unknown"), backupName, spec.Runtime.EngineBin)
 		}
-		r.logf("compose: %s: restoring backup %s left by an interrupted replacement", spec.Service, backupName)
-		if _, err := r.engine("rename", leftover.id, spec.ContainerName); err != nil {
-			return ReplaceUnchanged, err
-		}
-		old = r.inspect(spec.ContainerName)
 	}
 	if old.exists && !old.legacy(spec.Service) && !old.ours(spec.Service) {
 		return ReplaceUnchanged, fmt.Errorf("container %s is not a compose container of service %s; leaving it untouched", spec.ContainerName, spec.Service)
@@ -243,7 +274,7 @@ func ReplaceRunningService(spec ReplaceSpec) (ReplaceOutcome, error) {
 	if upErr == nil && current.ours(spec.Service) && current.running() {
 		if backedUp {
 			if _, err := r.engine("rm", "-f", old.id); err != nil {
-				r.logf("compose: %s: replacement running; could not remove backup %s: %v", spec.Service, backupName, err)
+				r.logf("compose: %s: replacement running; could not remove backup %s (the next replacement removes it, or run `%s rm -f %s`): %v", spec.Service, backupName, spec.Runtime.EngineBin, backupName, err)
 			}
 		}
 		if old.exists && current.id == old.id {
@@ -291,6 +322,12 @@ func (r replacer) recover(old containerInfo, backedUp bool, failure error) (Repl
 	if old.running() {
 		if now := r.inspect(spec.ContainerName); !now.running() {
 			problems = append(problems, fmt.Errorf("%s is not running", spec.ContainerName))
+		}
+	} else if old.exists && !backedUp {
+		if now := r.inspect(spec.ContainerName); now.id != old.id {
+			// compose already removed the stopped container; nothing was
+			// running, so nothing is started, but it is not restored either.
+			problems = append(problems, fmt.Errorf("the stopped container %s (%s) was removed by compose and not recreated", spec.ContainerName, old.id))
 		}
 	}
 	if len(problems) > 0 {

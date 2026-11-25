@@ -169,6 +169,12 @@ func (e *Engine) engineLocked(args []string) ([]byte, []byte, error) {
 	if len(args) == 0 {
 		return errOut("no engine verb")
 	}
+	if args[0] == "container" && len(args) > 1 {
+		args = args[1:]
+	} else if args[0] == "inspect" {
+		// A bare inspect would also match images, networks and volumes.
+		return errOut("fake engine: use container inspect")
+	}
 	switch args[0] {
 	case "inspect":
 		c := e.findLocked(args[len(args)-1])

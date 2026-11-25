@@ -230,9 +230,10 @@ func TestFineTuneHeldTagBlocksUpdateRefreshAndGatewaySwapStarts(t *testing.T) {
 	if err := composeUpDetached("unlimited-ocr", composePath); err == nil || !strings.Contains(err.Error(), "reserved by active fine-tune") {
 		t.Fatalf("module update restart under hold = %v", err)
 	}
-	if recreated, err := enginePortRecreator("unlimited-ocr", composePath, 18080); err == nil || recreated {
-		t.Fatalf("compose refresh recreate under hold = (%v, %v)", recreated, err)
-	}
+	refreshManagedComposeFilesWithSweep(configDir, func(composerefresh.Options) (composerefresh.Result, error) {
+		t.Fatal("compose refresh sweep ran under a fine-tune hold")
+		return composerefresh.Result{}, nil
+	}, func() int { return 0 })
 	swap := newSwapController(configDir, t.TempDir(), nil, nil)
 	if err := swap.Start(context.Background(), "unlimited-ocr", ""); err == nil || !strings.Contains(err.Error(), "reserved by active fine-tune") {
 		t.Fatalf("gateway swap start under hold = %v", err)

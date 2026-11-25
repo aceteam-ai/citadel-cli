@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
@@ -272,5 +273,77 @@ func TestReplaceRestoresBackupLeftByInterruptedRun(t *testing.T) {
 	c, ok := f.engine.Named("citadel-tei")
 	if !ok || c.ID != old.ID {
 		t.Fatalf("leftover backup not renamed back: %+v", f.engine.Containers())
+	}
+}
+
+// A backup an earlier successful replacement could not remove does not make
+// every later replacement refuse: it is removed by its labels while our
+// replacement runs under the pinned name.
+func TestReplaceRemovesBackupLeftByFailedCleanup(t *testing.T) {
+	f := newReplaceFixture(t)
+	old := f.addOld("citadel-tei", "running")
+	f.refresh(t)
+	f.engine.Fail["rm"] = 1
+	if outcome, err := ReplaceRunningService(f.spec(nil)); err != nil || outcome != ReplaceReplaced {
+		t.Fatalf("first replacement = %v, %v", outcome, err)
+	}
+	if _, ok := f.engine.Named(BackupContainerName("citadel-tei")); !ok {
+		t.Fatal("fixture: backup removal did not fail")
+	}
+	if _, err := ReplaceRunningService(f.spec(nil)); err != nil {
+		t.Fatalf("second replacement refused: %v", err)
+	}
+	all := f.engine.Containers()
+	if len(all) != 1 || all[0].Name != "citadel-tei" || all[0].ID == old.ID || all[0].State != "running" {
+		t.Fatalf("containers = %+v; want only the running replacement", all)
+	}
+
+	// A backup next to a container that is not our running replacement stays.
+	g := newReplaceFixture(t)
+	g.addOld("services", "exited")
+	backup := *g.engine.Add(stoppedContainer(BackupContainerName("citadel-tei"), "citadel-tei"))
+	if _, err := ReplaceRunningService(g.spec(nil)); err == nil {
+		t.Fatal("ambiguous backup accepted")
+	}
+	if b, ok := g.engine.Named(BackupContainerName("citadel-tei")); !ok || b != backup || g.engine.Count("rm") != 0 {
+		t.Fatalf("ambiguous backup touched: %+v %v", b, g.engine.Calls)
+	}
+}
+
+// stoppedContainer builds a stopped fake container for the named project.
+func stoppedContainer(name, project string) composefake.Container {
+	return composefake.Container{Name: name, State: "exited", Project: project, Service: "tei"}
+}
+
+// A failed recreate of a STOPPED same-project container that compose already
+// removed is reported as a failure that removed it, not as restored.
+func TestReplaceStoppedSameProjectRemovedIsNotRestored(t *testing.T) {
+	f := newReplaceFixture(t)
+	f.addOld("services", "exited")
+	f.refresh(t)
+	f.engine.Fail["up-start"] = 1
+	outcome, err := ReplaceRunningService(f.spec(nil))
+	if outcome != ReplaceFailed || err == nil || !strings.Contains(err.Error(), "removed by compose") {
+		t.Fatalf("outcome = %v, %v; want failed, reporting the removal", outcome, err)
+	}
+	if len(f.engine.Containers()) != 0 || f.engine.Count("--force-recreate") != 0 {
+		t.Fatalf("a stopped service was recreated or left partial: %+v %v", f.engine.Containers(), f.engine.Calls)
+	}
+	if f.file(t) != oldCompose {
+		t.Fatal("file not restored")
+	}
+}
+
+func TestReplaceInspectsContainersOnly(t *testing.T) {
+	f := newReplaceFixture(t)
+	f.addOld("services", "running")
+	f.refresh(t)
+	if _, err := ReplaceRunningService(f.spec(nil)); err != nil {
+		t.Fatal(err)
+	}
+	for _, call := range f.engine.Calls {
+		if strings.HasPrefix(call, "docker inspect") {
+			t.Fatalf("bare inspect used: %s", call)
+		}
 	}
 }
