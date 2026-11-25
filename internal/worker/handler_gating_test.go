@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,30 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 )
+
+func TestConditionalFileWriteLiveFilesRefusal(t *testing.T) {
+	enabled := true
+	handlers := CreateLegacyHandlersWithOpts(LegacyHandlerOpts{
+		WorkspaceDir: t.TempDir(),
+		FilesEnabled: func() bool { return enabled },
+	})
+	var write JobHandler
+	for _, handler := range handlers {
+		if handler.CanHandle(JobTypeFileWriteIfUnchanged) {
+			write = handler
+			break
+		}
+	}
+	if write == nil {
+		t.Fatal("conditional file write handler missing")
+	}
+	enabled = false
+	_, err := write.Execute(context.Background(), &Job{ID: "revoked", Type: JobTypeFileWriteIfUnchanged}, &NoOpStreamWriter{})
+	var refusal *jobs.ShellRefusal
+	if !errors.As(err, &refusal) || refusal.Reason != "files_disabled" {
+		t.Fatalf("revoked Files permission must return files_disabled: %v", err)
+	}
+}
 
 // anyHandles reports whether the built handler set registers a handler for the
 // given job type.
