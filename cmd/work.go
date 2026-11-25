@@ -75,10 +75,11 @@ var (
 	workMaxRetries int
 
 	// Status server flags
-	workStatusPort int
-	workBaseURL    string
-	workAPIKey     string
-	workNodeName   string
+	workStatusPort    int
+	workStatusBindLAN bool
+	workBaseURL       string
+	workAPIKey        string
+	workNodeName      string
 
 	// SSH key sync flags
 	workSSHSync     bool
@@ -1801,6 +1802,10 @@ func runWork(cmd *cobra.Command, args []string) {
 			// The control listener's SSH-key deployment honors the operator's
 			// live SSH permission, read strictly per request.
 			SSHDeployAllowed: nodeSSHDeployAllowed,
+			// Loopback + mesh by default; a LAN bind is an explicit opt-in.
+			BindLAN: statusBindLAN(workStatusBindLAN),
+			// Read-only /agent/* routes admit only a verified same-owner peer.
+			PeerVerifier: meshPeerVerifier(network.WhoIsPeer),
 		}
 
 		// Publish the gateway's self-signed leaf cert at GET /gateway-cert.pem so
@@ -1904,12 +1909,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				if certErr != nil {
 					fmt.Fprintf(os.Stderr, "   - ⚠️ Coordinator mTLS control listener NOT enabled (server cert: %v)\n", certErr)
 				} else {
-					controlPort := status.DefaultControlPort
-					if p := strings.TrimSpace(os.Getenv("CITADEL_CONTROL_PORT")); p != "" {
-						if parsed, perr := strconv.Atoi(p); perr == nil && parsed > 0 {
-							controlPort = parsed
-						}
-					}
+					controlPort := resolveControlPort()
 					serverCfg.CAVerifier = verifier
 					serverCfg.ControlServerCert = &ctrlCert
 					serverCfg.ControlPort = controlPort
@@ -4318,6 +4318,7 @@ func init() {
 
 	// Status flags
 	workCmd.Flags().IntVar(&workStatusPort, "status-port", 0, "Enable status HTTP server on port (0 = disabled)")
+	workCmd.Flags().BoolVar(&workStatusBindLAN, "status-bind-lan", false, "Serve the plaintext status server on ALL interfaces (default: loopback plus the mesh listener only; or set CITADEL_STATUS_BIND_LAN=1)")
 	workCmd.Flags().StringVar(&workBaseURL, "base-url", "", "AceTeam API base URL (default: https://aceteam.ai, or set ACETEAM_URL env)")
 	workCmd.Flags().StringVar(&workAPIKey, "api-key", "", "API key for authentication (or set CITADEL_API_KEY env)")
 	workCmd.Flags().StringVar(&workNodeName, "node-name", "", "Node name for status reporting (default: hostname)")

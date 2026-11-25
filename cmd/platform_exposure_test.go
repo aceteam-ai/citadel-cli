@@ -183,3 +183,35 @@ func TestPlatformExposureBindModeAndTargetValidation(t *testing.T) {
 		t.Fatalf("bind error = %v", err)
 	}
 }
+
+// A platform exposure may not forward mesh traffic to loopback on the node's
+// own status or control port, by default target or by forward_target.
+func TestPlatformTargetRefusesOwnServerPorts(t *testing.T) {
+	oldPort := workStatusPort
+	defer func() { workStatusPort = oldPort }()
+	workStatusPort = 18080
+	t.Setenv("CITADEL_CONTROL_PORT", "18444")
+
+	for _, c := range []struct {
+		port     int
+		override string
+	}{
+		{18080, ""},
+		{18444, ""},
+		{9000, "127.0.0.1:18080"},
+		{9000, "127.0.0.1:18444"},
+		{9000, "[::1]:18080"},
+	} {
+		if _, err := platformTarget(c.port, c.override); err == nil {
+			t.Errorf("platformTarget(%d, %q) must be refused", c.port, c.override)
+		}
+	}
+	// An unrelated loopback port and a private address on the same port number
+	// stay allowed.
+	if _, err := platformTarget(9000, "127.0.0.1:9001"); err != nil {
+		t.Errorf("unrelated loopback port refused: %v", err)
+	}
+	if _, err := platformTarget(9000, "10.0.0.8:18080"); err != nil {
+		t.Errorf("private address refused: %v", err)
+	}
+}

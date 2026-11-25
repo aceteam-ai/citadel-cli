@@ -107,68 +107,95 @@ type LogQuery struct {
 	Since string // relative duration, e.g. "5m", "1h"
 }
 
-// registerAgentRoutes attaches the agent introspection & control routes to mux.
-// All routes require VPN origin or a valid org token (same posture as the SSH
-// key handler): the aceteam backend reaches them over the mesh after validating
-// org ownership; local callers must present a token.
-func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
+// agentRoute is one /agent/* route. sensitive routes read node content (logs,
+// config) or mutate state, so they are served only on the mTLS control
+// listener; the rest are read-only introspection that a verified caller may
+// also reach on the plaintext listener.
+type agentRoute struct {
+	path      string
+	sensitive bool
+	handler   http.HandlerFunc
+}
+
+// agentRoutes is the single table behind both listeners. Every /agent/* route
+// except expose/unexpose appears here exactly once.
+func (s *Server) agentRoutes() []agentRoute {
 	p := s.agent
 	if p == nil {
+		return nil
+	}
+	return []agentRoute{
+		{"/agent/worker-status", false, s.handleAgentJSON("worker_status", func(_ *http.Request) (any, error) {
+			if p.WorkerStatus == nil {
+				return nil, errUnavailable
+			}
+			return p.WorkerStatus(), nil
+		})},
+		{"/agent/node-info", false, s.handleAgentJSON("node_info", func(_ *http.Request) (any, error) {
+			if p.NodeInfo == nil {
+				return nil, errUnavailable
+			}
+			return p.NodeInfo(), nil
+		})},
+		{"/agent/doctor", false, s.handleAgentJSON("doctor", func(_ *http.Request) (any, error) {
+			if p.Doctor == nil {
+				return nil, errUnavailable
+			}
+			return p.Doctor(), nil
+		})},
+		{"/agent/vendor-agents", false, s.handleVendorAgents},
+		{"/agent/config", true, s.handleAgentJSON("config", func(_ *http.Request) (any, error) {
+			if p.Config == nil {
+				return nil, errUnavailable
+			}
+			return p.Config(), nil
+		})},
+		{"/agent/logs", true, s.handleAgentLogs},
+		{"/agent/set-log-level", true, s.handleSetLogLevel},
+		{"/agent/resubscribe", true, s.handleAgentAction("resubscribe", func() (any, error) {
+			if p.Resubscribe == nil {
+				return nil, errUnavailable
+			}
+			return p.Resubscribe()
+		})},
+		{"/agent/worker-restart", true, s.handleAgentAction("worker_restart", func() (any, error) {
+			if p.WorkerRestart == nil {
+				return nil, errUnavailable
+			}
+			return p.WorkerRestart()
+		})},
+	}
+}
+
+// registerAgentRoutes attaches the agent routes to the PLAINTEXT mux. Read-only
+// routes need a verified caller (requireAgentCaller); sensitive routes answer a
+// fail-closed 403 to everyone (agentMovedToControl) and are
+// served for real by registerAgentControlRoutes.
+func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
+	if s.agent == nil {
 		return
 	}
-
-	mux.HandleFunc("/agent/worker-status", s.requireVPNOrAuth(s.handleAgentJSON("worker_status", func(_ *http.Request) (any, error) {
-		if p.WorkerStatus == nil {
-			return nil, errUnavailable
+	for _, rt := range s.agentRoutes() {
+		if rt.sensitive {
+			mux.HandleFunc(rt.path, s.agentMovedToControl(rt.handler))
+		} else {
+			mux.HandleFunc(rt.path, s.requireAgentCaller(rt.handler))
 		}
-		return p.WorkerStatus(), nil
-	})))
-
-	mux.HandleFunc("/agent/node-info", s.requireVPNOrAuth(s.handleAgentJSON("node_info", func(_ *http.Request) (any, error) {
-		if p.NodeInfo == nil {
-			return nil, errUnavailable
-		}
-		return p.NodeInfo(), nil
-	})))
-
-	mux.HandleFunc("/agent/doctor", s.requireVPNOrAuth(s.handleAgentJSON("doctor", func(_ *http.Request) (any, error) {
-		if p.Doctor == nil {
-			return nil, errUnavailable
-		}
-		return p.Doctor(), nil
-	})))
-
-	mux.HandleFunc("/agent/config", s.requireVPNOrAuth(s.handleAgentJSON("config", func(_ *http.Request) (any, error) {
-		if p.Config == nil {
-			return nil, errUnavailable
-		}
-		return p.Config(), nil
-	})))
-
-	mux.HandleFunc("/agent/logs", s.requireVPNOrAuth(s.handleAgentLogs))
-
-	mux.HandleFunc("/agent/vendor-agents", s.requireVPNOrAuth(s.handleVendorAgents))
-
-	// Control endpoints (POST, may be nil -> 503).
-	mux.HandleFunc("/agent/set-log-level", s.requireVPNOrAuth(s.handleSetLogLevel))
-	mux.HandleFunc("/agent/resubscribe", s.requireVPNOrAuth(s.handleAgentAction("resubscribe", func() (any, error) {
-		if p.Resubscribe == nil {
-			return nil, errUnavailable
-		}
-		return p.Resubscribe()
-	})))
-	mux.HandleFunc("/agent/worker-restart", s.requireVPNOrAuth(s.handleAgentAction("worker_restart", func() (any, error) {
-		if p.WorkerRestart == nil {
-			return nil, errUnavailable
-		}
-		return p.WorkerRestart()
-	})))
+	}
 	// Expose/unexpose program the node gateway, so they must not trust mesh
 	// origin (citadel-cli#1318). Their only caller is this node's own
 	// `citadel service expose|unexpose`, which dials the node's own mesh IP;
 	// the platform publishes services through the EXPOSE_SET job instead.
 	mux.HandleFunc("/agent/expose", s.requireSelfOrigin(s.handleAgentExpose))
 	mux.HandleFunc("/agent/unexpose", s.requireSelfOrigin(s.handleAgentUnexpose))
+}
+
+// registerAgentControlRoutes serves every /agent/* introspection and control
+// route on the mTLS control listener behind requireCoordinator.
+func (s *Server) registerAgentControlRoutes(mux *http.ServeMux, requireCoordinator func(http.HandlerFunc) http.HandlerFunc) {
+	for _, rt := range s.agentRoutes() {
+		mux.HandleFunc(rt.path, requireCoordinator(rt.handler))
+	}
 }
 
 // handleAgentUnexpose revokes an exposure on the in-process gateway. POST with

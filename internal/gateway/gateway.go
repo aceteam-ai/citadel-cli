@@ -819,6 +819,10 @@ func (s *Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, target *
 	// Forward the original request headers
 	upstreamConn.Write([]byte(reqLine))
 	r.Header.Set("Host", target.Host)
+	// Overwrite, never trust, a client-supplied value: the upstream treats
+	// X-Forwarded-For as a statement by this gateway (same as the HTTP
+	// ReverseProxy Director above).
+	r.Header.Set("X-Forwarded-For", r.RemoteAddr)
 	r.Header.Write(upstreamConn)
 	upstreamConn.Write([]byte("\r\n"))
 

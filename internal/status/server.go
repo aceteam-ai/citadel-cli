@@ -101,6 +101,12 @@ type Server struct {
 	// sshDeployAllowed backs the operator SSH permission on the control
 	// listener's /ssh/authorized-keys; see ServerConfig.SSHDeployAllowed.
 	sshDeployAllowed func() bool
+
+	// bindLAN, when true, restores the all-interfaces plaintext bind; the
+	// default is loopback only (see bindAddr).
+	bindLAN bool
+	// peerVerifier backs requireAgentCaller's verified-mesh-identity branch.
+	peerVerifier PeerVerifier
 }
 
 // ServerConfig holds configuration for the status server.
@@ -159,6 +165,17 @@ type ServerConfig struct {
 	// closed); the caller is expected to read the live permissions strictly so
 	// an unreadable or damaged file also refuses.
 	SSHDeployAllowed func() bool
+
+	// BindLAN is the explicit operator opt-in to serve the plaintext status
+	// listener on every interface. Default false: loopback only, with mesh
+	// reachability coming from AddListener. Start logs the opt-in loudly.
+	BindLAN bool
+
+	// PeerVerifier reports whether the mesh peer behind remoteAddr is a
+	// verified, same-owner device (see PeerVerifier). Nil refuses every mesh
+	// caller on the read-only /agent/* routes (fail closed); loopback and a
+	// valid org token are unaffected.
+	PeerVerifier PeerVerifier
 }
 
 // DefaultControlPort is the default port for the mTLS control listener. It is
@@ -194,6 +211,8 @@ func NewServer(cfg ServerConfig, collector *Collector) *Server {
 		controlPort:       cfg.ControlPort,
 		controlServerCert: cfg.ControlServerCert,
 		sshDeployAllowed:  cfg.SSHDeployAllowed,
+		bindLAN:           cfg.BindLAN,
+		peerVerifier:      cfg.PeerVerifier,
 	}
 }
 
@@ -262,6 +281,8 @@ func (s *Server) buildControlMux() *http.ServeMux {
 	for _, reg := range s.controlRouteRegistrars {
 		reg(mux, s.caVerifier.requireCoordinator)
 	}
+	// /agent/* introspection and control: the coordinator-facing copy.
+	s.registerAgentControlRoutes(mux, s.caVerifier.requireCoordinator)
 	return mux
 }
 
@@ -317,8 +338,9 @@ func (s *Server) buildMux() *http.ServeMux {
 	// instead of silently 404ing or, worse, still writing keys.
 	mux.HandleFunc("/ssh/authorized-keys", s.handleSSHMovedToControl)
 
-	// Agent introspection & control endpoints (issue #236), gated the same way
-	// (VPN origin or valid org token). No-op when no providers were supplied.
+	// Agent introspection & control endpoints (issue #236). Verified callers
+	// only; the content-reading and mutating ones live on the control listener
+	// (see registerAgentRoutes). No-op when no providers were supplied.
 	s.registerAgentRoutes(mux)
 
 	// Invoke registered route registrars (e.g., provisioning API).
@@ -339,10 +361,17 @@ func (s *Server) buildMux() *http.ServeMux {
 func (s *Server) Start(ctx context.Context) error {
 	mux := s.buildMux()
 	s.httpServer = &http.Server{
-		Addr:         fmt.Sprintf(":%d", s.port),
+		Addr:         s.bindAddr(),
 		Handler:      mux,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,
+	}
+	if s.bindLAN {
+		log.Printf("[status] WARNING: plaintext status listener bound to ALL interfaces (%s) by operator opt-in; "+
+			"the LAN can reach /status, /health and the other unauthenticated routes. "+
+			"Remove the LAN bind opt-in to return to loopback + mesh only", s.httpServer.Addr)
+	} else {
+		log.Printf("[status] plaintext status listener bound to %s (loopback; mesh listener added separately)", s.httpServer.Addr)
 	}
 
 	// Start server in goroutine
@@ -428,6 +457,15 @@ func (s *Server) startControlServer() {
 		log.Printf("[status] mTLS control listener also on %s (VPN)", ln.Addr().String())
 		go s.serveControlListener(ln, tlsConfig, report)
 	}
+}
+
+// bindAddr owns the plaintext listener's bind: loopback unless the operator
+// opted into a LAN bind. Mesh reachability is the separate AddListener path.
+func (s *Server) bindAddr() string {
+	if s.bindLAN {
+		return fmt.Sprintf(":%d", s.port)
+	}
+	return fmt.Sprintf("127.0.0.1:%d", s.port)
 }
 
 // Port returns the port the server is configured to listen on.
