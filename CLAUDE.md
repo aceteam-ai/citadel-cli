@@ -1123,6 +1123,15 @@ not appear in diagnostics. `tests/test_hosted_turn_token.py` and
 
 ### Worker Mode (Redis Streams) - High-Performance Private Cloud
 
+`worker.TmuxSessionHandler` owns `TMUX_SESSION`. Like `LANE_OPERATION`, it
+runs only from this node's exact per-node stream with a matching payload node
+id, checked before the shell gate. `ensure`/`create` (and any other action)
+then pass `jobs.ShellGateReason` with the shared passcode throttle; `list` and
+`has` need only the stream and the live Shell permission. It is advertised only
+while Shell is on, is wired in `buildNodeJobHandlers`, and is not on the
+diagnostic Nexus path or the setup-posture allowlist. `jobs.TmuxSessionHandler`
+still owns name and lease validation.
+
 `worker.LaneOperationHandler` serves aceteam's `lane_capture` and `lane_send`
 (`LANE_OPERATION`, #1659). It accepts only this node's exact per-node stream and
 payload node id. Those checks run before the SHELL_COMMAND shell gate and shared

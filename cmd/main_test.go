@@ -9,6 +9,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/clilog"
 	"github.com/aceteam-ai/citadel-cli/internal/config"
+	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/laneop"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
@@ -32,6 +33,7 @@ func TestMain(m *testing.M) {
 	nativeLaneExec = func() laneop.Exec {
 		return func(context.Context, []byte, ...string) ([]byte, error) { return nil, laneop.ErrTmuxUnavailable }
 	}
+	nativeTmuxSessions = func() jobs.JobHandler { return refusingTmuxSessions{} }
 	// A direct init-time assignment would otherwise be overwritten by the
 	// Once below, masking its pre-fixture reads and captured paths.
 	if jobHandlers != nil {
