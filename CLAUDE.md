@@ -2655,15 +2655,17 @@ only start-path recreate trigger: `cmd.runningStartAction` (local start) and
 `ServiceHandler.serviceStart` (SERVICE_START) apply it once, as the boot
 sweep's `cmd.managedComposeRecreatorUnchecked` does for files the sweep
 rewrote. All honor `CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE`; the sweep, local
-start and restart skip `desired_status: stopped` (SERVICE_START clears it). `cmd.restartByRecreatingManagedService`
-makes `citadel run --restart` recreate known templates, since `compose restart`
+start and restart skip `desired_status: stopped` (SERVICE_START clears it).
+`cmd.restartByRecreatingManagedService` makes `citadel run --restart` recreate known templates, since `compose restart`
 keeps the old config. `compose.ReplaceRunningService` owns every such recreate:
 it preflights (limits, `compose config`, image presence) before touching the
 container, renames a legacy-project container aside instead of removing it,
 and on failure brings the previous container (or, for a same-project one
 compose already removed, the previous file) back running and restores the
 file. Compose selects containers by immutable project labels, so only a
-legacy-project container can be hidden from it by a rename. The CPU/GPU flavor reconcile does not trigger a recreate.
+legacy-project container can be hidden from it by a rename. The start-time
+CPU/GPU flavor reconcile does not trigger a recreate; a sweep rewrite that
+includes a flavor change does.
 
 **The vLLM endpoint has two explicit owners (citadel-cli#1076/#1167/#1186).**
 `services.resolveVLLMHostPort` and `services.resolveVLLMHost`

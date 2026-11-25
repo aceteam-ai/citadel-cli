@@ -187,8 +187,11 @@ func (r replacer) inspect(name string) containerInfo {
 //     removed is brought back with a forced `up` from the restored file.
 //
 // Commands go through Spec.Runtime's EngineCommand/ComposeCommand seam. A crash
-// between the rename and the restore leaves the backup behind; the next call
-// renames it back before doing anything else.
+// between the rename and the restore leaves the stopped backup behind. A call
+// that finds it while the pinned name is free renames it back first, but the
+// callers only call this for a running container, so a fresh start does not
+// reach that recovery: the backup stays until it is removed by hand or by a
+// legacy-project cleanup.
 func ReplaceRunningService(spec ReplaceSpec) (ReplaceOutcome, error) {
 	r := replacer{spec: spec, exec: spec.Exec}
 	if r.exec == nil {
