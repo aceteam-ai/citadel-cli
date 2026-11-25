@@ -10,8 +10,8 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 )
 
-// Classify from the original stream entry, not a caller-supplied type. Only
-// FILE_FETCH is disposable on ACK; other job streams retain existing semantics.
+// Classify from the original stream entry, not a caller-supplied type. Fetch
+// capabilities and lane send literals must disappear after ACK.
 var acknowledgeFileFetch = goredis.NewScript(`
 local entries = redis.call('XRANGE', KEYS[1], ARGV[2], ARGV[2])
 local kind = ''
@@ -28,7 +28,7 @@ if #entries > 0 then
   end
 end
 local acknowledged = redis.call('XACK', KEYS[1], ARGV[1], ARGV[2])
-if acknowledged == 1 and kind == 'FILE_FETCH' then redis.call('XDEL', KEYS[1], ARGV[2]) end
+if acknowledged == 1 and (kind == 'FILE_FETCH' or kind == 'LANE_OPERATION') then redis.call('XDEL', KEYS[1], ARGV[2]) end
 return acknowledged
 `)
 
@@ -38,6 +38,11 @@ func (c *Client) AckFileFetchJob(ctx context.Context, queue, messageID string) e
 		queue = c.queueName
 	}
 	return acknowledgeFileFetch.Run(ctx, c.client, []string{queue}, c.consumerGroup, messageID).Err()
+}
+
+// AckLaneOperationJob removes the original message literal after terminal ACK.
+func (c *Client) AckLaneOperationJob(ctx context.Context, queue, messageID string) error {
+	return c.AckFileFetchJob(ctx, queue, messageID)
 }
 
 // MarshalJSON omits credential-bearing fields from retained job envelopes.

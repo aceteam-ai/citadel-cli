@@ -11,6 +11,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -69,8 +71,8 @@ type Service struct {
 	Sleep  func(context.Context, time.Duration) error
 	// Audit receives one line per send: lane, pane, offer and outcome only.
 	Audit func(format string, args ...any)
-	// sendMu serializes sends on this node, so two offers never interleave
-	// keystrokes into one pane.
+	// sendMu serializes callers of this Service. A separate OS pane lock below
+	// also covers other worker processes sharing this user's tmux server.
 	sendMu sync.Mutex
 }
 
@@ -358,9 +360,29 @@ func (s *Service) Send(ctx context.Context, req SendRequest) SendResult {
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
 	fp := Fingerprint(req)
-	result := s.send(ctx, req, fp)
+	result := SendResult{Status: StatusUnknown}
+	if !PanePattern.MatchString(req.Pane) {
+		result = s.send(ctx, req, fp)
+	} else if unlock, err := s.lockPane(req.Pane); err == nil {
+		// Keep the OS lock through preflight, paste, Enter and outcome read.
+		// The ledger's shorter Reserve lock alone cannot fence another process.
+		result = s.send(ctx, req, fp)
+		unlock()
+	}
 	s.audit(req, result)
 	return result
+}
+
+func (s *Service) lockPane(id string) (func(), error) {
+	if s.Ledger == nil || !filepath.IsAbs(s.Ledger.dir) || !PanePattern.MatchString(id) {
+		return nil, ErrLedgerUnavailable
+	}
+	if err := os.MkdirAll(s.Ledger.dir, 0o700); err != nil {
+		return nil, err
+	}
+	// PanePattern permits digits only after %, so the lock name cannot escape
+	// the ledger directory. Never unlink a lock file: all processes need one inode.
+	return lockFile(filepath.Join(s.Ledger.dir, "lane-pane-"+id[1:]+".lock"))
 }
 
 func replay(entry Entry, fp string) SendResult {

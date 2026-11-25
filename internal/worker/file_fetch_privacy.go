@@ -13,6 +13,9 @@ func (s *RedisSource) ackDelivery(ctx context.Context, kind string, payload map[
 	if kind == JobTypeFileFetch {
 		return s.client.AckFileFetchJob(ctx, queue, messageID)
 	}
+	if kind == JobTypeLaneOperation {
+		return s.client.AckLaneOperationJob(ctx, queue, messageID)
+	}
 	// Only a stage_file entry (a user's file as base64) is disposable; every
 	// other COBROWSE_SESSION action keeps the plain ack below.
 	if kind == JobTypeCobrowseSession {

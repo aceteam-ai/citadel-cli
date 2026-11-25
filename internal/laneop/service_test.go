@@ -71,6 +71,45 @@ func TestSendSubmitsOnceThroughBracketedPaste(t *testing.T) {
 	}
 }
 
+func TestTwoServicesSharingPaneDoNotInterleaveOffers(t *testing.T) {
+	f := newFakeTmux()
+	first, _ := newService(t, f)
+	second := &Service{Exec: f.exec, Ledger: NewLedger(first.Ledger.dir), Now: first.Now, Sleep: first.Sleep}
+	pasted := make(chan struct{})
+	release := make(chan struct{})
+	f.onPaste = func(*fakeTmux) {
+		f.onPaste = nil
+		close(pasted)
+		<-release
+	}
+	firstResult := make(chan SendResult, 1)
+	go func() { firstResult <- first.Send(context.Background(), request("first offer")) }()
+	select {
+	case <-pasted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first send never reached paste")
+	}
+	secondRequest := request("second offer")
+	secondRequest.OfferID = "offer-2"
+	secondResult := make(chan SendResult, 1)
+	go func() { secondResult <- second.Send(context.Background(), secondRequest) }()
+	select {
+	case result := <-secondResult:
+		t.Fatalf("second service crossed the pane lock during paste: %+v", result)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	if got := <-firstResult; got.Status != StatusSubmitted {
+		t.Fatalf("first send: %+v", got)
+	}
+	if got := <-secondResult; got.Status != StatusSubmitted {
+		t.Fatalf("second send: %+v", got)
+	}
+	if got := f.panes["%7"].submits; !slices.Equal(got, []string{"first offer", "second offer"}) {
+		t.Fatalf("interleaved pane submissions: %q", got)
+	}
+}
+
 func TestSendDedupesOfferAcrossRedeliveryWithNoTmuxCalls(t *testing.T) {
 	f := newFakeTmux()
 	s, _ := newService(t, f)
