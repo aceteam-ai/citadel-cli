@@ -60,6 +60,7 @@ type fakeLocalFlowEngine struct {
 	runs         [][]string
 	stdins       [][]byte
 	removed      []string
+	removeErr    error
 }
 
 func (f *fakeLocalFlowEngine) exec(cmd *exec.Cmd, stdin []byte, limit int) ([]byte, bool, error) {
@@ -74,6 +75,9 @@ func (f *fakeLocalFlowEngine) exec(cmd *exec.Cmd, stdin []byte, limit int) ([]by
 		return []byte("sha256:abc\n"), false, nil
 	case "rm":
 		f.removed = append(f.removed, args[len(args)-1])
+		if f.removeErr != nil {
+			return nil, false, f.removeErr
+		}
 		return nil, false, nil
 	case "run":
 		f.runs = append(f.runs, append([]string(nil), args...))
@@ -237,6 +241,72 @@ func TestLocalFlowPinnedManifestHash(t *testing.T) {
 	}
 	if err := jobs.ValidateTemplateParams(lfParams(t, map[string]string{"command": "sh"}), json.RawMessage(localFlowInputSchema), json.RawMessage(localFlowOutputSchema)); err == nil {
 		t.Fatal("closed input schema accepted an extra command param")
+	}
+}
+
+func TestLocalFlowExpiredClaimCannotEraseConcurrentNewClaim(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	old := filepath.Join(dir, lfTestRunID)
+	if err := os.WriteFile(old, []byte("old job\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	expired := now.Add(-localFlowRunRetention - time.Hour)
+	if err := os.Chtimes(old, expired, expired); err != nil {
+		t.Fatal(err)
+	}
+	// Both deliveries have already observed the expired entry. Expiry and the
+	// claim must still be one operation across the two independent callers.
+	for i := 0; i < 2; i++ {
+		seen, err := localFlowRunSeen(dir, lfTestRunID, now, localFlowRunRetention)
+		if err != nil || seen {
+			t.Fatalf("stale preflight %d: seen=%v err=%v", i, seen, err)
+		}
+	}
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for _, job := range []string{"job-a", "job-b"} {
+		go func(job string) {
+			<-start
+			results <- claimLocalFlowRun(dir, lfTestRunID, job, now, localFlowRunRetention)
+		}(job)
+	}
+	close(start)
+	first, second := <-results, <-results
+	if !((first == nil && errors.Is(second, os.ErrExist)) ||
+		(second == nil && errors.Is(first, os.ErrExist))) {
+		t.Fatalf("claims were not exclusive: %v, %v", first, second)
+	}
+	claim, err := os.ReadFile(old)
+	if err != nil || (string(claim) != "job-a\n" && string(claim) != "job-b\n") {
+		t.Fatalf("new claim was not retained: %q %v", claim, err)
+	}
+}
+
+func TestLocalFlowFailedContainerCleanupIsReconciledBeforeNextRun(t *testing.T) {
+	f := newLFFixture(t)
+	f.engine.exitCode = 2
+	f.engine.removeErr = errors.New("engine cleanup unavailable")
+	first, _ := f.execute(lfJob(t, lfParams(t, nil), lfOwnQueue))
+	if first.Status != worker.JobStatusFailure || first.Error == nil || !strings.Contains(first.Error.Error(), "cleanup pending") {
+		t.Fatalf("first run = %s %v, want cleanup pending", first.Status, first.Error)
+	}
+	marker := filepath.Join(f.ledger, ".cleanup-citadel-local-flow-test")
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("failed cleanup lost its durable marker: %v", err)
+	}
+	f.engine.removeErr = nil
+	f.engine.exitCode = 0
+	secondID := "0f3c2b8e-5a41-4d6b-9c7e-1a2b3c4d5e70"
+	second, _ := f.execute(lfJob(t, lfParams(t, map[string]string{"run_id": secondID}), lfOwnQueue))
+	if second.Status != worker.JobStatusSuccess {
+		t.Fatalf("second run = %s %v, want recovery", second.Status, second.Error)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("cleanup marker remains after recovery: %v", err)
+	}
+	if len(f.engine.removed) != 2 || f.engine.runCount() != 2 {
+		t.Fatalf("cleanup attempts = %d, runs = %d, want 2 each", len(f.engine.removed), f.engine.runCount())
 	}
 }
 

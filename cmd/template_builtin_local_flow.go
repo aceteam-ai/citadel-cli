@@ -1,8 +1,7 @@
 package cmd
 
-// local-flow-run (citadel-cli#1543, aceteam#13129): run one pinned Flow package
-// in the node's isolated Python local_flow engine container. The engine is the
-// one-request stdin/stdout CLI from aceteam#13130 (`python -m local_flow`): it
+// local-flow-run: run one pinned Flow package in the node's isolated Python
+// local_flow engine container. The engine is a one-request stdin/stdout CLI: it
 // reads {graph, package_digest, input, run_id}, writes {output, usage} or
 // {error} on stdout, and reads CITADEL_LOCAL_GATEWAY_PORT, CITADEL_LOCAL_MODELS
 // and CITADEL_LOCAL_RUNS_DIR from its environment. docs/local-flow-run.md owns
@@ -234,6 +233,16 @@ func runLocalFlowBuiltin(ctx context.Context, bind templateRunBinding, params js
 	if err != nil {
 		return nil, err
 	}
+	// Hold the container ledger lock through reconciliation and execution so
+	// another worker cannot mistake this run's live marker for stale cleanup.
+	unlock, err := lockLocalFlowRunLedger(filepath.Join(plan.ledger, ".local-flow-containers.lock"))
+	if err != nil {
+		return nil, fmt.Errorf("local-flow-run: cannot lock container ledger: %w", err)
+	}
+	defer unlock()
+	if err := reconcileLocalFlowContainers(plan, deps); err != nil {
+		return nil, fmt.Errorf("local-flow-run: prior container cleanup is pending: %w", err)
+	}
 	// The ledger entry is the last step before launch: a refused run never
 	// consumes its run id.
 	if err := plan.claimRun(); err != nil {
@@ -443,7 +452,7 @@ func admitLocalFlowRun(ctx context.Context, bind templateRunBinding, params json
 		ledger:  ledger,
 	}
 	plan.claimRun = func() error {
-		if err := claimLocalFlowRun(ledger, runID, jobID); err != nil {
+		if err := claimLocalFlowRun(ledger, runID, jobID, deps.now(), localFlowRunRetention); err != nil {
 			if errors.Is(err, os.ErrExist) {
 				return localFlowRefuse("duplicate run: this node already ran %s", runID)
 			}
@@ -631,8 +640,12 @@ func runLocalFlowContainer(ctx context.Context, plan *localFlowPlan, deps localF
 	if err != nil {
 		return nil, err
 	}
+	if err := recordLocalFlowContainer(plan.ledger, name); err != nil {
+		return nil, fmt.Errorf("local-flow-run: cannot track container before launch: %w", err)
+	}
 	args, err := buildLocalFlowRunArgs(plan, deps.image, name)
 	if err != nil {
+		_ = clearLocalFlowContainer(plan.ledger, name)
 		return nil, err
 	}
 	// The engine CLI keeps the worker environment (rootless Podman needs its
@@ -642,7 +655,13 @@ func runLocalFlowContainer(ctx context.Context, plan *localFlowPlan, deps localF
 	stdout, overflow, runErr := deps.exec(cmd, plan.request, localFlowMaxStdoutBytes)
 	if runErr != nil || ctx.Err() != nil {
 		// A killed engine client does not stop the container it started.
-		removeLocalFlowContainer(plan.runtime, name, deps)
+		if cleanupErr := removeLocalFlowContainer(plan.runtime, name, deps); cleanupErr != nil {
+			// The durable marker remains for the next admission to reconcile.
+			return nil, fmt.Errorf("local-flow-run: container outcome unknown; cleanup pending: %w", cleanupErr)
+		}
+	}
+	if err := clearLocalFlowContainer(plan.ledger, name); err != nil {
+		return nil, fmt.Errorf("local-flow-run: container cleanup marker remains: %w", err)
 	}
 	if overflow {
 		return nil, fmt.Errorf("local-flow-run: engine output exceeds %d bytes", localFlowMaxStdoutBytes)
@@ -667,10 +686,66 @@ func runLocalFlowContainer(ctx context.Context, plan *localFlowPlan, deps localF
 	return stdout, nil
 }
 
-func removeLocalFlowContainer(rt catalog.ContainerRuntime, name string, deps localFlowDeps) {
+func removeLocalFlowContainer(rt catalog.ContainerRuntime, name string, deps localFlowDeps) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	_, _, _ = deps.exec(rt.EngineCommandContext(ctx, "rm", "-f", name), nil, 4096)
+	_, _, err := deps.exec(rt.EngineCommandContext(ctx, "rm", "-f", name), nil, 4096)
+	return err
+}
+
+var localFlowContainerNamePattern = regexp.MustCompile(`^citadel-local-flow-[a-z0-9-]{1,64}$`)
+
+func localFlowContainerMarker(dir, name string) (string, error) {
+	if !localFlowContainerNamePattern.MatchString(name) {
+		return "", fmt.Errorf("invalid local Flow container name")
+	}
+	return filepath.Join(dir, ".cleanup-"+name), nil
+}
+
+func recordLocalFlowContainer(dir, name string) error {
+	path, err := localFlowContainerMarker(dir, name)
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	return errors.Join(f.Sync(), f.Close(), syncLocalFlowRunDir(dir))
+}
+
+func clearLocalFlowContainer(dir, name string) error {
+	path, err := localFlowContainerMarker(dir, name)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	return syncLocalFlowRunDir(dir)
+}
+
+func reconcileLocalFlowContainers(plan *localFlowPlan, deps localFlowDeps) error {
+	entries, err := os.ReadDir(plan.ledger)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), ".cleanup-") {
+			continue
+		}
+		name := strings.TrimPrefix(entry.Name(), ".cleanup-")
+		if !entry.Type().IsRegular() || !localFlowContainerNamePattern.MatchString(name) {
+			return fmt.Errorf("invalid cleanup marker")
+		}
+		if err := removeLocalFlowContainer(plan.runtime, name, deps); err != nil {
+			return err
+		}
+		if err := clearLocalFlowContainer(plan.ledger, name); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // parseLocalFlowStdout accepts exactly {"output":{...},"usage":{"input_tokens":
@@ -722,8 +797,8 @@ func parseLocalFlowStdout(stdout []byte) (map[string]any, map[string]any, error)
 	return output, usage, nil
 }
 
-// localFlowRunSeen reports whether runID is already in the ledger, after
-// removing entries older than retention so the ledger stays bounded.
+// localFlowRunSeen is a read-only early refusal. Expiry and the final claim
+// happen together under a process-shared lock in claimLocalFlowRun.
 func localFlowRunSeen(dir, runID string, now time.Time, retention time.Duration) (bool, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return false, err
@@ -733,45 +808,55 @@ func localFlowRunSeen(dir, runID string, now time.Time, retention time.Duration)
 		return false, err
 	}
 	defer root.Close()
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return false, err
-	}
-	cutoff := now.Add(-retention)
-	for _, e := range entries {
-		if !e.Type().IsRegular() || !localFlowRunIDPattern.MatchString(e.Name()) {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		if info.ModTime().Before(cutoff) {
-			_ = root.Remove(e.Name())
-		}
-	}
-	if _, err := root.Lstat(runID); err == nil {
-		return true, nil
+	if info, err := root.Lstat(runID); err == nil {
+		return !info.ModTime().Before(now.Add(-retention)), nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return false, err
 	}
 	return false, nil
 }
 
-// claimLocalFlowRun records runID with O_EXCL, so two concurrent deliveries of
-// one run cannot both start. It returns an os.ErrExist error for a duplicate.
-func claimLocalFlowRun(dir, runID, jobID string) error {
+// claimLocalFlowRun prunes and claims under one cross-process lock. A stale
+// preflight may never remove another worker's newly created claim.
+func claimLocalFlowRun(dir, runID, jobID string, now time.Time, retention time.Duration) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	unlock, err := lockLocalFlowRunLedger(filepath.Join(dir, ".local-flow-runs.lock"))
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return err
 	}
 	defer root.Close()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	cutoff := now.Add(-retention)
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() || !localFlowRunIDPattern.MatchString(entry.Name()) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.ModTime().Before(cutoff) {
+			if err := root.Remove(entry.Name()); err != nil {
+				return err
+			}
+		}
+	}
 	f, err := root.OpenFile(runID, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
 	_, writeErr := io.WriteString(f, sanitizeTemplateSegment(jobID)+"\n")
-	return errors.Join(writeErr, f.Close())
+	return errors.Join(writeErr, f.Sync(), f.Close(), syncLocalFlowRunDir(dir))
 }
 
 func newLocalFlowContainerName() (string, error) {
