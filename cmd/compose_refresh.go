@@ -33,6 +33,7 @@ import (
 	"strings"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
+	"github.com/aceteam-ai/citadel-cli/internal/compose"
 	"github.com/aceteam-ai/citadel-cli/internal/composerefresh"
 	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
@@ -130,6 +131,7 @@ type managedComposeDeps struct {
 	containerState func(engineBin, containerName string) (string, bool)
 	publishedPort  func(engineBin, containerName string) (int, bool)
 	serviceFor     func(configDir, service string) Service
+	removeLegacy   func(engineBin, service string)
 	run            func(cmd *exec.Cmd) ([]byte, error)
 }
 
@@ -138,6 +140,7 @@ var managedCompose = managedComposeDeps{
 	containerState: containerStateFor,
 	publishedPort:  runningPublishedHostPort,
 	serviceFor:     manifestServiceAt,
+	removeLegacy:   func(engineBin, service string) { compose.RemoveLegacyProjectContainers(engineBin, service) },
 	run:            func(cmd *exec.Cmd) ([]byte, error) { return cmd.CombinedOutput() },
 }
 
@@ -220,12 +223,15 @@ func managedComposeRecreatorUnchecked(service, composePath string, wantHostPort 
 // the same file arguments a start uses (sandbox, GPU and env-file overrides, the
 // --node-dir project, the Podman CDI and non-Linux GPU rewrites). force adds
 // --force-recreate; Podman always forces (see managedComposeRecreatorUnchecked).
+// A container still under the legacy per-service project (#528) is removed
+// first, because a no-`-p` up conflicts on its pinned container_name.
 func runManagedComposeUp(rt catalog.ContainerRuntime, service, composePath string, force bool, env []string) error {
 	args, cleanup, err := prepareComposeUpArgs(service, composePath, rt.EngineBin)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
+	managedCompose.removeLegacy(rt.EngineBin, service)
 	if force || rt.EngineBin == "podman" {
 		args = append(args, "--force-recreate")
 	}

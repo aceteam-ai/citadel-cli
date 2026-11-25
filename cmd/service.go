@@ -316,6 +316,10 @@ func startService(serviceName, composeFilePath string) (retErr error) {
 				case runningApplyRefreshedTemplate:
 					fmt.Printf("   ♻️  Container %s is running an older citadel template; applying the refreshed compose...\n", containerName)
 					applyRefreshedTemplate = true
+					// A running container under the legacy per-service project
+					// (#528) would make the no-`-p` up below conflict on its
+					// container_name; it is being recreated anyway.
+					removeLegacyCitadelProject(serviceName)
 					// Fall through to the compose-up below.
 				default:
 					if templateRefresh.Changed {

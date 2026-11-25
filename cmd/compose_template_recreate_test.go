@@ -34,12 +34,13 @@ func prePinTEICompose(t *testing.T) string {
 }
 
 type fakeManagedCompose struct {
-	engine   string
-	state    map[string]string // container -> State.Status; absent = no container
-	ports    map[string]int
-	runs     [][]string
-	runErr   error
-	stateHit int
+	engine       string
+	state        map[string]string // container -> State.Status; absent = no container
+	ports        map[string]int
+	runs         [][]string
+	runErr       error
+	stateHit     int
+	legacyCleans int
 }
 
 func installFakeManagedCompose(t *testing.T, f *fakeManagedCompose) {
@@ -65,7 +66,8 @@ func installFakeManagedCompose(t *testing.T, f *fakeManagedCompose) {
 			p, ok := f.ports[name]
 			return p, ok
 		},
-		serviceFor: manifestServiceAt,
+		serviceFor:   manifestServiceAt,
+		removeLegacy: func(string, string) { f.legacyCleans++ },
 		run: func(cmd *exec.Cmd) ([]byte, error) {
 			f.runs = append(f.runs, append([]string(nil), cmd.Args...))
 			return []byte("compose output"), f.runErr
@@ -121,6 +123,9 @@ func TestManagedComposeRecreatorAppliesRefreshedFileToRunningContainerOnly(t *te
 			}
 			if len(f.runs) != tc.wantRuns || recreated != (tc.wantRuns == 1) {
 				t.Fatalf("runs = %v, recreated = %v; want %d run(s)", f.runs, recreated, tc.wantRuns)
+			}
+			if f.legacyCleans != len(f.runs) {
+				t.Fatalf("legacy-project cleanups = %d, want one per up (%d)", f.legacyCleans, len(f.runs))
 			}
 			if tc.desired == "stopped" && f.stateHit != 0 {
 				t.Fatal("stopped service was inspected")
