@@ -40,16 +40,18 @@ var legacyCleanupMu sync.Mutex
 // The node config dir is machine-convergent across worker and interactive
 // callers, including distinct OS users. An inaccessible lock fails closed.
 // Never remove its file: replacing the inode would split concurrent holders.
-func withLegacyMutationLock(engineBin, serviceName string, fn func() error) error {
+func withLegacyMutationLock(serviceName string, fn func() error) error {
 	root := network.GetNodeConfigDir()
 	if root == "" || root == "." {
 		return fmt.Errorf("node config directory is unavailable for compose mutation lock")
 	}
-	return withLegacyMutationLockAt(root, engineBin, serviceName, fn)
+	return withLegacyMutationLockAt(root, serviceName, fn)
 }
 
-func withLegacyMutationLockAt(root, engineBin, serviceName string, fn func() error) error {
-	key := sha256.Sum256([]byte(engineBin + "\x00" + serviceName))
+func withLegacyMutationLockAt(root, serviceName string, fn func() error) error {
+	// EngineBin may be a bare command or an absolute path in another process.
+	// Over-serialize distinct engines rather than split a lock for one engine.
+	key := sha256.Sum256([]byte(serviceName))
 	return finetunesafety.WithExclusive(filepath.Join(root, "compose-mutation", fmt.Sprintf("%x", key)), fn)
 }
 
@@ -65,7 +67,7 @@ func RemoveLegacyProjectContainers(engineBin, serviceName string) []string {
 	legacyCleanupMu.Lock()
 	defer legacyCleanupMu.Unlock()
 	var removed []string
-	if err := withLegacyMutationLock(engineBin, serviceName, func() error {
+	if err := withLegacyMutationLock(serviceName, func() error {
 		removed = removeLegacyProjectContainersLocked(engineBin, serviceName)
 		return nil
 	}); err != nil {

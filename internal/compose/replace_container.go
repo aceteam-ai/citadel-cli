@@ -186,7 +186,7 @@ func ReplaceRunningService(spec ReplaceSpec) (ReplaceOutcome, error) {
 	var outcome ReplaceOutcome
 	var replaceErr error
 	ran := false
-	lockErr := withLegacyMutationLock(spec.Runtime.EngineBin, spec.Service, func() error {
+	lockErr := withLegacyMutationLock(spec.Service, func() error {
 		ran = true
 		outcome, replaceErr = replaceRunningServiceLocked(spec)
 		return nil

@@ -24,7 +24,7 @@ func TestLegacyRemovalExcludesReplacementBackup(t *testing.T) {
 // can list an ID that replacement might rename into a recoverable backup.
 func TestLegacyMutationLockCrossProcess(t *testing.T) {
 	if os.Getenv("CITADEL_TEST_COMPOSE_LOCK_HELPER") == "1" {
-		err := withLegacyMutationLockAt(os.Getenv("CITADEL_TEST_COMPOSE_LOCK_ROOT"), "docker", "tei", func() error {
+		err := withLegacyMutationLockAt(os.Getenv("CITADEL_TEST_COMPOSE_LOCK_ROOT"), "tei", func() error {
 			_, _ = io.WriteString(os.Stdout, "LOCKED\n")
 			_, _ = io.Copy(io.Discard, os.Stdin)
 			return nil
@@ -72,7 +72,7 @@ func TestLegacyMutationLockCrossProcess(t *testing.T) {
 		t.Fatalf("helper did not acquire lock: %q, %v", line, err)
 	}
 	called := false
-	err = withLegacyMutationLock("docker", "tei", func() error { called = true; return nil })
+	err = withLegacyMutationLock("tei", func() error { called = true; return nil })
 	if err == nil || called {
 		t.Fatalf("second process entered the backup window: called=%v err=%v", called, err)
 	}
@@ -89,7 +89,7 @@ func TestLegacyMutationLockCrossProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A completed replacement no longer blocks the next cleanup.
-	if err := withLegacyMutationLock("docker", "tei", func() error { called = true; return nil }); err != nil || !called {
+	if err := withLegacyMutationLock("tei", func() error { called = true; return nil }); err != nil || !called {
 		t.Fatalf("lock did not release: called=%v err=%v", called, err)
 	}
 }
