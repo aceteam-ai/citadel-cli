@@ -5,15 +5,18 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 
 	"github.com/aceteam-ai/citadel-cli/internal/aep"
 	"github.com/aceteam-ai/citadel-cli/internal/cacheindex"
 	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
 	"github.com/aceteam-ai/citadel-cli/internal/jobs"
 	"github.com/aceteam-ai/citadel-cli/internal/laneinventory"
+	"github.com/aceteam-ai/citadel-cli/internal/laneop"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/internal/pairingdisplay"
 	"github.com/aceteam-ai/citadel-cli/internal/status"
+	"github.com/aceteam-ai/citadel-cli/internal/tmux"
 	"github.com/aceteam-ai/citadel-cli/internal/whatsapp"
 	"github.com/aceteam-ai/citadel-cli/internal/worker"
 	"github.com/aceteam-ai/citadel-cli/internal/workflow"
@@ -35,6 +38,9 @@ type nodeJobHandlerOpts struct {
 	// Production callers leave it nil and use the lazy native collector.
 	InventoryCollect func(context.Context) (laneinventory.Report, error)
 	InventoryEnabled func() bool
+	// LaneExec is an optional tmux seam for tests. Production leaves it nil
+	// and LANE_OPERATION resolves tmux lazily, once.
+	LaneExec laneop.Exec
 	// WorkspaceDir is the sandbox root for file-operation handlers.
 	WorkspaceDir string
 	// ConfigDir is the citadel.yaml manifest directory (enables service handlers).
@@ -169,6 +175,7 @@ func buildNodeJobHandlers(opts nodeJobHandlerOpts) ([]worker.JobHandler, *worker
 	handlers = append(handlers, worker.NewLaneInventoryHandler(worker.LaneInventoryConfig{
 		OrgID: opts.OrgID, NodeID: opts.NodeID, Collect: collectInventory, Enabled: inventoryEnabled,
 	}))
+	handlers = append(handlers, newLaneOperationHandler(opts))
 	// llm_inference (issue #590): the aceteam python-backend dispatches
 	// job_type="llm_inference" for ALL fabric inference (OpenAI gateway, /fabric
 	// model deploys, mesh chat). Registered unconditionally — like the workflow
@@ -404,4 +411,39 @@ func nodeJobOrgID() string {
 		return manifest.Node.OrgID
 	}
 	return ""
+}
+
+// newLaneOperationHandler wires LANE_OPERATION (#1659) to the same live shell
+// gate and shared passcode throttle as SHELL_COMMAND, and to the offer ledger
+// in the machine-level node configuration directory. The tmux probe runs at
+// most once per process, on first advertisement.
+func newLaneOperationHandler(opts nodeJobHandlerOpts) *worker.LaneOperationHandler {
+	run := opts.LaneExec
+	if run == nil {
+		run = nativeLaneExec()
+	}
+	available := sync.OnceValue(func() bool { return laneop.Available(context.Background(), run) })
+	service := &laneop.Service{Exec: run, Settle: laneop.DefaultSettle, Audit: opts.HandlerLog}
+	if ledger := laneop.NewLedger(opts.PermissionsDir); ledger != nil {
+		service.Ledger = ledger
+	}
+	return worker.NewLaneOperationHandler(worker.LaneOperationConfig{
+		OrgID: opts.OrgID, NodeID: opts.NodeID,
+		Gate:      jobs.ShellGate{Enabled: opts.ShellEnabled, State: opts.ShellPasscodeState, Throttle: opts.PasscodeThrottle},
+		Service:   service,
+		Available: available,
+	})
+}
+
+// nativeLaneExec resolves tmux once, lazily. It is a variable so the cmd
+// package's TestMain can keep every test away from the real tmux binary.
+var nativeLaneExec = func() laneop.Exec {
+	resolve := sync.OnceValues(tmux.Resolve)
+	return func(ctx context.Context, stdin []byte, args ...string) ([]byte, error) {
+		bin, err := resolve()
+		if err != nil {
+			return nil, laneop.ErrTmuxUnavailable
+		}
+		return laneop.NativeExec(bin)(ctx, stdin, args...)
+	}
 }

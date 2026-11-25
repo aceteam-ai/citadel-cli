@@ -1662,7 +1662,7 @@ func ccStartServiceForHost(name string, gpuCount func() int) error {
 			// the start.
 			return withLocalServiceStartGuard(configDir, name, func() error {
 				// Keep compose publication under the existing pointer/reservation locks.
-				if err := reconcileHostComposeForStart(name, filepath.Join(configDir, service.ComposeFile), gpuCount); err != nil {
+				if _, err := reconcileHostComposeForStart(name, filepath.Join(configDir, service.ComposeFile), gpuCount); err != nil {
 					return err
 				}
 				_ = setServiceDesiredStatus(configDir, name, "")
@@ -1767,7 +1767,7 @@ func ccRestartServiceForHost(name string, gpuCount func() int) error {
 			// marker so the service also starts on the next boot. Best-effort.
 			return withLocalServiceStartGuard(configDir, name, func() error {
 				// Keep compose publication under the existing pointer/reservation locks.
-				if err := reconcileHostComposeForStart(name, filepath.Join(configDir, service.ComposeFile), gpuCount); err != nil {
+				if _, err := reconcileHostComposeForStart(name, filepath.Join(configDir, service.ComposeFile), gpuCount); err != nil {
 					return err
 				}
 				_ = setServiceDesiredStatus(configDir, name, "")

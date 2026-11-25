@@ -154,7 +154,7 @@ func cacheBaseDirectory() (string, error) {
 }
 
 // startService starts a docker-based service using docker compose.
-func startService(serviceName, composeFilePath string, gpuCount ...func() int) error {
+func startService(serviceName, composeFilePath string, gpuCount ...func() int) (retErr error) {
 	probe := platform.NvidiaGPUCountForCompose
 	if len(gpuCount) > 0 {
 		probe = gpuCount[0]
@@ -187,10 +187,23 @@ func startService(serviceName, composeFilePath string, gpuCount ...func() int) e
 	}
 
 	// Module starts and manifest boot starts can bypass ensureComposeFile.
-	// Reconcile only the canonical embedded file, before the running shortcut.
-	if err := reconcileHostComposeForStart(serviceName, composeFilePath, platform.NvidiaGPUCountForCompose); err != nil {
+	// Reconcile only the canonical embedded file, before the running shortcut,
+	// so a refreshed template reaches an already-running container below.
+	templateRefresh, err := reconcileHostComposeForStart(serviceName, composeFilePath, platform.NvidiaGPUCountForCompose)
+	if err != nil {
 		return err
 	}
+	// If this start fails after refreshing the file, restore the previous one
+	// so the next start (or sweep) retries the refresh and its recreate instead
+	// of treating the new file as already applied to a still-old container.
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		if rbErr := templateRefresh.Rollback(composeFilePath, serviceName); rbErr != nil {
+			fmt.Printf("   ⚠️  could not restore the previous %s compose: %v\n", serviceName, rbErr)
+		}
+	}()
 
 	// Warn (never refuse) when an embedded engine will be published on all
 	// interfaces (aceteam-ai/citadel-cli#1023) -- either an opt-in `bind: all` or
@@ -215,6 +228,11 @@ func startService(serviceName, composeFilePath string, gpuCount ...func() int) e
 	// the compose-up below so the loopback bind actually applies. See the running
 	// pre-flight branch and shouldRecreateForEngineBindDrift.
 	forceRecreateForBindDrift := false
+	// applyRefreshedTemplate is set when the reconcile above rewrote this
+	// service's citadel-managed compose and its container is running: the
+	// compose-up below then applies the new file (compose recreates only when
+	// the service config changed). See runningStartAction.
+	applyRefreshedTemplate := false
 
 	// Resolve the container runtime once (podman rootless preferred over docker;
 	// see catalog.SelectContainerRuntime) and drive every sub-command below
@@ -294,11 +312,26 @@ func startService(serviceName, composeFilePath string, gpuCount ...func() int) e
 				// on the #1025 engine set, the materialized file being loopback-only
 				// (loop guard), a live wildcard binding, and the
 				// CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE opt-out.
-				if shouldRecreateForEngineBindDrift(rt.EngineBin, serviceName, containerName, composeFilePath, bindEnv) {
+				switch runningStartAction(
+					shouldRecreateForEngineBindDrift(rt.EngineBin, serviceName, containerName, composeFilePath, bindEnv),
+					templateRefresh.Changed, recreateOnUpgradeEnabled(), serviceStartDisabled(manifestSvc),
+				) {
+				case runningRecreateForBindDrift:
 					fmt.Printf("   ♻️  Container %s is published on all interfaces; recreating to apply the loopback bind...\n", containerName)
 					forceRecreateForBindDrift = true
 					// Fall through to the compose-up below with --force-recreate.
-				} else {
+				case runningApplyRefreshedTemplate:
+					fmt.Printf("   ♻️  Container %s is running an older citadel template; applying the refreshed compose...\n", containerName)
+					applyRefreshedTemplate = true
+					// A running container under the legacy per-service project
+					// (#528) would make the no-`-p` up below conflict on its
+					// container_name; it is being recreated anyway.
+					removeLegacyCitadelProject(serviceName)
+					// Fall through to the compose-up below.
+				default:
+					if templateRefresh.Changed {
+						fmt.Printf("   ⚠️  %s compose was refreshed but the running container keeps its old config (CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE is set); run `citadel stop %s && citadel run %s` to apply\n", serviceName, serviceName, serviceName)
+					}
 					// Container is already running - skip starting
 					fmt.Printf("   ✅ Container %s is already running.\n", containerName)
 					return nil
@@ -344,48 +377,22 @@ func startService(serviceName, composeFilePath string, gpuCount ...func() int) e
 		return fmt.Errorf("cannot start %s: %w", serviceName, limitsErr)
 	}
 
-	// Podman consumes NVIDIA devices through CDI rather than Docker's --gpus /
-	// deploy reservation vocabulary. Rewrite a private temporary copy and leave
-	// the installed compose source untouched.
-	actualComposePath := composeFilePath
-	if rt.EngineBin == "podman" {
-		var cleanup func()
-		var rewriteErr error
-		actualComposePath, cleanup, rewriteErr = compose.MaterializePodmanGPUCompose(composeFilePath)
-		if rewriteErr != nil {
-			return fmt.Errorf("cannot translate %s GPU reservation for Podman: %w", serviceName, rewriteErr)
-		}
-		defer cleanup()
+	// Podman CDI and non-Linux GPU rewrites, then the compose file args
+	// (sandbox override, GPU override, env file, --node-dir project).
+	composeUpArgs, cleanupComposeArgs, argsErr := prepareComposeUpArgs(serviceName, composeFilePath, rt.EngineBin)
+	if argsErr != nil {
+		return argsErr
 	}
-
-	// On non-Linux platforms, strip GPU device reservations from compose file
-	if !platform.IsLinux() {
-		content, readErr := os.ReadFile(composeFilePath)
-		if readErr == nil {
-			filtered, filterErr := compose.StripGPUDevices(content)
-			if filterErr == nil {
-				// Write filtered content to a temp file (0600 for security)
-				tmpPath := filepath.Join(os.TempDir(), fmt.Sprintf("citadel-compose-%s.yml", serviceName))
-				if writeErr := os.WriteFile(tmpPath, filtered, 0600); writeErr == nil {
-					actualComposePath = tmpPath
-					defer os.Remove(tmpPath)
-					fmt.Println("   ℹ️  Running in CPU-only mode (GPU acceleration unavailable on this platform)")
-				}
-			}
-		}
-	}
-
-	// Include the per-module least-privilege sandbox override when a sibling
-	// <name>.sandbox.yml exists (written at install time for untrusted/Tier-2
-	// modules). A no-op for every existing (non-sandboxed) service. The sibling is
-	// derived from the ORIGINAL compose path, not actualComposePath -- on non-Linux
-	// the latter may be a GPU-stripped temp file in a different directory.
-	composeUpArgs := startServiceComposeArgs(composeFilePath, actualComposePath, rt.EngineBin)
+	defer cleanupComposeArgs()
 	if forceRecreateForBindDrift {
 		// Recreate the still-running container in place so the loopback publish
 		// applies. Graceful (compose stops then recreates) and on the sanctioned
 		// compose path -- unlike a bare `docker rm -f`, which SIGKILLs a live
 		// engine and bypasses compose's stop.
+		composeUpArgs = append(composeUpArgs, "--force-recreate")
+	} else if applyRefreshedTemplate && rt.EngineBin == "podman" {
+		// podman-compose does not compare config hashes; force the one-time
+		// recreate the refreshed template needs.
 		composeUpArgs = append(composeUpArgs, "--force-recreate")
 	}
 	args := rt.ComposeArgs(composeUpArgs...)
@@ -407,6 +414,33 @@ func startService(serviceName, composeFilePath string, gpuCount ...func() int) e
 	}
 	startOllamaPreload(serviceName, manifestSvc)
 	return nil
+}
+
+// runningStartKind is what startService does for an already-running managed
+// container.
+type runningStartKind int
+
+const (
+	runningKeep runningStartKind = iota
+	runningRecreateForBindDrift
+	runningApplyRefreshedTemplate
+)
+
+// runningStartAction decides it, as a pure function: the #1030 loopback-bind
+// drift recreate wins; otherwise a template this start just refreshed
+// (templateChanged) is applied once, unless the operator opted out of
+// upgrade recreates or the service is marked `desired_status: stopped`. The
+// refresh is the only trigger, and it fires once per template change, so a
+// running container is never recreated in a loop.
+func runningStartAction(bindDrift, templateChanged, recreateEnabled, stopped bool) runningStartKind {
+	switch {
+	case bindDrift:
+		return runningRecreateForBindDrift
+	case templateChanged && recreateEnabled && !stopped:
+		return runningApplyRefreshedTemplate
+	default:
+		return runningKeep
+	}
 }
 
 func refuseManagedVLLMStart(serviceName string) error {
@@ -510,6 +544,51 @@ func startServiceComposeArgs(composeFilePath, actualComposePath, engineBin strin
 	args = append(args, gpuDeviceOverrideArgsFor(composeFilePath, engineBin)...)
 	args = append(args, "up", "-d")
 	return composeArgsWithProject(args)
+}
+
+// prepareComposeUpArgs returns startServiceComposeArgs for composeFilePath
+// after the per-host rewrites every compose up needs: Podman consumes NVIDIA
+// devices through CDI rather than Docker's --gpus / deploy reservation
+// vocabulary, and non-Linux hosts drop GPU reservations. Both rewrite a private
+// temporary copy and leave the installed compose source untouched; cleanup
+// removes it. The sandbox, GPU-override and env-file siblings are derived from
+// the ORIGINAL compose path, not the temporary copy. startService and the
+// refresh recreate (runManagedComposeUp) share it so both apply one file the
+// same way.
+func prepareComposeUpArgs(serviceName, composeFilePath, engineBin string) ([]string, func(), error) {
+	actualComposePath := composeFilePath
+	var cleanups []func()
+	cleanup := func() {
+		for i := len(cleanups) - 1; i >= 0; i-- {
+			cleanups[i]()
+		}
+	}
+	if engineBin == "podman" {
+		rewritten, podmanCleanup, rewriteErr := compose.MaterializePodmanGPUCompose(composeFilePath)
+		if rewriteErr != nil {
+			return nil, func() {}, fmt.Errorf("cannot translate %s GPU reservation for Podman: %w", serviceName, rewriteErr)
+		}
+		actualComposePath = rewritten
+		cleanups = append(cleanups, podmanCleanup)
+	}
+
+	// On non-Linux platforms, strip GPU device reservations from compose file
+	if !platform.IsLinux() {
+		content, readErr := os.ReadFile(composeFilePath)
+		if readErr == nil {
+			filtered, filterErr := compose.StripGPUDevices(content)
+			if filterErr == nil {
+				// Write filtered content to a temp file (0600 for security)
+				tmpPath := filepath.Join(os.TempDir(), fmt.Sprintf("citadel-compose-%s.yml", serviceName))
+				if writeErr := os.WriteFile(tmpPath, filtered, 0600); writeErr == nil {
+					actualComposePath = tmpPath
+					cleanups = append(cleanups, func() { os.Remove(tmpPath) })
+					fmt.Println("   ℹ️  Running in CPU-only mode (GPU acceleration unavailable on this platform)")
+				}
+			}
+		}
+	}
+	return startServiceComposeArgs(composeFilePath, actualComposePath, engineBin), cleanup, nil
 }
 
 // gpuDeviceOverrideArgsFor resolves the ["-f", <name>.gpu.yml] argument for the

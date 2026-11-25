@@ -49,7 +49,9 @@ func TestCUDAServiceStartUnknownOrPresentKeepsNormalAttempt(t *testing.T) {
 			attempts := 0
 			h.dockerServiceRunningFn = func(string) bool { attempts++; return true }
 			h.externalEngineServingFn = func(context.Context, string, int) ([]string, bool) { return nil, false }
-			out, err := h.serviceStart(testCtx(), manifestService{Name: name, Type: "docker"}, "", 0, 0, trustRemoteCodeUnspecified)
+			// Template reconciliation validates the configured path before the
+			// running shortcut; this control represents a valid managed service.
+			out, err := h.serviceStart(testCtx(), manifestService{Name: name, Type: "docker", ComposeFile: "services/" + name + ".yml"}, "", 0, 0, trustRemoteCodeUnspecified)
 			var result serviceResult
 			if err != nil || json.Unmarshal(out, &result) != nil || !result.Running || attempts == 0 {
 				t.Fatal("possible GPU was suppressed", name, count, err, string(out), attempts)

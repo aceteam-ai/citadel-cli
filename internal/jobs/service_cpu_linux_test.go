@@ -90,11 +90,11 @@ func TestExistingManifestComposeUsesHostSelectionAtEveryStart(t *testing.T) {
 			count := 1
 			h.gpuCount = func() int { return count }
 			svc := manifestService{Name: name, Type: "docker", ComposeFile: "services/" + name + ".yml"}
-			if err := h.prepareEmbeddedComposeForStart(svc); err != nil {
+			if _, err := h.prepareEmbeddedComposeForStart(svc); err != nil {
 				t.Fatal(err)
 			}
 			count = 0
-			if err := h.prepareEmbeddedComposeForStart(svc); err != nil {
+			if _, err := h.prepareEmbeddedComposeForStart(svc); err != nil {
 				t.Fatal(err)
 			}
 			want, _ := embeddedservices.ComposeForHost(name, "linux", func() int { return 0 })
@@ -109,7 +109,7 @@ func TestExistingManifestComposeUsesHostSelectionAtEveryStart(t *testing.T) {
 			}
 			h.gpuCount = func() int { t.Fatal("custom compose probed GPU"); return 0 }
 			svc.ComposeFile = "custom.yml"
-			if err := h.prepareEmbeddedComposeForStart(svc); err != nil {
+			if _, err := h.prepareEmbeddedComposeForStart(svc); err != nil {
 				t.Fatal(err)
 			}
 			got, err = os.ReadFile(custom)

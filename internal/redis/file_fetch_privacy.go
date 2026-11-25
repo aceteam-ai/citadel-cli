@@ -10,8 +10,8 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 )
 
-// Classify from the original stream entry, not a caller-supplied type. Only
-// FILE_FETCH is disposable on ACK; other job streams retain existing semantics.
+// Classify from the original stream entry, not a caller-supplied type. Fetch
+// capabilities and lane send literals must disappear after ACK.
 var acknowledgeFileFetch = goredis.NewScript(`
 local entries = redis.call('XRANGE', KEYS[1], ARGV[2], ARGV[2])
 local kind = ''
@@ -28,7 +28,7 @@ if #entries > 0 then
   end
 end
 local acknowledged = redis.call('XACK', KEYS[1], ARGV[1], ARGV[2])
-if acknowledged == 1 and kind == 'FILE_FETCH' then redis.call('XDEL', KEYS[1], ARGV[2]) end
+if acknowledged == 1 and (kind == 'FILE_FETCH' or kind == 'LANE_OPERATION') then redis.call('XDEL', KEYS[1], ARGV[2]) end
 return acknowledged
 `)
 
@@ -40,15 +40,20 @@ func (c *Client) AckFileFetchJob(ctx context.Context, queue, messageID string) e
 	return acknowledgeFileFetch.Run(ctx, c.client, []string{queue}, c.consumerGroup, messageID).Err()
 }
 
+// AckLaneOperationJob removes the original message literal after terminal ACK.
+func (c *Client) AckLaneOperationJob(ctx context.Context, queue, messageID string) error {
+	return c.AckFileFetchJob(ctx, queue, messageID)
+}
+
 // MarshalJSON omits credential-bearing fields from retained job envelopes.
 func (job Job) MarshalJSON() ([]byte, error) {
 	type plain Job
 	safe := plain(job)
 	if job.Type == jobprivacy.FileFetch {
 		safe.Payload, safe.RawPayload, safe.RawData = nil, nil, nil
-	} else if jobprivacy.HasPasscode(job.Payload) {
-		// The raw stream bytes carry the passcode too, so drop them.
-		safe.Payload = jobprivacy.WithoutPasscode(job.Payload)
+	} else if retained, changed := jobprivacy.Retained(job.Type, job.Payload); changed {
+		// The raw stream bytes carry the same fields, so drop them.
+		safe.Payload = retained
 		safe.RawPayload, safe.RawData = nil, nil
 	}
 	return json.Marshal(safe)
@@ -61,8 +66,8 @@ func (job Job) Format(state fmt.State, verb rune) {
 	}
 	type plain Job
 	safe := plain(job)
-	if jobprivacy.HasPasscode(job.Payload) {
-		safe.Payload = jobprivacy.WithoutPasscode(job.Payload)
+	if retained, changed := jobprivacy.Retained(job.Type, job.Payload); changed {
+		safe.Payload = retained
 		safe.RawPayload, safe.RawData = nil, nil
 	}
 	_, _ = fmt.Fprintf(state, fmt.FormatString(state, verb), safe)

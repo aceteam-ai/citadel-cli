@@ -55,7 +55,7 @@ func TestManifestStartReconcilesCPUVariantWithoutCreatingCustomFiles(t *testing.
 	if err := os.WriteFile(path, []byte(services.ServiceMap["llamacpp"]), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := reconcileHostComposeForStart("llamacpp", path, func() int { return 0 }); err != nil {
+	if _, err := reconcileHostComposeForStart("llamacpp", path, func() int { return 0 }); err != nil {
 		t.Fatal(err)
 	}
 	want, _ := services.ComposeForHost("llamacpp", "linux", func() int { return 0 })
@@ -63,7 +63,7 @@ func TestManifestStartReconcilesCPUVariantWithoutCreatingCustomFiles(t *testing.
 	if err != nil || string(got) != want {
 		t.Fatalf("manifest start kept GPU: %v", err)
 	}
-	if err := reconcileHostComposeForStart("llamacpp", filepath.Join(dir, "custom.yml"), func() int { t.Fatal("custom path probed GPU"); return 0 }); err != nil {
+	if _, err := reconcileHostComposeForStart("llamacpp", filepath.Join(dir, "custom.yml"), func() int { t.Fatal("custom path probed GPU"); return 0 }); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -106,7 +106,7 @@ func TestUnknownGPUKeepsBothExistingFlavorsAndSkipsBootRewrite(t *testing.T) {
 			if err := ensureComposeFileForHost(dir, name, "linux", func() int { return -1 }); err != nil {
 				t.Fatal(err)
 			}
-			if err := reconcileHostComposeForStart(name, path, func() int { return -1 }); err != nil {
+			if _, err := reconcileHostComposeForStart(name, path, func() int { return -1 }); err != nil {
 				t.Fatal(err)
 			}
 			after, err := os.ReadFile(path)
@@ -137,7 +137,7 @@ func TestUnknownGPUCanonicalBootStartMaterializesMissingFile(t *testing.T) {
 	for _, name := range []string{"ollama", "llamacpp"} {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "services", name+".yml")
-		if err := reconcileHostComposeForStart(name, path, func() int { return -1 }); err != nil {
+		if _, err := reconcileHostComposeForStart(name, path, func() int { return -1 }); err != nil {
 			t.Fatal(err)
 		}
 		got, err := os.ReadFile(path)

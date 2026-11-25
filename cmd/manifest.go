@@ -790,11 +790,45 @@ func healStaleGPUReservationOnDisk(destPath, serviceName string) error {
 // reconcileHostComposeForStart covers canonical manifest/module start paths.
 // Missing files get the initial template even when GPU evidence is unknown;
 // existing flavors retain the same preservation policy as explicit starts.
-// Custom compose paths never acquire embedded-file ownership.
-func reconcileHostComposeForStart(name, path string, gpuCount func() int) error {
-	if runtime.GOOS != "linux" || !services.HasCPUComposeVariant(name) ||
+// An existing embedded file that is a known, unedited older citadel template
+// is refreshed to the current one (compose.RefreshKnownComposeOnDisk), so a
+// start that runs before the worker's versioned sweep does not launch a stale
+// command. The result reports whether that refresh (not the flavor reconcile)
+// changed the file, which startService uses to recreate a running container
+// once. Custom compose paths never
+// acquire embedded-file ownership.
+func reconcileHostComposeForStart(name, path string, gpuCount func() int) (compose.StartRefresh, error) {
+	return reconcileHostComposeForStartOn(runtime.GOOS, name, path, gpuCount)
+}
+
+func reconcileHostComposeForStartOn(goos, name, path string, gpuCount func() int) (compose.StartRefresh, error) {
+	if !isEmbeddedService(name) ||
 		filepath.Base(path) != name+".yml" || filepath.Base(filepath.Dir(path)) != "services" {
-		return nil
+		return compose.StartRefresh{}, nil
 	}
-	return ensureComposeFileForHost(filepath.Dir(filepath.Dir(path)), name, runtime.GOOS, gpuCount)
+	sampled, count := false, -1
+	probe := func() int {
+		if !sampled && gpuCount != nil {
+			count = gpuCount()
+		}
+		sampled = true
+		return count
+	}
+	// The CPU/GPU flavor reconcile keeps its own policy and does not, by
+	// itself, recreate a running container; only a template refresh does.
+	if goos == "linux" && services.HasCPUComposeVariant(name) {
+		if err := ensureComposeFileForHost(filepath.Dir(filepath.Dir(path)), name, goos, probe); err != nil {
+			return compose.StartRefresh{}, err
+		}
+	}
+	return compose.CaptureStartRefresh(path, func() error {
+		selection := services.SelectComposeForHost(name, goos, probe)
+		if !selection.Embedded || selection.PreserveExisting {
+			return nil
+		}
+		if _, err := compose.RefreshKnownComposeOnDisk(path, name, selection.Content, resolveNodeDirOverride()); err != nil {
+			return fmt.Errorf("refresh managed compose for %q: %w", name, err)
+		}
+		return nil
+	})
 }

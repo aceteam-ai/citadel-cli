@@ -13,6 +13,9 @@ func (s *RedisSource) ackDelivery(ctx context.Context, kind string, payload map[
 	if kind == JobTypeFileFetch {
 		return s.client.AckFileFetchJob(ctx, queue, messageID)
 	}
+	if kind == JobTypeLaneOperation {
+		return s.client.AckLaneOperationJob(ctx, queue, messageID)
+	}
 	// Only a stage_file entry (a user's file as base64) is disposable; every
 	// other COBROWSE_SESSION action keeps the plain ack below.
 	if kind == JobTypeCobrowseSession {
@@ -31,9 +34,9 @@ func (job Job) MarshalJSON() ([]byte, error) {
 	safe := plain(job)
 	if job.Type == jobprivacy.FileFetch {
 		safe.Payload, safe.RawPayload = nil, nil
-	} else if jobprivacy.HasPasscode(job.Payload) {
-		// The raw stream bytes carry the passcode too, so drop them.
-		safe.Payload = jobprivacy.WithoutPasscode(job.Payload)
+	} else if retained, changed := jobprivacy.Retained(job.Type, job.Payload); changed {
+		// The raw stream bytes carry the same fields, so drop them.
+		safe.Payload = retained
 		safe.RawPayload = nil
 	}
 	return json.Marshal(safe)
@@ -46,8 +49,8 @@ func (job Job) Format(state fmt.State, verb rune) {
 	}
 	type plain Job
 	safe := plain(job)
-	if jobprivacy.HasPasscode(job.Payload) {
-		safe.Payload = jobprivacy.WithoutPasscode(job.Payload)
+	if retained, changed := jobprivacy.Retained(job.Type, job.Payload); changed {
+		safe.Payload = retained
 		safe.RawPayload = nil
 	}
 	_, _ = fmt.Fprintf(state, fmt.FormatString(state, verb), safe)

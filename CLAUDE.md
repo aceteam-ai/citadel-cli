@@ -1123,6 +1123,22 @@ not appear in diagnostics. `tests/test_hosted_turn_token.py` and
 
 ### Worker Mode (Redis Streams) - High-Performance Private Cloud
 
+`worker.LaneOperationHandler` serves aceteam's `lane_capture` and `lane_send`
+(`LANE_OPERATION`, #1659). It accepts only this node's exact per-node stream and
+payload node id. Those checks run before the SHELL_COMMAND shell gate and shared
+passcode throttle, so a misrouted job never counts as a wrong passcode. It is
+advertised only while tmux accepts `-N`, the gates are wired and shell is on.
+`laneop.Service.Send` owns once-per-offer submission. The `laneop.Ledger` record
+is written before any paste, and a redelivered offer replays it without calling
+tmux. The message reaches tmux only on stdin, through a bracketed paste. Enter
+is pressed only when `laneop.ReadScreen` shows an empty, framed input box before
+the paste and exactly the message after it. Unrecognized screens refuse.
+A send refusal is a successful result with `status: rejected`, because the
+server reads send status only from an end event. `jobprivacy.Retained` drops
+the message from every retained rendering. The recognizer fixtures are
+synthetic, so acceptance against a live harness happens after merge. Nothing
+writes `mcp:lane:binding` yet: the server has no authenticated binding verb.
+
 `laneinventory.Collector` owns the read-only #1699 metadata projection and its
 bounded redaction. `worker.LaneInventoryHandler` requires the exact configured
 own-node stream; paired platform key-bound session-read admission is #14139,
@@ -2629,6 +2645,20 @@ directory is scoped to the shared project, not to that service, so it lists
 sibling services too. Anything reasoning about "is THIS service up" must filter
 by the service keys declared in its compose file rather than trusting project
 scoping — see #692, which this stale doc helped hide.
+
+**A refreshed citadel template must reach a running container.** Every start
+path short-circuits on an already-running container, so rewriting a compose
+file alone never changes what runs. `compose.RefreshKnownComposeOnDisk` owns
+the start-time refresh (only a file matching `services.KnownComposeHashes`,
+never an operator edit), and its one-shot `compose.StartRefresh` result is the
+only start-path recreate trigger: `cmd.runningStartAction` (local start) and
+`ServiceHandler.serviceStart` (SERVICE_START) apply it once, as the boot
+sweep's `cmd.managedComposeRecreatorUnchecked` does for files the sweep
+rewrote. All honor `CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE`; the sweep, local
+start and restart skip `desired_status: stopped` (SERVICE_START clears it). `cmd.restartByRecreatingManagedService`
+makes `citadel run --restart` recreate known templates, since `compose restart`
+keeps the old config. A failed recreate restores the previous file so the next
+start retries. The CPU/GPU flavor reconcile does not trigger a recreate.
 
 **The vLLM endpoint has two explicit owners (citadel-cli#1076/#1167/#1186).**
 `services.resolveVLLMHostPort` and `services.resolveVLLMHost`
