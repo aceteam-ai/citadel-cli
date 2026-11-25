@@ -178,11 +178,26 @@ func (r replacer) inspect(name string) (containerInfo, error) {
 // remove that container before the replacement starts, so a recovery up cannot
 // guarantee the old service. Refusal restores the previous managed file.
 // A confirmed legacy backup is removed only after the replacement is running.
-// RemoveLegacyProjectContainers excludes backups and shares a process lock
-// with this operation. Commands use Spec.Runtime's EngineCommand/ComposeCommand.
+// RemoveLegacyProjectContainers excludes backups and shares an OS advisory
+// lock with this operation. Commands use Spec.Runtime's EngineCommand/ComposeCommand.
 func ReplaceRunningService(spec ReplaceSpec) (ReplaceOutcome, error) {
 	legacyCleanupMu.Lock()
 	defer legacyCleanupMu.Unlock()
+	var outcome ReplaceOutcome
+	var replaceErr error
+	ran := false
+	lockErr := withLegacyMutationLock(spec.Runtime.EngineBin, spec.Service, func() error {
+		ran = true
+		outcome, replaceErr = replaceRunningServiceLocked(spec)
+		return nil
+	})
+	if !ran {
+		return (replacer{spec: spec}).abortUnchanged(fmt.Errorf("compose mutation lock unavailable: %w", lockErr))
+	}
+	return outcome, errors.Join(replaceErr, lockErr)
+}
+
+func replaceRunningServiceLocked(spec ReplaceSpec) (ReplaceOutcome, error) {
 	r := replacer{spec: spec, exec: spec.Exec}
 	if r.exec == nil {
 		r.exec = DefaultExec

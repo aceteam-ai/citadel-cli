@@ -22,14 +22,36 @@
 package compose
 
 import (
+	"crypto/sha256"
+	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/aceteam-ai/citadel-cli/internal/finetunesafety"
 )
 
 // The worker and the Control Center can mutate the same legacy service in
 // parallel within one process. Keep cleanup out of the backup window.
 var legacyCleanupMu sync.Mutex
+
+// The persistent advisory lock also covers separate Citadel processes running
+// as the same user. Never remove its file: replacing the inode would split the
+// lock between old and new holders.
+func withLegacyMutationLock(engineBin, serviceName string, fn func() error) error {
+	root, err := os.UserCacheDir()
+	if err != nil {
+		return fmt.Errorf("locate compose mutation lock: %w", err)
+	}
+	return withLegacyMutationLockAt(root, engineBin, serviceName, fn)
+}
+
+func withLegacyMutationLockAt(root, engineBin, serviceName string, fn func() error) error {
+	key := sha256.Sum256([]byte(engineBin + "\x00" + serviceName))
+	return finetunesafety.WithExclusive(filepath.Join(root, "citadel", "compose-mutation", fmt.Sprintf("%x", key)), fn)
+}
 
 // RemoveLegacyProjectContainers force-removes all containers created under the
 // legacy per-service compose project "citadel-<serviceName>". engineBin is the
@@ -42,6 +64,19 @@ func RemoveLegacyProjectContainers(engineBin, serviceName string) []string {
 	}
 	legacyCleanupMu.Lock()
 	defer legacyCleanupMu.Unlock()
+	var removed []string
+	if err := withLegacyMutationLock(engineBin, serviceName, func() error {
+		removed = removeLegacyProjectContainersLocked(engineBin, serviceName)
+		return nil
+	}); err != nil {
+		// Cleanup is best effort. Refusing on lock contention keeps a backup
+		// available for the replacement that owns the lock.
+		return nil
+	}
+	return removed
+}
+
+func removeLegacyProjectContainersLocked(engineBin, serviceName string) []string {
 	legacyProject := "citadel-" + serviceName
 	out, err := exec.Command(engineBin, "ps", "-aq",
 		"--filter", "label=com.docker.compose.project="+legacyProject,
