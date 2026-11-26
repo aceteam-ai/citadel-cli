@@ -49,6 +49,7 @@ type Hit struct {
 	ID         string    `json:"session_id"`
 	Harness    string    `json:"harness"`
 	Title      string    `json:"title"`
+	Cwd        string    `json:"cwd,omitempty"`
 	State      string    `json:"state"`
 	LastActive time.Time `json:"last_active"`
 	Snippets   []Snippet `json:"snippets"`
@@ -140,7 +141,6 @@ func Search(ctx context.Context, home string, uid int, opts Options, panes []lan
 		if g.Title == "" {
 			g.Title = g.Harness + " " + g.ID[:8]
 		}
-		s.hookName(g)
 		s.report.Hits = append(s.report.Hits, g.Hit)
 	}
 	sort.Slice(s.report.Hits, func(i, j int) bool {
@@ -153,6 +153,11 @@ func Search(ctx context.Context, home string, uid int, opts Options, panes []lan
 	if len(s.report.Hits) > 20 {
 		s.report.Hits = s.report.Hits[:20]
 		s.report.Partial = true
+	}
+	for i := range s.report.Hits {
+		if ctx.Err() == nil {
+			s.hookName(&s.report.Hits[i])
+		}
 	}
 	if ctx.Err() != nil {
 		s.report.Partial = true
@@ -246,9 +251,6 @@ func (s *search) record(g *group, kind, text string, at time.Time) {
 		}
 	}
 	g.matched = true
-	if len(g.Snippets) >= 3 {
-		return
-	}
 	// Centre the snippet on the first search word, then apply the shared guard.
 	output := safe(text)
 	if output != withheld {
@@ -261,6 +263,10 @@ func (s *search) record(g *group, kind, text string, at time.Time) {
 		output = safe(string(runes[start:min(start+240, len(runes))]))
 	}
 	g.Snippets = append(g.Snippets, Snippet{kind, output, at})
+	sort.SliceStable(g.Snippets, func(i, j int) bool { return g.Snippets[i].Time.After(g.Snippets[j].Time) })
+	if len(g.Snippets) > 3 {
+		g.Snippets = g.Snippets[:3]
+	}
 }
 func (s *search) unavailable(component string) {
 	s.report.Partial = true
@@ -362,6 +368,8 @@ type entry struct {
 	SessionID   string          `json:"sessionId"`
 	CodexID     string          `json:"session_id"`
 	Display     string          `json:"display"`
+	Project     string          `json:"project"`
+	Cwd         string          `json:"cwd"`
 	Text        string          `json:"text"`
 	Timestamp   json.RawMessage `json:"timestamp"`
 	TS          int64           `json:"ts"`
@@ -374,6 +382,8 @@ type entry struct {
 		Content json.RawMessage `json:"content"`
 	} `json:"message"`
 	Payload struct {
+		ID      string          `json:"id"`
+		Cwd     string          `json:"cwd"`
 		Type    string          `json:"type"`
 		Role    string          `json:"role"`
 		Content json.RawMessage `json:"content"`
@@ -406,12 +416,22 @@ func (s *search) line(raw []byte, harness, id string, history bool) {
 				at = time.Unix(e.TS, 0).UTC()
 			}
 		}
-		s.record(s.get(harness, id), "prompt", text, at)
+		g := s.get(harness, id)
+		if g != nil && filepath.IsAbs(e.Project) {
+			g.Cwd = safe(e.Project)
+		}
+		s.record(g, "prompt", text, at)
 		return
 	}
 	g := s.get(harness, id)
 	if g == nil || e.IsMeta || e.IsSidechain {
 		return
+	}
+	if filepath.IsAbs(e.Cwd) {
+		g.Cwd = safe(e.Cwd)
+	}
+	if harness == "codex" && e.Type == "session_meta" && strings.EqualFold(e.Payload.ID, g.ID) && filepath.IsAbs(e.Payload.Cwd) {
+		g.Cwd = safe(e.Payload.Cwd)
 	}
 	if harness == "claude" && (e.Type == "custom-title" || e.Type == "agent-name") {
 		title := e.Title
@@ -434,14 +454,19 @@ func (s *search) line(raw []byte, harness, id string, history bool) {
 	if role != "assistant" {
 		return
 	}
-	var blocks []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
+	var blocks []json.RawMessage
 	if json.Unmarshal(content, &blocks) != nil {
 		return
 	}
-	for _, block := range blocks {
+	for _, rawBlock := range blocks {
+		var block struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(rawBlock, &block) != nil {
+			s.unavailable(harness)
+			continue
+		}
 		if block.Type == "text" && harness == "claude" || block.Type == "output_text" && harness == "codex" {
 			s.record(g, "reply", block.Text, at)
 		}

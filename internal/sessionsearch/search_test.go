@@ -50,7 +50,7 @@ func TestSessionSearchPromptReplySelection(t *testing.T) {
 	if len(r.Hits) != 1 || len(r.Hits[0].Snippets) != 2 || r.Hits[0].Title != "Compass session" || r.Hits[0].State != "ended" || r.Hits[0].Open != "claude -r "+testID {
 		t.Fatalf("unexpected result: %+v", r)
 	}
-	if r.Hits[0].Snippets[0].Kind != "prompt" || r.Hits[0].Snippets[1].Kind != "reply" {
+	if r.Hits[0].Snippets[0].Kind != "reply" || r.Hits[0].Snippets[1].Kind != "prompt" {
 		t.Fatal("missing source labels")
 	}
 	if r := find(t, home, Options{Query: "planted"}); len(r.Hits) != 0 {
@@ -69,6 +69,9 @@ func TestSessionSearchCodexAndFilters(t *testing.T) {
 	r := find(t, home, Options{Query: "violet", Harness: "codex", Since: time.Date(2026, 11, 1, 0, 1, 0, 0, time.UTC)})
 	if len(r.Hits) != 1 || len(r.Hits[0].Snippets) != 1 || r.Hits[0].Snippets[0].Kind != "reply" || r.Hits[0].Open != "codex resume "+testID {
 		t.Fatalf("unexpected result: %+v", r)
+	}
+	if r.Hits[0].Cwd != "/synthetic/project" {
+		t.Fatal("session metadata directory missing")
 	}
 	if r := find(t, home, Options{Query: "excluded"}); len(r.Hits) != 0 {
 		t.Fatal("non-assistant content searchable")
@@ -156,5 +159,53 @@ func TestSessionSearchMalformedRecordDoesNotDiscardOthers(t *testing.T) {
 	r := find(t, home, Options{Query: "needle"})
 	if len(r.Hits) != 1 || !r.Partial {
 		t.Fatal("malformed line discarded valid record or hid incomplete coverage")
+	}
+}
+
+func TestSessionSearchMalformedOptionalBlockAndTitle(t *testing.T) {
+	home := t.TempDir()
+	fixture(t, home, ".claude/history.jsonl", `{"display":"ordinary prompt","sessionId":"`+testID+`","timestamp":1793491200000}`+"\n")
+	fixture(t, home, ".claude/projects/project/"+testID+".jsonl", `{"type":"custom-title","customTitle":"violet compass"}`+"\n"+
+		`{"type":"assistant","timestamp":"2026-11-01T00:02:00Z","message":{"role":"assistant","content":[{"type":"tool_use","text":123},{"type":"text","text":"needle reply"}]}}`+"\n")
+	if r := find(t, home, Options{Query: "violet compass"}); len(r.Hits) != 1 {
+		t.Fatal("title not searchable")
+	}
+	r := find(t, home, Options{Query: "needle"})
+	if len(r.Hits) != 1 || len(r.Hits[0].Snippets) != 1 || !r.Partial {
+		t.Fatal("malformed optional block discarded valid reply")
+	}
+}
+
+func TestSessionSearchResultLimitAndDateRange(t *testing.T) {
+	home := t.TempDir()
+	var lines []string
+	for i := 0; i < 25; i++ {
+		lines = append(lines, fmt.Sprintf(`{"display":"needle","sessionId":"11111111-2222-4333-8444-%012d","timestamp":%d}`, i, int64(1793491200000)+int64(i)*1000))
+	}
+	fixture(t, home, ".claude/history.jsonl", strings.Join(lines, "\n"))
+	r := find(t, home, Options{Query: "needle"})
+	if len(r.Hits) != 20 || !r.Partial || !strings.HasSuffix(r.Hits[0].ID, "000000000024") {
+		t.Fatal("result limit or recent ordering lost")
+	}
+	r = find(t, home, Options{Query: "needle", Until: time.UnixMilli(1793491201000)})
+	if len(r.Hits) != 2 || r.Partial {
+		t.Fatal("inclusive until filter lost")
+	}
+}
+
+func TestSessionSearchOversizedLineAndNonRegularSource(t *testing.T) {
+	home := t.TempDir()
+	fixture(t, home, ".claude/history.jsonl", strings.Repeat("x", maxLineBytes+1))
+	r := find(t, home, Options{Query: "needle"})
+	if !r.Partial || len(r.Hits) != 0 {
+		t.Fatal("oversized record not bounded")
+	}
+	other := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(other, ".claude", "history.jsonl"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	r = find(t, other, Options{Query: "needle"})
+	if !r.Partial {
+		t.Fatal("non-regular content source accepted")
 	}
 }

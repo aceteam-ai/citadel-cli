@@ -15,4 +15,4 @@ func openOwned(*os.Root, string, int, bool) (*os.File, error) { return nil, ErrU
 func Native(context.Context, Options, []laneinventory.Pane) (Report, error) {
 	return Report{}, ErrUnavailable
 }
-func (*search) hookName(*group) {}
+func (*search) hookName(*Hit) {}

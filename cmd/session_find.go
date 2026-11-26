@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -50,6 +51,9 @@ func newSessionFindCommand(selected *string, find sessionFinder, inventory func(
 			// consume the content scan's deadline or prevent offline results.
 			report, err := find(ctx, opts, nil)
 			if err != nil {
+				if errors.Is(err, sessionsearch.ErrOptions) {
+					return sessionsearch.ErrOptions
+				}
 				return sessionsearch.ErrUnavailable
 			}
 			if inventory != nil && len(report.Hits) > 0 && ctx.Err() == nil {
@@ -58,6 +62,9 @@ func newSessionFindCommand(selected *string, find sessionFinder, inventory func(
 				stop()
 				if placementErr == nil {
 					sessionsearch.Locate(&report, placement.Panes)
+					if placement.Truncated || len(placement.Unavailable) > 0 {
+						report.Unavailable = append(report.Unavailable, "location")
+					}
 				} else {
 					report.Unavailable = append(report.Unavailable, "location")
 				}
@@ -68,6 +75,11 @@ func newSessionFindCommand(selected *string, find sessionFinder, inventory func(
 			for _, hit := range report.Hits {
 				if _, err := fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\t%s\t%s\n", hit.Title, hit.Harness, hit.LastActive.Format(time.RFC3339), hit.State, hit.Location); err != nil {
 					return err
+				}
+				if hit.Cwd != "" {
+					if _, err := fmt.Fprintf(cmd.OutOrStdout(), "  Directory: %s\n", hit.Cwd); err != nil {
+						return err
+					}
 				}
 				for _, snippet := range hit.Snippets {
 					if _, err := fmt.Fprintf(cmd.OutOrStdout(), "  %s: %s\n", snippet.Kind, snippet.Text); err != nil {
@@ -81,7 +93,9 @@ func newSessionFindCommand(selected *string, find sessionFinder, inventory func(
 				}
 			}
 			if len(report.Hits) == 0 {
-				fmt.Fprintln(cmd.OutOrStdout(), "No matching local sessions.")
+				if _, err := fmt.Fprintln(cmd.OutOrStdout(), "No matching local sessions."); err != nil {
+					return err
+				}
 			}
 			if report.Partial || len(report.Unavailable) > 0 {
 				_, err = fmt.Fprintln(cmd.OutOrStdout(), "Coverage incomplete; some local sources or locations were unavailable.")

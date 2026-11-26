@@ -12,6 +12,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/aceteam-ai/citadel-cli/internal/laneinventory"
@@ -26,24 +27,39 @@ func owned(info os.FileInfo, uid int) bool {
 	return ok && int(st.Uid) == uid
 }
 func openOwned(root *os.Root, path string, uid int, dir bool) (*os.File, error) {
-	// Root confines resolution; no-follow plus nonblocking prevents leaf links
-	// and special files from becoming content readers. Parent links are refused.
-	parent := filepath.Dir(path)
-	for parent != "." {
-		info, err := root.Lstat(parent)
+	// Pin each parent directory and compare its identity before descending.
+	// A later rename cannot redirect the leaf open through an unchecked parent.
+	clean := filepath.Clean(path)
+	if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return nil, ErrUnavailable
+	}
+	current := root
+	parts := strings.Split(clean, string(filepath.Separator))
+	for _, part := range parts[:len(parts)-1] {
+		info, err := current.Lstat(part)
 		if err != nil {
 			return nil, err
 		}
 		if !info.IsDir() || !owned(info, uid) {
 			return nil, ErrUnavailable
 		}
-		parent = filepath.Dir(parent)
+		next, err := current.OpenRoot(part)
+		if err != nil {
+			return nil, err
+		}
+		pinned, err := next.Stat(".")
+		if err != nil || !os.SameFile(info, pinned) || !owned(pinned, uid) {
+			next.Close()
+			return nil, ErrUnavailable
+		}
+		defer next.Close()
+		current = next
 	}
 	flags := os.O_RDONLY | unix.O_NOFOLLOW | unix.O_NONBLOCK
 	if dir {
 		flags |= unix.O_DIRECTORY
 	}
-	f, err := root.OpenFile(path, flags, 0)
+	f, err := current.OpenFile(parts[len(parts)-1], flags, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -60,12 +76,12 @@ func Native(ctx context.Context, opts Options, panes []laneinventory.Pane) (Repo
 		return Report{}, ErrUnavailable
 	}
 	account, err := user.LookupId(strconv.Itoa(uid))
-	if err != nil || account.Uid != strconv.Itoa(uid) {
+	if err != nil || account == nil || account.Uid != strconv.Itoa(uid) {
 		return Report{}, ErrUnavailable
 	}
 	return Search(ctx, account.HomeDir, uid, opts, panes)
 }
-func (s *search) hookName(g *group) {
+func (s *search) hookName(g *Hit) {
 	if g.Harness != "claude" || g.Location != "" {
 		return
 	}
