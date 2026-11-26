@@ -92,6 +92,9 @@ type EmbeddingHandler struct {
 	Origin string
 	// nowFn is a test seam for the receipt issued_at; nil uses time.Now.
 	nowFn func() time.Time
+	// native is set only by the explicit, currently unwired protocol adapter.
+	// The zero-value production handler retains the existing TEI behavior.
+	native *nativeEmbeddingBinding
 }
 
 // Capabilities declares the embedding lifecycle contract (citadel-cli#1287). The
@@ -185,7 +188,13 @@ func (h *EmbeddingHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 	}
 
 	ctx.Log("info", "     - [Job %s] Waiting for TEI embedding service to become ready...", job.ID)
-	op := newTEIEmbeddingOperation(teiBaseURL())
+	op, err := h.embeddingOperation(req)
+	if err != nil {
+		return nil, err
+	}
+	if h.native != nil {
+		defer op.client.CloseIdleConnections()
+	}
 	if err := op.initialize(ctx.Context()); err != nil {
 		return nil, err
 	}
@@ -281,6 +290,7 @@ type teiEmbeddingOperation struct {
 	client         *http.Client
 	requestTimeout time.Duration
 	readyTimeout   time.Duration
+	native         *nativeEmbeddingBinding
 
 	initOnce  sync.Once
 	initErr   error
@@ -379,11 +389,11 @@ func (o *teiEmbeddingOperation) embed(ctx context.Context, req *EmbeddingRequest
 		if end > len(req.Input) {
 			end = len(req.Input)
 		}
-		batch, err := callTEIEmbeddingBatch(ctx, o.client, o.baseURL, o.requestTimeout, &EmbeddingRequest{
+		batch, err := callBoundEmbeddingBatch(ctx, o.client, o.baseURL, o.requestTimeout, &EmbeddingRequest{
 			Model:      req.Model,
 			Input:      req.Input[start:end],
 			Dimensions: req.Dimensions,
-		})
+		}, o.native)
 		if err != nil {
 			return nil, fmt.Errorf("embedding batch %d-%d: %w", start, end-1, err)
 		}
@@ -464,6 +474,10 @@ func callTEIEmbeddings(baseURL string, req *EmbeddingRequest) (*EmbeddingResult,
 // /v1/embeddings endpoint and strictly validates cardinality, indices, and
 // vector dimensions before returning it to the operation-level aggregator.
 func callTEIEmbeddingBatch(ctx context.Context, client *http.Client, baseURL string, timeout time.Duration, req *EmbeddingRequest) (*EmbeddingResult, error) {
+	return callBoundEmbeddingBatch(ctx, client, baseURL, timeout, req, nil)
+}
+
+func callBoundEmbeddingBatch(ctx context.Context, client *http.Client, baseURL string, timeout time.Duration, req *EmbeddingRequest, native *nativeEmbeddingBinding) (*EmbeddingResult, error) {
 	requestCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -516,6 +530,9 @@ func callTEIEmbeddingBatch(ctx context.Context, client *http.Client, baseURL str
 	}
 	if len(teiResp.Data) != len(req.Input) {
 		return nil, fmt.Errorf("TEI returned %d embeddings for %d inputs", len(teiResp.Data), len(req.Input))
+	}
+	if native != nil && teiResp.Model != native.model {
+		return nil, errors.New("embedding response does not match the native model")
 	}
 
 	result := &EmbeddingResult{
