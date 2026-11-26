@@ -204,11 +204,19 @@ func safe(text string) string {
 		}
 		return r
 	}, text)
-	r := []rune(strings.Join(strings.Fields(text), " "))
+	text = strings.Join(strings.Fields(text), " ")
+	if len(trust.CheckSecrets("", text)) != 0 {
+		return withheld
+	}
+	r := []rune(text)
 	if len(r) > 240 {
 		r = r[:240]
 	}
-	return string(r)
+	display := string(r)
+	if len(trust.CheckSecrets("", display)) != 0 {
+		return withheld
+	}
+	return display
 }
 func validName(s string) bool { return namePattern.MatchString(s) }
 func (s *search) get(harness, id string) *group {

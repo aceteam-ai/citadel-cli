@@ -24,7 +24,8 @@ Custom harness roots are not searched.
 Matches are grouped by harness and validated session UUID. Each result contains
 at most three recent matching snippets, each at most 240 characters, and the
 report contains at most 20 sessions. The shared `trust.CheckSecrets` guard scans
-the complete selected value before clipping and the final snippet after clipping;
+the raw and normalized complete selected value before clipping, and the final
+display slice after clipping;
 possible secrets are withheld. Titles use the same guard. Control and Unicode
 format characters are removed before terminal output. Detection is not a guarantee that all sensitive
 personal text is removed: this is an explicit owner-local content search.

@@ -143,6 +143,30 @@ func TestSessionSearchDisplayFormatCharacters(t *testing.T) {
 		}
 	}
 }
+
+func TestSessionSearchNormalizedValueWithholding(t *testing.T) {
+	// Synthetic detector fixtures, not credentials. Every display projection
+	// checks the normalized full value even when the matching snippet is earlier.
+	value := "api_key\u200b=" + strings.Repeat("A", 20)
+	for _, separator := range []string{"\u200b", "\u2066", "\x01", "\n"} {
+		if got := safe("api_key" + separator + "=" + strings.Repeat("A", 20)); got != withheld {
+			t.Fatal("normalized detector fixture was not withheld")
+		}
+	}
+	home := t.TempDir()
+	row, _ := json.Marshal(map[string]any{"display": "needle " + strings.Repeat("x", 300) + " " + value, "project": "/synthetic/" + value, "sessionId": testID, "timestamp": int64(1793491200000)})
+	fixture(t, home, ".claude/history.jsonl", string(row)+"\n")
+	title, _ := json.Marshal(map[string]any{"type": "custom-title", "customTitle": value})
+	fixture(t, home, ".claude/projects/project/"+testID+".jsonl", string(title)+"\n")
+	report := find(t, home, Options{Query: "needle"})
+	if len(report.Hits) != 1 || len(report.Hits[0].Snippets) != 1 {
+		t.Fatal("normalized display fixture not selected")
+	}
+	hit := report.Hits[0]
+	if hit.Title != withheld || hit.Cwd != withheld || hit.Snippets[0].Text != withheld {
+		t.Fatal("normalized full-value guard missing from a display projection")
+	}
+}
 func TestSessionSearchPlacement(t *testing.T) {
 	r := Report{Hits: []Hit{{ID: testID, Harness: "claude", State: "ended"}}}
 	p := laneinventory.Pane{ThreadID: testID, Harness: "claude", Target: "%8", DeclaredSession: "sample-session"}
