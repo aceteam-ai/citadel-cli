@@ -44,11 +44,23 @@ func TestTmuxSessionHandler_Unavailable(t *testing.T) {
 	}
 }
 
-func TestTmuxSessionHandler_UnsupportedAction(t *testing.T) {
-	if !tmux.IsAvailable() {
-		t.Skip("tmux not available on this runner")
-	}
+// noTmuxRunner fails the test if a tmux command would run, so these tests
+// never reach a real tmux binary or server.
+type noTmuxRunner struct{ t *testing.T }
+
+func (r noTmuxRunner) Run(_ context.Context, _ string, args ...string) ([]byte, error) {
+	r.t.Fatalf("tmux command ran: %v", args)
+	return nil, nil
+}
+
+func fakeManagerHandler(mgr tmuxSessionManager) *TmuxSessionHandler {
 	h := NewTmuxSessionHandler("")
+	h.newManager = func() (tmuxSessionManager, error) { return mgr, nil }
+	return h
+}
+
+func TestTmuxSessionHandler_UnsupportedAction(t *testing.T) {
+	h := fakeManagerHandler(&fakeTmuxSessionManager{})
 	_, err := h.Execute(JobContext{}, tmuxJob(map[string]string{"action": "bogus"}))
 	if err == nil {
 		t.Fatal("expected error for unsupported action, got nil")
@@ -56,10 +68,7 @@ func TestTmuxSessionHandler_UnsupportedAction(t *testing.T) {
 }
 
 func TestTmuxSessionHandler_InvalidName(t *testing.T) {
-	if !tmux.IsAvailable() {
-		t.Skip("tmux not available on this runner")
-	}
-	h := NewTmuxSessionHandler("")
+	h := fakeManagerHandler(tmux.NewManagerWith("tmux", noTmuxRunner{t}))
 	_, err := h.Execute(JobContext{}, tmuxJob(map[string]string{"action": "ensure", "name": "bad name"}))
 	if err == nil {
 		t.Fatal("expected error for invalid session name, got nil")
@@ -70,10 +79,7 @@ func TestTmuxSessionHandler_InvalidName(t *testing.T) {
 }
 
 func TestTmuxSessionHandler_ListEnvelope(t *testing.T) {
-	if !tmux.IsAvailable() {
-		t.Skip("tmux not available on this runner")
-	}
-	h := NewTmuxSessionHandler("")
+	h := fakeManagerHandler(&fakeTmuxSessionManager{})
 	out, err := h.Execute(JobContext{}, tmuxJob(map[string]string{"action": "list"}))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

@@ -86,7 +86,7 @@ func (h *TmuxSessionHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, er
 		return nil, err
 	}
 
-	bg := context.Background()
+	bg := ctx.Context()
 
 	switch action {
 	case "list":
