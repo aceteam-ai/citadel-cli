@@ -47,6 +47,11 @@ live method boundary. No reset consumption, login, logout, email or model-turn
 method is enabled here.
 
 Remaining acceptance for #1749 includes trusted native collectors and isolation,
-registry/protocol/CLI integration, vendor-version schema-diff CI, verified
+registry/CLI and live protocol integration, vendor-version schema-diff CI, verified
 formats for the other harnesses and durable bounded history/cadence ownership.
 Unknown vendor identity stays held. Tests use supplied synthetic data only.
+
+The additive candidate payload and pure projection helpers are described in
+`harness-driver-protocol.md`. They accept these normalized observations without
+adding a native reader or a live event publisher. This is partial protocol work,
+not completion of the probe acceptance.

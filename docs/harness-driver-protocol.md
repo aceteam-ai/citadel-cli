@@ -31,6 +31,38 @@ not assert an exit code. A completed model turn can still contain tool errors
 and denials. Assistant text is never a tool-success signal. An idle observation
 without authoritative completion must not become a successful turn outcome.
 
+### Additive seat reports
+
+Refs #1749. `SeatQuota` adds a complete seat metadata block to `quota.reported`:
+`seat_ref`, `scope`, nullable `reached`, `overage`, `reset_credits_available`,
+`source`, `confidence`, `adapter_version` and `observed_at`. Optional bounded
+`window_minutes`, model-scoped `model` and machine-readable `reason` complete
+the observation. Account-scoped rows cannot claim a model. The candidate also
+names weekly, session, plan-period and credit windows for future collectors;
+this does not add collectors or establish those vendors' wire schemas.
+
+Any extension field requires the complete metadata block. Unknown and
+consumption-only observations cannot carry a known quota percentage. Known
+percentages require exact or derived confidence and a known window. Five-hour
+and seven-day durations, when supplied, must agree with their named window.
+Reset counts remain report-only. Legacy minimal `Quota` and `Usage` payloads
+and earlier golden fixtures remain valid and serialize unchanged.
+
+`ProjectSeatQuota` copies the normalized supplied observation into that
+validated payload; absent windows become explicitly unknown. `ProjectSeatUsage`
+adds a seat reference and an optional actual model, leaving the legacy `model`
+empty rather than substituting a requested model. Unknown counts remain null,
+not zero. Both return owned pointers and finite errors without partial reports.
+These functions do not produce an authenticated event envelope, prove identity,
+advance freshness, replenish quota after reset or enable admission. A future
+caller still owns trustworthy binding, receipt time, sequence and isolation.
+
+The [app-server documentation](https://learn.chatgpt.com/docs/app-server)
+informs the separate supplied quota parser. This candidate normalized schema is
+not the native schema or a version-pinned compatibility check. Tests use only
+synthetic observations; native collection, schema-diff CI and the seat probe
+remain unimplemented. No runtime caller is wired by this checkpoint.
+
 Input previews, output excerpts and assistant text are bounded **content**, not
 safe diagnostics. The package does not scrub arbitrary secrets. In a future
 adapter, preview/excerpt fields must remain empty until a reviewed projection
@@ -84,7 +116,7 @@ admission surface or admission-ledger entry.
 The remaining R1 work includes the Codex initialize/model-discovery adapter,
 versioned schema evidence, strict isolated launch and pinned configuration,
 trusted per-session/turn and approval correlation, reviewed content projections,
-per-turn usage conversion and quota integration, the fake vendor server, the
+native per-turn usage conversion and quota integration, the fake vendor server, the
 local try command and separately authorized end-to-end/native acceptance. The
 registry's existing identity/isolation holds are unchanged. No supplied protocol
 field clears them. Source tests do not establish any of these runtime properties.

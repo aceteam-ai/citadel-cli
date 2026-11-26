@@ -7,6 +7,8 @@
     "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"},
     "maybeId": {"anyOf": [{"const": ""}, {"$ref": "#/$defs/id"}]},
     "model": {"type": "string", "maxLength": 128, "pattern": "^([A-Za-z0-9][A-Za-z0-9._/-]*)?$"},
+    "actualModel": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"},
+    "seat": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"},
     "count": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
     "nullableCount": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/count"}]},
     "text": {"type": "object", "additionalProperties": false, "required": ["text"], "properties": {"text": {"type": "string", "maxLength": 32768}, "item_id": {"$ref": "#/$defs/id"}}},
@@ -46,15 +48,48 @@
     },
     "usage": {
       "type": "object", "additionalProperties": false, "required": ["model", "input_tokens", "output_tokens", "cached_tokens"],
-      "properties": {"model": {"$ref": "#/$defs/model"}, "input_tokens": {"$ref": "#/$defs/nullableCount"}, "output_tokens": {"$ref": "#/$defs/nullableCount"}, "cached_tokens": {"$ref": "#/$defs/nullableCount"}}
+      "properties": {"model": {"$ref": "#/$defs/model"}, "seat_ref": {"$ref": "#/$defs/seat"}, "model_actual": {"$ref": "#/$defs/actualModel"}, "input_tokens": {"$ref": "#/$defs/nullableCount"}, "output_tokens": {"$ref": "#/$defs/nullableCount"}, "cached_tokens": {"$ref": "#/$defs/nullableCount"}},
+      "dependentRequired": {"model_actual": ["seat_ref"]}
     },
     "quota": {
       "type": "object", "additionalProperties": false, "required": ["window", "used_percent", "resets_at"],
       "properties": {
-        "window": {"enum": ["unknown", "five_hour", "seven_day"]},
+        "window": {"enum": ["unknown", "five_hour", "seven_day", "weekly", "session", "plan_period", "credits"]},
         "used_percent": {"type": ["number", "null"], "minimum": 0, "maximum": 100},
-        "resets_at": {"type": ["string", "null"], "format": "date-time"}
-      }
+        "resets_at": {"type": ["string", "null"], "format": "date-time"},
+        "seat_ref": {"$ref": "#/$defs/seat"},
+        "window_minutes": {"type": "integer", "minimum": 1, "maximum": 5256000},
+        "scope": {"enum": ["account", "model"]}, "model": {"$ref": "#/$defs/actualModel"},
+        "reached": {"type": ["boolean", "null"]},
+        "reason": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"},
+        "overage": {"type": ["boolean", "null"]},
+        "reset_credits_available": {"type": ["integer", "null"], "minimum": 0, "maximum": 1000000},
+        "source": {"enum": ["vendor_read", "vendor_push", "turn_side_effect", "error_message", "consumption_only"]},
+        "confidence": {"enum": ["exact", "derived", "consumption_only", "unknown"]},
+        "adapter_version": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$"},
+        "observed_at": {"type": "string", "format": "date-time"}
+      },
+      "dependentRequired": {
+        "window_minutes": ["seat_ref"], "scope": ["seat_ref"], "model": ["seat_ref"],
+        "reached": ["seat_ref"], "reason": ["seat_ref"], "overage": ["seat_ref"],
+        "reset_credits_available": ["seat_ref"], "source": ["seat_ref"],
+        "confidence": ["seat_ref"], "adapter_version": ["seat_ref"], "observed_at": ["seat_ref"]
+      },
+      "allOf": [
+        {"if": {"required": ["seat_ref"]}, "then": {
+          "required": ["scope", "reached", "overage", "reset_credits_available", "source", "confidence", "adapter_version", "observed_at"],
+          "allOf": [
+            {"if": {"properties": {"scope": {"const": "model"}}}, "then": {"required": ["model"]}, "else": {"not": {"required": ["model"]}}},
+            {"if": {"properties": {"confidence": {"enum": ["unknown", "consumption_only"]}}}, "then": {"properties": {"used_percent": {"type": "null"}}}},
+            {"if": {"properties": {"confidence": {"enum": ["exact", "derived"]}}}, "then": {"properties": {"used_percent": {"type": "number"}}}},
+            {"if": {"properties": {"source": {"const": "consumption_only"}}}, "then": {"properties": {"confidence": {"enum": ["consumption_only", "unknown"]}, "used_percent": {"type": "null"}}}},
+            {"if": {"properties": {"window": {"const": "unknown"}}}, "then": {"properties": {"used_percent": {"type": "null"}, "confidence": {"const": "unknown"}}}},
+            {"if": {"properties": {"window": {"const": "five_hour"}}}, "then": {"properties": {"window_minutes": {"const": 300}}}},
+            {"if": {"properties": {"window": {"enum": ["seven_day", "weekly"]}}}, "then": {"properties": {"window_minutes": {"const": 10080}}}}
+          ]
+        }},
+        {"if": {"properties": {"window": {"enum": ["weekly", "session", "plan_period", "credits"]}}}, "then": {"required": ["seat_ref"]}}
+      ]
     },
     "models": {
       "type": "object", "additionalProperties": false, "required": ["ids"],
