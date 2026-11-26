@@ -500,6 +500,7 @@ func (s *APISource) nextMulti(ctx context.Context, queues []string, blockMs int)
 // convertJob converts an API job to a worker.Job.
 func (s *APISource) convertJob(aj *redisapi.Job) *Job {
 	job := &Job{
+		media:       aj.PrivateMediaPayload(),
 		observation: aj.DeliveryObservation(),
 		ID:          aj.JobID,
 		Type:        aj.Type,
@@ -507,6 +508,9 @@ func (s *APISource) convertJob(aj *redisapi.Job) *Job {
 		RawPayload:  bytes.Clone(aj.RawPayload),
 		Source:      "redis-api",
 		MessageID:   aj.MessageID,
+	}
+	if job.media == nil {
+		job.media = jobprivacy.CaptureMedia(aj.Type, aj.Payload, aj.RawPayload, aj.RawData)
 	}
 	// Extract rayId: check RawData first, then payload
 	if aj.RawData != nil {
@@ -519,6 +523,10 @@ func (s *APISource) convertJob(aj *redisapi.Job) *Job {
 			job.RayID = rayID
 		}
 	}
+	if job.media != nil {
+		job.RayID = privateMediaRayID(job.media)
+	}
+	job.sealMedia()
 	return job
 }
 
@@ -548,7 +556,7 @@ func (s *APISource) Nack(ctx context.Context, job *Job, err error) error {
 		job.delivery().stop()
 		return nil
 	}
-	s.client.SetJobStatus(ctx, job.ID, "failed", jobprivacy.FailureData(job.Type, job.Payload, err, nil))
+	s.client.SetJobStatus(ctx, job.ID, "failed", jobprivacy.FailureData(job.Type, job.diagnosticPayload(), err, nil))
 	// Don't ACK - let it retry
 	return nil
 }
@@ -609,9 +617,9 @@ func (s *APISource) Fail(ctx context.Context, job *Job, err error, data map[stri
 				}
 			}
 		}
-		return job.delivery().finish(ctx, err, code)
+		return job.delivery().finish(ctx, jobprivacy.Error(job.Type, job.diagnosticPayload(), err), code)
 	}
-	status := jobprivacy.FailureData(job.Type, job.Payload, err, data)
+	status := jobprivacy.FailureData(job.Type, job.diagnosticPayload(), err, data)
 	s.client.SetJobStatus(ctx, job.ID, "failed", status)
 	queue := job.SourceQueue
 	if queue == "" {

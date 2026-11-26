@@ -7,7 +7,10 @@
 // All API calls require a device_api_token obtained during device authentication.
 package redisapi
 
-import "github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
+import (
+	"github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
+	"github.com/aceteam-ai/citadel-cli/internal/jobprivacy"
+)
 
 // ConsumeRequest is the request body for POST /api/fabric/redis/jobs/consume
 type ConsumeRequest struct {
@@ -44,6 +47,7 @@ type StreamMessageData struct {
 
 // Job represents a parsed job ready for processing
 type Job struct {
+	media     *jobprivacy.MediaPayload
 	MessageID string         `json:"message_id"`
 	JobID     string         `json:"job_id"`
 	Type      string         `json:"type"`
