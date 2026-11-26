@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 )
@@ -464,6 +465,63 @@ func TestFileList_Basic(t *testing.T) {
 	count := int(result["count"].(float64))
 	if count != 3 {
 		t.Errorf("count = %d, want 3", count)
+	}
+	entries := result["entries"].([]any)
+	for _, raw := range entries {
+		entry := raw.(map[string]any)
+		modified, ok := entry["modified_at"].(string)
+		if !ok {
+			t.Fatalf("missing modified_at in entry %v", entry)
+		}
+		if _, err := time.Parse(time.RFC3339Nano, modified); err != nil {
+			t.Fatalf("invalid modified_at %q: %v", modified, err)
+		}
+		if created, ok := entry["created_at"].(string); ok {
+			if _, err := time.Parse(time.RFC3339Nano, created); err != nil {
+				t.Fatalf("invalid created_at %q: %v", created, err)
+			}
+		}
+	}
+}
+
+func TestFileList_CreationTimeContract(t *testing.T) {
+	ws := setupWorkspace(t)
+	path := writeTestFile(t, ws, "report.pdf", "report")
+	h := NewFileListHandler(ws)
+	created := time.Date(2026, 11, 24, 18, 0, 0, 0, time.UTC)
+	h.birthTime = func(got string) (time.Time, bool) {
+		if got != path {
+			t.Errorf("birth time path = %q, want %q", got, path)
+		}
+		return created, true
+	}
+	list := func() map[string]any {
+		t.Helper()
+		out, err := h.Execute(JobContext{}, makeJob(map[string]string{"path": ws}))
+		if err != nil {
+			t.Fatalf("FILE_LIST: %v", err)
+		}
+		var result struct {
+			Entries []map[string]any `json:"entries"`
+		}
+		if err := json.Unmarshal(out, &result); err != nil {
+			t.Fatalf("decode FILE_LIST: %v", err)
+		}
+		if len(result.Entries) != 1 {
+			t.Fatalf("entries = %d, want 1", len(result.Entries))
+		}
+		return result.Entries[0]
+	}
+	if got := list()["created_at"]; got != created.Format(time.RFC3339Nano) {
+		t.Fatalf("created_at = %v, want %s", got, created.Format(time.RFC3339Nano))
+	}
+	h.birthTime = func(string) (time.Time, bool) { return time.Time{}, false }
+	if _, ok := list()["created_at"]; ok {
+		t.Fatal("created_at must be omitted when birth time is unavailable")
+	}
+	h.birthTime = func(string) (time.Time, bool) { return time.Time{}, true }
+	if _, ok := list()["created_at"]; ok {
+		t.Fatal("created_at must be omitted for a zero birth time")
 	}
 }
 
