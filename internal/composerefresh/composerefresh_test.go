@@ -293,44 +293,26 @@ func TestSweep_StampRoundTrip(t *testing.T) {
 	}
 }
 
-// The Recreator runs once for every file the sweep rewrote, port-managed or not,
-// and never for a materialized, current or preserved (operator-edited) file, nor
-// on a second sweep at the same version. Uses a fake recreator (no docker).
-func TestSweep_RecreatorCalledOnceForEachRewrittenFile(t *testing.T) {
+// Recreate is only attempted on a port-managed service whose file was refreshed,
+// and only when a Recreator is wired in. Uses a fake recreator (no docker).
+func TestSweep_RecreateOnlyOnPortManagedRefresh(t *testing.T) {
 	dir := t.TempDir()
-	const teiOld = "services:\n  tei:\n    command: [\"--model-id\", \"m\"]\n"
-	const teiNew = "services:\n  tei:\n    command: [\"--model-id\", \"m\", \"--revision\", \"abc\"]\n"
-	const current = "services:\n  kokoro:\n    image: same\n"
-	const edited = "services:\n  vllm:\n    image: operator\n"
 	writeFile(t, filepath.Join(dir, "llamacpp.yml"), embeddedV1)
-	writeFile(t, filepath.Join(dir, "tei.yml"), teiOld)
-	writeFile(t, filepath.Join(dir, "kokoro.yml"), current)
-	writeFile(t, filepath.Join(dir, "vllm.yml"), edited)
+	writeFile(t, filepath.Join(dir, "ollama.yml"), "services:\n  ollama:\n    image: old\n")
 
-	calls := map[string]int{}
-	ports := map[string]int{}
+	var calls []string
 	opts := Options{
 		ServicesDir: dir,
 		Version:     "v2.57.0",
 		Embedded: map[string]string{
 			"llamacpp": embeddedV2,
-			"tei":      teiNew,
-			"kokoro":   current,
-			"vllm":     "services:\n  vllm:\n    image: new\n",
-			"absent":   "services:\n  absent:\n    image: new\n",
+			// ollama refreshes too, but it is NOT port-managed.
+			"ollama": "services:\n  ollama:\n    image: new\n",
 		},
 		PortManaged: map[string]int{"llamacpp": 8200},
-		KnownHistoricalHashes: map[string]map[string]bool{
-			"llamacpp": {sha(embeddedV1): true},
-			"tei":      {sha(teiOld): true},
-		},
 		Recreator: func(service, composePath string, wantHostPort int) (bool, error) {
-			calls[service]++
-			ports[service] = wantHostPort
-			if got, _ := os.ReadFile(composePath); service == "tei" && string(got) != teiNew {
-				t.Fatalf("recreator saw stale tei file: %s", got)
-			}
-			return true, nil
+			calls = append(calls, service)
+			return true, nil // pretend the port moved and we recreated
 		},
 	}
 
@@ -338,48 +320,14 @@ func TestSweep_RecreatorCalledOnceForEachRewrittenFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
-	if len(calls) != 2 || calls["llamacpp"] != 1 || calls["tei"] != 1 {
-		t.Fatalf("recreator calls = %v, want llamacpp and tei once each", calls)
+	if len(calls) != 1 || calls[0] != "llamacpp" {
+		t.Fatalf("recreator should be called only for port-managed llamacpp, got %v", calls)
 	}
-	if ports["llamacpp"] != 8200 || ports["tei"] != 0 {
-		t.Fatalf("wantHostPort = %v, want llamacpp 8200 and tei 0", ports)
+	if !contains(res.Recreated, "llamacpp") {
+		t.Fatalf("expected llamacpp recreated, got %+v", res)
 	}
-	if !contains(res.Recreated, "llamacpp") || !contains(res.Recreated, "tei") {
-		t.Fatalf("expected llamacpp and tei recreated, got %+v", res)
-	}
-	if !contains(res.Preserved, "vllm") {
-		t.Fatalf("operator-edited vllm must be preserved, got %+v", res)
-	}
-
-	res2, err := Sweep(opts)
-	if err != nil || !res2.Skipped {
-		t.Fatalf("second sweep = %+v, %v; want skipped", res2, err)
-	}
-	if calls["llamacpp"] != 1 || calls["tei"] != 1 {
-		t.Fatalf("second sweep recreated again: %v", calls)
-	}
-}
-
-// With no Recreator (the opt-out) the file is still refreshed and nothing is
-// recreated.
-func TestSweep_NilRecreatorRefreshesWithoutRecreate(t *testing.T) {
-	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "llamacpp.yml"), embeddedV1)
-	res, err := Sweep(baseOpts(dir, "v2.57.0"))
-	if err != nil {
-		t.Fatalf("Sweep: %v", err)
-	}
-	if !contains(res.Refreshed, "llamacpp") || len(res.Recreated) != 0 {
-		t.Fatalf("result = %+v, want refreshed and not recreated", res)
-	}
-}
-
-func TestRecreateOnUpgradeDisabled(t *testing.T) {
-	for value, want := range map[string]bool{"": false, "0": false, "no": false, "1": true, "TRUE": true, " yes ": true, "on": true} {
-		t.Setenv("CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE", value)
-		if got := RecreateOnUpgradeDisabled(); got != want {
-			t.Fatalf("RecreateOnUpgradeDisabled(%q) = %v, want %v", value, got, want)
-		}
+	if contains(res.Recreated, "ollama") {
+		t.Fatal("non-port-managed ollama must never be recreated")
 	}
 }
 

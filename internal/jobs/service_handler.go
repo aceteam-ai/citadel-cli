@@ -20,7 +20,6 @@ import (
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
 	"github.com/aceteam-ai/citadel-cli/internal/clilog"
 	"github.com/aceteam-ai/citadel-cli/internal/compose"
-	"github.com/aceteam-ai/citadel-cli/internal/composerefresh"
 	"github.com/aceteam-ai/citadel-cli/internal/externalengine"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
@@ -390,7 +389,7 @@ func (h *ServiceHandler) serviceStatus(ctx context.Context, svc manifestService)
 // requiredRAMBytes is the optional RAM budget (#831) applyRAMIsolation's
 // preflight enforces; like requiredVRAMBytes it is 0 when no budget is known,
 // which always fits (fail-safe on an absent signal).
-func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model string, requiredVRAMBytes, requiredRAMBytes uint64, trustRemoteCode trustRemoteCodeIntent) (_ []byte, retErr error) {
+func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model string, requiredVRAMBytes, requiredRAMBytes uint64, trustRemoteCode trustRemoteCodeIntent) ([]byte, error) {
 	kind := h.resolveKind(svc)
 	var err error
 	// appliedModel is the model this start serves via compose env interpolation;
@@ -486,28 +485,8 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 		if out, adopted := h.maybeAdoptExternalEngine(ctx, svc, model, kind); adopted {
 			return out, nil
 		}
-		templateRefresh, prepErr := h.prepareEmbeddedComposeForStart(svc)
-		if prepErr != nil {
-			return nil, prepErr
-		}
-		// A refreshed citadel template must reach a running container: it
-		// bypasses the already-running shortcut below like a model change, once
-		// per template change, unless the operator opted out of upgrade
-		// recreates. If this start then fails, the previous file is restored so
-		// the next start retries.
-		templateChanged := templateRefresh.Changed && !composerefresh.RecreateOnUpgradeDisabled()
-		if templateRefresh.Changed {
-			defer func() {
-				// err is the soft (reported) compose failure; retErr a hard one.
-				if err == nil && retErr == nil {
-					return
-				}
-				if composePath, pathErr := h.resolveComposePath(svc); pathErr == nil {
-					if rbErr := templateRefresh.Rollback(composePath, svc.Name); rbErr != nil {
-						ctx.Log("warn", "     - could not restore the previous %s compose: %v", svc.Name, rbErr)
-					}
-				}
-			}()
+		if err := h.prepareEmbeddedComposeForStart(svc); err != nil {
+			return nil, err
 		}
 		modelChanged := false
 		if model != "" {
@@ -535,7 +514,7 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 		// Already-running short-circuit, UNLESS the persisted model or
 		// trust_remote_code flag just changed: then the running container serves
 		// the old config and must be recreated.
-		if !modelChanged && !trustChanged && !templateChanged && h.dockerServiceRunning(svc.Name) {
+		if !modelChanged && !trustChanged && h.dockerServiceRunning(svc.Name) {
 			msg := svc.Name + " is already running"
 			if appliedModel != "" {
 				msg = fmt.Sprintf("%s is already running serving %s", svc.Name, appliedModel)
@@ -1637,51 +1616,18 @@ func (h *ServiceHandler) materializeEmbeddedService(name string) (manifestServic
 // prepareEmbeddedComposeForStart covers services already present in a manifest.
 // Only the canonical embedded path participates; custom compose paths remain
 // operator-owned. Native and adopted external engines bypass this docker step.
-// Linux CPU/GPU-variant services reconcile their flavor first; then any existing
-// embedded file that is a known, unedited older citadel template is refreshed to
-// the current one (compose.RefreshKnownComposeOnDisk). The result reports
-// whether that refresh changed the file, so serviceStart recreates a running
-// container once instead of taking the already-running shortcut.
-func (h *ServiceHandler) prepareEmbeddedComposeForStart(svc manifestService) (compose.StartRefresh, error) {
-	if _, embedded := embeddedservices.ServiceMap[svc.Name]; !embedded {
-		return compose.StartRefresh{}, nil
+func (h *ServiceHandler) prepareEmbeddedComposeForStart(svc manifestService) error {
+	if runtime.GOOS != "linux" || !embeddedservices.HasCPUComposeVariant(svc.Name) {
+		return nil
 	}
 	path, err := h.resolveComposePath(svc)
 	if err != nil {
-		return compose.StartRefresh{}, err
+		return err
 	}
 	if path != filepath.Join(h.ConfigDir, "services", svc.Name+".yml") {
-		return compose.StartRefresh{}, nil
-	}
-	gpuCount := h.gpuCount
-	if gpuCount == nil {
-		gpuCount = platform.NvidiaGPUCountForCompose
-	}
-	sampled, count := false, -1
-	probe := func() int {
-		if !sampled {
-			count = gpuCount()
-		}
-		sampled = true
-		return count
-	}
-	// The CPU/GPU flavor reconcile keeps its own policy and does not, by
-	// itself, recreate a running container; only a template refresh does.
-	if runtime.GOOS == "linux" && embeddedservices.HasCPUComposeVariant(svc.Name) {
-		if err := h.ensureEmbeddedComposeFileWith(svc.Name, probe); err != nil {
-			return compose.StartRefresh{}, err
-		}
-	}
-	return compose.CaptureStartRefresh(path, func() error {
-		selection := embeddedservices.SelectComposeForHost(svc.Name, runtime.GOOS, probe)
-		if !selection.Embedded || selection.PreserveExisting {
-			return nil
-		}
-		if _, err := compose.RefreshKnownComposeOnDisk(path, svc.Name, selection.Content, strings.TrimSpace(os.Getenv("CITADEL_NODE_DIR"))); err != nil {
-			return fmt.Errorf("refresh managed compose for %q: %w", svc.Name, err)
-		}
 		return nil
-	})
+	}
+	return h.ensureEmbeddedComposeFile(svc.Name)
 }
 
 // ensureEmbeddedComposeFile writes the embedded compose file for name into
@@ -1712,10 +1658,6 @@ func (h *ServiceHandler) ensureEmbeddedComposeFile(name string) error {
 	if gpuCount == nil {
 		gpuCount = platform.NvidiaGPUCountForCompose
 	}
-	return h.ensureEmbeddedComposeFileWith(name, gpuCount)
-}
-
-func (h *ServiceHandler) ensureEmbeddedComposeFileWith(name string, gpuCount func() int) error {
 	selection := embeddedservices.SelectComposeForHost(name, runtime.GOOS, gpuCount)
 	content, ok := selection.Content, selection.Embedded
 	if !ok {
