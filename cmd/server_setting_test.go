@@ -135,6 +135,30 @@ func TestServerSettingVisibleFlagAndIdentityOutput(t *testing.T) {
 	}
 }
 
+func TestServerSettingInheritedFlags(t *testing.T) {
+	t.Setenv("CITADEL_SERVER", "environment.example.test")
+	t.Setenv("CITADEL_AUTH_HOST", "")
+	for _, args := range [][]string{
+		{"--server", "selected.example.test", "enroll"},
+		{"enroll", "--server", "selected.example.test"},
+		{"enroll", "--auth-service", "selected.example.test"},
+	} {
+		var chosen string
+		root := &cobra.Command{Use: "fixture", PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+			var err error
+			chosen, err = resolveInvocationServer(cmd, "")
+			return err
+		}}
+		root.PersistentFlags().String("server", "", "")
+		root.PersistentFlags().String("auth-service", defaultControlPlaneServer, "")
+		root.AddCommand(&cobra.Command{Use: "enroll", Run: func(*cobra.Command, []string) {}})
+		root.SetArgs(args)
+		if err := root.Execute(); err != nil || chosen != "https://selected.example.test" {
+			t.Fatalf("inherited flags %q: %q %v", args, chosen, err)
+		}
+	}
+}
+
 func TestServerSettingRefusesDifferentSavedServerAndUnsafeInput(t *testing.T) {
 	for _, input := range []serverSelection{
 		{Flag: "other.example.test", FlagSet: true, Saved: "https://saved.example.test"},
