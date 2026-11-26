@@ -25,7 +25,7 @@ import (
 )
 
 func TestControlWorkerQueues(t *testing.T) {
-	p := workerQueueParams{Role: config.WorkerRoleControl, NodeID: "1915", OrgID: "fixture-org", WorkQueue: "jobs:v1:assigned", Serving: true,
+	p := workerQueueParams{Role: config.WorkerRoleControl, NodeID: "4321", OrgID: "fixture-org", WorkQueue: "jobs:v1:assigned", Serving: true,
 		NodeCaps: &capabilities.NodeCapabilities{GPU: &capabilities.GPUCapabilities{Devices: []capabilities.GPUDevice{{Name: "fixture GPU"}}}}}
 	want := []string{nodeQueueName(p.OrgID, p.NodeID)}
 	for _, held := range []bool{false, true} {
@@ -108,7 +108,7 @@ func TestControlWorkerFakeBrokerKeepsSharedJobsAndAppliesNodeConfig(t *testing.T
 	defer cancel()
 	client := redis.NewClient(&redis.Options{Addr: broker.Addr()})
 	defer client.Close()
-	p := workerQueueParams{Role: config.WorkerRoleControl, OrgID: "fixture-org", NodeID: "1915", WorkQueue: worker.DefaultCPUQueue}
+	p := workerQueueParams{Role: config.WorkerRoleControl, OrgID: "fixture-org", NodeID: "4321", WorkQueue: worker.DefaultCPUQueue}
 	resolved := resolveDirectRedisQueuesForRole(p, nil, nil)
 	if resolved.Err != nil {
 		t.Fatal(resolved.Err)
@@ -165,7 +165,7 @@ func TestControlWorkerFakeBrokerKeepsSharedJobsAndAppliesNodeConfig(t *testing.T
 }
 
 func TestControlWorkerMissingIdentityRefuses(t *testing.T) {
-	for _, p := range []workerQueueParams{{Role: config.WorkerRoleControl, OrgID: "org"}, {Role: config.WorkerRoleControl, NodeID: "1915"}} {
+	for _, p := range []workerQueueParams{{Role: config.WorkerRoleControl, OrgID: "org"}, {Role: config.WorkerRoleControl, NodeID: "4321"}} {
 		for _, got := range []workerQueueResult{resolveWorkerQueues(context.Background(), p), resolveDirectRedisQueuesForRole(p, nil, nil)} {
 			if got.Err == nil || len(got.Queues) != 0 {
 				t.Fatalf("missing identity must refuse without fallback: %+v", got)
@@ -176,12 +176,12 @@ func TestControlWorkerMissingIdentityRefuses(t *testing.T) {
 
 func TestControlWorkerIdentityPreflight(t *testing.T) {
 	calls := 0
-	lookup := func(context.Context) string { calls++; return "1915" }
+	lookup := func(context.Context) string { calls++; return "4321" }
 	pause := func(context.Context, time.Duration) bool { return false }
 	if _, err := controlWorkerIdentityFrom(context.Background(), "", lookup, pause); err == nil || calls != 0 {
 		t.Fatal("missing org must refuse before network lookup")
 	}
-	if id, err := controlWorkerIdentityFrom(context.Background(), "fixture-org", lookup, pause); err != nil || id != "1915" {
+	if id, err := controlWorkerIdentityFrom(context.Background(), "fixture-org", lookup, pause); err != nil || id != "4321" {
 		t.Fatalf("id=%s err=%v", id, err)
 	}
 	if id, err := controlWorkerIdentityFrom(context.Background(), "fixture-org", func(context.Context) string { return "" }, pause); err == nil || id != "" {

@@ -239,7 +239,7 @@ this order, first match wins:
 Each `Target` carries `{Username, UID, GID, HomeDir, PathEnv, Signal}` where
 `Signal` is one of `config | node-dir-owner | sudo-user | process`. `Signal`
 is not decorative: it is what lets a consumer (and a human reading a heartbeat)
-tell "probed jason's environment" from "probed root's environment on a
+tell "probed owner's environment" from "probed root's environment on a
 root-owned node", which are the two outcomes that look identical today.
 
 Honesty mapping, the rule every branch protects:
@@ -354,7 +354,7 @@ Response shape (the snapshot, section 3c):
 {
   "probed_at": "2026-09-09T12:00:00Z",
   "stale": false,
-  "target": {"user": "jason", "uid": 1000, "home": "/home/jason", "signal": "node-dir-owner"},
+  "target": {"user": "owner", "uid": 1000, "home": "/home/owner", "signal": "node-dir-owner"},
   "resolve_error": "",
   "agents": [
     {"name": "claude", "installed": true, "version": "2.1.0", "authed": "authed", "adapter_class": "claude-code-hooks"},
@@ -429,7 +429,7 @@ The operator command keeps a zero `Options` by default (S1 behavior is
 byte-unchanged for the table and JSON `agents` shape) but adds `--target-user
 <name>` and, for JSON, the same `target` block the endpoint returns. Under
 `sudo`, an operator can then run `sudo citadel agents probe --target-user
-jason` and see exactly what the worker sees, including whether the version
+owner` and see exactly what the worker sees, including whether the version
 exec ran with dropped privileges. Not `--as-worker` (which would need the
 worker's resolved state) and not a silent default change.
 

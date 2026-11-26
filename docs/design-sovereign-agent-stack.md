@@ -2,7 +2,7 @@
 
 Status: **PROPOSED; independent design review required. Not an accepted Design
 of Record or a build approval.** This is the design lane of [#1214](https://github.com/aceteam-ai/citadel-cli/issues/1214),
-observed 2026-10-22. Its separate Jason BUILD gate remains closed. No runtime,
+observed 2026-10-22. Its separate Owner BUILD gate remains closed. No runtime,
 provider configuration, credential, module, image, workflow or service is
 created or activated by this document. No build children have been filed.
 
@@ -236,7 +236,7 @@ platform record or credential is changed by this design.
 ## 7. Review decisions and later evidence
 
 Automated-citadel should review the source/dialect/permission inventory before
-Jason decides product authority. Proposed sequence, **not filed build children**:
+Owner decides product authority. Proposed sequence, **not filed build children**:
 
 1. Review S5 with one explicit OpenCode version/provider dialect; settle exact
    inference endpoint/principal/auth ownership with the gateway/platform owners.
@@ -252,7 +252,7 @@ Jason decides product authority. Proposed sequence, **not filed build children**
 4. Choose browser approach and memory ownership separately. Reuse the accepted
    adapter contract for Qwen Code/pi only after their own interface/security
    evaluation; do not mechanically copy environment or permission settings.
-5. Only after independent design acceptance **and a separate Jason BUILD yes**
+5. Only after independent design acceptance **and a separate Owner BUILD yes**
    create bounded implementation children. Design acceptance alone does not
    authorize implementation, mark children automated or activate services.
 

@@ -208,10 +208,10 @@ func buildDiagnosticJobHandlers(shellEnabled bool, indexesDir string) map[string
 	fileSemanticSearchHandler := jobs.NewFileSemanticSearchHandler("", "")
 	fileSemanticSearchHandler.IndexesDir = indexesDir
 
-	// Register all job handlers for test command
+	// Register all job handlers for test command. TMUX_SESSION is not here:
+	// it runs only from the worker's own per-node stream.
 	return map[string]jobs.JobHandler{
 		"SHELL_COMMAND":        shellHandler,
-		"TMUX_SESSION":         jobs.NewTmuxSessionHandler(""),
 		"DOWNLOAD_MODEL":       &jobs.DownloadModelHandler{},
 		"OLLAMA_PULL":          &jobs.OllamaPullHandler{},
 		"LLAMACPP_INFERENCE":   &jobs.LlamaCppInferenceHandler{},

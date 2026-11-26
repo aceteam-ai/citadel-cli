@@ -235,7 +235,7 @@ func (b *stopOnAdmitBrowser) Evaluate(js string) (any, error) {
 }
 
 // A Stop observed at the admission-to-recording boundary is a cancellation:
-// recording never starts and nothing is transcribed (Jason's #1506 decision).
+// recording never starts and nothing is transcribed (Owner's #1506 decision).
 func TestMeetingStopAtRecordingBoundaryRecordsNothing(t *testing.T) {
 	workspace := t.TempDir()
 	h := NewMeetingJoinHandler(workspace)

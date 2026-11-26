@@ -39,7 +39,7 @@ func TestDeviceAttrResponder_TertiaryDAIgnored(t *testing.T) {
 func TestDeviceAttrResponder_EmbeddedInOutput(t *testing.T) {
 	// A realistic startup burst: prompt text, the DA query, more text.
 	var r deviceAttrResponder
-	got := r.scan([]byte("jason@host ~> \x1b[c\x1b[0m hi"))
+	got := r.scan([]byte("owner@host ~> \x1b[c\x1b[0m hi"))
 	if !bytes.Equal(got, primaryDAResponse) {
 		t.Fatalf("got %q, want primary DA reply", got)
 	}

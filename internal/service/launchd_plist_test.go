@@ -14,8 +14,8 @@ func TestRenderLaunchdPlist(t *testing.T) {
 		Label:     launchdLabel,
 		ExecPath:  "/opt/homebrew/bin/citadel",
 		Args:      []string{"work"},
-		HomeDir:   "/Users/jason",
-		LogDir:    "/Users/jason/Library/Logs/citadel",
+		HomeDir:   "/Users/owner",
+		LogDir:    "/Users/owner/Library/Logs/citadel",
 		RunAtLoad: true,
 		KeepAlive: true,
 		PathEnv:   launchdServicePATH,
@@ -27,8 +27,8 @@ func TestRenderLaunchdPlist(t *testing.T) {
 		"<string>work</string>",
 		"<key>CITADEL_SERVICE</key>",
 		"<string>true</string>",
-		"/Users/jason/Library/Logs/citadel/citadel.log",
-		"/Users/jason/Library/Logs/citadel/citadel-error.log",
+		"/Users/owner/Library/Logs/citadel/citadel.log",
+		"/Users/owner/Library/Logs/citadel/citadel-error.log",
 		`<?xml version="1.0"`,
 		// PATH must include Homebrew + Docker Desktop dirs (launchd's minimal
 		// default PATH omits both, breaking every docker/brew job).
@@ -95,8 +95,8 @@ func TestParseLaunchdProgramArguments(t *testing.T) {
 		Label:    launchdLabel,
 		ExecPath: "/opt/homebrew/Cellar/citadel/2.1.0/bin/citadel",
 		Args:     []string{"work", "--gateway"},
-		HomeDir:  "/Users/jason",
-		LogDir:   "/Users/jason/Library/Logs/citadel",
+		HomeDir:  "/Users/owner",
+		LogDir:   "/Users/owner/Library/Logs/citadel",
 	})
 	got := parseLaunchdProgramArguments(plist)
 	want := []string{"/opt/homebrew/Cellar/citadel/2.1.0/bin/citadel", "work", "--gateway"}
@@ -114,8 +114,8 @@ func TestIsCitadelManagedPlist(t *testing.T) {
 		Label:    launchdLabel,
 		ExecPath: "/opt/homebrew/bin/citadel",
 		Args:     []string{"work"},
-		HomeDir:  "/Users/jason",
-		LogDir:   "/Users/jason/Library/Logs/citadel",
+		HomeDir:  "/Users/owner",
+		LogDir:   "/Users/owner/Library/Logs/citadel",
 	})
 	if !isCitadelManagedPlist(managed) {
 		t.Error("citadel plist should be recognized as managed")
@@ -126,8 +126,8 @@ func TestIsCitadelManagedPlist(t *testing.T) {
 		Label:    launchdLabel,
 		ExecPath: "/opt/homebrew/bin/citadel",
 		Args:     []string{"status"},
-		HomeDir:  "/Users/jason",
-		LogDir:   "/Users/jason/Library/Logs/citadel",
+		HomeDir:  "/Users/owner",
+		LogDir:   "/Users/owner/Library/Logs/citadel",
 	})
 	if isCitadelManagedPlist(notWork) {
 		t.Error("a non-`work` citadel plist should not be treated as the managed node service")
@@ -138,7 +138,7 @@ func TestIsCitadelManagedPlist(t *testing.T) {
 		Label:    "com.example.other",
 		ExecPath: "/usr/bin/other",
 		Args:     []string{"work"},
-		HomeDir:  "/Users/jason",
+		HomeDir:  "/Users/owner",
 		LogDir:   "/tmp",
 	})
 	if isCitadelManagedPlist(foreign) {
@@ -154,8 +154,8 @@ func TestReplaceFirstProgramArgument(t *testing.T) {
 		Label:     launchdLabel,
 		ExecPath:  "/opt/homebrew/Cellar/citadel/2.1.0/bin/citadel",
 		Args:      []string{"work", "--gateway"},
-		HomeDir:   "/Users/jason",
-		LogDir:    "/Users/jason/Library/Logs/citadel",
+		HomeDir:   "/Users/owner",
+		LogDir:    "/Users/owner/Library/Logs/citadel",
 		RunAtLoad: true,
 		KeepAlive: true,
 	})

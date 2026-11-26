@@ -32,6 +32,7 @@ type reapProc struct {
 
 // Seams so tests need no real /proc, browser or signals.
 var (
+	reapProcRoot   = "/proc"
 	listReapProcs  = listProcForReap
 	lookupReapProc = readProcForReap
 	reapEUID       = os.Geteuid
@@ -80,20 +81,30 @@ func splitCmdline(raw []byte) []string {
 }
 
 func listProcForReap() ([]reapProc, error) {
-	ents, err := os.ReadDir("/proc")
+	ents, err := os.ReadDir(reapProcRoot)
 	if err != nil {
-		// No /proc: nothing to find, as before.
-		return nil, nil
+		// An unreadable /proc is unknown, not "no processes": callers must not
+		// seal a profile or settle a recovery launch on an empty list.
+		return nil, fmt.Errorf("list processes: %w", err)
 	}
 	var out []reapProc
+	self, sawSelf := os.Getpid(), false
 	for _, e := range ents {
 		pid, err := strconv.Atoi(e.Name())
 		if err != nil {
 			continue
 		}
+		if pid == self {
+			sawSelf = true
+		}
 		if p, ok := readProcForReap(pid); ok {
 			out = append(out, p)
 		}
+	}
+	// A real procfs always lists the scanning process. An empty or foreign
+	// directory at the mount point (procfs unmounted) is unknown, not "none".
+	if !sawSelf {
+		return nil, fmt.Errorf("list processes: %s does not list this process; procfs may not be mounted", reapProcRoot)
 	}
 	return out, nil
 }

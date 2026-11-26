@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/tmux"
 	"github.com/gorilla/websocket"
 )
@@ -632,6 +633,19 @@ func (s *Server) resolveAuth(ctx context.Context, token string, overVPN bool, re
 
 // handleWebSocket handles WebSocket upgrade and terminal session
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	var admittedHash string
+	verifier := s.config.PasscodeVerifier
+	hasPasscode := s.config.PasscodeHasPasscode
+	if source := s.config.PermissionSource; source != nil {
+		perms, err := source()
+		if err != nil || !config.CapabilityEnabled(perms, "console") {
+			writeJSONError(w, "console disabled by node policy", http.StatusForbidden)
+			return
+		}
+		admittedHash = perms.PasscodeHash
+		verifier = perms.VerifyPasscode
+		hasPasscode = perms.HasPasscode
+	}
 	// Get client IP for rate limiting
 	ip := getClientIP(r)
 
@@ -701,7 +715,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	//     logs, browser history, and Referer headers. Slated for removal in a
 	//     later release once #7528's browser/relay side ships the
 	//     subprotocol path.
-	if s.config.PasscodeVerifier != nil {
+	if verifier != nil {
 		passcode := r.Header.Get("X-Citadel-Passcode")
 		if passcode == "" {
 			if sp, ok := passcodeFromSubprotocol(wsProtocols); ok {
@@ -711,7 +725,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		if passcode == "" {
 			passcode = r.URL.Query().Get("passcode")
 		}
-		if !s.config.PasscodeVerifier(passcode) {
+		if !verifier(passcode) {
 			// Distinguish "no passcode configured at all" (ReasonPasscodeNotSet:
 			// the operator must set one) from "a passcode is set but the wrong
 			// one was presented" (ReasonPasscodeInvalid), mirroring
@@ -720,9 +734,9 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			// and the reject falls back to the pre-#753 reason-less response
 			// (writeJSONError) rather than guessing.
 			atomic.AddInt64(&s.failedConnections, 1)
-			if s.config.PasscodeHasPasscode != nil {
+			if hasPasscode != nil {
 				reason := ReasonPasscodeInvalid
-				if !s.config.PasscodeHasPasscode() {
+				if !hasPasscode() {
 					reason = ReasonPasscodeNotSet
 				}
 				s.logger.Printf("passcode gate rejected connection from %s (user %s, via %s, reason=%s)", ip, tokenInfo.UserID, authVia, reason)
@@ -756,6 +770,10 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		upgradeResponseHeader = http.Header{}
 		upgradeResponseHeader.Set("Sec-WebSocket-Protocol", terminalPasscodeSubprotocol)
 	}
+	if source := s.config.PermissionSource; source != nil && !source.StillPermitted("console", admittedHash) {
+		writeJSONError(w, "console disabled by node policy", http.StatusForbidden)
+		return
+	}
 	conn, err := s.upgrader.Upgrade(w, r, upgradeResponseHeader)
 	if err != nil {
 		s.logger.Printf("websocket upgrade failed for %s: %v", ip, err)
@@ -776,6 +794,14 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// the early-return error writes below and every write inside
 	// handleConnection share the same mutex — see safeConn's doc comment.
 	sc := newSafeConn(conn)
+	policyCtx, stopPolicy := context.WithCancel(r.Context())
+	defer stopPolicy()
+	if source := s.config.PermissionSource; source != nil {
+		go source.Watch(policyCtx, "console", admittedHash, func() {
+			stopPolicy()
+			conn.Close()
+		})
+	}
 
 	// Generate session ID
 	sessionID := generateSessionID()
@@ -798,11 +824,14 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// the on-demand tmux install that only fires for an override-requested
 	// session.
 	sessionOverride := r.URL.Query().Get("session")
+	if source := s.config.PermissionSource; source != nil && !source.StillPermitted("console", admittedHash) {
+		return
+	}
 	tmuxCommand, tmuxSessionName, wantedSession := resolveSessionCommand(
 		s.config.SessionName, sessionOverride, tokenInfo.UserID, s.config.Shell, ensureTmuxInstalledFn)
 	var tmuxFallbackReason error
 	if tmuxCommand != nil {
-		prepareCtx, cancel := context.WithTimeout(r.Context(), tmuxReapTimeout)
+		prepareCtx, cancel := context.WithTimeout(policyCtx, tmuxReapTimeout)
 		tmuxCommand, tmuxFallbackReason = s.prepareTmuxSession(
 			prepareCtx, tmuxSessionName, s.config.Shell, sessionLeaseDeadline(s.now(), s.config.SessionTTL))
 		cancel()
@@ -841,6 +870,10 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Create PTY session
+	if source := s.config.PermissionSource; source != nil &&
+		(policyCtx.Err() != nil || !source.StillPermitted("console", admittedHash)) {
+		return
+	}
 	session, err := NewSession(SessionConfig{
 		ID:          sessionID,
 		UserID:      tokenInfo.UserID,
@@ -879,7 +912,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer stopLeaseRenewal()
 
 	// Handle the connection
-	s.handleConnection(conn, sc, session)
+	s.handleConnectionWithPolicy(conn, sc, session, policyCtx, admittedHash)
 
 	s.logger.Printf("session %s ended (sessions=%d)", sessionID, s.sessions.Count())
 }
@@ -1010,9 +1043,15 @@ func (s *Server) renewTmuxLease(parent context.Context, name string) {
 // PTY->WebSocket relay goroutine below and this function's own WebSocket->PTY
 // loop are two independent goroutines that can both want to write at once.
 func (s *Server) handleConnection(conn *websocket.Conn, sc *safeConn, session *Session) {
-	ctx, cancel := context.WithCancel(context.Background())
+	s.handleConnectionWithPolicy(conn, sc, session, context.Background(), "")
+}
+
+func (s *Server) handleConnectionWithPolicy(conn *websocket.Conn, sc *safeConn, session *Session, parent context.Context, admittedHash string) {
+	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	defer session.Close()
+	stopClose := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stopClose()
 
 	// Set up ping/pong for connection health. WriteControl is intentionally
 	// called on conn directly, not through sc: gorilla documents it as safe
@@ -1074,6 +1113,9 @@ func (s *Server) handleConnection(conn *websocket.Conn, sc *safeConn, session *S
 				return
 			}
 
+			if source := s.config.PermissionSource; source != nil && !source.StillPermitted("console", admittedHash) {
+				return
+			}
 			msg, err := UnmarshalMessage(data)
 			if err != nil {
 				s.logger.Debugf("invalid message from session %s: %v", session.ID, err)

@@ -74,7 +74,7 @@ A remote E2E test script validates the first-time user experience on a Windows m
 
 ```bash
 ./scripts/windows-e2e-test.sh \
-  --host 192.168.2.207 \
+  --host 192.168.50.207 \
   --user acewin \
   --password '***' \
   --authkey tskey-auth-xxx

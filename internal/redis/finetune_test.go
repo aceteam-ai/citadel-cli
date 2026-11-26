@@ -9,7 +9,7 @@ import (
 func TestFineTuneCancelRequestAllowsOnlyConfirmedTerminalOutcome(t *testing.T) {
 	_, client, raw := setupMiniredis(t)
 	ctx := context.Background()
-	const org, node = "org-a", "1297"
+	const org, node = "org-a", "4321"
 	for _, id := range []string{"cleanup-ok", "cleanup-failed"} {
 		if err := raw.HSet(ctx, "finetune:job:"+id, map[string]any{
 			"org_id": org, "node_id": node, "status": "cancelling",

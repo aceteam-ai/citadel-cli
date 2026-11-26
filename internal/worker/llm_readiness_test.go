@@ -71,7 +71,7 @@ func TestEnsureEngineReady_EveryBackendIsProbed(t *testing.T) {
 	shortenReadinessBudget(t, 50*time.Millisecond)
 
 	// A listener that accepts and immediately closes: a port that is bound but
-	// not serving, which is exactly the 78s window measured on node 1297.
+	// not serving, which is exactly the 78s window measured on a dev node.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)

@@ -22,13 +22,13 @@ func registeredOnlineIdentity() NodeIdentity {
 		MeshIPv4:           "100.64.0.5",
 		OrgID:              "org-123",
 		OrgName:            "Acme Inc",
-		UserEmail:          "jason@example.com",
-		UserName:           "Jason",
+		UserEmail:          "owner@example.com",
+		UserName:           "Owner",
 		Registered:         true,
 		CitadelVersion:     "v2.116.0",
 		HeartbeatFreshness: "ok",
 		LastHeartbeatAt:    "2026-08-25T00:00:00Z",
-		NodeConfigDir:      "/home/jason/citadel-node",
+		NodeConfigDir:      "/home/owner/citadel-node",
 	}
 }
 
@@ -64,7 +64,7 @@ func TestRenderIdentity_RegisteredOnline(t *testing.T) {
 		"100.64.0.5",
 		"Acme Inc",
 		"org-123",
-		"jason@example.com",
+		"owner@example.com",
 		"ok",
 		"registered citadel node",
 	} {
@@ -105,13 +105,13 @@ func TestRenderIdentity_UnregisteredDegradesGracefully(t *testing.T) {
 
 func TestRenderIdentity_PlatformNodeIDShownWhenPresent(t *testing.T) {
 	id := registeredOnlineIdentity()
-	id.PlatformNodeID = "1297"
+	id.PlatformNodeID = "4321"
 
 	var buf bytes.Buffer
 	renderIdentity(&buf, id)
 	out := buf.String()
 
-	if !strings.Contains(out, "1297") {
+	if !strings.Contains(out, "4321") {
 		t.Errorf("expected platform node ID to be rendered when present:\n%s", out)
 	}
 	if strings.Contains(out, "not available locally") {
@@ -129,10 +129,10 @@ func TestResolvePlatformNodeID(t *testing.T) {
 		sshSyncID    string
 		want         string
 	}{
-		{"fabric node id present, wins over ssh sync fallback", "1297", "999", "1297"},
+		{"fabric node id present, wins over ssh sync fallback", "4321", "999", "4321"},
 		{"fabric node id absent, falls back to ssh sync", "", "999", "999"},
 		{"both absent", "", "", ""},
-		{"fabric node id present, ssh sync absent", "1297", "", "1297"},
+		{"fabric node id present, ssh sync absent", "4321", "", "4321"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -169,9 +169,9 @@ func TestUserDisplayString(t *testing.T) {
 		id   NodeIdentity
 		want string
 	}{
-		{"both", NodeIdentity{UserName: "Jason", UserEmail: "j@x.com"}, "Jason <j@x.com>"},
+		{"both", NodeIdentity{UserName: "Owner", UserEmail: "j@x.com"}, "Owner <j@x.com>"},
 		{"email only", NodeIdentity{UserEmail: "j@x.com"}, "j@x.com"},
-		{"name only", NodeIdentity{UserName: "Jason"}, "Jason"},
+		{"name only", NodeIdentity{UserName: "Owner"}, "Owner"},
 		{"neither", NodeIdentity{}, ""},
 	}
 	for _, c := range cases {

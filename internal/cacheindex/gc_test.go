@@ -140,7 +140,7 @@ func TestPlanGC_BackfillEntriesAreEligible(t *testing.T) {
 	}
 	plan := PlanGC(entries, GCInputs{Now: now, PinnedModels: map[string]bool{}})
 	if len(plan.Candidates) != 1 || plan.Candidates[0].Model != "org/backfilled" {
-		t.Fatalf("a SourceBackfill entry must be GC-eligible (Jason's 2026-08-25 decision); plan=%+v", plan)
+		t.Fatalf("a SourceBackfill entry must be GC-eligible (Owner's 2026-08-25 decision); plan=%+v", plan)
 	}
 }
 

@@ -228,7 +228,7 @@ func (h *MeetingJoinHandler) waitForMeetingEndInteractive(
 	// returning. This is the Bug B lifecycle fix: Execute must then proceed to the
 	// end-of-call batch transcribe with the rolling goroutine already stopped, so
 	// no pass keeps "firing after leaving" and the terminal result is always
-	// produced (found live on node 1084, 2026-07-16). The wait is bounded so a
+	// produced (found live on a dev node, 2026-07-16). The wait is bounded so a
 	// pathologically slow final pass can never wedge the terminal outcome —
 	// transcribeMu still serializes the batch transcribe for correctness if the
 	// grace trips.

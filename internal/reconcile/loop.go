@@ -128,7 +128,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (plan Plan, applyRes App
 	//     essentially every node today, since nothing yet writes that durable
 	//     store (aceteam#4273's deferred follow-up; see PR description). Treating
 	//     this as an error made the guard trip every single pass forever (4574+
-	//     times over 5+ days on node 1297, which was never assigned anything).
+	//     times over 5+ days on a dev node, which was never assigned anything).
 	//   - MANAGED: the control plane DOES have a revision history for this node
 	//     (it was assigned modules at some point) and is now serving zero. That
 	//     is the genuine "empty/misconfigured control plane" foot-gun this guard

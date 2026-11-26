@@ -101,7 +101,7 @@ type GCPlan struct {
 // and a fresh residency check) immediately before deleting it, since a
 // candidate can go stale between planning and execution.
 //
-// SourceBackfill entries are NOT exempt here (Jason's 2026-08-25 decision,
+// SourceBackfill entries are NOT exempt here (Owner's 2026-08-25 decision,
 // design doc §11 "Backfill evictability" -- see SourceBackfill's doc
 // comment in cacheindex.go): this function applies no source-based
 // exemption at all. A "_store" native aggregate row (tei, no

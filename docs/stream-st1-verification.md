@@ -1,6 +1,6 @@
 # ST1 offline verification
 
-Measured 2026-10-20 UTC on ubuntu-gpu, Linux amd64, Go 1.26.6,
+Measured 2026-10-20 UTC on linux-node, Linux amd64, Go 1.26.6,
 13th Gen Intel Core i5-13600K. This is source acceptance for Citadel #1352,
 not a live runtime, fleet capacity, release or deployment result. All inputs
 are the committed synthetic Shield corpus. No service was started.

@@ -34,7 +34,7 @@ No actual profile, state store, credentials or running node was read.
 
 The method name `controlclient.Login` also covers resuming an already authorized
 identity with its existing key. Automated-citadel's **reviewer interpretation of
-the 2026-10-22 owner decision, pending Jason ratification** is:
+the 2026-10-22 owner decision, pending Owner ratification** is:
 
 - Permit control-plane resume/registration presenting the existing persisted
   node key of an already-authorized identity, with no interaction or new
@@ -45,7 +45,7 @@ the 2026-10-22 owner decision, pending Jason ratification** is:
   refusal pointing to `citadel login`.
 
 This interpretation is proposed design guidance, not a newly ratified exception
-or runtime permission. Jason can overrule it. It separates existing-identity
+or runtime permission. Owner can overrule it. It separates existing-identity
 exchange from new authorization; implementation remains held on ratification
 and the enforcement proof below.
 

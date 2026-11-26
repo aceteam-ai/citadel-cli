@@ -27,7 +27,7 @@ state must not be treated as permission to wake a personal/undeclared session.
 L4 consequence: keep the human-driving refusal/policy boundary and L0 gate;
 never inspect terminal contents or inject a key to fill this evidence gap.
 
-## What Jason would need to do
+## What Owner would need to do
 
 This needs an operator-owned interactive canary, not another headless daemon
 probe. It is a proposed manual procedure, not a run or a new authorization:
@@ -38,7 +38,7 @@ probe. It is a proposed manual procedure, not a run or a new authorization:
    endpoint guard, reviewed fixture hooks, bounded observation and own-process
    cleanup from the reviewed native canary. Do not use a real lane, real model,
    auth file, personal draft, global daemon command or existing thread.
-2. Open that new canary in the actual native TUI. Jason manually types a unique
+2. Open that new canary in the actual native TUI. Owner manually types a unique
    fake sentinel, for example `unsent composer sentinel from probe`, and leaves
    it unsent. Record the version and that the canary is idle with this draft
    visibly present. The agent must not read, scrape or write the terminal.
@@ -46,13 +46,13 @@ probe. It is a proposed manual procedure, not a run or a new authorization:
    the one-shot queue argv above against only that new canary UUID. Record CLI
    exit/acknowledgement separately from model-request, UserPromptSubmit, pending
    count and thread-status observations. Never retry an uncertain queue.
-4. Jason visually checks whether the sentinel remains byte-for-byte editable,
+4. Owner visually checks whether the sentinel remains byte-for-byte editable,
    was cleared, replaced, merged with the queued text, or submitted. The fake
    provider can check exact sentinel presence in memory and emit booleans only,
    without logging request contents. Distinguish a preserved draft with a
    processed queue from a preserved draft that blocks the queue. Do not infer
    composer preservation from a hook, status read or absence of model traffic.
-5. After the first bounded observation, Jason may manually submit the sentinel
+5. After the first bounded observation, Owner may manually submit the sentinel
    once to prove it remains his separate draft. Record that optional action's
    timestamp and additional request separately; it must not be attributed to
    the earlier queued wake. Stop and clean up only the created canary processes
@@ -65,5 +65,5 @@ cannot be safely started, leave D unverified. No automated PTY, tmux or
 keystroke fallback is an acceptable substitute.
 
 C reconnect pause is a separate remaining interactive gap; completing D alone
-would not clear it or complete L0. The literal Jason gate in #1818 remains for
-the coordinator or Jason to update, not this lane.
+would not clear it or complete L0. The literal Owner gate in #1818 remains for
+the coordinator or Owner to update, not this lane.

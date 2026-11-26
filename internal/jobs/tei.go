@@ -5,7 +5,7 @@
 // file gathers the two live inputs that decision needs -- the node's GPU compute
 // capabilities and whether the container runtime hands a GPU to an unqualified
 // container -- behind package-var seams so a compose-up wiring test never shells
-// out to the real GPU (node 1795 is a live GPU node). Mirrors cmd/tei.go for the
+// out to a real GPU on a live GPU node. Mirrors cmd/tei.go for the
 // cmd-side start paths.
 package jobs
 

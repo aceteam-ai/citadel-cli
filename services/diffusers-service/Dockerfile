@@ -10,7 +10,7 @@
 # just slowly.
 # torch 2.7.1 / CUDA 12.6 (was 2.5.1 / 12.4) for the diffusers 0.37.1 stack in
 # requirements.txt (citadel-cli#1335). CUDA 12.6 needs NVIDIA driver >= 560 on
-# the host; node 1795 runs 580.x. bitsandbytes 0.48.2 (nf4 / 8-bit loads)
+# the host; acceptance used a 580.x driver. bitsandbytes 0.48.2 (nf4 / 8-bit loads)
 # requires torch >= 2.3.
 FROM pytorch/pytorch:2.7.1-cuda12.6-cudnn9-runtime
 

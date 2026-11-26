@@ -10,7 +10,7 @@ does not complete the governed-lane supervisor.
 
 ## One aggregate and explicit policy
 
-Jason's October 29 decision on [Aceteam #12838](https://github.com/aceteam-ai/aceteam/issues/12838),
+Owner's October 29 decision on [Aceteam #12838](https://github.com/aceteam-ai/aceteam/issues/12838),
 carried into [#1442 scope, item 2](https://github.com/aceteam-ai/citadel-cli/issues/1442),
 sets per-harness defaults: **Codex 48** and **Claude Code 10** automatic turns per
 lane per rolling 24 hours, **30 minutes** per turn and **one active turn** per lane.

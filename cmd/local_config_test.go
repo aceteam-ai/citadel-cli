@@ -173,7 +173,10 @@ func TestMergeWritesThroughSymlink(t *testing.T) {
 		t.Skip("symlinks need privileges on Windows")
 	}
 	// macOS temp dirs sit under a symlinked /var; compare resolved paths.
-	dir, _ := filepath.EvalSymlinks(t.TempDir())
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	real := filepath.Join(dir, "dotfiles", "c.json")
 	_ = os.MkdirAll(filepath.Dir(real), 0o700)
 	_ = os.WriteFile(real, []byte(`{"mcpServers":{}}`), 0o640)
@@ -499,7 +502,10 @@ func TestMergeOpencodeWritesThroughSymlink(t *testing.T) {
 		t.Skip("symlinks need privileges on Windows")
 	}
 	// macOS temp dirs sit under a symlinked /var; compare resolved paths.
-	dir, _ := filepath.EvalSymlinks(t.TempDir())
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	real := filepath.Join(dir, "dotfiles", "opencode.json")
 	_ = os.MkdirAll(filepath.Dir(real), 0o700)
 	_ = os.WriteFile(real, []byte(`{"model":"a/b"}`), 0o640)
@@ -679,7 +685,10 @@ func TestMergeBOMWritesThroughSymlink(t *testing.T) {
 		t.Skip("symlinks need privileges on Windows")
 	}
 	// macOS temp dirs sit under a symlinked /var; compare resolved paths.
-	dir, _ := filepath.EvalSymlinks(t.TempDir())
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	real := filepath.Join(dir, "dotfiles", "c.json")
 	_ = os.MkdirAll(filepath.Dir(real), 0o700)
 	_ = os.WriteFile(real, []byte("\xEF\xBB\xBF"+`{"mcpServers":{}}`), 0o640)

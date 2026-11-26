@@ -8,11 +8,11 @@ and [design-model-exclusivity.md](design-model-exclusivity.md) (#8248/#8249);
 this doc extends the same primitives to two job types that are not
 `SERVICE_START`: `MEETING_JOIN` and `TRANSCRIBE_AUDIO`.
 
-## Implementation status (2026-08-30, Jason's decision)
+## Implementation status (2026-08-30, Owner's decision)
 
-Jason's call: **ship the honest-refusal / diagnosis tier only. Do NOT build
+Owner's call: **ship the honest-refusal / diagnosis tier only. Do NOT build
 the preempt arm.** `CITADEL_MEETING_VRAM_PREEMPT` (§4, §8 P2) and any
-`Reserve`/`Release` wiring are DEFERRED pending a live re-verify on node 1297
+`Reserve`/`Release` wiring are DEFERRED pending a live re-verify on a dev node
 per §7 Q1 — this design's own §1a finding (the shipped transcribe sidecar is
 CPU-only, so #558's VRAM mechanism may not even reproduce) makes building an
 eviction mechanism premature until that's confirmed.
@@ -83,7 +83,7 @@ failing fast with a clear "insufficient VRAM" error or preempting to make room.
 The head-of-line half of #558 was fixed by #489/#895 (MEETING_JOIN's dedicated
 async lane); this is the other half.
 
-The #558 incident (node 1084, v2.80.0, 2026-07-17): `nvidia-smi` showed
+The #558 incident (a dev node, v2.80.0, 2026-07-17): `nvidia-smi` showed
 22.1/24.6 GB used (vLLM/Qwen3-8B holding ~21GB), the `citadel-transcribe`
 container was "Up 18 hours" but never became ready, and every rolling pass
 logged `Waiting for transcription service to become ready...` then burned its
@@ -120,7 +120,7 @@ ready within 120s" means the container's HTTP server was not answering at all �
 a crashed/restart-looping uvicorn, a wedged process, host-RAM OOM thrash (vLLM
 pins substantial host RAM alongside VRAM), or a port/bind failure. It cannot
 mean "whisper is waiting for VRAM." The #558 diagnosis conflated the visible
-`nvidia-smi` pressure with the readiness failure; the actual node-1084
+`nvidia-smi` pressure with the readiness failure; the actual dev-node
 mechanism was never confirmed (`docker logs citadel-transcribe` from the
 incident window was not captured). Issue #891's own verification posture —
 REAL-BUT-NEEDS-HARDWARE, "scope before implementing" — anticipated exactly
@@ -340,7 +340,7 @@ only on the already-2-minutes-slow failure path — no new steady-state
 `docker stats`/`nvidia-smi` sweeps (the #416/#612 rule about riding existing
 collections applies; here we don't even ride one, we pay only on failure).
 
-This tier is the part that would have turned the node-1084 incident from a
+This tier is the part that would have turned the dev-node incident from a
 4-hour silent wedge into a first-pass log line naming vLLM's 21GB and the
 container's actual state — *whatever* the true mechanism was, VRAM or not.
 
@@ -413,13 +413,13 @@ container's actual state — *whatever* the true mechanism was, VRAM or not.
    cross-repo contract, inert until the backend sends it — same posture as
    #577's original landing).
 
-## 7. Open questions for Jason — RESOLVED 2026-08-30
+## 7. Open questions for Owner — RESOLVED 2026-08-30
 
-1. **Was node-1084's starvation actually VRAM? RESOLVED: unconfirmed, and
-   that uncertainty is exactly why P2 does not ship now.** Jason's decision:
+1. **Was the dev node's starvation actually VRAM? RESOLVED: unconfirmed, and
+   that uncertainty is exactly why P2 does not ship now.** Owner's decision:
    ship P0 (diagnosis) + P1 (fail-fast preflight) only; do NOT build the
    preempt arm. `CITADEL_MEETING_VRAM_PREEMPT` and any `Reserve`/`Release`
-   wiring are DEFERRED pending a live re-verify on node 1297 (vLLM serving +
+   wiring are DEFERRED pending a live re-verify on a dev node (vLLM serving +
    a meeting join, capture `docker logs citadel-transcribe` + `free -m`) —
    this design's own §1a finding (the shipped sidecar is CPU-only, so #558's
    VRAM mechanism may not even reproduce) makes building an eviction
@@ -476,8 +476,8 @@ container's actual state — *whatever* the true mechanism was, VRAM or not.
   (mirrors #577's own ungated payload precedent; there is no gated estimate
   tier left to gate). Inert on every current node until the backend sends a
   payload field.
-- **P2 — preempt-and-restore: DEFERRED**, pending Q1's live re-verify on node
-  1297 (see §7). Not started; `CITADEL_MEETING_VRAM_PREEMPT` does not exist.
+- **P2 — preempt-and-restore: DEFERRED**, pending Q1's live re-verify on a dev
+  node (see §7). Not started; `CITADEL_MEETING_VRAM_PREEMPT` does not exist.
   When it is built: `Reserve` at meeting start / `Release` after
   `backupAndPrune`, worklock-holding path only, first production job-type
   caller of #832 — the plan below is unchanged from the original design,
@@ -488,7 +488,7 @@ container's actual state — *whatever* the true mechanism was, VRAM or not.
   branches on `insufficient_vram` (cloud fallback / re-dispatch). Contract in
   §5.
 - **Explicitly out of scope:** host-RAM starvation of the CPU sidecar (the
-  likely true node-1084 mechanism — belongs with #831's RAM machinery if Q1
+  likely true dev-node mechanism — belongs with #831's RAM machinery if Q1
   confirms it; P0's diagnosis annotation DOES surface free RAM today as a
   first-pass signal toward diagnosing this, without building dedicated RAM
   machinery), fabric-level meeting placement/scheduling, per-pass

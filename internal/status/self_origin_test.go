@@ -110,12 +110,12 @@ func TestExposeRefusesEverythingButSelfOrigin(t *testing.T) {
 	}
 }
 
-// The other /agent/* routes keep their existing requireVPNOrAuth posture; this
-// change is scoped to expose/unexpose.
+// The read-only /agent/* routes still admit a verified mesh peer; the self-origin
+// gate is scoped to expose/unexpose.
 func TestNonExposeAgentRoutesUnchanged(t *testing.T) {
 	called := false
 	p := &AgentProviders{WorkerStatus: func() any { called = true; return map[string]any{} }}
-	s := NewServer(ServerConfig{Port: 8080, Version: "test", Agent: p, SelfMeshIPs: selfIPs},
+	s := NewServer(ServerConfig{Port: 8080, Version: "test", Agent: p, SelfMeshIPs: selfIPs, PeerVerifier: testPeerVerifier},
 		NewCollector(CollectorConfig{NodeName: "n"}))
 	mux := http.NewServeMux()
 	s.registerAgentRoutes(mux)

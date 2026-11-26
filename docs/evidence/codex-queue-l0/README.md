@@ -130,7 +130,7 @@ this is not permission to wake blocked lanes or resume their goals.
 This does not prove all interactive lifecycle states or clear L0. C's TUI
 reconnect pause and other stalled states and D's unsent human composer remain
 unverified. Reconnect pause and the composer need operator-owned interactive
-observations. The D note gives a manual fake-sentinel procedure for Jason; it
+observations. The D note gives a manual fake-sentinel procedure for Owner; it
 does not authorize a lane to inspect or manipulate his terminal.
 Keep [L4 #1817](https://github.com/aceteam-ai/citadel-cli/issues/1817) gated.
 Do not replace missing observations with a second writer, `--remote`, PTY reads,

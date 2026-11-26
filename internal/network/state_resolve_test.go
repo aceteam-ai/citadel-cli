@@ -29,8 +29,8 @@ func TestResolveStateDir(t *testing.T) {
 			name: "pointer wins over everything",
 			in: stateDirInputs{
 				pointerDir:        "/etc/citadel/node",
-				configNodeDir:     "/home/jason/citadel-node",
-				ownerHome:         "/home/jason",
+				configNodeDir:     "/home/owner/citadel-node",
+				ownerHome:         "/home/owner",
 				legacyStateExists: legacyPresent,
 				goos:              "linux",
 			},
@@ -40,34 +40,34 @@ func TestResolveStateDir(t *testing.T) {
 			name: "config used when no pointer",
 			in: stateDirInputs{
 				pointerDir:        "",
-				configNodeDir:     "/home/jason/citadel-node",
-				ownerHome:         "/home/jason",
+				configNodeDir:     "/home/owner/citadel-node",
+				ownerHome:         "/home/owner",
 				legacyStateExists: legacyPresent,
 				goos:              "linux",
 			},
-			want: filepath.Join("/home/jason/citadel-node", "network"),
+			want: filepath.Join("/home/owner/citadel-node", "network"),
 		},
 		{
 			name: "existing legacy state reused when no pointer/config",
 			in: stateDirInputs{
 				pointerDir:        "",
 				configNodeDir:     "",
-				ownerHome:         "/home/jason",
+				ownerHome:         "/home/owner",
 				legacyStateExists: legacyPresent,
 				goos:              "linux",
 			},
-			want: filepath.Join("/home/jason", "citadel-node", "network"),
+			want: filepath.Join("/home/owner", "citadel-node", "network"),
 		},
 		{
 			name: "fresh machine falls back to owner home",
 			in: stateDirInputs{
 				pointerDir:        "",
 				configNodeDir:     "",
-				ownerHome:         "/home/jason",
+				ownerHome:         "/home/owner",
 				legacyStateExists: legacyAbsent,
 				goos:              "linux",
 			},
-			want: filepath.Join("/home/jason", "citadel-node", "network"),
+			want: filepath.Join("/home/owner", "citadel-node", "network"),
 		},
 		{
 			name: "windows SYSTEM-profile pointer is rejected, falls through to config",
@@ -105,15 +105,15 @@ func TestResolveStateDir(t *testing.T) {
 
 // TestResolveStateDir_DifferentHomeSameOwner is the discriminating regression
 // test for #383. Two invocations with DIFFERENT raw $HOME but the SAME resolved
-// owner (e.g. the user-mode service running as jason, vs `sudo citadel login`
-// whose raw $HOME is /root but whose SUDO_USER resolves back to jason's home)
+// owner (e.g. the user-mode service running as owner, vs `sudo citadel login`
+// whose raw $HOME is /root but whose SUDO_USER resolves back to owner's home)
 // MUST produce the identical state dir. If they diverge, tsnet mints a fresh
 // machine key and Headscale registers a duplicate node.
 func TestResolveStateDir_DifferentHomeSameOwner(t *testing.T) {
 	// Both contexts share a pointer file (the canonical convergence source).
 	serviceCtx := stateDirInputs{
 		pointerDir:        "/etc/citadel/node",
-		ownerHome:         "/home/jason", // service runs as jason
+		ownerHome:         "/home/owner", // service runs as owner
 		legacyStateExists: func(string) bool { return true },
 		goos:              "linux",
 	}
@@ -134,19 +134,19 @@ func TestResolveStateDir_DifferentHomeSameOwner(t *testing.T) {
 // TestResolveStateDir_OwnerHomeConvergesWithoutPointer documents the residual
 // single-owner assumption: when there is NO pointer and NO config, convergence
 // depends on both contexts resolving the SAME owner home. With owner-consistent
-// resolution (SUDO_USER-aware), a service-as-jason and `sudo citadel login`
-// (SUDO_USER=jason → /home/jason) both land on the same dir even though the
+// resolution (SUDO_USER-aware), a service-as-owner and `sudo citadel login`
+// (SUDO_USER=owner → /home/owner) both land on the same dir even though the
 // sudo invoker's raw $HOME is /root.
 func TestResolveStateDir_OwnerHomeConvergesWithoutPointer(t *testing.T) {
 	serviceCtx := stateDirInputs{
-		ownerHome:         "/home/jason",
+		ownerHome:         "/home/owner",
 		legacyStateExists: func(string) bool { return true },
 		goos:              "linux",
 	}
-	// getOwnerHomeDir() resolves SUDO_USER=jason back to /home/jason, so the
-	// caller passes /home/jason here, NOT the raw /root.
+	// getOwnerHomeDir() resolves SUDO_USER=owner back to /home/owner, so the
+	// caller passes /home/owner here, NOT the raw /root.
 	sudoCtx := stateDirInputs{
-		ownerHome:         "/home/jason",
+		ownerHome:         "/home/owner",
 		legacyStateExists: func(string) bool { return false },
 		goos:              "linux",
 	}
@@ -164,7 +164,7 @@ func TestUsableNodeDir(t *testing.T) {
 		want    string
 	}{
 		{"empty", "", "linux", ""},
-		{"linux passthrough", "/home/jason/citadel-node", "linux", "/home/jason/citadel-node"},
+		{"linux passthrough", "/home/owner/citadel-node", "linux", "/home/owner/citadel-node"},
 		{"windows normal", `C:\Users\acewin\citadel-node`, "windows", `C:\Users\acewin\citadel-node`},
 		{"windows systemprofile rejected", `C:\Windows\system32\config\systemprofile\x`, "windows", ""},
 		{"systemprofile only rejected on windows", `/x/systemprofile/y`, "linux", "/x/systemprofile/y"},
@@ -254,7 +254,7 @@ func TestMachineStatePointerRoundTrip(t *testing.T) {
 	tmp := t.TempDir()
 	pointer := filepath.Join(tmp, machineStatePointerFile)
 
-	want := "/home/jason/citadel-node"
+	want := "/home/owner/citadel-node"
 	if err := os.WriteFile(pointer, []byte(want+"\n"), 0644); err != nil {
 		t.Fatal(err)
 	}

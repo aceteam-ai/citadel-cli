@@ -72,7 +72,7 @@ const (
 	// that predates the index). Never overwrites a SourcePull entry -- see
 	// ReconcileScan's doc comment.
 	//
-	// EVICTABLE by P5 GC, per Jason's 2026-08-25 decision
+	// EVICTABLE by P5 GC, per Owner's 2026-08-25 decision
 	// (docs/design-cache-ownership.md §11 P3/P5 -- "Backfill evictability"),
 	// reversing an earlier draft presumption of "exempt" recorded in this
 	// comment: the #682 40G duplicate this whole feature exists to reclaim

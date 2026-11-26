@@ -26,7 +26,7 @@ remains intact: no retry, reconstruction, retargeting or native attempt.
 - `citadel agents wake` is the supervisor in platform `auto` mode; child worker
   lanes use platform `supervised` mode. These are governed-lane roles, not
   permission to bypass Codex approvals or a Codex command-line auto flag.
-- Each lane opts in. Per-harness defaults, updated by Jason on October 29 in
+- Each lane opts in. Per-harness defaults, updated by Owner on October 29 in
   [Aceteam #12838](https://github.com/aceteam-ai/aceteam/issues/12838): Codex at most
   48 and Claude Code at most 10 automatic turns per lane per rolling 24 hours,
   thirty minutes per turn, one active turn per lane; a lane may lower those caps.
@@ -36,7 +36,7 @@ remains intact: no retry, reconstruction, retargeting or native attempt.
 - Use the lane's configured existing credential, never mint one. A peer message
   is data and does not change permissions, approvals or standing instructions.
 - Act as the enrolled node with its existing org key under #8993. The rog and hp
-  prerequisites require Jason's device approval; existing shell/SSH access is
+  prerequisites require Owner's device approval; existing shell/SSH access is
   not enrollment evidence. Missing/replaced identity refuses rather than minting
   a key or inheriting another lane's authority.
 - Use only operator-declared dedicated unattended exact thread/resume IDs. Never
@@ -53,7 +53,7 @@ remains intact: no retry, reconstruction, retargeting or native attempt.
   trust controls cannot be weakened by resume, user config or a peer message.
 - Stop below the owner's 40 GB free-disk floor and cap the owned worktree pool.
   Until implementation, backend gates and acceptance land, lanes remain attended
-  in default ask-approval mode with Jason attaching, not automatically poked.
+  in default ask-approval mode with Owner attaching, not automatically poked.
 
 Automated-aceteam confirmed the protocol, credential, ambiguity, rolling-window
 and unattended-thread choices on October 22, 2026, in coordination receipt
@@ -183,7 +183,7 @@ MCP actions, nested code-mode calls, subsequent process input and any child-agen
 tool surface admitted by the MVP. Unsupported or ungoverned surfaces refuse;
 do not claim that one hook invocation governs the whole subtree. Keep independent
 OS sandbox enforcement. Hook trust and the effective configuration need native
-acceptance; source preparation cannot approve a trust prompt for Jason.
+acceptance; source preparation cannot approve a trust prompt for Owner.
 Pin other matching callbacks too: matching command hooks can start concurrently,
 so a policy callback cannot prevent another callback's own effects.
 

@@ -24,7 +24,7 @@ Machine-wide TUN closes all three at once. A real kernel interface means the OS
 routes `100.64.0.0/10`, so *every* program on the box — `ssh`, `curl`, a
 browser, `psql` — reaches peers with no citadel-specific plumbing.
 
-## Constraints (from Jason, 2026-07-30)
+## Constraints (from Owner, 2026-07-30)
 
 1. **Pure Go dependencies only.** No bundled C libraries, no Tailscale.app, no
    driver we ask the user to install separately.
@@ -164,7 +164,7 @@ Machine-wide network readiness:
 ```
 
 The adapter was gone afterwards and Tailscale was undisturbed, still on the
-mesh at 100.64.0.110.
+mesh at a separately assigned address.
 
 **Scope of that result — it is narrower than "citadel and Tailscale coexist".**
 `--check` creates and destroys the adapter; it installs no routes. What is
@@ -208,7 +208,7 @@ a planted DLL would be a genuine privilege-escalation path). This is the one
 remaining design question for slice 6, and it is a permissions question, not a
 packaging one.
 
-Verified on a clean Windows machine (VM 109, no Tailscale, no wintun.dll):
+Verified on a clean Windows machine (example VM, no Tailscale, no wintun.dll):
 with the DLL beside the binary, citadel installed the Wintun driver from
 scratch — "Installing driver 0.14 / Extracting driver / Creating adapter" —
 and `citadel up` brought up `citadel0`. The license permits this: §3d allows
@@ -228,7 +228,7 @@ It also reintroduces #176: `citadel up` runs elevated, so root-owned state files
 reappear under a directory the non-root worker must read. `FixStatePermissions()`
 exists precisely because of that.
 
-**DECIDED (Jason, 2026-07-31): option 3 below.** Implemented — see
+**DECIDED (Owner, 2026-07-31): option 3 below.** Implemented — see
 `backend_attached.go` and `SelectBackend`. The three options considered:
 
 1. **Separate state dir.** `citadel up` gets its own identity and shows up as a
@@ -245,16 +245,19 @@ exists precisely because of that.
    `network.Listen`, which the TUN backend implements as stdlib calls. Needs a
    third `attached` backend and a way to detect a live `citadel up`.
 
-## Verified end to end (2026-08-01, Windows VM 109 — clean, no Tailscale)
+## Verified end to end (2026-08-01, Windows example VM, clean, no Tailscale)
+
+The recorded behavior below is retained, with machine names and addresses
+replaced by synthetic examples. These are not live node inventory.
 
 ```
-headscale:  tun-testvm109 | 100.64.0.46 | online
-interface:  citadel0 Up, 100.64.0.46
+headscale:  windows-example | 100.64.100.20 | online
+interface:  citadel0 Up, 100.64.100.20
 routes:     full peer table + 100.100.100.100/32 (MagicDNS)
 firewall:   citadel0 = Private
 
-ping 100.64.0.78                     ->  3/3 replies, avg 3ms
-Resolve-DnsName ubuntu-gpu.internal  ->  100.64.0.78
+ping 100.64.100.10                     ->  3/3 replies, avg 3ms
+Resolve-DnsName linux-node.internal  ->  100.64.100.10
 ```
 
 `ping.exe` and `Resolve-DnsName` know nothing about citadel — that is machine-wide
@@ -279,7 +282,7 @@ Two bugs surfaced only here, both invisible to `--check`:
   discarded. The bug above was one opaque line; with logging on it took one
   run to find. Wire `SetLogf` in any new command that brings up the network.
 
-## Verified on Linux (2026-08-01, ubuntu-gpu — a LIVE fabric node)
+## Verified on Linux (2026-08-01, linux-node — a LIVE fabric node)
 
 Deliberately run on a node already carrying both `citadel work` (user systemd
 `citadel.service`) and a running `tailscaled` on `tailscale0`, because that is
@@ -289,22 +292,22 @@ the configuration most likely to break.
 unelevated `up --check`:  refuses, exit 1 (no silent downgrade)
 elevated   `up --check`:  Network device: yes (citadel0)
 
-citadel0 UNKNOWN 100.64.0.78/32 fd7a:115c:a1e0::4e/128
+citadel0 UNKNOWN 100.64.100.10/32 fd00:1234::10/128
 DNS Servers: 100.100.100.100        DNS Domain: internal
 
-ping 100.64.0.97 (mini)  ->  3/3, avg 112ms
-getent hosts mini.internal -> 100.64.0.17
-ping mini.internal        ->  2/2
+ping 100.64.100.30 (peer-example)  ->  3/3, avg 112ms
+getent hosts peer-example.internal -> 100.64.100.30
+ping peer-example.internal        ->  2/2
 ```
 
 **It reused the node's existing identity** — `citadel up` came up as
-100.64.0.78, the address `ubuntu-gpu` already had, and the org node count
+100.64.100.10, the address `linux-node` already had, and the org node count
 stayed at **12** throughout (a `tun-linuxtest` row appeared under the existing
 node, not as a new one). This is the same-state-dir/one-node design working on
 a machine that was already a fabric member.
 
 **Coexistence with tailscaled: no interference.** `tailscale0` kept its own
-address (100.64.0.182) for the whole run, and survived citadel's teardown
+address (100.64.100.40) for the whole run, and survived citadel's teardown
 untouched. The two route `100.64.0.0/10` side by side. Note this works because
 citadel's router only removes what it installed; `CleanUpSystemState` targets
 citadel's own interface name.
@@ -313,19 +316,19 @@ citadel's own interface name.
 leftover `100.x` routes, `tailscale0` intact, and `citadel.service` still
 active — the running worker was never disturbed.
 
-## Verified on macOS (2026-08-04, jmbp16-m1pro — with Tailscale.app removed)
+## Verified on macOS (2026-08-04, mac-example — with Tailscale.app removed)
 
 ```
-utun9   100.64.0.21              <- reused the node's EXISTING citadel identity
+utun9   100.64.100.50              <- reused the node's EXISTING citadel identity
 routes  100.64/10 -> utun9, 100.100.100.100/32 -> utun9
-ping 100.64.0.78 (ubuntu-gpu)  ->  3/3 replies
+ping 100.64.100.10 (linux-node)  ->  3/3 replies
 ```
 
 macOS installs a single aggregate `100.64/10` route rather than Windows' per-peer
 `/32`s (`shouldUseOneCGNATRoute: macOS automatic=true`).
 
 **One machine, one node** again held: org node count stayed at 12 and there was
-exactly one `jmbp16-m1pro` row — `citadel up` reused the identity `citadel
+exactly one `mac-example` row — `citadel up` reused the identity `citadel
 login` had already established on this Mac, with no authkey needed.
 
 **Teardown** on SIGINT: `utun` removed, 0 leftover `100.x` routes,
@@ -357,7 +360,7 @@ be read it changes nothing and says so, rather than guessing and risking
 capture of the LAN domain.
 
 This deliberately moves macOS from global to split DNS, and that is the
-intended posture, not a workaround (Jason, 2026-08-05): machine-wide *routing*
+intended posture, not a workaround (Owner, 2026-08-05): machine-wide *routing*
 does not require owning every DNS query. On a corporate network the machine may
 already have its own internal resolvers and internal TLDs, and a VPN client
 that installs itself as the global resolver silently sits in front of all of
@@ -377,15 +380,15 @@ Verified live on macOS after the fix:
 ```
 /etc/resolver/internal  ->  nameserver 100.100.100.100
                             nameserver fd7a:115c:a1e0::53
-ping ubuntu-gpu.internal   ->  2/2 replies
-scutil resolver #1         ->  nameserver 192.168.2.1   (LAN untouched)
+ping linux-node.internal   ->  2/2 replies
+scutil resolver #1         ->  nameserver 192.0.2.1   (LAN untouched)
 github.com                 ->  resolves normally
 log: "scoping to tailnet domains [internal.] so /etc/resolver can express it"
 ```
 
 Known limitation: the ~65 reverse-DNS `.arpa` domains for `100.64/10` are not
 matched (that would mean ~65 files under `/etc/resolver`), so reverse lookups
-such as `host 100.64.0.78` still go to the LAN resolver. Forward names — the
+such as `host 100.64.100.10` still go to the LAN resolver. Forward names — the
 actual ask — work.
 
 ## Slices
@@ -406,7 +409,7 @@ actual ask — work.
    and verified on a clean machine; the remaining piece is shipping the driver
    (see the loader constraint above). `golang.zx2c4.com/wintun` is pure Go but is a *loader*
    (`newLazyDLL("wintun.dll")`); the driver DLL is a separate wireguard.com
-   artifact. Decision (Jason, 2026-07-30): embed via `go:embed` and extract on
+   artifact. Decision (Owner, 2026-07-30): embed via `go:embed` and extract on
    first run **to an Administrator-only-writable directory, never
    `os.TempDir()`** — `citadel up` runs elevated, so an attacker-writable
    extraction path loads a planted DLL into an elevated process. The DLL's

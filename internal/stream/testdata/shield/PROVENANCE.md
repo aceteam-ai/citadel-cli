@@ -2,7 +2,7 @@
 
 These seven combined-access-log fixtures are byte-for-byte copies of the
 existing `examples/*.log` files in
-`/home/jason/workspace/aceteam-ai/shield-concept/`, inspected on 2026-10-19.
+`/home/owner/workspace/aceteam-ai/shield-concept/`, inspected on 2026-10-19.
 They contain synthetic documentation/benchmark IP addresses, example hostnames,
 and generated requests, not customer logs. `gen.py` declares `random.seed(7)`;
 it was read, not rerun. Each vendored log retains its original final newline.
@@ -14,7 +14,7 @@ sections 3.3, 3.5, 3.8, and 7.
 ## Source durability prerequisite
 
 At this inspection the prototype directory had no separate Git repository.
-Its enclosing repository was `/home/jason/workspace/aceteam-ai`, whose
+Its enclosing repository was `/home/owner/workspace/aceteam-ai`, whose
 `git ls-files -- shield-concept` returned no tracked paths and whose scoped
 status listed the prototype files as untracked. There is no source commit to
 cite. The design explicitly requires committing the prototype before ST1;

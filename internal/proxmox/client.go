@@ -19,7 +19,7 @@ import (
 
 // Client communicates with a Proxmox VE API server.
 type Client struct {
-	baseURL    string // e.g. "https://192.168.2.4:8006"
+	baseURL    string // e.g. "https://192.168.50.4:8006"
 	httpClient *http.Client
 
 	// Auth: exactly one of tokenHeader or ticket should be set.
@@ -28,14 +28,14 @@ type Client struct {
 	csrfToken   string
 }
 
-// BaseURL returns the configured Proxmox API base URL (e.g. "https://192.168.2.4:8006").
+// BaseURL returns the configured Proxmox API base URL (e.g. "https://192.168.50.4:8006").
 func (c *Client) BaseURL() string {
 	return c.baseURL
 }
 
 // ClientConfig holds configuration for creating a new Client.
 type ClientConfig struct {
-	// BaseURL is the Proxmox host URL, e.g. "https://192.168.2.4:8006".
+	// BaseURL is the Proxmox host URL, e.g. "https://192.168.50.4:8006".
 	BaseURL string
 
 	// TokenID is the API token in the format "user@realm!tokenid".

@@ -33,7 +33,7 @@ var wantSetupPostureRefused = []string{
 	JobTypeFileScreenshot, JobTypeVNCScreenshot, JobTypeVNCType, JobTypeVNCKeys, JobTypeVNCActions,
 	JobTypeCobrowse, JobTypeTranscribeAudio, JobTypeSynthesizeSpeech, JobTypeMediaGenerate,
 	JobTypeWhatsAppProvision, JobTypeResourceSnapshot, JobTypeInstanceMessage, JobTypeModuleSet,
-	JobTypeFineTuneStart, JobTypeExposeSet, JobTypeExposeList, JobTypeLaneInventory, JobTypeUnexpose,
+	JobTypeFineTuneStart, JobTypeExposeSet, JobTypeExposeList, JobTypeLaneInventory, JobTypeLaneOperation, JobTypeUnexpose,
 	JobTypeMeetingJoin, JobTypeHuddleJoin, JobTypeHuddleTeardown, JobTypeDocumentRasterize,
 	JobTypeShowPairingCode, JobTypeClearPairingCode, JobTypeVoiceManage,
 	JobTypeAppDeploy, JobTypeAppStop, JobTypeAppStart, JobTypeAppStatus, JobTypeAppLogs, JobTypeAppDestroy,

@@ -699,6 +699,7 @@ func startTerminalServer(orgID string, activityFn func(level, msg string)) error
 	termCfg.OrgID = orgID
 	termCfg.AuthServiceURL = authServiceURL
 	termCfg.Port = ccTerminalPort
+	termCfg.PermissionSource = loadNodePermissionsStrict
 
 	// Per-node passcode gate (aceteam#6524), same as the `citadel work` terminal
 	// server: even after a valid token or same-owner mesh identity, a connection
@@ -2394,6 +2395,10 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		ConfigDir:           "",
 		Services:            nil,
 		PermissionsProvider: loadNodePermissions,
+		CobrowseJobRecovery: func() bool {
+			runner := ccNodeRunner.Load()
+			return runner != nil && runner.CobrowseJobRecoveryAvailable()
+		},
 		JobTypes: func() []string {
 			runner := ccNodeRunner.Load()
 			if runner == nil {

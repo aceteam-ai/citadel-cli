@@ -1,6 +1,6 @@
 # Meeting safety timing and disclosure
 
-Refs #1505 and Jason's [accepted values](https://github.com/aceteam-ai/citadel-cli/issues/1505#issuecomment-6525494676).
+Refs #1505 and Owner's [accepted values](https://github.com/aceteam-ai/citadel-cli/issues/1505#issuecomment-6525494676).
 The node's source contract lives in `meetingpolicy.Default`, `Profile.Budget`
 and `Budget.CheckAuthority`. The shared numeric [fixture](meeting-pipeline-budget-fixtures.json)
 is a producer/node test contract, not new wire fields or live acceptance.

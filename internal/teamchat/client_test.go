@@ -60,7 +60,7 @@ func TestMessagesPagination(t *testing.T) {
 		w.Write([]byte(`{
 			"messages":[
 				{"id":"m-1","channel_id":"ch-1","content":"hello","created_at":"2026-07-01T12:00:00+00:00","message_type":"user","reply_count":0,
-				 "sender":{"id":"u-1","email":"jason@example.com","full_name":"Jason Sun"}},
+				 "sender":{"id":"u-1","email":"owner@example.com","full_name":"Test User"}},
 				{"id":"m-2","channel_id":"ch-1","content":"hi from an agent","created_at":"2026-07-01T12:00:05.123456+00:00","message_type":"agent","reply_count":2,
 				 "agent":{"id":"a-1","title":"Ace"},"sender":null}
 			],
@@ -80,8 +80,8 @@ func TestMessagesPagination(t *testing.T) {
 	}
 
 	human, agent := page.Messages[0], page.Messages[1]
-	if human.SenderLabel() != "Jason Sun" {
-		t.Errorf("human SenderLabel = %q, want Jason Sun", human.SenderLabel())
+	if human.SenderLabel() != "Test User" {
+		t.Errorf("human SenderLabel = %q, want Test User", human.SenderLabel())
 	}
 	if agent.SenderLabel() != "Ace" {
 		t.Errorf("agent SenderLabel = %q, want Ace", agent.SenderLabel())
@@ -144,7 +144,7 @@ func TestListMembers(t *testing.T) {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
 		w.Write([]byte(`{"members":[
-			{"id":"cm-1","user_id":"u-1","role":"admin","source":"direct","user":{"id":"u-1","email":"jason@example.com","full_name":"Jason Sun"}},
+			{"id":"cm-1","user_id":"u-1","role":"admin","source":"direct","user":{"id":"u-1","email":"owner@example.com","full_name":"Test User"}},
 			{"id":"team:t-1:u-2","user_id":"u-2","role":"member","source":"team","user":{"id":"u-2","email":"justin@example.com"}}
 		]}`))
 	})
@@ -156,7 +156,7 @@ func TestListMembers(t *testing.T) {
 	if len(members) != 2 {
 		t.Fatalf("got %d members, want 2", len(members))
 	}
-	if members[0].Label() != "Jason Sun" {
+	if members[0].Label() != "Test User" {
 		t.Errorf("member 0 label = %q", members[0].Label())
 	}
 	if members[1].Label() != "justin@example.com" {

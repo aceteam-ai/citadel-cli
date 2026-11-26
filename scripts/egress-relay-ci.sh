@@ -14,21 +14,21 @@
 #   it is only meaningful on a fabric with two independent public egresses.
 #   This is the automated form of Act 4 of docs/demo-sovereign-fabric-runbook.md.
 #
-# TOPOLOGY (the aceteam dual-uplink pve host, 192.168.2.4):
-#   - RELAY  = CT114 "citadel-relay"  on Cogeco cable, runs `citadel egress-relay
+# TOPOLOGY (illustrative roles on a dual-uplink operator host):
+#   - RELAY  = the relay container on uplink A, runs `citadel egress-relay
 #              serve` (systemd unit citadel-relay.service), mesh SOCKS5 :7861.
-#   - CLIENT = CT113 "citadel-client" on Bell fiber, runs `citadel proxy 1055
-#              100.64.0.53:7861 --bind 127.0.0.1` (systemd unit
+#   - CLIENT = the client container on uplink B, runs `citadel proxy 1055
+#              <relay-mesh-address>:7861 --bind 127.0.0.1` (systemd unit
 #              citadel-proxy.service), exposing a LOCAL SOCKS5 at 127.0.0.1:1055
 #              that citadel's own userspace mesh dial bridges to the relay. No
 #              kernel TUN is needed on the client for this to work.
-#   The self-hosted GitHub Actions runner lives INSIDE CT113, so "direct" here
-#   is the Bell uplink and "relayed" (via 127.0.0.1:1055) is the Cogeco uplink.
+#   The self-hosted GitHub Actions runner lives inside the client container,
+#   so "direct" uses uplink B and "relayed" (via 127.0.0.1:1055) uses uplink A.
 #
 # ASSERTIONS (in order; each has a DISTINCT exit code so the failure is legible):
 #   [infra=2] the client can reach the internet at all (direct fetch succeeds)
 #   [relay=3] the relay path is reachable (relayed fetch succeeds) -- i.e. both
-#             citadel-relay (CT114) and citadel-proxy (CT113) are actually up
+#             citadel-relay and citadel-proxy are actually up
 #   [flip=1]  the relayed public IP DIFFERS from the direct public IP -- the
 #             sovereign-egress proof. Drift-proof: it never hardcodes an ISP IP.
 #   [1]       (optional) if EXPECT_RELAY_IP / EXPECT_CLIENT_IP are set, the

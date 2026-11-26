@@ -47,6 +47,7 @@ type Collector struct {
 	laneActivity     func() []LaneActivity             // live bounded-execution-lane activity (citadel #908), optional
 	pairingDisplay   func() *PairingDisplayCapability  // live pairing-display capability probe (citadel #659), optional
 	cacheReport      func() *CacheReport               // live cache-index attribution (citadel #682 P3), optional
+	browseRecovery   func() bool                       // live scoped co-browse job-recovery support, optional
 	jobTypes         func() []string                   // live registered worker job types (aceteam #9962), optional
 	permissions      func() *config.Permissions        // authoritative node permission policy, optional
 	visibleGPUs      []string                          // nil = all devices
@@ -126,6 +127,8 @@ type CollectorConfig struct {
 	// capability-aware dispatch. nil or an empty result leaves job_types omitted
 	// until the live runner is fully registered.
 	JobTypes func() []string
+	// CobrowseJobRecovery reads the live configured recovery adapter.
+	CobrowseJobRecovery func() bool
 	// VisibleGPUs, when non-nil, limits GPU metrics to these device indexes
 	// (CUDA_VISIBLE_DEVICES entries). A batch allocation reports only the GPUs
 	// its scheduler gave it; an empty non-nil slice reports none. nil (every
@@ -183,6 +186,7 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		pairingDisplay:   cfg.PairingDisplay,
 		cacheReport:      cfg.CacheReport,
 		jobTypes:         cfg.JobTypes,
+		browseRecovery:   cfg.CobrowseJobRecovery,
 		permissions:      cfg.PermissionsProvider,
 		visibleGPUs:      cfg.VisibleGPUs,
 		appPods:          cfg.AppPods,
@@ -555,6 +559,12 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	// surfaces never appear dispatchable.
 	if c.jobTypes != nil {
 		status.Capabilities.JobTypes = c.jobTypes()
+	}
+	// Clear a cached value too: unsupported/disabled is never a stale true.
+	status.Capabilities.CobrowseJobRecovery = nil
+	if c.browseRecovery != nil {
+		enabled := c.browseRecovery()
+		status.Capabilities.CobrowseJobRecovery = &enabled
 	}
 
 	// Advertise the generic sandboxed-module runtime availability (citadel-cli

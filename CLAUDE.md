@@ -31,6 +31,12 @@ So, when adding to this file:
 
 ## Project Overview
 
+`housekeeping.Plan` owns the pure, supplied-metadata dry-run policy receipt.
+`newHousekeepingCommand` exposes only the stdin-driven `housekeeping plan` leaf;
+`isHousekeepingPlanCommand` scopes its startup exemption after profile admission.
+It does not scan, inspect native handles/Git state, delete, install a timer or
+publish remote cleanup authority. See `docs/housekeeping-plan.md` for that boundary.
+
 `status.collectCapacityMetrics` owns additive optional heartbeat placement
 signals and per-source unknown handling. `nativeCapacityProbes` owns the
 build-tagged OS readers; `TestCapacity*` exercises bounded procfs parsing and
@@ -1123,6 +1129,31 @@ not appear in diagnostics. `tests/test_hosted_turn_token.py` and
 
 ### Worker Mode (Redis Streams) - High-Performance Private Cloud
 
+`worker.TmuxSessionHandler` owns `TMUX_SESSION`. Like `LANE_OPERATION`, it
+runs only from this node's exact per-node stream with a matching payload node
+id, checked before the shell gate. `ensure`/`create` (and any other action)
+then pass `jobs.ShellGateReason` with the shared passcode throttle; `list` and
+`has` need only the stream and the live Shell permission. It is advertised only
+while Shell is on, is wired in `buildNodeJobHandlers`, and is not on the
+diagnostic Nexus path or the setup-posture allowlist. `jobs.TmuxSessionHandler`
+still owns name and lease validation.
+
+`worker.LaneOperationHandler` serves aceteam's `lane_capture` and `lane_send`
+(`LANE_OPERATION`, #1659). It accepts only this node's exact per-node stream and
+payload node id. Those checks run before the SHELL_COMMAND shell gate and shared
+passcode throttle, so a misrouted job never counts as a wrong passcode. It is
+advertised only while tmux accepts `-N`, the gates are wired and shell is on.
+`laneop.Service.Send` owns once-per-offer submission. The `laneop.Ledger` record
+is written before any paste, and a redelivered offer replays it without calling
+tmux. The message reaches tmux only on stdin, through a bracketed paste. Enter
+is pressed only when `laneop.ReadScreen` shows an empty, framed input box before
+the paste and exactly the message after it. Unrecognized screens refuse.
+A send refusal is a successful result with `status: rejected`, because the
+server reads send status only from an end event. `jobprivacy.Retained` drops
+the message from every retained rendering. The recognizer fixtures are
+synthetic, so acceptance against a live harness happens after merge. Nothing
+writes `mcp:lane:binding` yet: the server has no authenticated binding verb.
+
 `laneinventory.Collector` owns the read-only #1699 metadata projection and its
 bounded redaction. `worker.LaneInventoryHandler` requires the exact configured
 own-node stream; paired platform key-bound session-read admission is #14139,
@@ -1677,7 +1708,7 @@ layer down — through the real `Manager`, a fake `Renderer`, and
 future "log the payload on parse failure" edit to either layer trips one of
 these.
 
-Per Jason's product decision, the console render is unconditional (never
+Per Owner's product decision, the console render is unconditional (never
 refused because the console appears "in use") but always carries an
 explanatory banner ("someone is requesting access to this machine") so a
 person at the physical console understands why their screen changed.
@@ -2377,12 +2408,29 @@ the intended fail-closed direction. (Constructing it also needs the verifier
 and the control server cert.) Check callers before moving a route, in aceteam
 as well as in this repo's own CLI commands. Wire both sides with
 `cmd.registerControlOnlyAPI`, whose test pins which listener each side lands on.
+
 A coordinator cert does not override the operator's permission toggles: a
 control route for a toggled surface also takes that permission, read strictly
 per request, as its extra gate (`registerRAGControlAPI` and
 `registerProvisionControlAPI` own this for `/rag` and provisioning), and
 `/ssh/authorized-keys` takes it through `status.ServerConfig.SSHDeployAllowed`,
 where nil refuses.
+
+`status.Server.bindAddr` owns the plaintext listener's bind: loopback by default,
+all interfaces only on the explicit `cmd.statusBindLAN` opt-in (logged loudly at
+start); mesh reachability comes only from the `AddListener` VPN listener. The
+`/agent/*` table is `status.Server.agentRoutes`: its `sensitive` routes (logs,
+config, log level, resubscribe, worker restart) answer a flat fail-closed 403
+on the plaintext listener (`agentMovedToControl`) and are served for real by
+`registerAgentControlRoutes` behind `requireCoordinator`; the read-only routes
+use `requireAgentCaller`, which admits only a mesh peer that
+`cmd.meshPeerVerifier` (WhoIs: same owner, stable device and owner id) vouches
+for, or a valid org token. Neither a CGNAT source nor loopback is an identity
+(the exposure relay and the gateway dial loopback for remote callers), and a
+forwarding header voids the mesh branch. `cmd.platformTarget` refuses a
+platform exposure that would forward to loopback on the node's own status or
+control port. Change a route's class in that table, not at the registration
+sites.
 
 `status.Server.ControlTLS` reports the public certificate held by the active
 control listener, using the same immutable DER snapshot as its TLS config.

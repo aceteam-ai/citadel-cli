@@ -443,6 +443,6 @@ and the capped ten-minute CPU timing on the target node, then review the final
 closed schema and registration manifest/hash. The independent render wall
 timeout is two hours; RunNodeJob currently caps a supplied timeout at 1800 s.
 Coordinate the eventual release with FILE_FETCH (#11482); source presence or a
-version number alone does not establish node capability. Jason owns the eventual
-template registration and approval on node 1795, after the release routed through
+version number alone does not establish node capability. Owner owns the eventual
+template registration and approval on a dev node, after the release routed through
 automated-citadel. This source change performs none of those actions.

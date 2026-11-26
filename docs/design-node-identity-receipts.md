@@ -23,7 +23,7 @@ signing overlaps `internal/nodevault` (the master-PIN/browser-session lane,
 owned by a different agent per the 2026-08-25 lane split — see
 `internal/nodevault`'s recent history below). This doc reads `internal/nodevault`
 read-only, does not modify it, and treats "which key signs the receipt" as an
-open decision for Jason, not something resolved here.
+open decision for Owner, not something resolved here.
 
 ---
 
@@ -181,7 +181,7 @@ structurally cannot do unattended signing as designed." Section 3 below
 proposes `nodeidentity`'s existing ECDSA key as the signing primitive
 precisely because it is the one node-local key that is both asymmetric and
 available without a human present — and flags that this is a recommendation
-for Jason to confirm, not a decision made unilaterally.
+for Owner to confirm, not a decision made unilaterally.
 
 ---
 
@@ -283,7 +283,7 @@ and cannot back unattended signing as currently designed.**
 `internal/nodeidentity.Store`'s existing ECDSA P-256 keypair
 (`GetOrCreateKey`, `nodeidentity.go:105`) is unattended-capable and already
 generated at every `citadel init` — it is the recommended primitive, but this
-is a recommendation for Jason to confirm, not a decision this doc makes
+is a recommendation for Owner to confirm, not a decision this doc makes
 unilaterally, because:
 
 - `internal/nodeidentity` was built for a different purpose (mTLS
@@ -414,7 +414,7 @@ starting.
 
 ---
 
-## Open questions for Jason
+## Open questions for Owner
 
 1. **Nodevault-lane / key-choice decision (blocks Phase 2/3 entirely, read
    this first):** nodevault as built cannot back unattended signing (§1c) —
