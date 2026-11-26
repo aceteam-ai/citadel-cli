@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/aceteam-ai/citadel-cli/internal/laneinventory"
 )
@@ -106,6 +107,40 @@ func TestSessionSearchWithholdAndBounds(t *testing.T) {
 	}
 	if len([]rune(safe(strings.Repeat("界", 300)))) != 240 {
 		t.Fatal("rune bound changed")
+	}
+}
+
+func TestSessionSearchDisplayFormatCharacters(t *testing.T) {
+	home := t.TempDir()
+	fixture(t, home, ".claude/history.jsonl", `{"display":"needle prompt\u202e next\u200b field","project":"/synthetic/\u2066project\u2069","sessionId":"`+testID+`","timestamp":1793491200000}`+"\n")
+	fixture(t, home, ".claude/projects/project/"+testID+".jsonl", `{"type":"custom-title","customTitle":"title\u202e next\u202c\u200d field"}`+"\n"+
+		`{"type":"assistant","timestamp":"2026-11-01T00:02:00Z","message":{"role":"assistant","content":[{"type":"text","text":"needle reply\u2067 next\u2069\ufeff field"}]}}`+"\n")
+	report := find(t, home, Options{Query: "needle"})
+	if len(report.Hits) != 1 || len(report.Hits[0].Snippets) != 2 {
+		t.Fatal("synthetic display fixture not selected")
+	}
+	hit := report.Hits[0]
+	values := []string{hit.Title, hit.Cwd}
+	for _, snippet := range hit.Snippets {
+		values = append(values, snippet.Text)
+	}
+	for _, value := range values {
+		if value == "" {
+			t.Fatal("display value missing")
+		}
+		for _, r := range value {
+			if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+				t.Fatal("display formatting character survived")
+			}
+		}
+	}
+	if hit.Title != "title next field" || hit.Cwd != "/synthetic/ project" {
+		t.Fatalf("unexpected normalized display: %q %q", hit.Title, hit.Cwd)
+	}
+	for _, r := range []rune{'\u202a', '\u202b', '\u202c', '\u202d', '\u202e', '\u2066', '\u2067', '\u2068', '\u2069', '\u200b', '\u200c', '\u200d', '\u200e', '\u200f', '\u2060', '\ufeff'} {
+		if got := safe("before" + string(r) + "after"); got != "before after" {
+			t.Fatalf("format category U+%04X survived", r)
+		}
 	}
 }
 func TestSessionSearchPlacement(t *testing.T) {

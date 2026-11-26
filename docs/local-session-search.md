@@ -25,8 +25,8 @@ Matches are grouped by harness and validated session UUID. Each result contains
 at most three recent matching snippets, each at most 240 characters, and the
 report contains at most 20 sessions. The shared `trust.CheckSecrets` guard scans
 the complete selected value before clipping and the final snippet after clipping;
-possible secrets are withheld. Titles use the same guard. Control characters are
-removed before terminal output. Detection is not a guarantee that all sensitive
+possible secrets are withheld. Titles use the same guard. Control and Unicode
+format characters are removed before terminal output. Detection is not a guarantee that all sensitive
 personal text is removed: this is an explicit owner-local content search.
 
 Traversal is capped at 4,096 entries, 4,096 grouped sessions, 16 MiB per file,

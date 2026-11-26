@@ -199,7 +199,7 @@ func safe(text string) string {
 		return withheld
 	}
 	text = strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
 			return ' '
 		}
 		return r
