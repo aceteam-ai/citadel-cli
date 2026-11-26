@@ -31,6 +31,12 @@ So, when adding to this file:
 
 ## Project Overview
 
+`housekeeping.Plan` owns the pure, supplied-metadata dry-run policy receipt.
+`newHousekeepingCommand` exposes only the stdin-driven `housekeeping plan` leaf;
+`isHousekeepingPlanCommand` scopes its startup exemption after profile admission.
+It does not scan, inspect native handles/Git state, delete, install a timer or
+publish remote cleanup authority. See `docs/housekeeping-plan.md` for that boundary.
+
 `status.collectCapacityMetrics` owns additive optional heartbeat placement
 signals and per-source unknown handling. `nativeCapacityProbes` owns the
 build-tagged OS readers; `TestCapacity*` exercises bounded procfs parsing and
