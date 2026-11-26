@@ -164,7 +164,7 @@ Machine-wide network readiness:
 ```
 
 The adapter was gone afterwards and Tailscale was undisturbed, still on the
-mesh at 100.64.0.110.
+mesh at a separately assigned address.
 
 **Scope of that result — it is narrower than "citadel and Tailscale coexist".**
 `--check` creates and destroys the adapter; it installs no routes. What is
