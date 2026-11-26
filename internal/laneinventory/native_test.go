@@ -70,7 +70,7 @@ func TestInventoryNativeProcessOwnership(t *testing.T) {
 func TestInventoryNativeSeams(t *testing.T) {
 	// Construction is lazy; never invoke these native functions in source tests.
 	c := NewNative("/fixture/not-opened")
-	if c.Deps.Panes == nil || c.Deps.Argv == nil || c.Deps.Git == nil || c.Deps.Declarations == nil {
+	if c.Deps.Panes == nil || c.Deps.Argv == nil || c.Deps.ThreadID == nil || c.Deps.Git == nil || c.Deps.Declarations == nil {
 		t.Fatal("native edge missing")
 	}
 	lookups := []string{}

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -233,7 +234,8 @@ func terminalSessionName(name, base string) bool {
 }
 
 // NewNative does not perform any observation at construction. The caller
-// selects nodeDir once at the CLI/worker boundary; no leaf home/config lookup.
+// selects nodeDir once at the CLI/worker boundary. The optional descriptor
+// fallback resolves default transcript roots lazily for the current user.
 // Unsupported same-user process identity (notably Windows) refuses rather than
 // returning another user's data. No Environ, prompt/rollout/log read exists.
 func NewNative(nodeDir string) Collector {
@@ -302,7 +304,28 @@ func NewNative(nodeDir string) Collector {
 			})
 		},
 		Declarations: func(ctx context.Context) (map[int32]string, error) { return declaredPIDs(ctx, nodeDir) },
-		Git:          func(ctx context.Context, cwd string) (*Worktree, error) { return readGit(ctx, runReadOnly, cwd) },
+		ThreadID: func(ctx context.Context, expected Process, harness string) (string, error) {
+			if runtime.GOOS != "linux" {
+				return "", ErrUnavailable
+			}
+			account, err := user.LookupId(strconv.FormatInt(int64(uid), 10))
+			if err != nil || !filepath.IsAbs(account.HomeDir) {
+				return "", ErrUnavailable
+			}
+			return nativeThreadID(ctx, uid, expected, filepath.Clean(account.HomeDir), "/proc", harness, func(ctx context.Context) ([]int32, int64, error) {
+				current, err := process.NewProcessWithContext(ctx, expected.PID)
+				if err != nil {
+					return nil, 0, err
+				}
+				ids, err := current.UidsWithContext(ctx)
+				if err != nil {
+					return nil, 0, err
+				}
+				started, err := current.CreateTimeWithContext(ctx)
+				return ids, started, err
+			})
+		},
+		Git: func(ctx context.Context, cwd string) (*Worktree, error) { return readGit(ctx, runReadOnly, cwd) },
 		Capacity: func(ctx context.Context) (Capacity, error) {
 			value := Capacity{NCPU: runtime.NumCPU()}
 			var failures []error
