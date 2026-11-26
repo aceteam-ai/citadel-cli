@@ -29,6 +29,7 @@ type LegacyHandlerAdapter struct {
 	// before the handler runs. On such an adapter the payload passcode key is
 	// removed, so the handler never sees it.
 	passcodeGate func(presented string) error
+	jobGate      func(*Job) error
 }
 
 // newGatedLegacyHandlerAdapter creates an adapter whose dispatchability follows
@@ -102,6 +103,11 @@ func (a *LegacyHandlerAdapter) RunBackground(ctx context.Context) {
 // Execute processes the job using the wrapped legacy handler.
 func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream StreamWriter) (*JobResult, error) {
 	start := time.Now()
+	if a.jobGate != nil {
+		if err := a.jobGate(job); err != nil {
+			return &JobResult{Status: JobStatusFailure, Error: err, Duration: time.Since(start)}, err
+		}
+	}
 	if a.enabled != nil && !a.enabled() {
 		err := legacyPermissionRefusal(a.jobType)
 		if a.refusal != nil {
@@ -236,6 +242,9 @@ var _ JobHandler = (*LegacyHandlerAdapter)(nil)
 
 // LegacyHandlerOpts configures optional behaviour for CreateLegacyHandlers.
 type LegacyHandlerOpts struct {
+	// ServiceOrgID and ServiceNodeID identify the node's service control stream.
+	ServiceOrgID  string
+	ServiceNodeID string
 	// CobrowseRecoveryNodeID and CobrowseRecoveryOrgID bind recovery jobs to
 	// this configured control node's exact per-node stream.
 	CobrowseRecoveryNodeID string
@@ -651,9 +660,9 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	if opts.ConfigDir != "" {
 		svcHandler := jobs.NewServiceHandlerWithWorkspace(opts.ConfigDir, opts.WorkspaceDir)
 		handlers = append(handlers,
-			NewLegacyHandlerAdapter(JobTypeServiceStart, svcHandler),
-			NewLegacyHandlerAdapter(JobTypeServiceStop, svcHandler),
-			NewLegacyHandlerAdapter(JobTypeServiceStatus, svcHandler),
+			newServiceLegacyHandlerAdapter(JobTypeServiceStart, svcHandler, opts),
+			newServiceLegacyHandlerAdapter(JobTypeServiceStop, svcHandler, opts),
+			newServiceLegacyHandlerAdapter(JobTypeServiceStatus, svcHandler, opts),
 		)
 	}
 

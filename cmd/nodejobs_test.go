@@ -54,11 +54,14 @@ func TestNodeJobHandlersCoverPrivilegedTypes(t *testing.T) {
 // separately-authorized, cross-platform read-only inspection handlers.
 func TestNodeJobHandlersAdvertiseReadOnlyInspectionWithShellDisabled(t *testing.T) {
 	opts := nodeJobHandlerOpts{
-		WorkspaceDir:  t.TempDir(),
-		ConfigDir:     t.TempDir(),
-		ShellDisabled: true,
-		WorkflowExec:  workflow.NewExecutor(workflow.ExecutorConfig{}),
-		HandlerLog:    func(string, ...any) {},
+		OrgID:          "example",
+		NodeID:         "node-a",
+		PermissionsDir: t.TempDir(),
+		WorkspaceDir:   t.TempDir(),
+		ConfigDir:      t.TempDir(),
+		ShellDisabled:  true,
+		WorkflowExec:   workflow.NewExecutor(workflow.ExecutorConfig{}),
+		HandlerLog:     func(string, ...any) {},
 	}
 	handlers, _ := buildNodeJobHandlers(opts)
 	runner := worker.NewRunner(nil, handlers, worker.RunnerConfig{})

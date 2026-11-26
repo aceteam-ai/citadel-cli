@@ -37,13 +37,14 @@ import (
 // enabled but has no passcode set fails CLOSED (access denied) — enablement
 // without a passcode never silently opens the surface.
 type Permissions struct {
-	Console   bool `yaml:"console" json:"console"`     // Terminal WebSocket access (default-deny, opt-in)
-	Desktop   bool `yaml:"desktop" json:"desktop"`     // VNC, screenshots, actions (default-deny, opt-in)
-	Files     bool `yaml:"files" json:"files"`         // File browser API (default-deny, opt-in)
-	Services  bool `yaml:"services" json:"services"`   // Service list/management (default-on, opt-out)
-	SSH       bool `yaml:"ssh" json:"ssh"`             // SSH authorized_keys sync (default-on, opt-out)
-	Provision bool `yaml:"provision" json:"provision"` // Container provisioning API (default-on, opt-out)
-	Shell     bool `yaml:"shell" json:"shell"`         // SHELL_COMMAND job execution (default-deny, opt-in)
+	Console     bool `yaml:"console" json:"console"`                               // Terminal WebSocket access (default-deny, opt-in)
+	Desktop     bool `yaml:"desktop" json:"desktop"`                               // VNC, screenshots, actions (default-deny, opt-in)
+	Files       bool `yaml:"files" json:"files"`                                   // File browser API (default-deny, opt-in)
+	Services    bool `yaml:"services" json:"services"`                             // Service list/management (default-on, opt-out)
+	SSH         bool `yaml:"ssh" json:"ssh"`                                       // SSH authorized_keys sync (default-on, opt-out)
+	Provision   bool `yaml:"provision" json:"provision"`                           // Container provisioning API (default-on, opt-out)
+	Shell       bool `yaml:"shell" json:"shell"`                                   // SHELL_COMMAND job execution (default-deny, opt-in)
+	HostNetwork bool `yaml:"host_network,omitempty" json:"host_network,omitempty"` // Service host networking (default-deny, local opt-in)
 
 	// CobrowsePublicOnly runs every remote (node-wide) co-browse session behind
 	// an egress guard that refuses loopback, private, link-local and mesh
