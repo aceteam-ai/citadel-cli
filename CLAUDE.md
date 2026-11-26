@@ -1708,7 +1708,7 @@ layer down — through the real `Manager`, a fake `Renderer`, and
 future "log the payload on parse failure" edit to either layer trips one of
 these.
 
-Per Jason's product decision, the console render is unconditional (never
+Per Owner's product decision, the console render is unconditional (never
 refused because the console appears "in use") but always carries an
 explanatory banner ("someone is requesting access to this machine") so a
 person at the physical console understands why their screen changed.

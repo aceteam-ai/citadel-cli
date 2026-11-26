@@ -81,7 +81,7 @@ func TestVerify_FailsClosed(t *testing.T) {
 		},
 		{
 			name:   "RFC1918 LAN IP is not a mesh address",
-			meshIP: "192.168.2.9",
+			meshIP: "192.168.50.9",
 			id:     sameOwnerIdentity(),
 		},
 		{

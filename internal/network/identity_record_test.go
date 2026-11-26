@@ -10,7 +10,7 @@ func TestIdentityRecord_SaveLoadRoundTrip(t *testing.T) {
 	rec := IdentityRecord{
 		HeadscaleNodeID: "758",
 		MeshIP:          "100.64.0.78",
-		Hostname:        "ubuntu-gpu",
+		Hostname:        "linux-node",
 		StableID:        "sha256:abc123",
 	}
 	if err := SaveIdentityRecord(dir, rec); err != nil {

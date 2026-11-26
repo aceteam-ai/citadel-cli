@@ -87,9 +87,9 @@ func TestMeetingDisclosureRequiresNewReadbackAndSeedsBeforePost(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			p := testParams()
 			p.BotDisplayName = "Recorder"
-			p.OwnerDisplayName = "Jason"
+			p.OwnerDisplayName = "Owner"
 			guard := map[string]struct{}{}
-			b := &disclosureBrowser{text: meetingpolicy.Announcement("Recorder", "Jason"), confirmed: tc.confirm, preexisting: tc.preexisting, postErr: tc.postErr, readErr: tc.readErr, guard: guard}
+			b := &disclosureBrowser{text: meetingpolicy.Announcement("Recorder", "Owner"), confirmed: tc.confirm, preexisting: tc.preexisting, postErr: tc.postErr, readErr: tc.readErr, guard: guard}
 			h := &MeetingJoinHandler{}
 			if got := h.announceOnAdmission(JobContext{}, b, guard, p); got != tc.want {
 				t.Fatalf("disclosure=%v want%v", got, tc.want)

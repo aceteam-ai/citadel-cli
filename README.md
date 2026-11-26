@@ -498,14 +498,14 @@ A remote E2E test script validates the full first-time user experience on a Wind
 
 # Full test (all phases)
 PYTHON=~/.venvs/winrm/bin/python3 ./scripts/windows-e2e-test.sh \
-  --host 192.168.2.207 --user acewin --password 'P@ssword' \
+  --host 192.168.50.207 --user acewin --password 'P@ssword' \
   --authkey tskey-auth-xxx
 
 # Dry run (show commands without executing)
-./scripts/windows-e2e-test.sh --dry-run --host 192.168.2.207 ...
+./scripts/windows-e2e-test.sh --dry-run --host 192.168.50.207 ...
 
 # Run a single phase: clean, install, provision, or verify
-./scripts/windows-e2e-test.sh verify --host 192.168.2.207 ...
+./scripts/windows-e2e-test.sh verify --host 192.168.50.207 ...
 ```
 
 See `scripts/windows-e2e-test.sh` for all options and WinRM setup instructions.

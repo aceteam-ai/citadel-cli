@@ -18,7 +18,7 @@ func TestConfigPath(t *testing.T) {
 func TestDeleteConfig_RemovesExistingFile(t *testing.T) {
 	dir := t.TempDir()
 
-	cfg := &Config{BaseURL: "https://192.168.2.4:8006", NodeName: "pve"}
+	cfg := &Config{BaseURL: "https://192.168.50.4:8006", NodeName: "pve"}
 	if err := SaveConfig(dir, cfg); err != nil {
 		t.Fatalf("SaveConfig: %v", err)
 	}

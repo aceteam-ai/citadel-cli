@@ -163,7 +163,7 @@ func TestNetworkStatusNodeIDField(t *testing.T) {
 	status := NetworkStatus{
 		Connected:    true,
 		BackendState: "Running",
-		Hostname:     "ubuntu-gpu-8gluaaom",
+		Hostname:     "linux-node-fixture1",
 		NodeID:       "758",
 		IPv4:         "100.64.0.1",
 	}

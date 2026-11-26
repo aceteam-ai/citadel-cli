@@ -946,7 +946,7 @@ type containerAdopter interface {
 }
 
 // selectingRunner runs the node-wide manager's sessions in containers while the
-// runtime is healthy and otherwise on the host runner (Jason D3: capability
+// runtime is healthy and otherwise on the host runner (Owner D3: capability
 // based, the fallback logged once per distinct reason).
 type selectingRunner struct {
 	host browserRunner

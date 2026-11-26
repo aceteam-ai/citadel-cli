@@ -1304,7 +1304,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	}
 	if nodeName == "" {
 		// Try to get the actual registered hostname from network status
-		// This returns the Headscale-assigned name (e.g., "ubuntu-gpu-8gluaaom") not just the requested name
+		// This returns the Headscale-assigned name (e.g., "linux-node-fixture1") not just the requested name
 		if netStatus, err := network.GetGlobalStatus(ctx); err == nil && netStatus.Connected && netStatus.Hostname != "" {
 			Debug("got hostname from network status: %s", netStatus.Hostname)
 			nodeName = netStatus.Hostname

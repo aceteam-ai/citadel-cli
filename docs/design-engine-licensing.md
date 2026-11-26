@@ -11,7 +11,7 @@ Legal disclaimer, stated once and meant everywhere below: AceTeam **labels**
 licences; it does not interpret them and does not give legal advice. A label of
 `commercial_use: allowed` is a transcription of a model card, not a warranty.
 Whether an org may use a given output is that org's decision, with its own
-counsel. Jason signs off on which licences are carried in the curated catalog;
+counsel. Owner signs off on which licences are carried in the curated catalog;
 nobody else in the pipeline is asserting anything legal.
 
 Facts below are marked **[verified]** (read from code at the cited line, or from
@@ -32,7 +32,7 @@ citadel-inference-server `faf0e19`, aceteam `781cc5833` (all `origin/main`).
 | 6 | Heartbeat `ServiceInfo.model_license` | `internal/status/types.go:664`; attached by `applyModelLicenseSignal` `collector.go:257-264`; store `model_license.go:18-73` | One string **per engine**, process-local, unpersisted, populated only after a TTS dispatch. Nothing on the platform reads it (aceteam#11455 section 5.1 confirms) | Label |
 | 7 | Diffusers sidecar catalog | citadel-cli `services/diffusers-service/image_models.py:126-222` `ImageModelSpec.license` + `permissive`; `/health.allowed_models[].license/permissive_license` (`image_swap.py:273-274`) | `apache-2.0` (FLUX.2-klein-4B, Z-Image-Turbo, Qwen-Image), `sai-nc-community (Stability AI Community License)` for sdxl-turbo, `unverified (operator-supplied DIFFUSERS_MODEL)` for custom | **Soft gate**: `DEFAULT_ALLOWLIST` `:233-237` excludes sdxl-turbo unless the operator names it. The licence is **not** carried to the MEDIA_GENERATE result (`internal/jobs/media_generate.go:301-345` receipt has task/size/seed only) |
 | 8 | Platform model catalogs | `python-backend/data/model_catalog.json` (47 entries: `Apache 2.0`, `MIT`, `Llama 3.1 Community License`, `Qwen License`, `LFM Open License v1.0`, `Gemma License`, `DeepSeek License`, `Stability AI Community License`); DB `fabric_catalog_models.license TEXT NOT NULL DEFAULT 'unknown'` (`supabase/migrations/20260701_fabric_catalog.sql:76`); HF ingest `models/hf_model_metadata.py:109,142` copies `cardData.license` else `"unknown"` | Free text, inconsistent casing (`Apache 2.0` vs `apache-2.0` vs `Apache-2.0`); community licences named, terms not encoded | Label: `fabric/models` page (`app/(protected)/fabric/models/[modelId]/page.tsx:341`), library card/table, `DatacenterModels.tsx:67` licence filter, MCP `fabric_catalog_models` (`aceteam_mcp_fabric_catalog.py:145`). The only **gate** is HF `gated` (`fabric_provision.py:871-884`), which is about download tokens, not licence terms |
-| 9 | Platform TTS receipt | `routes/native_tts.py:376-385` optional fields; `workflows/synthesize_speech.py:107-114` always-present keys, `:762-800` `_merge_license_fields` (first `commercial_use=False` wins); `utils/voice_license.py:41-57` and `utils/voiceLicense.ts:62-82` (`/\bNC\b/i` regex) | "most restrictive" = any non-commercial wins, else first. Unknown is **not** NC (`voiceLicense.ts:62`) | Label, explicitly: `EnrollVoiceDialog.tsx:477` "This is a label only and does not block anything"; Jason's 2026-10-09 decision in aceteam#11455/#11459 |
+| 9 | Platform TTS receipt | `routes/native_tts.py:376-385` optional fields; `workflows/synthesize_speech.py:107-114` always-present keys, `:762-800` `_merge_license_fields` (first `commercial_use=False` wins); `utils/voice_license.py:41-57` and `utils/voiceLicense.ts:62-82` (`/\bNC\b/i` regex) | "most restrictive" = any non-commercial wins, else first. Unknown is **not** NC (`voiceLicense.ts:62`) | Label, explicitly: `EnrollVoiceDialog.tsx:477` "This is a label only and does not block anything"; Owner's 2026-10-09 decision in aceteam#11455/#11459 |
 | 10 | Drive / pages | `document_info.metadata.license = {model_license, commercial_use, engine, source}` copied at attach/upload (aceteam#11459); `FileRow.tsx:238` chip; hosted-page footer notice (`utils/hostedPage.ts:852`) | Same subset as #9; aligner fields are dropped at this boundary | Label |
 | 11 | Signed receipts | `internal/aep/receipt_v2.go:54-83` canonical fields: version, node, job, time, engine, model, input/output/policy hashes, action, verdict hash, grounding; work receipts `:376`; app-deploy `:258` | **No licence field anywhere**. `policy_hash` is `EmptyPolicyHash` | n/a |
 | 12 | Usage records | `internal/usage/record.go:6-60` (`Backend`, `Model`, units, receipt binding) | No licence | n/a |
@@ -159,7 +159,7 @@ So:
 | Component | Authority | Why |
 |-----------|-----------|-----|
 | Module/engine **code** | citadel-services `service.yaml` `license.code`; embedded engines: a new `services/licenses.go` table keyed like `EngineCacheDirs` and pinned by a test | The module author knows the image's licence; it changes with the image tag |
-| **Weights** of a managed, catalog-deployed model | aceteam `fabric_catalog_models` row, pinned to `source_ref@revision` | Curated once, reviewed by Jason, versioned with the row |
+| **Weights** of a managed, catalog-deployed model | aceteam `fabric_catalog_models` row, pinned to `source_ref@revision` | Curated once, reviewed by Owner, versioned with the row |
 | Weights of an operator-chosen model (`DIFFUSERS_MODEL`, `LLAMACPP_MODEL`, a bare `ollama pull`) | The serving sidecar's own report (`/info`, diffusers `/health`), else `unknown` | The node is the only party that knows what is loaded |
 | Auxiliary components | The module that bundles them (voice-clone's aligner) | Only the module knows which aligner/VAE it loaded |
 | HF model card | **Evidence, not authority.** Recorded with the pull as `card_license@revision` | Cards change; OmniVoice has no tag; `other` is not a licence |
@@ -209,7 +209,7 @@ A job's effective licence is the fold of its components. Rules, per flag:
 
 ### 2f. Policy: label vs gate
 
-Default posture stays **label only**, per Jason's 2026-10-09 decision
+Default posture stays **label only**, per Owner's 2026-10-09 decision
 (aceteam#11455/#11459) and the consent dialog's own wording. The design adds
 the data so a gate *could* exist, and defines where one would sit, without
 turning any on.
@@ -277,7 +277,7 @@ simply omit the new object and the platform's "absent means None" rule holds.
 
 | Phase | Scope | Gate to start |
 |-------|-------|---------------|
-| P0 | Licence table + normalizer + fold, in all three languages; normalize `fabric_catalog_models.license` and `model_catalog.json` (data migration, Jason sign-off); every citadel-services `service.yaml` and every `ServiceMap` engine gets a `license.{code,weights}` block; catalog tests fail on a missing block | Jason approves the table and the `LicenseRef-` list |
+| P0 | Licence table + normalizer + fold, in all three languages; normalize `fabric_catalog_models.license` and `model_catalog.json` (data migration, Owner sign-off); every citadel-services `service.yaml` and every `ServiceMap` engine gets a `license.{code,weights}` block; catalog tests fail on a missing block | Owner approves the table and the `LicenseRef-` list |
 | P1 | Per-model resolution: diffusers licence into `MEDIA_GENERATE` output, catalog pin into `llm_inference` output, `ModelLicenses` on the heartbeat, `license_drift` from the pull record, chips read the object | P0 merged |
 | P2 | Receipts and usage: unsigned `license` + `license_hash` beside `aep_receipt`; `UsageRecord` columns; `fabric_run_work` ingest | P1; aceteam#9287 verifier told to ignore the sibling |
 | P3 | Policy: node acceptance file + `citadel license accept`; org policy enum; marketplace default exclusion; signed `license_hash` rides the v3 JCS cutover | Section 3 decided 2026-10-20; the enforcement parts (org `block`, marketplace exclusion) wait for a new decision under the surface-only override |
@@ -304,12 +304,12 @@ simply omit the new object and the platform's "absent means None" rule holds.
 Legal interpretation of any licence; automated reading of licence text; a
 content filter; DRM; retroactive relabeling of already-published artifacts
 (they keep whatever label they carried, per aceteam#11459's "no network read at
-render time"). The product labels and records; Jason, with counsel, decides what
+render time"). The product labels and records; Owner, with counsel, decides what
 any label means for the business.
 
 ## 3. Owner decisions (2026-10-20)
 
-Jason accepted all eight recommendations, with one override: **surface only,
+Owner accepted all eight recommendations, with one override: **surface only,
 no enforcement for now.** Nothing refuses, gates or excludes until a later
 decision. The held build slice is #1377.
 
@@ -324,9 +324,9 @@ decision. The held build slice is #1377.
    acceptance screen later. A node owner's acceptance never satisfies a
    consuming org's policy.
 6. **Catalog licence pins.** A `license-review` label on the catalog PR plus a
-   named second reviewer (Jason by default).
+   named second reviewer (Owner by default).
 7. **paw-compile weights.** Keep shipping with `LicenseRef-None-Declared` and
    an "unverified" chip.
 8. **Data migration** of `fabric_catalog_models.license` and
    `model_catalog.json` to normalized ids. Approved in principle; the exact SQL
-   needs Jason's sign-off before it runs (aceteam side).
+   needs Owner's sign-off before it runs (aceteam side).

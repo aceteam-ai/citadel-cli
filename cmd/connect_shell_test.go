@@ -16,9 +16,9 @@ func TestConnectIsShellTarget(t *testing.T) {
 		shell bool
 	}{
 		{"gpu-node-1", true},              // bare hostname -> shell
-		{"ubuntu-gpu", true},              // bare hostname -> shell
+		{"linux-node", true},              // bare hostname -> shell
 		{"100.64.0.5", true},              // bare IPv4 -> shell
-		{"192.168.2.10", true},            // bare LAN IPv4 -> shell
+		{"192.168.50.10", true},           // bare LAN IPv4 -> shell
 		{"fd7a:115c:a1e0::1", true},       // bare IPv6 (all colons) -> shell, not host:port
 		{"gpu-node-1:5432", false},        // host:port -> raw TCP
 		{"100.64.0.5:11434", false},       // ip:port -> raw TCP

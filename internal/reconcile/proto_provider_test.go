@@ -395,7 +395,7 @@ func TestNeverManagedThroughRealProtoWireNoUninstall(t *testing.T) {
 // ID — never a hostname.
 func TestReconcileUsesHeadscaleNodeIDNotHostname(t *testing.T) {
 	const headscaleNodeID = "4321" // fabric_node_status.node_id — Headscale numeric ID
-	const hostname = "ubuntu-gpu"  // the WRONG key the loop used before #535
+	const hostname = "linux-node"  // the WRONG key the loop used before #535
 
 	tr := &fakeTransport{desired: &fabricpb.DesiredState{
 		Revision: "rev-535",
