@@ -301,7 +301,7 @@ func mqttBlock(m MQTTSpec) map[string]any {
 
 // GenerateFrigateConfig renders a Frigate 0.17 config.yml from the assignment
 // config and the runtime-discovered camera list. It bakes in every scar from the
-// live SJC build:
+// configured deployment:
 //
 //   - openvino -> explicit model: block (bundled xml + coco labelmap) so Frigate
 //     0.17 does not crash on a missing model path; cpu -> a `type: cpu` detector

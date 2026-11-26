@@ -19,7 +19,7 @@ func TestAPIPublisherWiresAgentVersion(t *testing.T) {
 
 	pub, err := NewAPIPublisher(APIPublisherConfig{
 		Client:       &redisapi.Client{},
-		NodeID:       "ubuntu-gpu",
+		NodeID:       "linux-node",
 		OrgID:        "org-123",
 		AgentVersion: "v2.75.0",
 	}, collector)
@@ -38,7 +38,7 @@ func TestStatusMessageAgentVersionIncludedWhenSet(t *testing.T) {
 	msg := StatusMessage{
 		Version:      "1.0",
 		Timestamp:    "2024-01-15T12:00:00Z",
-		NodeID:       "ubuntu-gpu",
+		NodeID:       "linux-node",
 		AgentVersion: "v2.75.0",
 		Status:       &status.NodeStatus{Version: "1.0"},
 	}
@@ -62,7 +62,7 @@ func TestStatusMessageAgentVersionOmittedWhenEmpty(t *testing.T) {
 	msg := StatusMessage{
 		Version:   "1.0",
 		Timestamp: "2024-01-15T12:00:00Z",
-		NodeID:    "ubuntu-gpu",
+		NodeID:    "linux-node",
 		Status:    &status.NodeStatus{Version: "1.0"},
 	}
 

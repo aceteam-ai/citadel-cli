@@ -79,7 +79,7 @@ func TestCombinedQuotedEscapesIPv6AndNoBytes(t *testing.T) {
 func TestSyslog3164DerivesYearFromIngest(t *testing.T) {
 	meta := testEnvelope()
 	meta.TWallNS = time.Date(2026, 1, 1, 0, 0, 10, 0, time.UTC).UnixNano()
-	raw := "<34>Dec 31 23:59:59 host sshd[123]: Failed password for jason from 192.0.2.1 port 2222 ssh2"
+	raw := "<34>Dec 31 23:59:59 host sshd[123]: Failed password for owner from 192.0.2.1 port 2222 ssh2"
 	got, err := Parse("syslog3164", raw, meta, ParserOptions{})
 	if err != nil {
 		t.Fatal(err)

@@ -511,7 +511,7 @@ func (s *NetworkServer) Status(ctx context.Context) (*NetworkStatus, error) {
 	hostname := s.hostname
 	if status.Self != nil {
 		if status.Self.DNSName != "" {
-			// DNSName is like "ubuntu-gpu-8gluaaom.tailnet.ts.net." - extract first part
+			// DNSName is like "linux-node-fixture1.tailnet.ts.net." - extract first part
 			dnsName := status.Self.DNSName
 			if idx := strings.Index(dnsName, "."); idx > 0 {
 				hostname = dnsName[:idx]

@@ -190,7 +190,7 @@ func TestIsGenericHostname(t *testing.T) {
 	}
 
 	meaningful := []string{
-		"aceteamvm", "gpu-server", "jason-desktop",
+		"aceteamvm", "gpu-server", "owner-desktop",
 		"citadel-23bd5f21", "my-workstation", "prod-node-1",
 	}
 	for _, name := range meaningful {

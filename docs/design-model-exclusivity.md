@@ -375,7 +375,7 @@ wrapper — and it sits awkwardly against #8249's own acceptance criterion
 qwen3.8 exclusively"), which implies this should work with *only* `citadel
 mcp` running, not a separate `citadel work` process too. So (b) should be
 read as "the safest shape if the plumbing gap turns out to be small," not a
-recommendation to build on top of — §5 Q1 asks Jason to weigh that gap
+recommendation to build on top of — §5 Q1 asks Owner to weigh that gap
 against (a)'s weaker crash-safety story and (c)'s `worklock` contract change
 before committing to one. If (b) is chosen and the plumbing turns out to be
 more than "small," that alone may be reason to prefer (a) or (c) instead.
@@ -590,7 +590,7 @@ side work has a clear contract to build against:
   `node:modules` grant and an agent using local MCP on-box should both end up
   driving the same `SERVICE_START`/`Reserve` primitive, per the point above.
 
-## 5. Open questions for Jason
+## 5. Open questions for Owner
 
 1. **§2.3 — is `run --exclusive` primarily a CLI command backed by a running
    worker (job-dispatch, recommendation (b)), a standalone CLI process that

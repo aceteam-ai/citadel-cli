@@ -69,10 +69,10 @@ func TestAgentConfigRedacts(t *testing.T) {
 	// The agent-facing config response must use the same resolver as the
 	// worker/CLI. In particular, it must not synthesize ~/.citadel-node from
 	// the current process HOME: the configured machine node directory may be
-	// /home/jason/citadel-node instead.
+	// /home/owner/citadel-node instead.
 	original := getAgentNodeConfigDir
 	t.Cleanup(func() { getAgentNodeConfigDir = original })
-	const resolvedNodeDir = "/home/jason/citadel-node"
+	const resolvedNodeDir = "/home/owner/citadel-node"
 	getAgentNodeConfigDir = func() string { return resolvedNodeDir }
 
 	cfg := agentConfig("node-1", "https://aceteam.ai", "org-x", []string{"jobs:v1:shell:org_x"})
@@ -395,7 +395,7 @@ func TestWorkerLivenessCarriesIdentityUnresolved(t *testing.T) {
 	}
 
 	healthy := worker.NewWorkerState()
-	healthy.SetIdentity("w", "redis-api", "citadel-node-1008", "1008", "org-x")
+	healthy.SetIdentity("w", "redis-api", "citadel-node-4321", "4321", "org-x")
 	if workerLivenessFrom(healthy.Snapshot()).IdentityUnresolved {
 		t.Error("heartbeat liveness must not report identity_unresolved once the Headscale ID resolved")
 	}

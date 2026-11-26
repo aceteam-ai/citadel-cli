@@ -1,5 +1,7 @@
 # Demo runbook — The Sovereign Compute Fabric, in four acts
 
+Machine names and addresses in examples are synthetic, not deployment inventory.
+
 **Audience:** a technical prospect/partner (e.g. an investor or design-partner engineer).
 **Duration:** ~12–15 minutes.
 **Thesis:** *You can run real AI on hardware you own — join it in minutes, chat with
@@ -200,9 +202,9 @@ a sovereign exit, not an open proxy.
 **Captured fallback (this is the real result from validation on a dual-uplink host):**
 ```
 # client direct (its own ISP)
-142.181.124.149
+198.51.100.10
 # client through the relay (the exit node's ISP)
-24.141.120.77
+203.0.113.20
 ```
 
 ---
@@ -233,7 +235,7 @@ a sovereign exit, not an open proxy.
 ## Appendix B — The dual-uplink test scaffolding (validated 2026-09-11)
 
 Act 4 was validated end to end on a Proxmox host with two independent uplinks
-(Bell Fiber `142.181.124.149` and Cogeco Cable `24.141.120.77`) using two Ubuntu
+(illustrated here by documentation addresses `198.51.100.10` and `203.0.113.20`) using two Ubuntu
 LXCs. Full setup notes (VMIDs, per-uplink bridges, the DNS gotcha, the
 non-ephemeral-key and `systemd-run`-persistence lessons) live in the maintenance
 memory for this work. Relay port is `services.EgressRelayPort` (7861). Before

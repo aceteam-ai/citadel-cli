@@ -93,7 +93,7 @@ Candidate replacement evidence only:
 
 Neither candidate's metadata proves that a particular fabric image/checkpoint,
 voice asset, dependency composition or generated output is cleared for a use.
-Jason's named license review and any required legal review remain gates. This
+Owner's named license review and any required legal review remain gates. This
 proposal chooses no automatic exclusion/block mode, and grants no commercial
 deployment authorization for Breeze or either swap.
 

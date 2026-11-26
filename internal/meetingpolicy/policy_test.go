@@ -106,15 +106,15 @@ func TestMeetingNamesArePresentationAndBounded(t *testing.T) {
 			t.Fatalf("unusable name did not fall back: %q", got)
 		}
 	}
-	if got := Name("  Jason   Sun  ", OwnerFallback); got != "Jason Sun" {
+	if got := Name("  Test   User  ", OwnerFallback); got != "Test User" {
 		t.Fatal(got)
 	}
 	s := strings.Repeat("界", 128)
 	if Name(s, OwnerFallback) != s {
 		t.Fatal("Unicode boundary rejected")
 	}
-	text := Announcement("Recorder", "Jason")
-	want := "Hi, I'm Recorder. I'm recording audio and transcribing this meeting for Jason. Anyone can type /ace leave to remove me, or the host can remove me."
+	text := Announcement("Recorder", "Owner")
+	want := "Hi, I'm Recorder. I'm recording audio and transcribing this meeting for Owner. Anyone can type /ace leave to remove me, or the host can remove me."
 	if text != want || strings.Contains(text, "video") {
 		t.Fatal("wrong disclosure")
 	}

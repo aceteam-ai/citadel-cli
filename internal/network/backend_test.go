@@ -179,7 +179,7 @@ func TestStatusSummarizesBackend(t *testing.T) {
 			BackendState: "Running",
 			Self: &ipnstate.PeerStatus{
 				ID:      tailcfg.StableNodeID("1234"),
-				DNSName: "jmbp16-m1pro-8gluaaom.tailnet.ts.net.",
+				DNSName: "mac-example-fixture1.tailnet.ts.net.",
 			},
 		},
 	})
@@ -193,8 +193,8 @@ func TestStatusSummarizesBackend(t *testing.T) {
 	}
 	// The registered name wins over the requested hostname, and only the
 	// first DNS label is kept.
-	if got.Hostname != "jmbp16-m1pro-8gluaaom" {
-		t.Errorf("Hostname = %q, want jmbp16-m1pro-8gluaaom", got.Hostname)
+	if got.Hostname != "mac-example-fixture1" {
+		t.Errorf("Hostname = %q, want mac-example-fixture1", got.Hostname)
 	}
 	if got.NodeID != "1234" {
 		t.Errorf("NodeID = %q, want 1234", got.NodeID)
@@ -223,7 +223,7 @@ func TestGetPeersFiltersToSameUser(t *testing.T) {
 		Self: &ipnstate.PeerStatus{UserID: selfUser},
 		Peer: map[key.NodePublic]*ipnstate.PeerStatus{
 			mine: {
-				HostName:     "citadel3090",
+				HostName:     "linux-example",
 				UserID:       selfUser,
 				Online:       true,
 				TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.5")},
@@ -243,8 +243,8 @@ func TestGetPeersFiltersToSameUser(t *testing.T) {
 	if len(peers) != 1 {
 		t.Fatalf("got %d peers, want 1 (other users must be filtered out)", len(peers))
 	}
-	if peers[0].Hostname != "citadel3090" {
-		t.Errorf("peer = %q, want citadel3090", peers[0].Hostname)
+	if peers[0].Hostname != "linux-example" {
+		t.Errorf("peer = %q, want linux-example", peers[0].Hostname)
 	}
 	if peers[0].IP != "100.64.0.5" {
 		t.Errorf("peer IP = %q, want 100.64.0.5", peers[0].IP)

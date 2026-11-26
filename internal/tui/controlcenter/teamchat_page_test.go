@@ -13,7 +13,7 @@ func tsAt(t time.Time) teamchat.Timestamp {
 }
 
 func TestFormatTeamChatMessage(t *testing.T) {
-	name := "Jason Sun"
+	name := "Test User"
 	parent := "m-1"
 	created := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
 
@@ -30,7 +30,7 @@ func TestFormatTeamChatMessage(t *testing.T) {
 				CreatedAt: tsAt(created),
 				Sender:    &teamchat.Sender{ID: "u-1", Email: "j@x.c", FullName: &name},
 			},
-			contains: []string{"[cyan]Jason Sun[white]", "hello team"},
+			contains: []string{"[cyan]Test User[white]", "hello team"},
 			excludes: []string{"replies", Glyph(MarkerThreadReply)},
 		},
 		{

@@ -357,7 +357,7 @@ func TestPolicyDialerDeniesHostnameResolvingToPrivateIP(t *testing.T) {
 		if host != "attacker.example" {
 			t.Fatalf("unexpected resolve host %q", host)
 		}
-		return []net.IP{mustParseIP(t, "192.168.2.201")}, nil
+		return []net.IP{mustParseIP(t, "192.168.50.201")}, nil
 	})
 
 	fd := newFakeDialer()
@@ -535,7 +535,7 @@ func TestServerHostnameResolvingToPrivateIPIsDeniedEndToEnd(t *testing.T) {
 		if host != "internal.attacker.example" {
 			t.Fatalf("unexpected resolve host %q", host)
 		}
-		return []net.IP{mustParseIP(t, "192.168.2.201")}, nil
+		return []net.IP{mustParseIP(t, "192.168.50.201")}, nil
 	})
 
 	resolver := &MockIdentityResolver{Identity: &PeerIdentity{LoginName: "alice", SameOwner: true}}

@@ -30,7 +30,7 @@ const nvrBridgeContainer = "citadel-nvr-wyze-bridge"
 // actually existing. The container fallback is load-bearing: a node that runs
 // the NVR via `citadel run` / `citadel init` / a hand `docker compose up` has
 // NO lockfile entry (the #733/#739 class), and the mini-NVR this issue fixes
-// was a hand-built SJC node -- gating on the lockfile alone would leave
+// was a manually configured node; gating on the lockfile alone would leave
 // self-heal silently OFF on exactly the node it exists for. The probe runs
 // once at startup, never per tick (only when the cheap lockfile check misses),
 // so a non-nvr node still pays almost nothing and a module-installed node pays

@@ -294,7 +294,7 @@ func TestConfigRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 
 	cfg := &Config{
-		BaseURL:     "https://192.168.2.4:8006",
+		BaseURL:     "https://192.168.50.4:8006",
 		TokenID:     "root@pam!citadel",
 		TokenSecret: "12345678-abcd-efgh-ijkl-123456789012",
 	}

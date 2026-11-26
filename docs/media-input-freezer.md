@@ -99,7 +99,7 @@ links, nor does it restrict owner UID.
 This next source slice is stacked on the #1404 path/type hardening draft. It
 does not complete C5 or enable a media task. The accepted input route and
 lifecycle come from the [shared DoR](https://github.com/aceteam-ai/aceteam/issues/11260#issuecomment-6290142842),
-as overridden by [Jason's recorded decisions](https://github.com/aceteam-ai/aceteam/issues/11260#issuecomment-6290189919).
+as overridden by [Owner's recorded decisions](https://github.com/aceteam-ai/aceteam/issues/11260#issuecomment-6290189919).
 
 1. Extract FILE_FETCH's fixed-origin, public-IP-pinned HTTPS GET policy into
    an internal shared client with a closed endpoint set and an `io.Writer`

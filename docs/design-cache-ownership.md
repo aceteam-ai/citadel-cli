@@ -361,7 +361,7 @@ before P5 so the duplicate is *visible* before anything starts deleting files
 based on it. P7 is deliberately last — it's the whole reason #682 was filed
 as a prerequisite, and nothing about it can be honest before P2 and P4 exist.
 
-## 6. Open questions for Jason
+## 6. Open questions for Owner
 
 1. **Pinning UX**: should `pinned_models` live in `citadel.yaml` (declarative,
    like `pinned_services`) or be a runtime-only CLI/API setting? The manifest
@@ -638,7 +638,7 @@ it impossible for hf-hub.
 - Engine first-start downloads for vllm etc. when no `MODEL_CACHE_PULL`
   preceded them: same wall, same answer (backfill).
 - `DOWNLOAD_MODEL` (`internal/jobs/download_model.go`): stays unindexed per
-  §6 Q5 unless Jason says otherwise (§8.7).
+  §6 Q5 unless Owner says otherwise (§8.7).
 
 ### 8.4 Read API — designed so P3/P5/P6/P7 are thin consumers
 
@@ -745,7 +745,7 @@ full P3 implementation design.*
 `LeastRecentlyUsed`/`Verify` + pinning — implementation design in §10), P6
 completeness (`FilesFor`-driven repo-id eviction, bonsai evict), P7.
 
-### 8.7 Open questions for Jason (P2 additions to §6)
+### 8.7 Open questions for Owner (P2 additions to §6)
 
 1. **Index format/unification:** single versioned JSON file at
    `GetNodeConfigDir()/cache-index.json` (proposed, mirroring
@@ -945,7 +945,7 @@ Decisions:
   with per-dir aggregates alone, but the dashboard's actionable rendering
   ("this node holds 16.8G of Llama-3.1-8B it hasn't used in 3 weeks") needs
   model rows, and 32 rows × ~150 bytes is noise next to the existing
-  services/GPU payload. Flagged as §11 Q1 in case Jason wants aggregates-only.
+  services/GPU payload. Flagged as §11 Q1 in case Owner wants aggregates-only.
 - **Per-tick cost is map-copy only.** `Snapshot()` copies the entries map
   (tens of entries); `IndexedBytesByDir`/sorting are in-memory. Zero
   subprocesses, zero filesystem walks on the tick — `MeasuredBytes`/
@@ -1041,7 +1041,7 @@ second probe with a second opinion of "the cache volume".
   eviction, and summed `SizeBytes` are only used for candidate ORDERING
   (tie-break), never for deciding "we've freed enough".
 - An absolute per-dir/global byte budget is deliberately not in v1 (§11 Q4
-  offers it as the alternative if Jason wants proactive trimming below the
+  offers it as the alternative if Owner wants proactive trimming below the
   pressure threshold on big-disk nodes).
 
 ### 10.2 Ordering: `LeastRecentlyUsed()` as shipped — and why the v1 recency signal is sufficient
@@ -1281,7 +1281,7 @@ writers but exposed no primitive for a non-lane mutator to join that
 exclusion), the `gc` heartbeat sub-struct, and the `resolveDiskPath` reuse.
 Plus §9.3's scan-metadata fields, which P5's reporting shares.
 
-## 11. Open questions for Jason (P3 + P5)
+## 11. Open questions for Owner (P3 + P5)
 
 ### P3 — RESOLVED, P3 SHIPPED (2026-08-30)
 
@@ -1299,7 +1299,7 @@ Plus §9.3's scan-metadata fields, which P5's reporting shares.
    daily/slow-timer rescan was added; a long-lived worker's `ScannedAt`/
    `MeasuredBytes`/`LegacyHFCache` values go stale against out-of-band
    container downloads exactly as this question describes, until the next
-   restart. Whether to add a periodic rescan is still Jason's call, for a
+   restart. Whether to add a periodic rescan is still Owner's call, for a
    follow-up PR — not blocking, since `printCacheInfo`'s freshness line
    ("index last reconciled ... at `citadel work` startup") and the
    heartbeat's `ScannedAt` field both surface the staleness honestly rather
@@ -1348,13 +1348,13 @@ Plus §9.3's scan-metadata fields, which P5's reporting shares.
 ### P5 — RESOLVED, P5 SHIPPED (2026-08-30)
 
 3. **Backfill evictability — the headline fork** (§10.3.4): **RESOLVED by
-   Jason (2026-08-25): EVICTABLE.** Reverses `SourceBackfill`'s earlier doc
+   Owner (2026-08-25): EVICTABLE.** Reverses `SourceBackfill`'s earlier doc
    comment ("Exempt from GC in a future phase") — the #682 40G duplicate IS
    backfill by definition, so exempting it would gut P5 against its own
    motivating incident. `PlanGC` applies no source-based exemption at all;
    `TestPlanGC_BackfillEntriesAreEligible` pins this. `SourceBackfill`'s doc
    comment in `internal/cacheindex/cacheindex.go` was updated to match.
-4. **Trigger/budget** (§10.1, carries §6 Q2/§8.7 Q5): **RESOLVED by Jason
+4. **Trigger/budget** (§10.1, carries §6 Q2/§8.7 Q5): **RESOLVED by Owner
    (2026-08-30): disk-percent high/low-water hysteresis on the cache volume,
    90%/80% defaults, NO absolute byte budget in v1.** Implemented exactly as
    §10.1 specifies: `CITADEL_CACHE_GC_HIGH_PERCENT`/`CITADEL_CACHE_GC_LOW_PERCENT`
@@ -1363,7 +1363,7 @@ Plus §9.3's scan-metadata fields, which P5's reporting shares.
    default pair rather than running unhysteresis'd. An absolute per-dir/
    global byte budget remains a documented, not-built follow-up if a future
    node needs proactive trimming below the pressure threshold.
-5. **Pinning source** (§10.3.2, carries §6 Q1): **RESOLVED by Jason
+5. **Pinning source** (§10.3.2, carries §6 Q1): **RESOLVED by Owner
    (2026-08-30): manifest `pinned_models` in `citadel.yaml`.** Mirrors
    `pinned_services` exactly (`CitadelManifest.PinnedModels`, `cmd/manifest.go`;
    `serviceManifest`-equivalent isn't needed since P5's executor reads it
@@ -1371,7 +1371,7 @@ Plus §9.3's scan-metadata fields, which P5's reporting shares.
    `manifestPinnedServices` already reads) — no index write, no new
    cross-process write path, matched exactly (trimmed, case-sensitive)
    against `Entry.Model`.
-6. **LRU fidelity gate** (§10.2, resolves §8.7 Q3): **RESOLVED by Jason
+6. **LRU fidelity gate** (§10.2, resolves §8.7 Q3): **RESOLVED by Owner
    (2026-08-30): ship on the v1 resident-implies-used signal**, per §10.2's
    sufficiency argument — P5 does not wait on per-request `MarkUsed`
    touches. Implemented: `LeastRecentlyUsed`'s ordering rule, reused inline

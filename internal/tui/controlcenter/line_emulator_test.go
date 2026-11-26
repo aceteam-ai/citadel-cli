@@ -61,8 +61,8 @@ func TestLineEmulatorFishTypingLS(t *testing.T) {
 
 	// Drive the prompt draw (final startup chunk) so the cursor sits after the
 	// prompt, exactly as fish leaves it before the user types.
-	// prompt: "...jason@ubuntu-gpu /t/c/-/5/s/fishcap> " then CR + forward 37.
-	e.feed([]byte("\x1b[92mjason\x1b(B\x1b[m@\x1b(B\x1b[mubuntu-gpu\x1b(B\x1b[m \x1b[32m/t/c/-/5/s/fishcap\x1b(B\x1b[m\x1b(B\x1b[m> \x1b[K\r\x1b[37C"))
+	// prompt: "...owner@linux-node /t/c/-/5/s/fishcap> " then CR + forward 37.
+	e.feed([]byte("\x1b[92mowner\x1b(B\x1b[m@\x1b(B\x1b[mlinux-node\x1b(B\x1b[m \x1b[32m/t/c/-/5/s/fishcap\x1b(B\x1b[m\x1b(B\x1b[m> \x1b[K\r\x1b[37C"))
 
 	// Type 'l': echo l, CR, forward 38; then BS + recolour l + CR + fwd 38;
 	// then autosuggestion 's' (gray) + CR + fwd 38.
@@ -158,9 +158,9 @@ func TestLineEmulatorLineFeedCommits(t *testing.T) {
 // finals like the leaked "B").
 func TestLineEmulatorCharsetStrippedAndColourKept(t *testing.T) {
 	var e lineEmulator
-	out := e.feed([]byte("\x1b(Bjason\x1b(B@\x1b(Bhost"))
-	if got := visibleLastLine(out); got != "jason@host" {
-		t.Fatalf("charset strip: got %q, want %q", got, "jason@host")
+	out := e.feed([]byte("\x1b(Bowner\x1b(B@\x1b(Bhost"))
+	if got := visibleLastLine(out); got != "owner@host" {
+		t.Fatalf("charset strip: got %q, want %q", got, "owner@host")
 	}
 	// Colour must be preserved in the raw (un-stripped) output.
 	coloured := e.render()

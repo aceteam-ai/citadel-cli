@@ -17,7 +17,7 @@ import (
 // node: block and a capabilities: block that must survive reconciliation.
 const preDiffusersManifest = `# citadel.yaml
 node:
-  name: ubuntu-gpu
+  name: linux-node
   tags: [rtx-3090, gpu]
   org_id: org_test
 services:
@@ -94,7 +94,7 @@ func TestReconcileEmbeddedServiceOnMissingManifest(t *testing.T) {
 		t.Fatalf("read reconciled manifest: %v", err)
 	}
 	got := string(raw)
-	for _, want := range []string{"vllm", "ollama", "llamacpp", "tei", "ubuntu-gpu", "org_test", "capabilities", "engines"} {
+	for _, want := range []string{"vllm", "ollama", "llamacpp", "tei", "linux-node", "org_test", "capabilities", "engines"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("reconciled manifest dropped %q:\n%s", want, got)
 		}
