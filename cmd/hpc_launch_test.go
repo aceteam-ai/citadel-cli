@@ -216,6 +216,9 @@ func TestHPCWorkerChildArgvIsAccepted(t *testing.T) {
 }
 
 func TestHPCRunAndLaunchRequireAnExplicitAuthService(t *testing.T) {
+	oldAuth := authServiceURL
+	t.Cleanup(func() { authServiceURL = oldAuth })
+	t.Setenv("CITADEL_SERVER", "")
 	t.Setenv("CITADEL_AUTH_HOST", "")
 	for _, c := range []*cobra.Command{hpcRunCmd, hpcLaunchCmd} {
 		if err := rootCmd.ParseFlags(nil); err != nil {

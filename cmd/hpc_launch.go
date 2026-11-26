@@ -381,11 +381,17 @@ caches are kept beside the venv.`,
 
 // requireExplicitAuthService refuses to fall back to the production default:
 // the single-use token is spent at whichever platform the job contacts, so
-// the platform must be named by --auth-service or CITADEL_AUTH_HOST.
+// the platform must be named explicitly. This path must not read host
+// enrollment/configuration or initialize network startup on a login node.
 func requireExplicitAuthService(cmd *cobra.Command) error {
-	if !flagChanged(cmd, "auth-service") && os.Getenv("CITADEL_AUTH_HOST") == "" {
-		return errors.New("pass --auth-service (the platform that minted the enrollment token or will approve the request)")
+	if !flagChanged(cmd, "server") && !flagChanged(cmd, "auth-service") && os.Getenv("CITADEL_SERVER") == "" && os.Getenv("CITADEL_AUTH_HOST") == "" {
+		return errors.New("pass --server (the platform that minted the enrollment token or will approve the request); the compatibility alias --auth-service is also accepted")
 	}
+	server, err := resolveInvocationServer(cmd, "")
+	if err != nil {
+		return err
+	}
+	authServiceURL = server
 	return nil
 }
 

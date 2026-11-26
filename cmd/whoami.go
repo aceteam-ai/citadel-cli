@@ -108,6 +108,7 @@ type NodeIdentity struct {
 	Registered bool `json:"registered"`
 
 	CitadelVersion string `json:"citadel_version"`
+	Server         string `json:"server"`
 
 	// HeartbeatFreshness summarizes the last successful durable heartbeat
 	// write (internal/heartbeat/marker.go): "ok", "stale (<age> ago)", or
@@ -147,6 +148,7 @@ func resolvePlatformNodeID(fabricNodeID, sshSyncNodeID string) string {
 func gatherIdentity(ctx context.Context) NodeIdentity {
 	id := NodeIdentity{
 		CitadelVersion: Version,
+		Server:         authServiceURL,
 	}
 	if h, err := os.Hostname(); err == nil {
 		id.Hostname = h
@@ -295,6 +297,7 @@ func renderIdentity(w io.Writer, id NodeIdentity) {
 	fmt.Fprintf(w, "\n%s %s\n", labelColor.Sprint("Node name:"), valueOrUnknown(id.NodeName))
 	fmt.Fprintf(w, "%s %s\n", labelColor.Sprint("Hostname:"), valueOrUnknown(id.Hostname))
 	fmt.Fprintf(w, "%s %s\n", labelColor.Sprint("Citadel version:"), id.CitadelVersion)
+	fmt.Fprintf(w, "%s %s\n", labelColor.Sprint("Server:"), id.Server)
 
 	headerColor.Fprintln(w, "\nFABRIC / NETWORK IDENTITY")
 	fmt.Fprintf(w, "  %s %s\n", labelColor.Sprint("Headscale node ID:"), valueOrUnknown(id.HeadscaleNodeID))

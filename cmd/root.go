@@ -373,7 +373,8 @@ func init() {
 
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.citadel-cli.yaml)")
 	rootCmd.PersistentFlags().StringVar(&nexusURL, "nexus", "https://nexus.aceteam.ai", "The URL of the AceTeam Nexus server")
-	rootCmd.PersistentFlags().StringVar(&authServiceURL, "auth-service", getEnvOrDefault("CITADEL_AUTH_HOST", "https://aceteam.ai"), "The URL of the authentication service")
+	rootCmd.PersistentFlags().StringVar(&serverURLFlag, "server", "", "AceTeam control-plane URL or host (or CITADEL_SERVER)")
+	rootCmd.PersistentFlags().StringVar(&authServiceURL, "auth-service", getEnvOrDefault("CITADEL_AUTH_HOST", defaultControlPlaneServer), "Compatibility alias for --server")
 	rootCmd.PersistentFlags().StringVar(&caCertPath, "ca-cert", getEnvOrDefault(catrust.EnvCACert, ""), "Trust this private CA for a self-hosted auth service and Nexus (Linux)")
 	rootCmd.PersistentFlags().BoolVar(&debugMode, "debug", false, "Enable debug output")
 	rootCmd.PersistentFlags().BoolVar(&noColorGlobal, "no-color", false, "Disable colorized output")

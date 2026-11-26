@@ -23,6 +23,7 @@ import (
 func TestPreparePrivateCATrustRecoversAuthOriginWithExplicitCA(t *testing.T) {
 	if os.Getenv("CITADEL_CA_EXPLICIT_RECOVERY_CHILD") == "1" {
 		t.Setenv("CITADEL_AUTH_HOST", "")
+		t.Setenv("CITADEL_SERVER", "")
 		nodeConfigDirFn = func() string { return os.Getenv("CITADEL_CA_TEST_DIR") }
 		deviceConfigForCATrustFn = func() *DeviceConfig { return nil }
 		caCertPath = os.Getenv("CITADEL_CA_TEST_CERT")
@@ -39,6 +40,19 @@ func TestPreparePrivateCATrustRecoversAuthOriginWithExplicitCA(t *testing.T) {
 		}
 		if authServiceURL != "https://web.tenant.test" {
 			t.Fatalf("authServiceURL = %q", authServiceURL)
+		}
+		// A durable CA binding also identifies the saved server when an
+		// authkey-only enrollment has no device config. An override must not
+		// bypass that binding.
+		cmd.Flags().String("server", "", "")
+		if err := cmd.Flags().Set("server", "other.example.test"); err != nil {
+			t.Fatal(err)
+		}
+		if err := preparePrivateCATrust(cmd); err != errServerSwitch {
+			t.Fatalf("durable-origin switch: %v", err)
+		}
+		if authServiceURL != "https://web.tenant.test" {
+			t.Fatal("refused override changed the prepared server")
 		}
 		return
 	}
