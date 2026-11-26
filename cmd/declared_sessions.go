@@ -11,6 +11,7 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/declaredsession"
 	"github.com/aceteam-ai/citadel-cli/internal/network"
+	"github.com/aceteam-ai/citadel-cli/internal/sessionsearch"
 	"github.com/spf13/cobra"
 )
 
@@ -87,6 +88,7 @@ func newDeclaredSessionsCommand(open declaredManagerFactory) *cobra.Command {
 	}
 	parent.PersistentFlags().StringVar(&nodeDir, "node-config-dir", "", "Existing node configuration directory (defaults to this node's configuration)")
 	parent.AddCommand(newLaneInventoryCommand(&nodeDir, collectNativeLaneInventory))
+	parent.AddCommand(newSessionFindCommand(&nodeDir, sessionsearch.Native, collectNativeLaneInventory))
 	parent.AddCommand(newContainerSessionCommands(&nodeDir)...)
 	for _, action := range []string{"list", "status", "start", "stop", "restart"} {
 		action := action
