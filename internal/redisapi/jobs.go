@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/aceteam-ai/citadel-cli/internal/workercontrol"
 	"maps"
 	"net/http"
 	"net/url"
@@ -71,6 +72,11 @@ func (c *Client) ConsumeJob(ctx context.Context, req ConsumeRequest) (*Job, erro
 		}
 		return nil, err
 	}
+	if workercontrol.IsQueue(req.Queue) || job.Control != nil {
+		if job.Control == nil || job.Control.Identity.Queue != req.Queue || job.Control.Identity.Group != req.Group {
+			return nil, workercontrol.ErrInvalid
+		}
+	}
 	// Repeated containers cannot erase the whole-response refusal marker.
 	job.durableMetadata = metadata
 	if req.Protocol == DurableResultsProtocol {
@@ -93,6 +99,17 @@ func ParseStreamMessage(msg StreamMessage) (*Job, error) {
 		JobID:       msg.Data.JobID,
 		Type:        msg.Data.Type, // Top-level stream field (e.g., SHELL_COMMAND)
 		RawData:     make(map[string]any),
+	}
+	if msg.Data.Type == "WORKER_CONTROL" || msg.Data.WorkerControl != "" {
+		raw, _ := json.Marshal(workercontrol.Data{JobID: msg.Data.JobID, Type: msg.Data.Type, Payload: msg.Data.Payload, WorkerControl: msg.Data.WorkerControl})
+		envelope, payload, err := workercontrol.ParseData(raw, msg.ID, "", "")
+		if err != nil {
+			return nil, err
+		}
+		job.Control = &envelope
+		job.Payload = map[string]any{"action": payload.Action, "target_node": payload.TargetNode}
+		job.RawPayload = []byte(msg.Data.Payload)
+		return job, nil
 	}
 
 	// Preserve raw fields from stream message data
@@ -131,6 +148,9 @@ func ParseStreamMessage(msg StreamMessage) (*Job, error) {
 // (the pre-#721 behaviour, which additionally read a `success` field the route
 // never sent) made every HTTP ack report failure.
 func (c *Client) AcknowledgeJob(ctx context.Context, req AcknowledgeRequest) error {
+	if workercontrol.IsQueue(req.Queue) || req.Group == workercontrol.Protocol || req.Group == "worker-control-v1" {
+		return workercontrol.ErrDenied
+	}
 	var resp AcknowledgeResponse
 	if err := c.doRequest(ctx, http.MethodPost, "/api/fabric/redis/jobs/acknowledge", req, &resp); err != nil {
 		return err

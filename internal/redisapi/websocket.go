@@ -15,12 +15,14 @@ import (
 
 	"github.com/aceteam-ai/citadel-cli/internal/deliverymetadata"
 	"github.com/aceteam-ai/citadel-cli/internal/platformhttp"
+	"github.com/aceteam-ai/citadel-cli/internal/workercontrol"
 	"github.com/gorilla/websocket"
 )
 
 // WSClient provides WebSocket-based access to the AceTeam Redis API.
 // Used for real-time pub/sub operations instead of HTTP polling.
 type WSClient struct {
+	control   controlWaiters
 	baseURL   string
 	token     string
 	proxy     func(*http.Request) (*url.URL, error)
@@ -480,6 +482,12 @@ func (c *WSClient) readLoop() {
 		_ = conn.SetReadDeadline(time.Now().Add(c.pongWait))
 
 		var msg WSMessage
+		if c.controlFrame(conn, message) {
+			continue
+		}
+		if workercontrol.LooksControl(message) && validateControlWSJob(message) != nil {
+			continue
+		}
 		if err := json.Unmarshal(message, &msg); err != nil {
 			c.debug("ws: failed to parse message: %v", err)
 			continue
@@ -637,6 +645,7 @@ func (c *WSClient) handleDisconnect(conn *websocket.Conn) {
 		c.connEstablishedAt = time.Time{}
 	}
 	c.connMu.Unlock()
+	c.failControlWaiters(conn)
 
 	if !c.reconnectEnabled {
 		return
@@ -1114,6 +1123,9 @@ func (c *WSClient) StopConsume() error {
 
 // AckJob sends an ack message to acknowledge a processed job.
 func (c *WSClient) AckJob(queue, group, messageID string) error {
+	if workercontrol.IsQueue(queue) || group == workercontrol.Protocol || group == "worker-control-v1" {
+		return workercontrol.ErrDenied
+	}
 	msg := WSMessage{
 		Type:      "ack",
 		Queue:     queue,

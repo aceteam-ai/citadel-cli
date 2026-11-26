@@ -219,7 +219,16 @@ var _ StreamWriter = (*APIStreamWriter)(nil)
 // This is used with Runner.WithStreamWriterFactory().
 func CreateAPIStreamWriterFactory(ctx context.Context, source *APISource) func(job *Job) StreamWriter {
 	return func(job *Job) StreamWriter {
+		if source.control != nil {
+			return &workerControlStreamWriter{APIStreamWriter: apiStreamWriterFor(ctx, source.Client(), job), session: job.controlSession}
+		}
 		return apiStreamWriterFor(ctx, source.Client(), job)
+	}
+}
+
+func CreateWorkerControlStreamWriterFactory(ctx context.Context, client *redisapi.Client) func(*Job) StreamWriter {
+	return func(job *Job) StreamWriter {
+		return &workerControlStreamWriter{APIStreamWriter: apiStreamWriterFor(ctx, client, job), session: job.controlSession}
 	}
 }
 
@@ -273,6 +282,8 @@ func observeStream(writer StreamWriter, clock *deliveryClock) StreamWriter {
 	case *RedisStreamWriter:
 		w.clock = clock
 	case *APIStreamWriter:
+		w.clock = clock
+	case *workerControlStreamWriter:
 		w.clock = clock
 	}
 	return &clockStreamWriter{StreamWriter: writer, clock: clock}
