@@ -68,7 +68,8 @@ type Respond struct {
 }
 type Empty struct{}
 type Text struct {
-	Text string `json:"text"`
+	Text   string `json:"text"`
+	ItemID string `json:"item_id,omitempty"`
 }
 type Tool struct {
 	ID            string `json:"id"`
@@ -102,9 +103,10 @@ type Models struct {
 	IDs []string `json:"ids"`
 }
 type Completed struct {
-	Outcome    string `json:"outcome"`
-	ToolErrors uint64 `json:"tool_errors"`
-	Denials    uint64 `json:"denials"`
+	Outcome     string `json:"outcome"`
+	ToolErrors  uint64 `json:"tool_errors"`
+	Denials     uint64 `json:"denials"`
+	CountsScope string `json:"counts_scope,omitempty"`
 }
 type Failure struct {
 	Code      string `json:"code"`

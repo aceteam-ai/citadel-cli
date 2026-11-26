@@ -9,7 +9,7 @@
     "model": {"type": "string", "maxLength": 128, "pattern": "^([A-Za-z0-9][A-Za-z0-9._/-]*)?$"},
     "count": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
     "nullableCount": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/count"}]},
-    "text": {"type": "object", "additionalProperties": false, "required": ["text"], "properties": {"text": {"type": "string", "maxLength": 32768}}},
+    "text": {"type": "object", "additionalProperties": false, "required": ["text"], "properties": {"text": {"type": "string", "maxLength": 32768}, "item_id": {"$ref": "#/$defs/id"}}},
     "empty": {"type": "object", "additionalProperties": false},
     "start": {
       "type": "object", "additionalProperties": false, "required": ["workspace", "model"],
@@ -62,7 +62,7 @@
     },
     "completed": {
       "type": "object", "additionalProperties": false, "required": ["outcome", "tool_errors", "denials"],
-      "properties": {"outcome": {"enum": ["completed", "interrupted", "failed", "unknown"]}, "tool_errors": {"$ref": "#/$defs/count"}, "denials": {"$ref": "#/$defs/count"}}
+      "properties": {"outcome": {"enum": ["completed", "interrupted", "failed", "unknown"]}, "tool_errors": {"$ref": "#/$defs/count"}, "denials": {"$ref": "#/$defs/count"}, "counts_scope": {"const": "observed_items"}}
     },
     "failure": {
       "type": "object", "additionalProperties": false, "required": ["code", "retryable"],

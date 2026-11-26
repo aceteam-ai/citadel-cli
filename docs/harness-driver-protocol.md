@@ -71,7 +71,11 @@ bind identities or offer durable delivery.
 
 ## Remaining acceptance
 
-No CLI, remote job, process launcher, credential reader, native stream adapter,
+An unwired supplied-item/turn reducer is documented in
+`codex-turn-projection.md`. Its optional text item identity and explicit observed
+count scope extend this candidate without changing earlier fixture decoding.
+
+No CLI, remote job, process launcher, credential reader, active native transport adapter,
 approval executor, storage or routing caller is added. Tests use synthetic
 memory buffers and owned pipes only. No vendor binary or real user session is
 inspected or invoked. This is not a registered remote tool and adds no remote
