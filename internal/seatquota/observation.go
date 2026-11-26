@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"regexp"
 	"time"
 )
@@ -90,10 +91,18 @@ func Codex(raw []byte, seat string, source Source, observed time.Time) ([]Observ
 		credit.Available = nil
 	}
 	var reached string
-	_ = json.Unmarshal(fields["rateLimitReachedType"], &reached)
+	if value, present := fields["rateLimitReachedType"]; present && !bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+		if json.Unmarshal(value, &reached) != nil {
+			reached = "unprojected"
+		}
+	}
 	rows := make([]Observation, 0, 2)
 	for _, slot := range []string{"primary", "secondary"} {
 		row := Observation{SeatRef: seat, Provider: "codex", Scope: "account", Source: source, Confidence: "unknown", AdapterVersion: AdapterVersion, ObservedAt: observed.UTC()}
+		if reached == slot {
+			flag := true
+			row.Reached = &flag
+		}
 		if credit.Available != nil {
 			count := *credit.Available
 			row.ResetCreditsAvailable = &count
@@ -105,6 +114,11 @@ func Codex(raw []byte, seat string, source Source, observed time.Time) ([]Observ
 		}
 		if json.Unmarshal(fields[slot], &window) != nil || window.Minutes == nil || window.Used == nil || *window.Used < 0 || *window.Used > 100 {
 			row.Reason = "quota_unknown"
+			rows = append(rows, row)
+			continue
+		}
+		if reached != "" && reached != "primary" && reached != "secondary" {
+			row.Reason = "vendor_limit_reported"
 			rows = append(rows, row)
 			continue
 		}
@@ -192,7 +206,7 @@ func checkJSON(d *json.Decoder, depth int, budget *int) error {
 
 // Freshness classifies observations only. A reset never implies restored quota.
 func Freshness(o Observation, now time.Time) string {
-	if now.IsZero() || o.ObservedAt.IsZero() || o.ObservedAt.After(now) || o.Confidence != "exact" || o.UsedPercent == nil {
+	if now.IsZero() || o.ObservedAt.IsZero() || o.ObservedAt.After(now) || o.Confidence != "exact" || o.UsedPercent == nil || math.IsNaN(*o.UsedPercent) || math.IsInf(*o.UsedPercent, 0) || *o.UsedPercent < 0 || *o.UsedPercent > 100 {
 		return "unknown"
 	}
 	if o.ResetsAt != nil && !o.ResetsAt.After(now) {
