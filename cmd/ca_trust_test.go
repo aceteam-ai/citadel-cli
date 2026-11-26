@@ -41,6 +41,19 @@ func TestPreparePrivateCATrustRecoversAuthOriginWithExplicitCA(t *testing.T) {
 		if authServiceURL != "https://web.tenant.test" {
 			t.Fatalf("authServiceURL = %q", authServiceURL)
 		}
+		// A durable CA binding also identifies the saved server when an
+		// authkey-only enrollment has no device config. An override must not
+		// bypass that binding.
+		cmd.Flags().String("server", "", "")
+		if err := cmd.Flags().Set("server", "other.example.test"); err != nil {
+			t.Fatal(err)
+		}
+		if err := preparePrivateCATrust(cmd); err != errServerSwitch {
+			t.Fatalf("durable-origin switch: %v", err)
+		}
+		if authServiceURL != "https://web.tenant.test" {
+			t.Fatal("refused override changed the prepared server")
+		}
 		return
 	}
 

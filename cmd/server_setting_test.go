@@ -124,6 +124,11 @@ func TestServerSettingVisibleFlagAndIdentityOutput(t *testing.T) {
 	if !strings.Contains(output.String(), "Server:") || !strings.Contains(output.String(), id.Server) {
 		t.Fatal("identity output omits server")
 	}
+	output.Reset()
+	printStatusServer(&output, id.Server)
+	if output.String() != "Server:\thttps://saved.example.test\n" {
+		t.Fatalf("standard status server: %q", output.String())
+	}
 	encoded, err := json.Marshal(id)
 	if err != nil || !bytes.Contains(encoded, []byte(`"server":"https://saved.example.test"`)) {
 		t.Fatalf("identity JSON: %s %v", encoded, err)

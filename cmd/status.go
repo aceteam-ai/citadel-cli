@@ -116,7 +116,7 @@ func runStandardStatus(commandCtx context.Context) {
 	manifest, _, _ := findAndReadManifest()
 
 	headerColor.Fprintf(w, "--- 📊 Citadel Node Status (%s) ---\n", Version)
-	fmt.Fprintf(w, "Server:\t%s\n", authServiceURL)
+	printStatusServer(w, authServiceURL)
 
 	headerColor.Fprintln(w, "\n🛠️ WORKER")
 	printConfiguredWorkerRole(w, getDeviceConfigFromFile())
@@ -155,6 +155,10 @@ func runStandardStatus(commandCtx context.Context) {
 
 	headerColor.Fprintln(w, "\n🚀 MANAGED SERVICES")
 	printServiceInfo(w)
+}
+
+func printStatusServer(w io.Writer, server string) {
+	fmt.Fprintf(w, "Server:\t%s\n", server)
 }
 
 // printWorkerInfo reports whether a `citadel work` worker currently holds the
