@@ -46,6 +46,11 @@ type Permissions struct {
 	Shell       bool `yaml:"shell" json:"shell"`                                   // SHELL_COMMAND job execution (default-deny, opt-in)
 	HostNetwork bool `yaml:"host_network,omitempty" json:"host_network,omitempty"` // Service host networking (default-deny, local opt-in)
 
+	// Harness is the local saved setting for the future typed harness driver.
+	// Default off, independent of Shell and all other access surfaces. This
+	// setting alone does not register jobs, launch a harness or grant admission.
+	Harness bool `yaml:"harness,omitempty" json:"harness,omitempty"`
+
 	// CobrowsePublicOnly runs every remote (node-wide) co-browse session behind
 	// an egress guard that refuses loopback, private, link-local and mesh
 	// addresses, so a remote agent cannot reach this machine's home network
@@ -116,6 +121,7 @@ func DefaultPermissions() *Permissions {
 		SSH:       true,
 		Provision: true,
 		Shell:     false,
+		Harness:   false,
 	}
 }
 

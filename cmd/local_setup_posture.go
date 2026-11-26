@@ -67,6 +67,7 @@ func writeSetupPosture(permissionsDir, meetingDir string, source ...string) erro
 		return fmt.Errorf("the node permissions file must be readable before the co-browse-only setting is saved: %w", err)
 	}
 	p.Console, p.Desktop, p.Files, p.Shell = false, false, false, false
+	p.Harness = false
 	p.Services, p.SSH, p.Provision = false, false, false
 	p.CobrowsePublicOnly = true
 	p.SetupPosture = config.SetupPostureCobrowseOnly

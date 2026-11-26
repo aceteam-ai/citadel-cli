@@ -72,11 +72,13 @@ func init() {
 	permissionCmd.AddCommand(permissionFilesCmd)
 	permissionCmd.AddCommand(permissionSetupPostureCmd)
 	permissionCmd.AddCommand(permissionCobrowsePublicOnlyCmd)
+	permissionCmd.AddCommand(newPermissionHarnessCommand(nodePermissionsDir))
 }
 
 func runPermissionStatus(cmd *cobra.Command, args []string) error {
 	perms := loadNodePermissions()
 	fmt.Fprintf(cmd.OutOrStdout(), "Shell: %s\n", enabledLabel(perms.Shell))
+	fmt.Fprintf(cmd.OutOrStdout(), "Harness: %s (local setting; execution not wired)\n", enabledLabel(perms.Harness))
 	fmt.Fprintf(cmd.OutOrStdout(), "Files: %s\n", enabledLabel(perms.Files))
 	fmt.Fprintf(cmd.OutOrStdout(), "Co-browse-only setup posture: %s\n", enabledLabel(config.SetupPostureActive(nodePermissionsDir())))
 	fmt.Fprintf(cmd.OutOrStdout(), "Passcode: %s\n", enabledLabel(perms.HasPasscode()))
