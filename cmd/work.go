@@ -3005,6 +3005,9 @@ func runWork(cmd *cobra.Command, args []string) {
 	// Shared with the control-center TUI via registerPrivilegedNodeJobHandlers so a
 	// control-center-only node handles the same privileged set.
 	registerPrivilegedNodeJobHandlers(runner, nodeJobOpts)
+	go runLocalFlowCleanupReconciler(ctx, liveLocalFlowDeps(), time.Minute, func(err error) {
+		Log("local Flow container cleanup pending: %v", err)
+	})
 	// Publish only after every handler is registered so heartbeats expose one
 	// complete immutable set, never a partial capability advertisement.
 	startStatusPublisherAfterRunner(&nodeRunner, runner, startStatusPublisher)
