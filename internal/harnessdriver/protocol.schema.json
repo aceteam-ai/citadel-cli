@@ -26,7 +26,12 @@
         "exit_code": {"type": ["integer", "null"], "minimum": -2147483648, "maximum": 2147483647},
         "is_error": {"type": ["boolean", "null"]},
         "input_preview": {"type": "string", "maxLength": 1024}, "output_excerpt": {"type": "string", "maxLength": 1024}
-      }
+      },
+      "allOf": [
+        {"if": {"properties": {"state": {"const": "started"}}}, "then": {"properties": {"exit_code": {"type": "null"}, "is_error": {"type": "null"}}}},
+        {"if": {"properties": {"state": {"const": "completed"}}}, "then": {"properties": {"exit_code": {"enum": [0, null]}, "is_error": {"const": false}}}},
+        {"if": {"properties": {"state": {"const": "failed"}}}, "then": {"properties": {"is_error": {"const": true}}}}
+      ]
     },
     "approval": {
       "type": "object", "additionalProperties": false, "required": ["id", "kind", "choices"],

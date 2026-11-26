@@ -20,11 +20,15 @@ const MaxEnvelopeBytes = 64 << 10
 
 var ErrProtocol = errors.New("harness_driver_invalid_protocol")
 
-// Schema is the candidate wire contract. It is embedded so runtime validation
+// The candidate wire contract is embedded so runtime validation
 // and the fixtures use the same artifact. No remote schema resolution is used.
 //
 //go:embed protocol.schema.json
-var Schema string
+var schemaJSON string
+
+// SchemaJSON returns the embedded candidate contract without exposing mutable
+// validation configuration.
+func SchemaJSON() string { return schemaJSON }
 
 type Event struct {
 	Protocol    string          `json:"protocol"`
@@ -119,7 +123,7 @@ func contract(event bool) (*jsonschema.Schema, error) {
 		compiler.AssertFormat = true
 		compiler.LoadURL = func(string) (io.ReadCloser, error) { return nil, ErrProtocol }
 		const base = "https://schemas.example.invalid/harness-driver/1"
-		if schemas.err = compiler.AddResource(base, bytes.NewBufferString(Schema)); schemas.err != nil {
+		if schemas.err = compiler.AddResource(base, bytes.NewBufferString(schemaJSON)); schemas.err != nil {
 			return
 		}
 		if schemas.event, schemas.err = compiler.Compile(base + "#/$defs/event"); schemas.err != nil {
@@ -167,7 +171,7 @@ func decode(raw []byte, event bool, target any) error {
 // uniqueValue rejects duplicate keys before decoding into maps can erase them.
 // Depth and token bounds also apply to unknown/optional payloads.
 func uniqueValue(d *json.Decoder, depth int, budget *int) error {
-	*budget++
+	(*budget)++
 	if depth > 16 || *budget > 16384 {
 		return ErrProtocol
 	}
@@ -212,13 +216,24 @@ func uniqueValue(d *json.Decoder, depth int, budget *int) error {
 	return nil
 }
 
-func DecodeEvent(raw []byte) (Event, error) { var e Event; err := decode(raw, true, &e); return e, err }
+func DecodeEvent(raw []byte) (Event, error) {
+	var e Event
+	if err := decode(raw, true, &e); err != nil {
+		return Event{}, err
+	}
+	return e, nil
+}
 func DecodeCommand(raw []byte) (Command, error) {
 	var c Command
-	err := decode(raw, false, &c)
-	return c, err
+	if err := decode(raw, false, &c); err != nil {
+		return Command{}, err
+	}
+	return c, nil
 }
 func (e Event) Validate() error {
+	if !boundedParts(len(e.Data), e.Protocol, e.Type, e.SessionName, e.Incarnation, e.NativeID, e.TurnID, e.Source, e.Fidelity) {
+		return ErrProtocol
+	}
 	raw, err := json.Marshal(e)
 	if err != nil {
 		return ErrProtocol
@@ -227,10 +242,27 @@ func (e Event) Validate() error {
 	return err
 }
 func (c Command) Validate() error {
+	if !boundedParts(len(c.Data), c.Protocol, c.Type, c.SessionName, c.Incarnation, c.NativeID, c.TurnID, c.RequestID) {
+		return ErrProtocol
+	}
 	raw, err := json.Marshal(c)
 	if err != nil {
 		return ErrProtocol
 	}
 	_, err = DecodeCommand(raw)
 	return err
+}
+
+func boundedParts(size int, fields ...string) bool {
+	if size > MaxEnvelopeBytes {
+		return false
+	}
+	remaining := MaxEnvelopeBytes - size
+	for _, field := range fields {
+		if len(field) > remaining {
+			return false
+		}
+		remaining -= len(field)
+	}
+	return true
 }
