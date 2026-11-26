@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/aceteam-ai/citadel-cli/internal/config"
 	"github.com/aceteam-ai/citadel-cli/internal/tmux"
 )
 
@@ -34,6 +35,8 @@ const DefaultSessionTTL = tmux.DefaultSessionLeaseTTL
 
 // Config holds the terminal server configuration
 type Config struct {
+	// PermissionSource reads current local console policy on each connection.
+	PermissionSource config.PermissionSource
 	// Host is the address the WebSocket server binds to (default: 127.0.0.1)
 	// External access comes through the tsnet VPN listener, not the TCP bind.
 	Host string

@@ -2453,6 +2453,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				termConfig.OrgID = orgID
 				termConfig.AuthServiceURL = baseURL
 				termConfig.Version = Version
+				termConfig.PermissionSource = loadNodePermissionsStrict
 
 				// Per-node passcode gate (aceteam#6524). Loaded fresh via the
 				// closure on each connection so a passcode rotated at runtime (via
@@ -2658,6 +2659,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		// Load and apply permissions
 		perms := workAppliedPermissions
 		gw.SetPermissions(perms)
+		gw.SetPermissionSource(loadNodePermissionsStrict)
 
 		// Model swapper (citadel-cli#686, construction-order fix): wired here, at
 		// gateway-construction time, NOT after buildNodeJobHandlers further down —
