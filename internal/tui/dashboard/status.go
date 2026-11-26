@@ -22,6 +22,7 @@ type StatusData struct {
 	Tags           []string  `json:"tags,omitempty"`
 	Connected      bool      `json:"connected"`
 	Version        string    `json:"version"`
+	Server         string    `json:"server"`
 	LastUpdate     time.Time `json:"lastUpdate"`
 
 	// System vitals
@@ -233,6 +234,9 @@ func (m StatusModel) View() string {
 	// Node info row
 	nodeInfo := m.formatNodeLine(boxWidth - 4)
 	sb.WriteString(m.boxLine(nodeInfo, boxWidth))
+	if m.data.Server != "" {
+		sb.WriteString(m.boxLine(tui.LabelStyle.Render("Server: ")+m.data.Server, boxWidth))
+	}
 
 	statusInfo := m.formatStatusLine(boxWidth - 4)
 	sb.WriteString(m.boxLine(statusInfo, boxWidth))

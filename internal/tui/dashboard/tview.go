@@ -179,6 +179,9 @@ func (d *TviewDashboard) updateNodeInfo() {
 
 	sb.WriteString(fmt.Sprintf(" [yellow]Node:[-]         %s\n", nodeName))
 	sb.WriteString(fmt.Sprintf(" [yellow]IP:[-]           %s\n", nodeIP))
+	if d.data.Server != "" {
+		sb.WriteString(fmt.Sprintf(" [yellow]Server:[-]       %s\n", tview.Escape(d.data.Server)))
+	}
 	sb.WriteString(fmt.Sprintf(" [yellow]Organization:[-] %s\n", org))
 	if len(d.data.Tags) > 0 {
 		sb.WriteString(fmt.Sprintf(" [yellow]Tags:[-]         %s\n", strings.Join(d.data.Tags, ", ")))

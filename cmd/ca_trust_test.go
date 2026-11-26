@@ -23,6 +23,7 @@ import (
 func TestPreparePrivateCATrustRecoversAuthOriginWithExplicitCA(t *testing.T) {
 	if os.Getenv("CITADEL_CA_EXPLICIT_RECOVERY_CHILD") == "1" {
 		t.Setenv("CITADEL_AUTH_HOST", "")
+		t.Setenv("CITADEL_SERVER", "")
 		nodeConfigDirFn = func() string { return os.Getenv("CITADEL_CA_TEST_DIR") }
 		deviceConfigForCATrustFn = func() *DeviceConfig { return nil }
 		caCertPath = os.Getenv("CITADEL_CA_TEST_CERT")

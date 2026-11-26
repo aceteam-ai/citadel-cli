@@ -116,6 +116,7 @@ func runStandardStatus(commandCtx context.Context) {
 	manifest, _, _ := findAndReadManifest()
 
 	headerColor.Fprintf(w, "--- 📊 Citadel Node Status (%s) ---\n", Version)
+	fmt.Fprintf(w, "Server:\t%s\n", authServiceURL)
 
 	headerColor.Fprintln(w, "\n🛠️ WORKER")
 	printConfiguredWorkerRole(w, getDeviceConfigFromFile())
@@ -460,6 +461,7 @@ func gatherInitialStatusData(commandCtx context.Context) (dashboard.StatusData, 
 func gatherStatusData() (dashboard.StatusData, error) {
 	data := dashboard.StatusData{
 		Version: Version,
+		Server:  authServiceURL,
 	}
 	if role, err := resolveWorkerRole(getDeviceConfigFromFile(), ""); err == nil {
 		data.ConfiguredRole = role.Report()
