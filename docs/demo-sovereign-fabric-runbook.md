@@ -77,9 +77,9 @@ $ citadel init
   → Device code: WDJF-2098
   → Open https://aceteam.ai/device and enter the code to authorize this node.
   ✓ Authorized. Joining the AceTeam Network...
-  ✓ Connected. Network IP: 100.64.0.61
+  ✓ Connected. Network IP: 100.64.100.60
 $ citadel status
-  AceTeam Network:   connected (100.64.0.61)
+  AceTeam Network:   connected (100.64.100.60)
   Node:              demo-node
   Services:          (none yet)
 ```
@@ -106,8 +106,8 @@ node with `--node <name-or-network-ip>`.)
 ```
 $ citadel mesh models
 MODEL                               NODE         ENGINE          ADDRESS
-llama3.1:8b                         demo-node    ollama          100.64.0.61:11434
-qwen3.8:27b                         demo-node    ollama          100.64.0.61:11434
+llama3.1:8b                         demo-node    ollama          100.64.100.60:11434
+qwen3.8:27b                         demo-node    ollama          100.64.100.60:11434
 2 model(s) across 1 reachable node(s).
 
 $ citadel mesh chat --model llama3.1:8b "Explain sovereign compute in one sentence."
