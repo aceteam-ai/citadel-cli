@@ -16,7 +16,7 @@ var wantSetupPostureAllowed = []string{
 	JobTypeApplyDeviceConfig, JobTypeAgentUpdate, JobTypeWorkerControl,
 	JobTypeShellCommand,
 	JobTypeFileRead, JobTypeFileReadBytes, JobTypeFileReadRangeV1, JobTypeFileReadRangeV2,
-	JobTypeFileWrite, JobTypeFileWriteBytes, JobTypeFileFetch, JobTypeFileEdit,
+	JobTypeFileWrite, JobTypeFileWriteIfUnchanged, JobTypeFileWriteBytes, JobTypeFileFetch, JobTypeFileEdit,
 	JobTypeFileList, JobTypeFileSearch, JobTypeFileIndex, JobTypeFileSemanticSearch,
 }
 
