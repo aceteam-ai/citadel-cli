@@ -8,7 +8,7 @@ It accepts one JSON document on stdin and emits a JSON receipt on stdout:
 citadel housekeeping plan < inventory.json
 ```
 
-There are no default roots, file arguments, shell commands, native inventory,
+The command has no default roots, file arguments, shell commands, native inventory,
 cache/process/Git inspection, deletion, timer installation, persistent receipt
 store or remote trigger. No node configuration or ordinary agent startup is
 needed. Profile admission still runs first; the HPC command list is unchanged.
@@ -91,6 +91,41 @@ Safe native inventory, run/status, execution locking and receipts, timer/update
 integration, free-space recovery and authorized platform operations remain
 unfinished #1895 scope. No current test or candidate receipt establishes them.
 
+## Unwired tree metadata inspector
+
+`InspectTree` is a separate internal, read-only helper. There is no CLI or
+production caller for it. Its caller must explicitly open an `os.Root` and
+provide a context, entry limit (1 through 1,000,000) and depth limit (1 through
+64). The caller owns and closes that root. The helper opens directories only,
+reads entries in batches of 64 and uses metadata without opening regular file
+contents. Entry count excludes the root; a depth of one permits direct child
+directories but not their child directories. An empty root is valid.
+
+The result contains entry/file counts, logical bytes for regular files only,
+and the newest mtime including directories and the root. It retains no names
+or paths. Directory bytes are excluded. Hard links may be counted more than
+once, sparse files are logical sizes, timestamps are not verified activity
+history, and a concurrent walk is not an atomic snapshot. The result is not an
+estimate of physically reclaimable space or evidence of complete live state.
+
+Observed symlinks and special entries, read failures, exceeded limits or
+cancellation return a finite error and no partial result. Opened child
+directories are checked against their observed identity. This is **not** a
+race-free no-follow or mount-boundary guarantee: `os.Root` does not exclude
+mounts, directory entries can change, and filesystem calls can block.
+Cancellation is checked between operations, not a deadline on individual
+system calls. Ownership, target category and safe root selection remain the
+responsibility of a future reviewed caller. Do not point this unwired helper
+at live roots as an acceptance test.
+
+Conversion through `TreeInventory.Observation` leaves target free space,
+open handles, in-use state and Git state unknown. Its observation time is a
+caller assertion. The existing planner therefore skips an unmodified converted
+observation. Supplying free space alone still cannot clear the unknown handle
+state. No metadata result authorizes deletion or changes the existing command's
+supplied-input startup boundary. Full safe native inventory and all cleanup,
+status, timer and platform integration remain incomplete.
+
 ## Tests
 
 `go test -race ./internal/housekeeping` exercises policy, unknown/unsafe input,
@@ -98,3 +133,6 @@ protected categories, freshness, per-target thresholds, worktree states and
 bounded parsing with synthetic metadata. `go test -race ./cmd -run
 'TestHousekeeping|TestNoSubcommandShadowsRootPersistentPreRun'` exercises stdin,
 sanitized errors, output failure and the narrow offline startup boundary.
+Owned temporary-directory tests cover bounded metadata walking, batch and
+depth boundaries, empty roots, timestamps, symlinks, special entries, closed
+roots and cancellation. They do not inspect live caches or prove cleanup safe.
