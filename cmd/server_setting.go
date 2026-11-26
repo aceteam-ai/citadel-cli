@@ -16,7 +16,7 @@ const defaultControlPlaneServer = "https://aceteam.ai"
 
 var serverURLFlag string
 var errServerURL = errors.New("server must be an HTTPS origin or bare host (HTTP is allowed only on loopback)")
-var errServerSwitch = errors.New("server differs from saved enrollment; disconnect or log out and enroll again before changing servers")
+var errServerSwitch = errors.New("server differs from saved enrollment; follow the server reset procedure in docs/server-setting.md (logout alone does not clear enrollment or private-CA bindings)")
 var serverHostLabel = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 
 type serverSelection struct {

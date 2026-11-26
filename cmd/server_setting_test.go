@@ -3,6 +3,9 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -156,6 +159,66 @@ func TestServerSettingInheritedFlags(t *testing.T) {
 		if err := root.Execute(); err != nil || chosen != "https://selected.example.test" {
 			t.Fatalf("inherited flags %q: %q %v", args, chosen, err)
 		}
+	}
+}
+
+func TestServerSettingDeviceDisconnectAllowsFreshServerWithoutCABinding(t *testing.T) {
+	oldDir, oldConfig := nodeConfigDirFn, deviceConfigForCATrustFn
+	oldAuth, oldNexus, oldCA := authServiceURL, nexusURL, caCertPath
+	t.Cleanup(func() {
+		nodeConfigDirFn, deviceConfigForCATrustFn = oldDir, oldConfig
+		authServiceURL, nexusURL, caCertPath = oldAuth, oldNexus, oldCA
+	})
+	t.Setenv("CITADEL_SERVER", "")
+	t.Setenv("CITADEL_AUTH_HOST", "")
+	node, legacy := t.TempDir(), t.TempDir()
+	for _, dir := range []string{node, legacy} {
+		if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("device_api_token: fixture-token\napi_base_url: https://prior.example.test\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	nodeConfigDirFn = func() string { return node }
+	deviceConfigForCATrustFn = func() *DeviceConfig { return readDeviceConfigFromDirs([]string{node, legacy}) }
+	authServiceURL, nexusURL, caCertPath = "https://prior.example.test", "https://coordination.example.test", ""
+	cmd := &cobra.Command{}
+	cmd.Flags().String("server", "", "")
+	cmd.Flags().String("nexus", "", "")
+	if err := cmd.Flags().Set("server", "new-server.example.test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Flags().Set("nexus", nexusURL); err != nil {
+		t.Fatal(err)
+	}
+	if err := preparePrivateCATrust(cmd); err != errServerSwitch {
+		t.Fatalf("existing enrollment must refuse switching: %v", err)
+	}
+	d := disconnectDeps{
+		stopWorker:       func() (bool, error) { return true, nil },
+		disableAutostart: func() (bool, error) { return true, nil },
+		logout: func() (logoutOutcome, error) {
+			if authServiceURL != "https://prior.example.test" {
+				t.Fatal("disconnect targeted the new server instead of the current one")
+			}
+			return logoutOutcome{Deregistered: true}, nil
+		},
+		removeCredentials: func() (bool, error) { return removeDeviceCredentialsIn([]string{node, legacy}) },
+	}
+	root := &cobra.Command{Use: "fixture"}
+	root.PersistentFlags().StringVar(&authServiceURL, "auth-service", defaultControlPlaneServer, "")
+	local := &cobra.Command{Use: "local"}
+	local.AddCommand(&cobra.Command{Use: "disconnect", RunE: func(*cobra.Command, []string) error {
+		return runLocalDisconnect(strings.NewReader(""), io.Discard, true, d)
+	}})
+	root.AddCommand(local)
+	root.SetArgs([]string{"--auth-service", "https://prior.example.test", "local", "disconnect"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("documented synthetic disconnect: %v", err)
+	}
+	if deviceConfigForCATrustFn() != nil {
+		t.Fatal("disconnect retained credential fallback")
+	}
+	if err := preparePrivateCATrust(cmd); err != nil || authServiceURL != "https://new-server.example.test" {
+		t.Fatalf("fresh server after disconnect: %q %v", authServiceURL, err)
 	}
 }
 
