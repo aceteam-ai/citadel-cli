@@ -74,7 +74,7 @@ CITADEL_GROUNDING_GUARDRAIL=1 CITADEL_SIGN_AEP_RECEIPTS=1 citadel work
 **Captured fallback:**
 ```
 $ citadel init
-  → Device code: WDJF-2098
+  → Device code: TEST-0000
   → Open https://aceteam.ai/device and enter the code to authorize this node.
   ✓ Authorized. Joining the AceTeam Network...
   ✓ Connected. Network IP: 100.64.100.60
@@ -199,7 +199,7 @@ The apparent egress IP moves to the relay's. The relay only accepts **same-org
 verified peers** over the mesh, and denies LAN/mesh destinations by default — it's
 a sovereign exit, not an open proxy.
 
-**Captured fallback (this is the real result from validation on a dual-uplink host):**
+**Captured fallback (sanitized addresses, retaining the observed dual-uplink result):**
 ```
 # client direct (its own ISP)
 198.51.100.10
