@@ -68,7 +68,8 @@ type Respond struct {
 }
 type Empty struct{}
 type Text struct {
-	Text string `json:"text"`
+	Text   string `json:"text"`
+	ItemID string `json:"item_id,omitempty"`
 }
 type Tool struct {
 	ID            string `json:"id"`
