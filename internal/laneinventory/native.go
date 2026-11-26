@@ -55,6 +55,18 @@ func ownProcessUID(ids []int32, uid int32) bool {
 	return uid >= 0 && len(ids) >= 2 && ids[0] == uid && ids[1] == uid
 }
 
+func threadHomeForUID(uid int32, lookup func(string) (*user.User, error)) (string, error) {
+	if uid < 0 || lookup == nil {
+		return "", ErrUnavailable
+	}
+	id := strconv.FormatInt(int64(uid), 10)
+	account, err := lookup(id)
+	if err != nil || account == nil || account.Uid != id || !filepath.IsAbs(account.HomeDir) {
+		return "", ErrUnavailable
+	}
+	return filepath.Clean(account.HomeDir), nil
+}
+
 func nativeProcesses(ctx context.Context, uid int32, list func(context.Context) ([]processRef, error)) ([]Process, error) {
 	processes, err := list(ctx)
 	if err != nil {
@@ -308,11 +320,11 @@ func NewNative(nodeDir string) Collector {
 			if runtime.GOOS != "linux" {
 				return "", ErrUnavailable
 			}
-			account, err := user.LookupId(strconv.FormatInt(int64(uid), 10))
-			if err != nil || !filepath.IsAbs(account.HomeDir) {
+			home, err := threadHomeForUID(uid, user.LookupId)
+			if err != nil {
 				return "", ErrUnavailable
 			}
-			return nativeThreadID(ctx, uid, expected, filepath.Clean(account.HomeDir), "/proc", harness, func(ctx context.Context) ([]int32, int64, error) {
+			return nativeThreadID(ctx, uid, expected, home, "/proc", harness, func(ctx context.Context) ([]int32, int64, error) {
 				current, err := process.NewProcessWithContext(ctx, expected.PID)
 				if err != nil {
 					return nil, 0, err
