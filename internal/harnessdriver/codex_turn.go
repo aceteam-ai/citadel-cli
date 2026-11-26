@@ -27,12 +27,15 @@ const maxProjectionSeq = uint64(9007199254740991)
 // CodexTurnIdentity is caller-supplied correlation, not native identity proof.
 // No field here can clear a registry, permission or native isolation hold.
 type CodexTurnIdentity struct {
-	SessionName string
-	Incarnation string
-	ThreadID    string
-	TurnID      string
-	FirstSeq    uint64
+	SessionName string `json:"-"`
+	Incarnation string `json:"-"`
+	ThreadID    string `json:"-"`
+	TurnID      string `json:"-"`
+	FirstSeq    uint64 `json:"-"`
 }
+
+func (CodexTurnIdentity) String() string   { return "supplied turn correlation (redacted)" }
+func (CodexTurnIdentity) GoString() string { return "supplied turn correlation (redacted)" }
 
 // CodexProjection contains explicit content events, never safe diagnostics.
 // Kind is a finite local disposition. The reducer has no transport or caller
@@ -41,6 +44,9 @@ type CodexProjection struct {
 	Kind   string
 	Events []Event
 }
+
+func (p CodexProjection) String() string   { return "offline notification projection (content omitted)" }
+func (p CodexProjection) GoString() string { return p.String() }
 
 // CodexTurn reduces an explicitly selected supplied turn stream. It owns no
 // vendor process, configuration, connection or launch permission. Counts are
@@ -184,6 +190,9 @@ func (t *CodexTurn) Apply(raw []byte, observedAt time.Time) (CodexProjection, er
 			if err != nil {
 				return CodexProjection{}, err
 			}
+			if _, done := t.seen[id]; done {
+				return CodexProjection{}, ErrCodexReplay
+			}
 			text, err := codexText(params, "delta")
 			if err != nil {
 				return CodexProjection{}, err
@@ -215,7 +224,8 @@ func (t *CodexTurn) item(params map[string]json.RawMessage, observedAt time.Time
 	if err != nil {
 		return CodexProjection{}, err
 	}
-	var event Event
+	var payload any
+	var eventKind string
 	var failed, declined bool
 	switch kind {
 	case "commandExecution":
@@ -242,21 +252,24 @@ func (t *CodexTurn) item(params map[string]json.RawMessage, observedAt time.Time
 		if isError {
 			state = "failed"
 		}
-		event, err = t.makeEvent("tool.activity", Tool{ID: id, State: state, ExitCode: exit, IsError: &isError}, observedAt, false)
+		eventKind = "tool.activity"
+		payload = Tool{ID: id, State: state, ExitCode: exit, IsError: &isError}
 	case "agentMessage":
 		text, textErr := codexText(item, "text")
 		if textErr != nil {
 			return CodexProjection{}, textErr
 		}
-		event, err = t.makeEvent("assistant.text", Text{Text: text, ItemID: id}, observedAt, false)
+		eventKind = "assistant.text"
+		payload = Text{Text: text, ItemID: id}
 	default:
 		return CodexProjection{}, ErrCodexUnsupported
 	}
-	if err != nil {
-		return CodexProjection{}, err
-	}
 	// Store only a hash of the projected semantic content, never native bodies.
-	digest := sha256.Sum256(append([]byte(event.Type+"\x00"), event.Data...))
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return CodexProjection{}, ErrCodexNotification
+	}
+	digest := sha256.Sum256(append([]byte(eventKind+"\x00"), data...))
 	if before, ok := t.seen[id]; ok {
 		if before != digest {
 			return CodexProjection{}, ErrCodexReplay
@@ -265,6 +278,10 @@ func (t *CodexTurn) item(params map[string]json.RawMessage, observedAt time.Time
 	}
 	if len(t.seen) >= maxCodexItems {
 		return CodexProjection{}, ErrCodexProjectionLimit
+	}
+	event, err := t.makeEvent(eventKind, payload, observedAt, false)
+	if err != nil {
+		return CodexProjection{}, err
 	}
 	t.seen[id] = digest
 	if failed {
@@ -279,7 +296,7 @@ func (t *CodexTurn) item(params map[string]json.RawMessage, observedAt time.Time
 }
 
 func (t *CodexTurn) finish(outcome string, at time.Time, derived bool) (CodexProjection, error) {
-	e, err := t.makeEvent("turn.completed", Completed{Outcome: outcome, ToolErrors: t.toolErrors, Denials: t.denials}, at, derived)
+	e, err := t.makeEvent("turn.completed", Completed{Outcome: outcome, ToolErrors: t.toolErrors, Denials: t.denials, CountsScope: "observed_items"}, at, derived)
 	if err != nil {
 		return CodexProjection{}, err
 	}

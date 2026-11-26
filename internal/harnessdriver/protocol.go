@@ -103,9 +103,10 @@ type Models struct {
 	IDs []string `json:"ids"`
 }
 type Completed struct {
-	Outcome    string `json:"outcome"`
-	ToolErrors uint64 `json:"tool_errors"`
-	Denials    uint64 `json:"denials"`
+	Outcome     string `json:"outcome"`
+	ToolErrors  uint64 `json:"tool_errors"`
+	Denials     uint64 `json:"denials"`
+	CountsScope string `json:"counts_scope,omitempty"`
 }
 type Failure struct {
 	Code      string `json:"code"`

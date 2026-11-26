@@ -54,7 +54,7 @@ func TestCodexOfflineFailureIsIndependentOfAssistantText(t *testing.T) {
 	}
 	var completed Completed
 	_ = json.Unmarshal(got.Events[0].Data, &completed)
-	if completed.Outcome != "completed" || completed.ToolErrors != 1 || completed.Denials != 0 || got.Events[0].Seq != 3 {
+	if completed.Outcome != "completed" || completed.ToolErrors != 1 || completed.Denials != 0 || completed.CountsScope != "observed_items" || got.Events[0].Seq != 3 {
 		t.Fatalf("lost observed failure: %+v", completed)
 	}
 	if _, err = r.Apply(raw, projectionTime); !errors.Is(err, ErrCodexTurnClosed) {

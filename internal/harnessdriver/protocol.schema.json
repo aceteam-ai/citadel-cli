@@ -62,7 +62,7 @@
     },
     "completed": {
       "type": "object", "additionalProperties": false, "required": ["outcome", "tool_errors", "denials"],
-      "properties": {"outcome": {"enum": ["completed", "interrupted", "failed", "unknown"]}, "tool_errors": {"$ref": "#/$defs/count"}, "denials": {"$ref": "#/$defs/count"}}
+      "properties": {"outcome": {"enum": ["completed", "interrupted", "failed", "unknown"]}, "tool_errors": {"$ref": "#/$defs/count"}, "denials": {"$ref": "#/$defs/count"}, "counts_scope": {"const": "observed_items"}}
     },
     "failure": {
       "type": "object", "additionalProperties": false, "required": ["code", "retryable"],
