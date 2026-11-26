@@ -11,9 +11,9 @@
 // composes forever and re-collide on the host ports #410 eliminated.
 //
 // This package runs a cheap version-gated sweep at boot that refreshes only the
-// citadel-owned files, preserving operator hand-edits, and hands each refreshed
-// service to an optional Recreator so a running container picks up the new
-// template. See Sweep for the full contract.
+// citadel-owned files, preserving operator hand-edits, and (optionally, and
+// only when a service's published host port actually moved) force-recreates the
+// affected container. See Sweep for the full contract.
 package composerefresh
 
 import (
@@ -24,7 +24,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 )
 
 // StampFile is the per-node record of what citadel last materialized. It lives
@@ -48,27 +47,13 @@ type managedStamp struct {
 // files skipped, recreate hints) without importing the cmd logger.
 type Logf func(format string, args ...any)
 
-// PortRecreator is invoked once for each service whose citadel-written compose
-// file a Sweep just rewrote. wantHostPort is the template's host port for a
-// service in Options.PortManaged and 0 otherwise. Implementations apply the
-// new file to a running container (force-recreating it when its published host
-// port moved) and leave a stopped or absent one alone. It returns
-// (recreated, err); an error makes the Sweep restore the previous file. A nil
-// PortRecreator disables all recreation (pure file-refresh mode).
+// PortRecreator is invoked after a managed compose file has been refreshed, for
+// services whose host publish citadel owns. Implementations should compare the
+// running container's published host port to wantHostPort and, if they differ
+// AND recreation is enabled, force-recreate the service from composePath. It
+// returns (recreated, err). A nil PortRecreator disables all recreation (pure
+// file-refresh mode) -- used by tests and by the conservative default.
 type PortRecreator func(service, composePath string, wantHostPort int) (bool, error)
-
-// RecreateOnUpgradeDisabled reports whether the operator opted out of
-// automatic recreation after a template refresh
-// (CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE=1|true|yes|on). Every start path
-// that refreshes a managed template consults it.
-func RecreateOnUpgradeDisabled() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE"))) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
-	}
-}
 
 // Options configures a Sweep.
 type Options struct {
@@ -82,12 +67,12 @@ type Options struct {
 	// content (services.ServiceMap). Only these files are ever touched.
 	Embedded map[string]string
 	// PortManaged maps citadel-owned service name -> the host port the current
-	// template publishes (services.ServiceHostPorts). It is passed to the
-	// Recreator as wantHostPort (0 for services absent here) so a moved host
-	// publish can be force-recreated.
+	// template publishes (services.ServiceHostPorts). Services absent here are
+	// still refreshed (templates change for image tags etc.) but never
+	// force-recreated on a port change.
 	PortManaged map[string]int
-	// Recreator, when non-nil, applies each rewritten file to a running
-	// container. Nil => file-refresh only.
+	// Recreator, when non-nil, may force-recreate a port-managed service whose
+	// running host port moved. Nil => file-refresh only.
 	Recreator PortRecreator
 	// KnownHistoricalHashes maps service name -> set of sha256 hex hashes of
 	// compose content that a PRIOR citadel binary is known to have shipped for
@@ -114,8 +99,8 @@ type Result struct {
 	// untouched because its content did not match the recorded citadel hash
 	// (i.e. it was hand-edited).
 	Preserved []string
-	// Recreated lists services the Recreator reported as recreated to apply the
-	// refreshed file.
+	// Recreated lists services the Recreator force-recreated due to a host-port
+	// change.
 	Recreated []string
 }
 
@@ -148,12 +133,11 @@ func (o Options) log(format string, args ...any) {
 //     If a stamp hash exists and the on-disk content does NOT match it, the file
 //     was hand-edited: it is left untouched and a warning is logged.
 //
-//  4. Recreation is opt-in via a non-nil Recreator, which is called once for
-//     each file this Sweep rewrote, never for a materialized, current or
-//     preserved file. A file whose content is already current is never
-//     rewritten and never disturbs a running container, and the version stamp
-//     makes the next boot on the same binary skip the sweep, so the recreate
-//     cannot repeat.
+//  4. Force-recreate is conservative and opt-in via a non-nil Recreator. Even
+//     then, a service is only recreated when its file was refreshed AND its
+//     running published host port differs from the new template's PortManaged
+//     port. A file whose content is already current is never rewritten and never
+//     disturbs a running container.
 //
 // The stamp is rewritten at the end with the new Version and the hashes of every
 // embedded template (so the next boot can detect edits precisely). Sweep tries
@@ -267,12 +251,16 @@ func Sweep(opts Options) (Result, error) {
 		res.Refreshed = append(res.Refreshed, name)
 		opts.log("compose-refresh: %s: installed selected host template", name)
 
-		// The Recreator applies the rewritten file to a running container: the
-		// start paths no-op on an already-running container, so without it the
-		// old config (host port, command, image) would keep running.
-		wantPort := opts.PortManaged[name]
-		if opts.Recreator == nil {
-			opts.log("compose-refresh: %s: compose file refreshed, but a running container is not recreated automatically; run `citadel stop %s && citadel run %s` to apply (or unset CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE)", name, name, name)
+		// Only port-managed services can trigger a recreate, and only when a
+		// Recreator is wired in and the running host port actually moved.
+		wantPort, portManaged := opts.PortManaged[name]
+		if !portManaged || opts.Recreator == nil {
+			if portManaged {
+				// A plain citadel restart will NOT move a running container: the
+				// start path no-ops on an already-running container. The operator
+				// must recreate it (or unset CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE).
+				opts.log("compose-refresh: %s: compose file refreshed to host port %d, but a running container is not moved automatically; run `citadel stop %s && citadel start %s` to apply (or unset CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE)", name, wantPort, name, name)
+			}
 			continue
 		}
 		recreated, err := opts.Recreator(name, destPath, wantPort)

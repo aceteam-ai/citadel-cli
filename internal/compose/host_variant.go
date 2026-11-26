@@ -12,7 +12,7 @@ import (
 
 // ReconcileCPUComposeOnDisk changes only the GPU flavor of a known embedded
 // template. Operator edits and same-flavor historical templates are preserved;
-// same-flavor template upgrades are RefreshKnownComposeOnDisk's job. The
+// ordinary template upgrades remain the versioned refresh sweep's job. The
 // local CLI callers hold the mutation lock; worker calls use their serialized
 // job lane. The replacement rechecks bytes but is not an interprocess lock.
 // This does not restart a service.
