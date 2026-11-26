@@ -1,6 +1,7 @@
-// Package housekeeping evaluates advisory prune policy. It never discovers
+// Package housekeeping evaluates advisory prune policy and provides an unwired
+// metadata inspector for explicitly opened directory roots. It never discovers
 // paths, reads file contents, shells out, changes configuration or deletes data.
-// Supplied observations are declarations, not cleanup authorization.
+// Observations and inventory estimates are not cleanup authorization.
 package housekeeping
 
 import (
