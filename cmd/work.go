@@ -3084,7 +3084,11 @@ func startManagedServices(ctx context.Context, gpuCount ...func() int) []started
 
 // Native observations and launch are injected together so boot admission can
 // be tested without probing an endpoint or starting an engine.
-func startManagedServicesForHost(ctx context.Context, probe func() int, nativeServing func(string) bool, nativeStart func(string, string) error) []startedService {
+func startManagedServicesForHost(ctx context.Context, probe func() int, nativeServing func(string) bool, nativeStart func(string, string) error, adoption ...func(string) (string, bool)) []startedService {
+	adopt := adoptExternalEngineForStart
+	if len(adoption) > 0 {
+		adopt = adoption[0]
+	}
 	sampled, count := false, -1
 	once := func() int {
 		if !sampled {
@@ -3143,7 +3147,28 @@ func startManagedServicesForHost(ctx context.Context, probe func() int, nativeSe
 
 		if serviceType == internalServices.ServiceTypeDocker {
 			if reason := services.CUDAStartRefusal(service.Name, runtime.GOOS, once); reason != "" {
-				fmt.Printf("   - %s\n", reason)
+				if _, allow := status.AdoptableExternalEnginePort(service.Name); !allow || composeProjectOverride() != "" {
+					skipped++
+					fmt.Printf("   - %s\n", reason)
+					continue
+				}
+				fullComposePath, err := platform.ValidatePathWithinDir(configDir, service.ComposeFile)
+				if err == nil {
+					err = withLocalServiceStartGuard(configDir, service.Name, func() error {
+						return startServiceForHost(service.Name, fullComposePath, once, adopt)
+					})
+				}
+				var unavailable *cudaServiceUnavailableError
+				switch {
+				case errors.As(err, &unavailable):
+					skipped++
+					fmt.Printf("   - %s\n", reason)
+				case err != nil:
+					failed++
+					fmt.Fprintf(os.Stderr, "     Error: %s: %v\n", service.Name, err)
+				default:
+					started = append(started, startedService{name: service.Name, composePath: fullComposePath})
+				}
 				continue
 			}
 		}

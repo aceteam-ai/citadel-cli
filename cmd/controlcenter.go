@@ -206,6 +206,24 @@ func controlCenterAPIPublisherConfig(client *redisapi.Client, nodeID, headscaleN
 	}
 }
 
+// Keep a live, adoptable external engine visible without advertising a new
+// managed CUDA launch. An isolated node never observes the shared endpoint.
+func controlCenterAvailableServicesForHost(goos string, gpuCount func() int, serving func(context.Context, string, int) ([]string, bool)) []string {
+	count := -1
+	if goos == "linux" && gpuCount != nil {
+		count = gpuCount()
+	}
+	var observed []string
+	if goos == "linux" && count == 0 && composeProjectOverride() == "" && serving != nil {
+		if port, ok := status.AdoptableExternalEnginePort("vllm"); ok {
+			if _, live := serving(context.Background(), "vllm", port); live {
+				observed = append(observed, "vllm")
+			}
+		}
+	}
+	return services.AvailableServicesForHost(goos, func() int { return count }, observed...)
+}
+
 // runControlCenter launches the unified control center TUI
 func runControlCenter() {
 	if !tui.IsTTY() {
@@ -252,7 +270,7 @@ func runControlCenter() {
 		RestartServiceFn: ccRestartService,
 		AddServiceFn:     ccAddService,
 		GetServicesFn: func() []string {
-			return services.AvailableServicesForHost(runtime.GOOS, platform.NvidiaGPUCountForCompose)
+			return controlCenterAvailableServicesForHost(runtime.GOOS, platform.NvidiaGPUCountForCompose, status.OpenAICompatServing)
 		},
 		GetConfiguredFn:    ccGetConfiguredServices,
 		GetServiceDetailFn: ccGetServiceDetail,

@@ -159,8 +159,30 @@ func startService(serviceName, composeFilePath string, gpuCount ...func() int) e
 	if len(gpuCount) > 0 {
 		probe = gpuCount[0]
 	}
+	return startServiceForHost(serviceName, composeFilePath, probe, adoptExternalEngineForStart)
+}
+
+func startServiceForHost(serviceName, composeFilePath string, probe func() int, adopt func(string) (string, bool)) error {
 	if reason := svcports.CUDAStartRefusal(serviceName, runtime.GOOS, probe); reason != "" {
-		return fmt.Errorf("cannot start %s", reason)
+		// GPU absence rules out a new managed launch, not an already serving
+		// external engine. Observe only an allowlisted, non-isolated target,
+		// after the same ownership and bind checks as an ordinary start.
+		if _, allow := status.AdoptableExternalEnginePort(serviceName); allow && composeProjectOverride() == "" {
+			if err := refuseManagedVLLMStart(serviceName); err != nil {
+				return err
+			}
+			service, _ := manifestServiceFor(serviceName)
+			if _, err := serviceBindEnvMap(serviceName, service.Bind); err != nil {
+				return fmt.Errorf("cannot start %s: %w", serviceName, err)
+			}
+			if adopt != nil {
+				if msg, ok := adopt(serviceName); ok {
+					fmt.Printf("   ✅ %s; not launching a citadel container\n", msg)
+					return nil
+				}
+			}
+		}
+		return &cudaServiceUnavailableError{reason: reason}
 	}
 	if err := refuseManagedVLLMStart(serviceName); err != nil {
 		return err
@@ -407,6 +429,26 @@ func startService(serviceName, composeFilePath string, gpuCount ...func() int) e
 	}
 	startOllamaPreload(serviceName, manifestSvc)
 	return nil
+}
+
+type cudaServiceUnavailableError struct{ reason string }
+
+func (e *cudaServiceUnavailableError) Error() string { return "cannot start " + e.reason }
+
+// Only observe the shared adoption endpoint for the canonical, non-isolated
+// target, retaining the same allowlist and managed-container ownership check.
+func adoptExternalEngineForStart(serviceName string) (string, bool) {
+	if composeProjectOverride() != "" {
+		return "", false
+	}
+	if _, ok := status.AdoptableExternalEnginePort(serviceName); !ok {
+		return "", false
+	}
+	rt := catalog.SelectContainerRuntime()
+	_, err := exec.LookPath(rt.EngineBin)
+	return maybeAdoptExternalEngineOnStart(context.Background(), serviceName, err == nil,
+		func() bool { return managedContainerRunningForStart(rt.EngineBin, "citadel-"+serviceName) },
+		status.OpenAICompatServing)
 }
 
 func refuseManagedVLLMStart(serviceName string) error {

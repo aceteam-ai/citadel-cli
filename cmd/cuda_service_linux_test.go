@@ -8,9 +8,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/aceteam-ai/citadel-cli/internal/externalengine"
+	"github.com/aceteam-ai/citadel-cli/internal/network"
 	"github.com/aceteam-ai/citadel-cli/services"
 )
 
@@ -111,6 +114,135 @@ func TestBootSkipsCUDAEnginesWithOneClearLineEach(t *testing.T) {
 		if strings.Contains(string(output), "Starting "+name+"...") {
 			t.Fatal("unsupported engine attempted", name)
 		}
+	}
+	if !strings.Contains(string(output), "0 started, 0 failed, 6 skipped") {
+		t.Fatal("CUDA skips missing from startup summary", string(output))
+	}
+}
+
+func TestCLIStartCUDAAbsenceAdoptsServingExternalEngine(t *testing.T) {
+	t.Setenv("CITADEL_NODE_DIR", "")
+	dir := writeManifestWithServices(t, []Service{{Name: "vllm", Type: "docker", ComposeFile: "services/vllm.yml"}})
+	t.Setenv("PATH", t.TempDir())
+	probed := false
+	err := startServiceForHost("vllm", filepath.Join(dir, "services/vllm.yml"), func() int { return 0 }, func(name string) (string, bool) {
+		probed = true
+		if name != "vllm" {
+			t.Fatal(name)
+		}
+		return "Adopted external vllm", true
+	})
+	if err != nil || !probed {
+		t.Fatalf("adoption=%v err=%v", probed, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "services/vllm.yml")); !os.IsNotExist(err) {
+		t.Fatal("adoption created compose", err)
+	}
+}
+
+func TestBootCUDAAbsenceAdoptsServingExternalEngine(t *testing.T) {
+	t.Setenv("CITADEL_NODE_DIR", "")
+	dir := writeManifestWithServices(t, []Service{{Name: "vllm", Type: "docker", ComposeFile: "services/vllm.yml"}})
+	t.Setenv("PATH", t.TempDir())
+	probed := false
+	started := startManagedServicesForHost(context.Background(), func() int { return 0 }, func(string) bool { t.Fatal("native probe"); return false }, func(string, string) error { t.Fatal("native launch"); return nil }, func(name string) (string, bool) {
+		probed = true
+		return "Adopted external vllm", true
+	})
+	if !probed || len(started) != 1 || started[0].name != "vllm" {
+		t.Fatalf("adoption=%v started=%v", probed, started)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "services/vllm.yml")); !os.IsNotExist(err) {
+		t.Fatal("boot adoption created compose", err)
+	}
+}
+
+func TestControlCenterCUDAListUsesServingObservation(t *testing.T) {
+	writeManifestWithServices(t, nil)
+	t.Setenv("CITADEL_NODE_DIR", "")
+	probed := false
+	names := controlCenterAvailableServicesForHost("linux", func() int { return 0 }, func(_ context.Context, name string, port int) ([]string, bool) {
+		probed = true
+		if name != "vllm" || port <= 0 {
+			t.Fatalf("unexpected observation: %s %d", name, port)
+		}
+		return []string{"synthetic-model"}, true
+	})
+	if !probed || !slices.Contains(names, "vllm") {
+		t.Fatalf("serving engine omitted: %v, probed=%v", names, probed)
+	}
+	for _, name := range []string{"bonsai", "sglang", "diffusers"} {
+		if slices.Contains(names, name) {
+			t.Fatal("non-adoptable engine included", name)
+		}
+	}
+}
+
+func TestCLIStartCUDAAbsenceAdoptionBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		service      string
+		isolated     bool
+		bind         string
+		corruptOwner bool
+		wantProbe    bool
+	}{
+		{name: "not serving", service: "vllm", wantProbe: true},
+		{name: "not allowlisted", service: "bonsai"},
+		{name: "isolated", service: "vllm", isolated: true},
+		{name: "invalid bind", service: "vllm", bind: "invalid"},
+		{name: "invalid ownership", service: "vllm", corruptOwner: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CITADEL_NODE_DIR", "")
+			dir := writeManifestWithServices(t, []Service{{Name: tc.service, Type: "docker", Bind: tc.bind}})
+			t.Setenv("PATH", t.TempDir())
+			if tc.isolated {
+				t.Setenv("CITADEL_NODE_DIR", dir)
+			}
+			if tc.corruptOwner {
+				if err := os.WriteFile(externalengine.Path(network.GetNodeConfigDir()), []byte("{"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			probed := false
+			err := startServiceForHost(tc.service, filepath.Join(dir, "services", tc.service+".yml"), func() int { return 0 }, func(string) (string, bool) {
+				probed = true
+				return "", false
+			})
+			if err == nil || probed != tc.wantProbe {
+				t.Fatalf("err=%v probed=%v wantProbe=%v", err, probed, tc.wantProbe)
+			}
+			if _, err := os.Stat(filepath.Join(dir, "services", tc.service+".yml")); !os.IsNotExist(err) {
+				t.Fatal("refused launch created compose", err)
+			}
+		})
+	}
+}
+
+func TestControlCenterCUDAListObservationBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name                                      string
+		gpu                                       int
+		isolated, serving, wantProbe, wantVisible bool
+	}{
+		{name: "not serving", gpu: 0, wantProbe: true},
+		{name: "isolated", gpu: 0, isolated: true, serving: true},
+		{name: "unknown", gpu: -1, wantVisible: true},
+		{name: "present", gpu: 1, wantVisible: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := writeManifestWithServices(t, nil)
+			t.Setenv("CITADEL_NODE_DIR", "")
+			if tc.isolated {
+				t.Setenv("CITADEL_NODE_DIR", dir)
+			}
+			probed, samples := false, 0
+			names := controlCenterAvailableServicesForHost("linux", func() int { samples++; return tc.gpu }, func(context.Context, string, int) ([]string, bool) { probed = true; return nil, tc.serving })
+			if probed != tc.wantProbe || slices.Contains(names, "vllm") != tc.wantVisible || samples != 1 {
+				t.Fatalf("probed=%v names=%v samples=%d", probed, names, samples)
+			}
+		})
 	}
 }
 
