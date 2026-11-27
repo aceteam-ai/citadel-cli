@@ -25,7 +25,7 @@ const AdapterVersion = "codex-quota-observation/1"
 var ErrInput = errors.New("quota_observation_invalid")
 var seatPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
 
-// Observation is an inactive proposed quota.reported payload, not a proven
+// Observation is a normalized supplied quota observation, not a proven
 // identity, complete harness-driver event or authorization to route work.
 type Observation struct {
 	SeatRef               string     `json:"seat_ref"`

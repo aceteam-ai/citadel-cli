@@ -90,6 +90,8 @@ type Resolution struct {
 }
 type Usage struct {
 	Model        string  `json:"model"`
+	SeatRef      string  `json:"seat_ref,omitempty"`
+	ModelActual  string  `json:"model_actual,omitempty"`
 	InputTokens  *uint64 `json:"input_tokens"`
 	OutputTokens *uint64 `json:"output_tokens"`
 	CachedTokens *uint64 `json:"cached_tokens"`
@@ -116,6 +118,7 @@ type Failure struct {
 var schemas struct {
 	sync.Once
 	event, command *jsonschema.Schema
+	quota, usage   *jsonschema.Schema
 	err            error
 }
 
@@ -131,7 +134,13 @@ func contract(event bool) (*jsonschema.Schema, error) {
 		if schemas.event, schemas.err = compiler.Compile(base + "#/$defs/event"); schemas.err != nil {
 			return
 		}
-		schemas.command, schemas.err = compiler.Compile(base + "#/$defs/command")
+		if schemas.command, schemas.err = compiler.Compile(base + "#/$defs/command"); schemas.err != nil {
+			return
+		}
+		if schemas.quota, schemas.err = compiler.Compile(base + "#/$defs/quota"); schemas.err != nil {
+			return
+		}
+		schemas.usage, schemas.err = compiler.Compile(base + "#/$defs/usage")
 	})
 	if schemas.err != nil {
 		return nil, ErrProtocol
