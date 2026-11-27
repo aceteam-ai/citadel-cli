@@ -22,12 +22,13 @@ const (
 	JobTypeExtraction = "EXTRACTION"
 
 	// File operation job types for agent workspace access
-	JobTypeFileRead      = "FILE_READ"
-	JobTypeFileReadBytes = "FILE_READ_BYTES"
-	JobTypeFileWrite     = "FILE_WRITE"
-	JobTypeFileEdit      = "FILE_EDIT"
-	JobTypeFileList      = "FILE_LIST"
-	JobTypeFileSearch    = "FILE_SEARCH"
+	JobTypeFileRead             = "FILE_READ"
+	JobTypeFileReadBytes        = "FILE_READ_BYTES"
+	JobTypeFileWrite            = "FILE_WRITE"
+	JobTypeFileWriteIfUnchanged = "FILE_WRITE_IF_UNCHANGED"
+	JobTypeFileEdit             = "FILE_EDIT"
+	JobTypeFileList             = "FILE_LIST"
+	JobTypeFileSearch           = "FILE_SEARCH"
 
 	// Model cache management job types
 	JobTypeModelCachePull  = "MODEL_CACHE_PULL"

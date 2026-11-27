@@ -198,68 +198,69 @@ const JobTypeFileReadRangeV2 = "FILE_READ_BYTES_RANGE_V2"
 // here, also add it to allKnownJobTypes below so it is reported in a node's
 // supported job-type set (issue #382).
 const (
-	JobTypeShellCommand       = "SHELL_COMMAND"
-	JobTypeTmuxSession        = "TMUX_SESSION" // Create/list/attach a named tmux session (issue #302)
-	JobTypeDownloadModel      = "DOWNLOAD_MODEL"
-	JobTypeOllamaPull         = "OLLAMA_PULL"
-	JobTypeLlamaCppInference  = "LLAMACPP_INFERENCE"
-	JobTypeVLLMInference      = "VLLM_INFERENCE"
-	JobTypeOllamaInference    = "OLLAMA_INFERENCE"
-	JobTypeLLMInference       = "llm_inference"        // Redis worker format
-	JobTypeEmbedding          = "embedding"            // Redis worker format
-	JobTypeApplyDeviceConfig  = "APPLY_DEVICE_CONFIG"  // Device config from onboarding
-	JobTypeExtraction         = "GLINER_EXTRACTION"    // Entity/relation extraction via GLiNER2
-	JobTypeHTTPProxy          = "HTTP_PROXY"           // Proxy HTTP requests through the local node
-	JobTypeWebFetch           = "WEB_FETCH"            // Native HTTP fetch from node egress with SSRF guards (aceteam#5995)
-	JobTypeFileRead           = "FILE_READ"            // Read a file from the workspace
-	JobTypeFileReadBytes      = "FILE_READ_BYTES"      // Read a file as raw base64-encoded bytes (binary-safe)
-	JobTypeFileWrite          = "FILE_WRITE"           // Write a file to the workspace
-	JobTypeFileWriteBytes     = "FILE_WRITE_BYTES"     // Write a file from raw base64-encoded bytes (binary-safe)
-	JobTypeFileFetch          = "FILE_FETCH"           // Stage an exact coordinator capability into the workspace
-	JobTypeFileEdit           = "FILE_EDIT"            // Edit (string replace) a file in the workspace
-	JobTypeFileList           = "FILE_LIST"            // List directory contents in the workspace
-	JobTypeFileSearch         = "FILE_SEARCH"          // Search for text across files in the workspace
-	JobTypeFileIndex          = "FILE_INDEX"           // (Re)build the node-local semantic index over workspace files (aceteam#6087)
-	JobTypeFileSemanticSearch = "FILE_SEMANTIC_SEARCH" // KNN over the node-local semantic index (aceteam#6087)
-	JobTypeServiceStart       = "SERVICE_START"        // Start a service on the node
-	JobTypeServiceStop        = "SERVICE_STOP"         // Stop a service on the node
-	JobTypeServiceStatus      = "SERVICE_STATUS"       // Check if a service is running
-	JobTypeSandboxSuspend     = "SANDBOX_SUSPEND"      // Pause a Docker container (sandbox suspend)
-	JobTypeSandboxResume      = "SANDBOX_RESUME"       // Unpause a Docker container (sandbox resume)
-	JobTypeModelCachePull     = "MODEL_CACHE_PULL"     // Pull model weights into local cache
-	JobTypeModelCacheEvict    = "MODEL_CACHE_EVICT"    // Evict model weights from local cache
-	JobTypeIOSBuild           = "IOS_BUILD"            // Build an iOS app via xcodebuild (macOS only)
-	JobTypeAndroidBuild       = "ANDROID_BUILD"        // Build an Android app via the Gradle wrapper
-	JobTypeGomobileBuild      = "GOMOBILE_BUILD"       // Cross-compile a Go package via gomobile bind
-	JobTypeFileScreenshot     = "FILE_SCREENSHOT"      // Capture the node's display, return base64 PNG (issue #4179)
-	JobTypeVNCScreenshot      = "VNC_SCREENSHOT"       // Capture the node's display via the VNC tool path (issue #4179)
-	JobTypeVNCType            = "VNC_TYPE"             // Type text on the node's display (issue #4179)
-	JobTypeVNCKeys            = "VNC_KEYS"             // Send a key combo to the node's display (issue #4179)
-	JobTypeVNCActions         = "VNC_ACTIONS"          // Execute pointer/keyboard actions (click, move, drag) on the node's display (issue #4180)
-	JobTypeCobrowse           = "COBROWSE"             // Human-in-the-loop co-browse over CDP (#4079)
-	JobTypeCobrowseSession    = "COBROWSE_SESSION"     // Isolated, concurrent interactive browser sessions (start/status/stop) (#793)
-	JobTypeTranscribeAudio    = "TRANSCRIBE_AUDIO"     // Transcribe workspace audio node-locally via the faster-whisper sidecar
-	JobTypeSynthesizeSpeech   = "SYNTHESIZE_SPEECH"    // Synthesize speech node-locally via the kokoro TTS sidecar (aceteam#6104)
-	JobTypeMediaGenerate      = "MEDIA_GENERATE"       // Generate an image or video node-locally via the diffusers sidecar (issue #968/#970)
-	JobTypeAgentUpdate        = "AGENT_UPDATE"         // Remotely update + restart this node's own citadel agent (aceteam#4427)
-	JobTypeWorkerControl      = "WORKER_CONTROL"       // Acknowledged, node-targeted worker restart (aceteam#9974)
-	JobTypeWhatsAppProvision  = "WHATSAPP_PROVISION"   // Remotely deploy + provision the WhatsApp bridge on this node (aceteam#4454)
-	JobTypeResourceSnapshot   = "RESOURCE_SNAPSHOT"    // Return the node's full GPU/host resource-consumer snapshot, managed and unmanaged (issue #427)
-	JobTypeInstanceMessage    = "INSTANCE_MESSAGE"     // Deliver a turn to a BYOC instance's loopback container (aceteam#5241)
-	JobTypeModuleSet          = "MODULE_SET"           // Set the desired state of a single module on this node (interim, aceteam#5280)
-	JobTypeFineTuneStart      = "FINETUNE_START"       // Train a node-local adapter on the pinned GPU node
-	JobTypeExposeSet          = "EXPOSE_SET"           // Expose a local service on the gateway with private/org/link visibility (issue #598)
-	JobTypeExposeList         = "EXPOSE_LIST"          // Read back this node's durable exposure inventory (issue #944)
-	JobTypeLaneInventory      = "LANE_INVENTORY"       // Bounded read-only lane inventory, exact own-node stream only (#1699)
-	JobTypeLaneOperation      = "LANE_OPERATION"       // Scrubbed capture or guarded once-per-offer send on a tmux lane pane (#1659)
-	JobTypeUnexpose           = "UNEXPOSE"             // Remotely revoke a gateway exposure (issue #944)
-	JobTypeMeetingJoin        = "MEETING_JOIN"         // Auto-join a video call, record + transcribe it node-locally (aceteam#5098)
-	JobTypeHuddleJoin         = "HUDDLE_JOIN"          // Join a native AceTeam huddle AS the agent (headless bot page) + confirm presence (aceteam#7081)
-	JobTypeHuddleTeardown     = "HUDDLE_TEARDOWN"      // Exact-attempt meetingd cleanup; always routable for durable lifecycle recovery
-	JobTypeDocumentRasterize  = "document_rasterize"   // Render selected PDF pages to images on this node so a scan can reach an OCR model (issue #675)
-	JobTypeShowPairingCode    = "SHOW_PAIRING_CODE"    // Render a node:exec pairing code on this node's console (issue #659)
-	JobTypeClearPairingCode   = "CLEAR_PAIRING_CODE"   // Clear a displayed node:exec pairing code (issue #659)
-	JobTypeVoiceManage        = "VOICE_MANAGE"         // Enroll/list/delete consented voices on the local voice-clone module (issue #1248). Per-node stream only, fail closed.
+	JobTypeShellCommand         = "SHELL_COMMAND"
+	JobTypeTmuxSession          = "TMUX_SESSION" // Create/list/attach a named tmux session (issue #302)
+	JobTypeDownloadModel        = "DOWNLOAD_MODEL"
+	JobTypeOllamaPull           = "OLLAMA_PULL"
+	JobTypeLlamaCppInference    = "LLAMACPP_INFERENCE"
+	JobTypeVLLMInference        = "VLLM_INFERENCE"
+	JobTypeOllamaInference      = "OLLAMA_INFERENCE"
+	JobTypeLLMInference         = "llm_inference"           // Redis worker format
+	JobTypeEmbedding            = "embedding"               // Redis worker format
+	JobTypeApplyDeviceConfig    = "APPLY_DEVICE_CONFIG"     // Device config from onboarding
+	JobTypeExtraction           = "GLINER_EXTRACTION"       // Entity/relation extraction via GLiNER2
+	JobTypeHTTPProxy            = "HTTP_PROXY"              // Proxy HTTP requests through the local node
+	JobTypeWebFetch             = "WEB_FETCH"               // Native HTTP fetch from node egress with SSRF guards (aceteam#5995)
+	JobTypeFileRead             = "FILE_READ"               // Read a file from the workspace
+	JobTypeFileReadBytes        = "FILE_READ_BYTES"         // Read a file as raw base64-encoded bytes (binary-safe)
+	JobTypeFileWrite            = "FILE_WRITE"              // Write a file to the workspace
+	JobTypeFileWriteIfUnchanged = "FILE_WRITE_IF_UNCHANGED" // Save only when node file metadata and digest match
+	JobTypeFileWriteBytes       = "FILE_WRITE_BYTES"        // Write a file from raw base64-encoded bytes (binary-safe)
+	JobTypeFileFetch            = "FILE_FETCH"              // Stage an exact coordinator capability into the workspace
+	JobTypeFileEdit             = "FILE_EDIT"               // Edit (string replace) a file in the workspace
+	JobTypeFileList             = "FILE_LIST"               // List directory contents in the workspace
+	JobTypeFileSearch           = "FILE_SEARCH"             // Search for text across files in the workspace
+	JobTypeFileIndex            = "FILE_INDEX"              // (Re)build the node-local semantic index over workspace files (aceteam#6087)
+	JobTypeFileSemanticSearch   = "FILE_SEMANTIC_SEARCH"    // KNN over the node-local semantic index (aceteam#6087)
+	JobTypeServiceStart         = "SERVICE_START"           // Start a service on the node
+	JobTypeServiceStop          = "SERVICE_STOP"            // Stop a service on the node
+	JobTypeServiceStatus        = "SERVICE_STATUS"          // Check if a service is running
+	JobTypeSandboxSuspend       = "SANDBOX_SUSPEND"         // Pause a Docker container (sandbox suspend)
+	JobTypeSandboxResume        = "SANDBOX_RESUME"          // Unpause a Docker container (sandbox resume)
+	JobTypeModelCachePull       = "MODEL_CACHE_PULL"        // Pull model weights into local cache
+	JobTypeModelCacheEvict      = "MODEL_CACHE_EVICT"       // Evict model weights from local cache
+	JobTypeIOSBuild             = "IOS_BUILD"               // Build an iOS app via xcodebuild (macOS only)
+	JobTypeAndroidBuild         = "ANDROID_BUILD"           // Build an Android app via the Gradle wrapper
+	JobTypeGomobileBuild        = "GOMOBILE_BUILD"          // Cross-compile a Go package via gomobile bind
+	JobTypeFileScreenshot       = "FILE_SCREENSHOT"         // Capture the node's display, return base64 PNG (issue #4179)
+	JobTypeVNCScreenshot        = "VNC_SCREENSHOT"          // Capture the node's display via the VNC tool path (issue #4179)
+	JobTypeVNCType              = "VNC_TYPE"                // Type text on the node's display (issue #4179)
+	JobTypeVNCKeys              = "VNC_KEYS"                // Send a key combo to the node's display (issue #4179)
+	JobTypeVNCActions           = "VNC_ACTIONS"             // Execute pointer/keyboard actions (click, move, drag) on the node's display (issue #4180)
+	JobTypeCobrowse             = "COBROWSE"                // Human-in-the-loop co-browse over CDP (#4079)
+	JobTypeCobrowseSession      = "COBROWSE_SESSION"        // Isolated, concurrent interactive browser sessions (start/status/stop) (#793)
+	JobTypeTranscribeAudio      = "TRANSCRIBE_AUDIO"        // Transcribe workspace audio node-locally via the faster-whisper sidecar
+	JobTypeSynthesizeSpeech     = "SYNTHESIZE_SPEECH"       // Synthesize speech node-locally via the kokoro TTS sidecar (aceteam#6104)
+	JobTypeMediaGenerate        = "MEDIA_GENERATE"          // Generate an image or video node-locally via the diffusers sidecar (issue #968/#970)
+	JobTypeAgentUpdate          = "AGENT_UPDATE"            // Remotely update + restart this node's own citadel agent (aceteam#4427)
+	JobTypeWorkerControl        = "WORKER_CONTROL"          // Acknowledged, node-targeted worker restart (aceteam#9974)
+	JobTypeWhatsAppProvision    = "WHATSAPP_PROVISION"      // Remotely deploy + provision the WhatsApp bridge on this node (aceteam#4454)
+	JobTypeResourceSnapshot     = "RESOURCE_SNAPSHOT"       // Return the node's full GPU/host resource-consumer snapshot, managed and unmanaged (issue #427)
+	JobTypeInstanceMessage      = "INSTANCE_MESSAGE"        // Deliver a turn to a BYOC instance's loopback container (aceteam#5241)
+	JobTypeModuleSet            = "MODULE_SET"              // Set the desired state of a single module on this node (interim, aceteam#5280)
+	JobTypeFineTuneStart        = "FINETUNE_START"          // Train a node-local adapter on the pinned GPU node
+	JobTypeExposeSet            = "EXPOSE_SET"              // Expose a local service on the gateway with private/org/link visibility (issue #598)
+	JobTypeExposeList           = "EXPOSE_LIST"             // Read back this node's durable exposure inventory (issue #944)
+	JobTypeLaneInventory        = "LANE_INVENTORY"          // Bounded read-only lane inventory, exact own-node stream only (#1699)
+	JobTypeLaneOperation        = "LANE_OPERATION"          // Scrubbed capture or guarded once-per-offer send on a tmux lane pane (#1659)
+	JobTypeUnexpose             = "UNEXPOSE"                // Remotely revoke a gateway exposure (issue #944)
+	JobTypeMeetingJoin          = "MEETING_JOIN"            // Auto-join a video call, record + transcribe it node-locally (aceteam#5098)
+	JobTypeHuddleJoin           = "HUDDLE_JOIN"             // Join a native AceTeam huddle AS the agent (headless bot page) + confirm presence (aceteam#7081)
+	JobTypeHuddleTeardown       = "HUDDLE_TEARDOWN"         // Exact-attempt meetingd cleanup; always routable for durable lifecycle recovery
+	JobTypeDocumentRasterize    = "document_rasterize"      // Render selected PDF pages to images on this node so a scan can reach an OCR model (issue #675)
+	JobTypeShowPairingCode      = "SHOW_PAIRING_CODE"       // Render a node:exec pairing code on this node's console (issue #659)
+	JobTypeClearPairingCode     = "CLEAR_PAIRING_CODE"      // Clear a displayed node:exec pairing code (issue #659)
+	JobTypeVoiceManage          = "VOICE_MANAGE"            // Enroll/list/delete consented voices on the local voice-clone module (issue #1248). Per-node stream only, fail closed.
 
 	// Hosted-app pod-per-app runner (CRAM slice A1, aceteam#9672). Privileged in
 	// the EXPOSE_SET sense: honored only on the per-node stream, fail closed on
@@ -312,6 +313,7 @@ var allKnownJobTypes = []string{
 	JobTypeFileReadRangeV1,
 	JobTypeFileReadRangeV2,
 	JobTypeFileWrite,
+	JobTypeFileWriteIfUnchanged,
 	JobTypeFileWriteBytes,
 	JobTypeFileFetch,
 	JobTypeFileEdit,
@@ -407,27 +409,28 @@ var allKnownJobTypes = []string{
 // Any other known type with no runnable handler is a handler_unavailable
 // refusal. Only a type absent from allKnownJobTypes receives the update hint.
 var gatedJobTypeReasons = map[string]string{
-	JobTypeShellCommand:       "shell execution requires a supported Unix platform and the node's Shell permission; enable Shell in the AceTeam control center on a supported node",
-	JobTypeFileRead:           "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
-	JobTypeFileReadBytes:      "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
-	JobTypeFileReadRangeV1:    "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
-	JobTypeFileReadRangeV2:    "conditional ranges require Linux artifact observations and the node's Files permission",
-	JobTypeFileWrite:          "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
-	JobTypeFileWriteBytes:     "this node has no workspace directory configured",
-	JobTypeFileFetch:          "FILE_FETCH requires supported Linux anonymous staging, a workspace, Files permission and a trusted HTTPS coordinator origin",
-	JobTypeFileEdit:           "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
-	JobTypeFileList:           "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
-	JobTypeFileSearch:         "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
-	JobTypeFileIndex:          "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
-	JobTypeFileSemanticSearch: "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
-	JobTypeFileScreenshot:     "the node's \"desktop\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
-	JobTypeVNCScreenshot:      "the node's \"desktop\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
-	JobTypeVNCType:            "the node's \"desktop\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
-	JobTypeVNCKeys:            "the node's \"desktop\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
-	JobTypeVNCActions:         "the node's \"desktop\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
-	JobTypeServiceStart:       "this node has no citadel.yaml manifest / config directory configured",
-	JobTypeServiceStop:        "this node has no citadel.yaml manifest / config directory configured",
-	JobTypeServiceStatus:      "this node has no citadel.yaml manifest / config directory configured",
-	JobTypeMeetingJoin:        "this node has no workspace directory configured, or its meeting capability is toggled off",
-	JobTypeHuddleJoin:         "this node's meeting capability is toggled off",
+	JobTypeShellCommand:         "shell execution requires a supported Unix platform and the node's Shell permission; enable Shell in the AceTeam control center on a supported node",
+	JobTypeFileRead:             "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeFileReadBytes:        "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeFileReadRangeV1:      "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeFileReadRangeV2:      "conditional ranges require Linux artifact observations and the node's Files permission",
+	JobTypeFileWrite:            "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeFileWriteIfUnchanged: "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeFileWriteBytes:       "this node has no workspace directory configured",
+	JobTypeFileFetch:            "FILE_FETCH requires supported Linux anonymous staging, a workspace, Files permission and a trusted HTTPS coordinator origin",
+	JobTypeFileEdit:             "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeFileList:             "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeFileSearch:           "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeFileIndex:            "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeFileSemanticSearch:   "the node's \"files\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeFileScreenshot:       "the node's \"desktop\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeVNCScreenshot:        "the node's \"desktop\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeVNCType:              "the node's \"desktop\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeVNCKeys:              "the node's \"desktop\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeVNCActions:           "the node's \"desktop\" permission is disabled (default-deny on a fresh node; enable it with citadel_set_worker_permission)",
+	JobTypeServiceStart:         "this node has no citadel.yaml manifest / config directory configured",
+	JobTypeServiceStop:          "this node has no citadel.yaml manifest / config directory configured",
+	JobTypeServiceStatus:        "this node has no citadel.yaml manifest / config directory configured",
+	JobTypeMeetingJoin:          "this node has no workspace directory configured, or its meeting capability is toggled off",
+	JobTypeHuddleJoin:           "this node's meeting capability is toggled off",
 }

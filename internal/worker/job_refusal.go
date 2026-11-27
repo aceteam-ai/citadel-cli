@@ -36,7 +36,7 @@ func legacyPermissionRefusal(jobType string) *jobs.ShellRefusal {
 		return jobs.WorkflowShellRefusal(jobs.ReasonShellDisabled)
 	case JobTypeFileScreenshot, JobTypeVNCScreenshot, JobTypeVNCType, JobTypeVNCKeys, JobTypeVNCActions:
 		return &jobs.ShellRefusal{Reason: "desktop_disabled", Message: "desktop permission is disabled on this node; enable Desktop in the AceTeam control center or use citadel_set_desktop_permission with enabled=true and confirm=true, then retry"}
-	case JobTypeFileRead, JobTypeFileReadBytes, JobTypeFileReadRangeV1, JobTypeFileReadRangeV2, JobTypeFileWrite, JobTypeFileWriteBytes, JobTypeFileEdit, JobTypeFileList, JobTypeFileSearch, JobTypeFileIndex, JobTypeFileSemanticSearch, JobTypeFileFetch:
+	case JobTypeFileRead, JobTypeFileReadBytes, JobTypeFileReadRangeV1, JobTypeFileReadRangeV2, JobTypeFileWrite, JobTypeFileWriteIfUnchanged, JobTypeFileWriteBytes, JobTypeFileEdit, JobTypeFileList, JobTypeFileSearch, JobTypeFileIndex, JobTypeFileSemanticSearch, JobTypeFileFetch:
 		return &jobs.ShellRefusal{Reason: "files_disabled", Message: "files permission is disabled on this node; enable Files in the AceTeam control center or use citadel_set_files_permission with enabled=true and confirm=true, then retry"}
 	case JobTypeHuddleJoin, JobTypeMeetingJoin:
 		return &jobs.ShellRefusal{Reason: "meeting_disabled", Message: "meeting capability is disabled on this node; enable it before dispatching new joins"}
@@ -63,7 +63,7 @@ func (g *registrationRefusals) RefusalFor(jobType string) *jobs.ShellRefusal {
 		if !permissionEnabled(o.DesktopEnabled, o.DesktopDisabled) {
 			return legacyPermissionRefusal(jobType)
 		}
-	case JobTypeFileRead, JobTypeFileReadBytes, JobTypeFileReadRangeV1, JobTypeFileReadRangeV2, JobTypeFileWrite, JobTypeFileWriteBytes, JobTypeFileEdit, JobTypeFileList, JobTypeFileSearch, JobTypeFileIndex, JobTypeFileSemanticSearch, JobTypeFileFetch, JobTypeMeetingJoin:
+	case JobTypeFileRead, JobTypeFileReadBytes, JobTypeFileReadRangeV1, JobTypeFileReadRangeV2, JobTypeFileWrite, JobTypeFileWriteIfUnchanged, JobTypeFileWriteBytes, JobTypeFileEdit, JobTypeFileList, JobTypeFileSearch, JobTypeFileIndex, JobTypeFileSemanticSearch, JobTypeFileFetch, JobTypeMeetingJoin:
 		if o.WorkspaceDir == "" {
 			return &jobs.ShellRefusal{Reason: "workspace_not_configured", Message: "this node has no workspace directory configured; configure a workspace before dispatching this job"}
 		}

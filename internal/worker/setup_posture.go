@@ -47,19 +47,20 @@ var setupPostureAllowedJobTypes = map[string]struct{}{
 	// the Shell permission plus the node passcode, the FILE_* types the Files
 	// permission ("read and upload files in the workspace"). Only the setup
 	// page, the viewer or `citadel permission` on the PC can turn them on.
-	JobTypeShellCommand:       {},
-	JobTypeFileRead:           {},
-	JobTypeFileReadBytes:      {},
-	JobTypeFileReadRangeV1:    {},
-	JobTypeFileReadRangeV2:    {},
-	JobTypeFileWrite:          {},
-	JobTypeFileWriteBytes:     {},
-	JobTypeFileFetch:          {},
-	JobTypeFileEdit:           {},
-	JobTypeFileList:           {},
-	JobTypeFileSearch:         {},
-	JobTypeFileIndex:          {},
-	JobTypeFileSemanticSearch: {},
+	JobTypeShellCommand:         {},
+	JobTypeFileRead:             {},
+	JobTypeFileReadBytes:        {},
+	JobTypeFileReadRangeV1:      {},
+	JobTypeFileReadRangeV2:      {},
+	JobTypeFileWrite:            {},
+	JobTypeFileWriteIfUnchanged: {},
+	JobTypeFileWriteBytes:       {},
+	JobTypeFileFetch:            {},
+	JobTypeFileEdit:             {},
+	JobTypeFileList:             {},
+	JobTypeFileSearch:           {},
+	JobTypeFileIndex:            {},
+	JobTypeFileSemanticSearch:   {},
 }
 
 var setupPostureSource atomic.Pointer[func() bool]
