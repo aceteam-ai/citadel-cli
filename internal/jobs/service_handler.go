@@ -104,6 +104,10 @@ type ServiceHandler struct {
 	// gpuCount overrides host GPU detection for compose materialization tests.
 	// Production uses platform.NvidiaGPUCountForCompose when this is nil.
 	gpuCount func() int
+	// Nil uses the real native serving/launch operations. Tests inject both
+	// boundaries so a refused native start cannot touch host state.
+	nativeServiceServingFn func(string) bool
+	nativeServiceStartFn   func(string, string) (*services.NativeProcess, error)
 	// WorkspaceDir is the absolute node workspace root. It is exported to
 	// docker compose as CITADEL_WORKSPACE so compose files that bind-mount the
 	// workspace (e.g. the transcribe sidecar) resolve to an absolute path even
@@ -391,6 +395,7 @@ func (h *ServiceHandler) serviceStatus(ctx context.Context, svc manifestService)
 // which always fits (fail-safe on an absent signal).
 func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model string, requiredVRAMBytes, requiredRAMBytes uint64, trustRemoteCode trustRemoteCodeIntent) ([]byte, error) {
 	kind := h.resolveKind(svc)
+
 	var err error
 	// appliedModel is the model this start serves via compose env interpolation;
 	// empty when no model was requested or the engine takes none.
@@ -422,10 +427,21 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 		// Serving, not merely process-present (#649). A SERVICE_START against a
 		// dead-but-process-matching engine must actually start it; short-circuiting
 		// here was how a deploy reported success onto a node serving nothing.
-		alreadyRunning := services.IsNativeServiceServing(svc.Name)
+		nativeServing := h.nativeServiceServingFn
+		if nativeServing == nil {
+			nativeServing = services.IsNativeServiceServing
+		}
+		nativeStart := h.nativeServiceStartFn
+		if nativeStart == nil {
+			nativeStart = services.StartNativeService
+		}
+		alreadyRunning := nativeServing(svc.Name)
 		if !alreadyRunning {
+			if reason := h.cudaStartRefusal(svc.Name); reason != "" {
+				return nil, fmt.Errorf("cannot start %s", reason)
+			}
 			logDir := filepath.Join(h.ConfigDir, "logs")
-			_, err = services.StartNativeService(svc.Name, logDir)
+			_, err = nativeStart(svc.Name, logDir)
 		}
 		if err == nil && pullModel != "" {
 			// Hard error on pull failure (job FAILURE), deliberately unlike the
@@ -484,6 +500,11 @@ func (h *ServiceHandler) serviceStart(ctx JobContext, svc manifestService, model
 		// See maybeAdoptExternalEngine / adoptedExternalEngine.
 		if out, adopted := h.maybeAdoptExternalEngine(ctx, svc, model, kind); adopted {
 			return out, nil
+		}
+		// GPU absence forbids launching a managed CUDA engine, not adopting a
+		// compatible engine already serving outside Citadel's ownership.
+		if reason := h.cudaStartRefusal(svc.Name); reason != "" {
+			return nil, fmt.Errorf("cannot start %s", reason)
 		}
 		if err := h.prepareEmbeddedComposeForStart(svc); err != nil {
 			return nil, err
@@ -2370,4 +2391,12 @@ func boolToStatus(running bool) string {
 		return "running"
 	}
 	return "stopped"
+}
+
+func (h *ServiceHandler) cudaStartRefusal(name string) string {
+	probe := h.gpuCount
+	if probe == nil {
+		probe = platform.NvidiaGPUCountForCompose
+	}
+	return embeddedservices.CUDAStartRefusal(name, runtime.GOOS, probe)
 }

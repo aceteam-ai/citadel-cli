@@ -20,6 +20,8 @@ import (
 func serviceHandlerWithAdoptSeams(t *testing.T, ourContainerRunning, serving bool, models []string) *ServiceHandler {
 	t.Helper()
 	h := NewServiceHandler(t.TempDir())
+	// Adoption fixtures must not depend on the runner having an NVIDIA GPU.
+	h.gpuCount = func() int { return 1 }
 	h.dockerServiceRunningFn = func(string) bool { return ourContainerRunning }
 	h.externalEngineServingFn = func(_ context.Context, _ string, _ int) ([]string, bool) {
 		return models, serving
@@ -283,6 +285,7 @@ func TestServiceStartRefusesManagedVLLMUnderPersistedOwnership(t *testing.T) {
 	for _, mode := range []string{"adopted", "detached"} {
 		t.Run(mode, func(t *testing.T) {
 			h := NewServiceHandler(t.TempDir())
+			h.gpuCount = func() int { return 1 }
 			c, err := externalengine.Validate(externalengine.Config{Version: 1, Mode: mode, Endpoint: externalengine.Endpoint{Host: "127.0.0.1", Port: 58000}, Model: "vendor/model", Revision: "1", RequestID: "00000000-0000-4000-8000-000000000001", NodeID: "12"}, true)
 			if err != nil {
 				t.Fatal(err)
@@ -297,6 +300,7 @@ func TestServiceStartRefusesManagedVLLMUnderPersistedOwnership(t *testing.T) {
 	}
 	t.Run("corrupt record fails closed", func(t *testing.T) {
 		h := NewServiceHandler(t.TempDir())
+		h.gpuCount = func() int { return 1 }
 		if err := os.WriteFile(externalengine.Path(h.ConfigDir), []byte("{"), 0600); err != nil {
 			t.Fatal(err)
 		}

@@ -178,7 +178,8 @@ func TestOllamaPolicyNormalizerWiredIntoEveryComposeUp(t *testing.T) {
 		marker string
 		needle string
 	}{
-		{"../cmd/service.go", "func startService(", "composeEnvForStrictServiceStart"},
+		{"../cmd/service.go", "func startService(", "startServiceForHost"},
+		{"../cmd/service.go", "func startServiceForHost(", "composeEnvForStrictServiceStart"},
 		{"../cmd/service_ollama.go", "func composeEnvForStrictServiceStart(", "OllamaMaxLoadedModelsComposeEnv"},
 		{"../cmd/service_bind.go", "func composeEnvForServiceValues(", "OllamaMaxLoadedModelsComposeEnv"},
 		{"../internal/jobs/service_handler.go", "func (h *ServiceHandler) composeEnvForEngineStart(", "OllamaMaxLoadedModelsComposeEnv"},

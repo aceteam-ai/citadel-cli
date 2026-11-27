@@ -3074,7 +3074,31 @@ type startedService struct {
 // that must not gate job-stream subscription on service readiness should invoke
 // it from a background goroutine (see runWork). The old blocking behavior is
 // still available via --wait-services.
-func startManagedServices(ctx context.Context) []startedService {
+func startManagedServices(ctx context.Context, gpuCount ...func() int) []startedService {
+	probe := platform.NvidiaGPUCountForCompose
+	if len(gpuCount) > 0 {
+		probe = gpuCount[0]
+	}
+	return startManagedServicesForHost(ctx, probe, internalServices.IsNativeServiceServing, startNativeServiceWithOwnership)
+}
+
+// Native observations and launch are injected together so boot admission can
+// be tested without probing an endpoint or starting an engine.
+func startManagedServicesForHost(ctx context.Context, probe func() int, nativeServing func(string) bool, nativeStart func(string, string) (bool, error), adoption ...func(string) (string, bool)) []startedService {
+	adopt := adoptExternalEngineForStart
+	if len(adoption) > 0 {
+		adopt = adoption[0]
+	}
+	sampled, count := false, -1
+	once := func() int {
+		if !sampled {
+			if probe != nil {
+				count = probe()
+			}
+			sampled = true
+		}
+		return count
+	}
 	manifest, configDir, err := findAndReadManifest()
 	if err != nil {
 		// No manifest found - this is fine, just skip service startup
@@ -3121,17 +3145,58 @@ func startManagedServices(ctx context.Context) []startedService {
 			continue
 		}
 
+		if serviceType == internalServices.ServiceTypeDocker {
+			if reason := services.CUDAStartRefusal(service.Name, runtime.GOOS, once); reason != "" {
+				if _, allow := status.AdoptableExternalEnginePort(service.Name); !allow || composeProjectOverride() != "" {
+					skipped++
+					fmt.Printf("   - %s\n", reason)
+					continue
+				}
+				fullComposePath, err := platform.ValidatePathWithinDir(configDir, service.ComposeFile)
+				if err == nil {
+					err = withLocalServiceStartGuard(configDir, service.Name, func() error {
+						return startServiceForHost(service.Name, fullComposePath, once, adopt)
+					})
+				}
+				var unavailable *cudaServiceUnavailableError
+				switch {
+				case errors.As(err, &unavailable):
+					skipped++
+					fmt.Printf("   - %s\n", reason)
+				case err != nil:
+					failed++
+					fmt.Fprintf(os.Stderr, "     Error: %s: %v\n", service.Name, err)
+				default:
+					// Adoption observes an existing engine; this worker does not
+					// own its lifetime and must not add it to managed teardown.
+					fmt.Printf("   - %s is already running\n", service.Name)
+				}
+				continue
+			}
+		}
+
 		if serviceType == internalServices.ServiceTypeNative {
+			launched := false
 			fmt.Printf("   - Starting %s (native)...\n", service.Name)
 			warnIfOllamaPolicyIgnoredNative(service)
 			if err := withLocalServiceStartGuard(configDir, service.Name, func() error {
-				return startNativeService(service.Name, configDir)
+				if nativeServing(service.Name) {
+					return nil
+				}
+				if reason := services.CUDAStartRefusal(service.Name, runtime.GOOS, once); reason != "" {
+					return fmt.Errorf("cannot start %s", reason)
+				}
+				var err error
+				launched, err = nativeStart(service.Name, configDir)
+				return err
 			}); err != nil {
 				failed++
 				fmt.Fprintf(os.Stderr, "     Error: %s: %v\n", service.Name, err)
 				continue
 			}
-			started = append(started, startedService{name: service.Name, native: true})
+			if launched {
+				started = append(started, startedService{name: service.Name, native: true})
+			}
 		} else {
 			// Validate that compose file path stays within config directory (prevent path traversal)
 			fullComposePath, err := platform.ValidatePathWithinDir(configDir, service.ComposeFile)
@@ -3141,14 +3206,17 @@ func startManagedServices(ctx context.Context) []startedService {
 				continue
 			}
 			fmt.Printf("   - Starting %s...\n", service.Name)
+			launched := false
 			if err := withLocalServiceStartGuard(configDir, service.Name, func() error {
-				return startService(service.Name, fullComposePath)
+				return startServiceForHost(service.Name, fullComposePath, once, adopt, func() { launched = true })
 			}); err != nil {
 				failed++
 				fmt.Fprintf(os.Stderr, "     Error: %s: %v\n", service.Name, err)
 				continue
 			}
-			started = append(started, startedService{name: service.Name, composePath: fullComposePath})
+			if launched {
+				started = append(started, startedService{name: service.Name, composePath: fullComposePath})
+			}
 		}
 		fmt.Printf("   - %s is running\n", service.Name)
 	}
@@ -3365,6 +3433,12 @@ func sensitiveCapabilityPasscodeWarning(perms *config.Permissions) string {
 // volumes; native stops leave any on-disk state). Services that were already
 // running when the worker booted are not in the list and are left untouched.
 func stopManagedServices(started []startedService) {
+	stopManagedServicesWith(started, internalServices.StopNativeService, stopServiceByCompose)
+}
+
+// Inject only the final stop operations so lifetime ownership can be exercised
+// from boot through shutdown without touching an actual engine.
+func stopManagedServicesWith(started []startedService, stopNative func(string) error, stopCompose func(string, bool) error) {
 	if len(started) == 0 {
 		return
 	}
@@ -3373,12 +3447,12 @@ func stopManagedServices(started []startedService) {
 	for i := len(started) - 1; i >= 0; i-- {
 		svc := started[i]
 		if svc.native {
-			if err := internalServices.StopNativeService(svc.name); err != nil {
+			if err := stopNative(svc.name); err != nil {
 				fmt.Fprintf(os.Stderr, "   - Warning: stop %s: %v\n", svc.name, err)
 			}
 			continue
 		}
-		if err := stopServiceByCompose(svc.composePath, false); err != nil {
+		if err := stopCompose(svc.composePath, false); err != nil {
 			fmt.Fprintf(os.Stderr, "   - Warning: stop %s: %v\n", svc.name, err)
 		}
 	}
