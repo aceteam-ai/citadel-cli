@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 
@@ -195,8 +194,16 @@ func runSingleService(serviceName string) {
 // registration, desired-status write, and actual start. The old split path
 // wrote the first three before checking an active fine-tune hold.
 func runSingleServiceApply(configDir, serviceName string, startFn func(string, string) error, gpuCount ...func() int) error {
+	probe := platform.NvidiaGPUCountForCompose
+	if len(gpuCount) > 0 {
+		probe = gpuCount[0]
+	}
+	return runSingleServiceApplyForHost(configDir, serviceName, startFn, probe, adoptExternalEngineForStart)
+}
+
+func runSingleServiceApplyForHost(configDir, serviceName string, startFn func(string, string) error, probe func() int, adopt func(string) (string, bool)) error {
 	return withLocalServiceStartGuardSource(configDir, serviceName, func(source nodeDirSource) error {
-		return runSingleServiceApplyLocked(configDir, source, serviceName, startFn, gpuCount...)
+		return runSingleServiceApplyLockedForHost(configDir, source, serviceName, startFn, probe, adopt)
 	})
 }
 
@@ -207,10 +214,17 @@ func runSingleServiceApplyLocked(configDir string, source nodeDirSource, service
 	if len(gpuCount) > 0 {
 		probe = gpuCount[0]
 	}
+	return runSingleServiceApplyLockedForHost(configDir, source, serviceName, startFn, probe, adoptExternalEngineForStart)
+}
+
+func runSingleServiceApplyLockedForHost(configDir string, source nodeDirSource, serviceName string, startFn func(string, string) error, probe func() int, adopt func(string) (string, bool)) error {
 	// Refuse before bootstrap, compose publication, registration or clearing a
 	// durable stopped marker. The pointer and reservation guards are still held.
-	if reason := services.CUDAStartRefusal(serviceName, runtime.GOOS, probe); reason != "" {
-		return fmt.Errorf("cannot start %s", reason)
+	if adopted, err := serviceStartAdmissionForHost(serviceName, probe, adopt); err != nil || adopted {
+		if err != nil {
+			return err
+		}
+		return clearAdoptedServiceStoppedMarker(configDir, serviceName)
 	}
 	manifest, _, err := findOrCreateManifestLockedAt(configDir, source)
 	if err != nil {

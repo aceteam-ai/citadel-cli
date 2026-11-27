@@ -224,6 +224,11 @@ func controlCenterAvailableServicesForHost(goos string, gpuCount func() int, ser
 	return services.AvailableServicesForHost(goos, func() int { return count }, observed...)
 }
 
+func externalEngineServingForChoices(_ context.Context, name string, _ int) ([]string, bool) {
+	_, live := adoptExternalEngineForStart(name)
+	return nil, live
+}
+
 // runControlCenter launches the unified control center TUI
 func runControlCenter() {
 	if !tui.IsTTY() {
@@ -270,7 +275,7 @@ func runControlCenter() {
 		RestartServiceFn: ccRestartService,
 		AddServiceFn:     ccAddService,
 		GetServicesFn: func() []string {
-			return controlCenterAvailableServicesForHost(runtime.GOOS, platform.NvidiaGPUCountForCompose, status.OpenAICompatServing)
+			return controlCenterAvailableServicesForHost(runtime.GOOS, platform.NvidiaGPUCountForCompose, externalEngineServingForChoices)
 		},
 		GetConfiguredFn:    ccGetConfiguredServices,
 		GetServiceDetailFn: ccGetServiceDetail,
@@ -1634,12 +1639,30 @@ func extractUptime(status string) string {
 	return ""
 }
 
+// Admission and explicit adoption intent share the existing start guards.
+func admitControlCenterServiceStart(configDir, name string, gpuCount func() int, adopt func(string) (string, bool)) (bool, error) {
+	adopted := false
+	err := withLocalServiceStartGuard(configDir, name, func() error {
+		var err error
+		adopted, err = serviceStartAdmissionForHost(name, gpuCount, adopt)
+		if err != nil || !adopted {
+			return err
+		}
+		return clearAdoptedServiceStoppedMarker(configDir, name)
+	})
+	return adopted, err
+}
+
 // ccStartService starts a service by name
 func ccStartService(name string) error {
 	return ccStartServiceForHost(name, platform.NvidiaGPUCountForCompose)
 }
 
 func ccStartServiceForHost(name string, gpuCount func() int) error {
+	return ccStartServiceForHostWithAdoption(name, gpuCount, adoptExternalEngineForStart)
+}
+
+func ccStartServiceForHostWithAdoption(name string, gpuCount func() int, adopt func(string) (string, bool)) error {
 	manifest, configDir, err := findAndReadManifest()
 	if err != nil {
 		return err
@@ -1650,8 +1673,8 @@ func ccStartServiceForHost(name string, gpuCount func() int) error {
 			// Existing manifest entries need the same host checks as CLI starts.
 			// Refuse unsupported CUDA engines and reconcile CPU-capable compose
 			// before runtime effects or clearing the durable stopped marker.
-			if reason := services.CUDAStartRefusal(name, runtime.GOOS, gpuCount); reason != "" {
-				return fmt.Errorf("cannot start %s", reason)
+			if adopted, err := admitControlCenterServiceStart(configDir, name, gpuCount, adopt); adopted || err != nil {
+				return err
 			}
 			// Preflight (citadel #767): this is the literal repro from the
 			// issue (TUI "Starting ollama..." -> "Failed to start ollama:
@@ -1761,6 +1784,10 @@ func ccRestartService(name string) error {
 }
 
 func ccRestartServiceForHost(name string, gpuCount func() int) error {
+	return ccRestartServiceForHostWithAdoption(name, gpuCount, adoptExternalEngineForStart)
+}
+
+func ccRestartServiceForHostWithAdoption(name string, gpuCount func() int, adopt func(string) (string, bool)) error {
 	manifest, configDir, err := findAndReadManifest()
 	if err != nil {
 		return err
@@ -1771,8 +1798,8 @@ func ccRestartServiceForHost(name string, gpuCount func() int) error {
 			// Existing manifest entries need the same host checks as CLI starts.
 			// Refuse unsupported CUDA engines and reconcile CPU-capable compose
 			// before runtime effects or clearing the durable stopped marker.
-			if reason := services.CUDAStartRefusal(name, runtime.GOOS, gpuCount); reason != "" {
-				return fmt.Errorf("cannot start %s", reason)
+			if adopted, err := admitControlCenterServiceStart(configDir, name, gpuCount, adopt); adopted || err != nil {
+				return err
 			}
 			// Preflight (citadel #767): same warn-and-proceed rationale as
 			// ccStartService above.

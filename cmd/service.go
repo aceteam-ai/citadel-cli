@@ -4,6 +4,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -163,26 +164,8 @@ func startService(serviceName, composeFilePath string, gpuCount ...func() int) e
 }
 
 func startServiceForHost(serviceName, composeFilePath string, probe func() int, adopt func(string) (string, bool)) error {
-	if reason := svcports.CUDAStartRefusal(serviceName, runtime.GOOS, probe); reason != "" {
-		// GPU absence rules out a new managed launch, not an already serving
-		// external engine. Observe only an allowlisted, non-isolated target,
-		// after the same ownership and bind checks as an ordinary start.
-		if _, allow := status.AdoptableExternalEnginePort(serviceName); allow && composeProjectOverride() == "" {
-			if err := refuseManagedVLLMStart(serviceName); err != nil {
-				return err
-			}
-			service, _ := manifestServiceFor(serviceName)
-			if _, err := serviceBindEnvMap(serviceName, service.Bind); err != nil {
-				return fmt.Errorf("cannot start %s: %w", serviceName, err)
-			}
-			if adopt != nil {
-				if msg, ok := adopt(serviceName); ok {
-					fmt.Printf("   ✅ %s; not launching a citadel container\n", msg)
-					return nil
-				}
-			}
-		}
-		return &cudaServiceUnavailableError{reason: reason}
+	if adopted, err := serviceStartAdmissionForHost(serviceName, probe, adopt); adopted || err != nil {
+		return err
 	}
 	if err := refuseManagedVLLMStart(serviceName); err != nil {
 		return err
@@ -435,17 +418,85 @@ type cudaServiceUnavailableError struct{ reason string }
 
 func (e *cudaServiceUnavailableError) Error() string { return "cannot start " + e.reason }
 
+// Admission is shared by the CLI, boot and Control Center paths. A validated
+// adopted record permits observation, not a competing managed launch; detached
+// or malformed records refuse. Unknown hardware never becomes proven absence.
+func serviceStartAdmissionForHost(serviceName string, probe func() int, adopt func(string) (string, bool)) (bool, error) {
+	reason := svcports.CUDAStartRefusal(serviceName, runtime.GOOS, probe)
+	if _, allow := status.AdoptableExternalEnginePort(serviceName); allow && composeProjectOverride() == "" {
+		record, err := externalengine.Load(network.GetNodeConfigDir())
+		if err != nil {
+			return false, fmt.Errorf("cannot inspect external vllm ownership: %w", err)
+		}
+		if record != nil && record.Mode == "detached" {
+			return false, fmt.Errorf("cannot start managed vllm: external detached ownership record exists")
+		}
+		if reason != "" || record != nil {
+			service, _ := manifestServiceFor(serviceName)
+			if _, err := serviceBindEnvMap(serviceName, service.Bind); err != nil {
+				return false, fmt.Errorf("cannot start %s: %w", serviceName, err)
+			}
+			if adopt != nil {
+				if msg, ok := adopt(serviceName); ok {
+					fmt.Printf("   ✅ %s; not launching a citadel container\n", msg)
+					return true, nil
+				}
+			}
+			if record != nil {
+				return false, fmt.Errorf("cannot start managed vllm: adopted external engine is not serving")
+			}
+		}
+	}
+	if reason != "" {
+		return false, &cudaServiceUnavailableError{reason: reason}
+	}
+	return false, nil
+}
+
+// Explicit Start/Restart may clear an existing stopped marker after successful
+// adoption. Never create a managed manifest or compose just to observe an engine.
+// Caller holds the existing pointer and reservation guards.
+func clearAdoptedServiceStoppedMarker(configDir, name string) error {
+	manifest, err := readManifestAt(configDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, service := range manifest.Services {
+		if service.Name == name && service.DesiredStatus == "stopped" {
+			return setServiceDesiredStatus(configDir, name, "")
+		}
+	}
+	return nil
+}
+
 // Only observe the shared adoption endpoint for the canonical, non-isolated
 // target, retaining the same allowlist and managed-container ownership check.
 func adoptExternalEngineForStart(serviceName string) (string, bool) {
+	return adoptExternalEngineForStartWithProbe(serviceName, externalengine.Probe)
+}
+
+func adoptExternalEngineForStartWithProbe(serviceName string, probe func(context.Context, externalengine.Endpoint, string) error) (string, bool) {
 	if composeProjectOverride() != "" {
 		return "", false
 	}
 	if _, ok := status.AdoptableExternalEnginePort(serviceName); !ok {
 		return "", false
 	}
+	record, err := externalengine.Load(network.GetNodeConfigDir())
+	if err != nil {
+		return "", false
+	}
+	if record != nil {
+		if record.Mode != "adopted" || probe == nil || probe(context.Background(), record.Endpoint, record.Model) != nil {
+			return "", false
+		}
+		return "Adopted external vllm is already serving", true
+	}
 	rt := catalog.SelectContainerRuntime()
-	_, err := exec.LookPath(rt.EngineBin)
+	_, err = exec.LookPath(rt.EngineBin)
 	return maybeAdoptExternalEngineOnStart(context.Background(), serviceName, err == nil,
 		func() bool { return managedContainerRunningForStart(rt.EngineBin, "citadel-"+serviceName) },
 		status.OpenAICompatServing)
