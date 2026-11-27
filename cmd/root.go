@@ -134,6 +134,12 @@ control center. All other subcommands are for scripting and advanced use.`,
 		if isHousekeepingPlanCommand(cmd) {
 			return
 		}
+		// Explicit owner-only seat metadata must not bootstrap CA trust, read
+		// device credentials, repair an update or start the updater/logging.
+		// This follows profile admission so HPC's positive list stays closed.
+		if isHarnessSeatCLI(cmd) {
+			return
+		}
 		// MCP command uses stdout as JSON-RPC transport -- any non-protocol
 		// output there corrupts the stream. Redirect debug to stderr FIRST,
 		// before any Log()/Debug() call in this function -- including

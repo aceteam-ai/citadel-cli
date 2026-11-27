@@ -289,19 +289,27 @@ func TestSessionAttachRootHookSkipsSharedStartup(t *testing.T) {
 			}
 		}
 		// This is a source boundary, not a live Control Center acceptance test:
-		// The original two leaves stay first. Only the separately tested
-		// housekeeping-plan predicate is added immediately after profile
-		// admission. Bare and neighboring live commands still reach startup.
+		// The original two leaves stay first. The exact housekeeping and seat
+		// metadata predicates follow profile admission in that order. Bare
+		// and neighboring live commands still reach startup.
 		housekeepingGuardSeen := false
+		seatGuardSeen := false
 		for index, statement := range function.Body.List[2:] {
 			if guard, ok := statement.(*ast.IfStmt); ok && len(guard.Body.List) == 1 {
 				if _, returns := guard.Body.List[0].(*ast.ReturnStmt); returns {
-					if !auditedHousekeepingStartupGuard(guard, index, function.Body.List[2]) {
+					switch {
+					case auditedHousekeepingStartupGuard(guard, index, function.Body.List[2]):
+						housekeepingGuardSeen = true
+					case auditedMetadataStartupGuard(guard, index, function.Body.List[2], "isHarnessSeatCLI", 2):
+						seatGuardSeen = true
+					default:
 						t.Fatal("an unaudited top-level startup bypass was introduced")
 					}
-					housekeepingGuardSeen = true
 				}
 			}
+		}
+		if !seatGuardSeen {
+			t.Fatal("local metadata guard was not audited")
 		}
 		if !housekeepingGuardSeen {
 			t.Fatal("housekeeping guard was not audited")
@@ -315,10 +323,15 @@ func TestSessionAttachRootHookSkipsSharedStartup(t *testing.T) {
 }
 
 // This is shared by the real source audit and negative synthetic-source tests.
-// Only one exact predicate immediately after profile admission is accepted.
+// The housekeeping predicate stays immediately after profile admission.
 func auditedHousekeepingStartupGuard(guard *ast.IfStmt, index int, previous ast.Stmt) bool {
+	return auditedMetadataStartupGuard(guard, index, previous, "isHousekeepingPlanCommand", 1)
+}
+
+// Each metadata exemption has its own exact predicate and fixed position.
+func auditedMetadataStartupGuard(guard *ast.IfStmt, index int, previous ast.Stmt, predicate string, expectedIndex int) bool {
 	call, ok := guard.Cond.(*ast.CallExpr)
-	if !ok || index != 1 || guard.Init != nil || guard.Else != nil || len(call.Args) != 1 || len(guard.Body.List) != 1 {
+	if !ok || index != expectedIndex || guard.Init != nil || guard.Else != nil || len(call.Args) != 1 || len(guard.Body.List) != 1 {
 		return false
 	}
 	if _, ok := guard.Body.List[0].(*ast.ReturnStmt); !ok {
@@ -326,7 +339,7 @@ func auditedHousekeepingStartupGuard(guard *ast.IfStmt, index int, previous ast.
 	}
 	name, named := call.Fun.(*ast.Ident)
 	argument, correctArg := call.Args[0].(*ast.Ident)
-	if !named || name.Name != "isHousekeepingPlanCommand" || !correctArg || argument.Name != "cmd" {
+	if !named || name.Name != predicate || !correctArg || argument.Name != "cmd" {
 		return false
 	}
 	profile, ok := previous.(*ast.IfStmt)
@@ -343,6 +356,33 @@ func auditedHousekeepingStartupGuard(guard *ast.IfStmt, index int, previous ast.
 	}
 	admissionName, ok := admission.Fun.(*ast.Ident)
 	return ok && admissionName.Name == "applyRunProfile"
+}
+
+func TestSeatStartupAuditRefusesOtherBypasses(t *testing.T) {
+	profile := "if handled, err := applyRunProfile(cmd, args); err != nil { panic(err) } else if handled { return }"
+	for _, tc := range []struct {
+		guard string
+		index int
+		want  bool
+	}{
+		{"if isHarnessSeatCLI(cmd) { return }", 2, true},
+		{"if isHarnessSeatCLI(cmd) { return }", 1, false},
+		{"if isHarnessSeatCLI(cmd) { return }", 3, false},
+		{"if isHousekeepingPlanCommand(cmd) { return }", 2, false},
+		{"if isHarnessSeatCLI(other) { return }", 2, false},
+		{"if isHarnessSeatCLI(cmd) || other(cmd) { return }", 2, false},
+		{"if isHarnessSeatCLI(cmd) { other(); return }", 2, false},
+		{"if isHarnessSeatCLI(cmd) { return } else { return }", 2, false},
+	} {
+		file, err := parser.ParseFile(token.NewFileSet(), "fixture.go", "package fixture; func f(){"+profile+";"+tc.guard+"}", 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := file.Decls[0].(*ast.FuncDecl).Body.List
+		if auditedMetadataStartupGuard(body[1].(*ast.IfStmt), tc.index, body[0], "isHarnessSeatCLI", 2) != tc.want {
+			t.Fatalf("seat startup audit changed scope: index %d, %s", tc.index, tc.guard)
+		}
+	}
 }
 
 func TestHousekeepingStartupAuditRefusesOtherBypasses(t *testing.T) {
