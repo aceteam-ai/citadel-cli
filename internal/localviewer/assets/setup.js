@@ -182,7 +182,10 @@
         node + " is already connected" + org + ".";
     }
     $("enroll-posture").hidden = !(st.stage === "connected" && st.posture);
-    $("enroll-posture").textContent = st.posture || "";
+    // Enrollment state keeps the initial receipt. Permission polling and human
+    // changes update this summary; don't restore the receipt's stale denials.
+    $("enroll-posture").textContent = $("node-perms-posture").textContent ||
+      "Check the current permission settings below before allowing agents to use this PC.";
     $("worker").hidden = !(st.stage === "connected" && st.worker_offer);
     $("posture-retry-row").hidden = !(st.stage === "connected" && st.posture_retry);
     if (active && !enrollTimer) enrollTimer = setInterval(pollEnroll, 1500);

@@ -12,28 +12,29 @@
   const headers = { "Content-Type": "application/json", "X-Citadel-CSRF": csrf };
   let busy = false;
 
+  function renderPosture(text) {
+    $("node-perms-posture").textContent = text;
+    // The enrollment receipt describes the initial defaults, not later human
+    // choices. Keep its visible summary on the same current settings as below.
+    const enrollPosture = $("enroll-posture");
+    if (enrollPosture) enrollPosture.textContent = text || "Check the current permission settings below before allowing agents to use this PC.";
+  }
+
   function render(st) {
     box.hidden = !st.available;
-    if (!st.available) return;
+    if (!st.available) { renderPosture(""); return; }
     $("perm-files").checked = !!st.files;
     $("perm-shell").checked = !!st.shell;
     $("perm-workspace").textContent = st.workspace || "the Citadel workspace folder";
     const parts = [];
     if (st.public_only) parts.push("Co-browse reaches public websites only, not your home network.");
-    const off = [];
-    if (!st.files) off.push("open files");
-    if (!st.shell) off.push("run commands");
-    if (!st.console) off.push("use a terminal");
-    if (!st.desktop) off.push("see or control the screen");
-    if (off.length === 4) {
-      parts.push("Agents can't open files, run commands, use a terminal, or see or control the screen on this PC.");
-    } else {
-      const on = [];
-      if (st.console) on.push("terminal (console)");
-      if (st.desktop) on.push("screen (desktop)");
-      if (on.length) parts.push("Remote " + on.join(" and ") + " access is on for this PC.");
-    }
-    $("node-perms-posture").textContent = parts.join(" ");
+    parts.push(st.files ?
+      "Agents may read, create and overwrite files in " + (st.workspace || "the Citadel workspace folder") + "." :
+      "Agents can't open files or create or overwrite files in the workspace.");
+    parts.push(st.shell ? "Command access is on for this PC." : "Agents can't run commands on this PC.");
+    parts.push(st.console ? "Remote terminal (console) access is on for this PC." : "Agents can't use a terminal on this PC.");
+    parts.push(st.desktop ? "Remote screen (desktop) access is on for this PC." : "Agents can't see or control the screen on this PC.");
+    renderPosture(parts.join(" "));
     $("node-perms-message").textContent = st.message || "";
   }
 
