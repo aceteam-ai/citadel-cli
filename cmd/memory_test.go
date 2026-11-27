@@ -54,7 +54,7 @@ func TestMemoryElevatedUserCheck(t *testing.T) {
 	if err := memoryElevatedUserCheck(false, ""); err != nil {
 		t.Fatalf("ordinary user rejected: %v", err)
 	}
-	if err := memoryElevatedUserCheck(true, "jason"); err == nil || !strings.Contains(err.Error(), "without sudo") {
+	if err := memoryElevatedUserCheck(true, "owner"); err == nil || !strings.Contains(err.Error(), "without sudo") {
 		t.Fatalf("sudo user mismatch not rejected clearly: %v", err)
 	}
 	if err := memoryElevatedUserCheck(true, ""); err == nil {

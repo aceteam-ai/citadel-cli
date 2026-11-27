@@ -202,6 +202,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Load and apply permissions
 	perms := loadNodePermissions()
 	gw.SetPermissions(perms)
+	gw.SetPermissionSource(loadNodePermissionsStrict)
 
 	// Service ingress / exposure (issue #598): wire the identity resolver
 	// (private/org visibility) and the per-node link-token signing key so an

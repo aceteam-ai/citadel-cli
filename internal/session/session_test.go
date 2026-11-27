@@ -73,21 +73,21 @@ func TestEvaluateDarwin(t *testing.T) {
 		{
 			name:        "aqua gui session",
 			env:         darwinEnv{},
-			consoleUser: "jason",
+			consoleUser: "owner",
 			wantDesktop: true,
 			wantType:    "aqua",
 		},
 		{
 			name:        "ssh session overrides console user",
 			env:         darwinEnv{sshTTY: "/dev/ttys000"},
-			consoleUser: "jason",
+			consoleUser: "owner",
 			wantDesktop: false,
 			wantType:    "ssh",
 		},
 		{
 			name:        "ssh connection env",
 			env:         darwinEnv{sshConnection: "1.2.3.4 22 5.6.7.8 22"},
-			consoleUser: "jason",
+			consoleUser: "owner",
 			wantDesktop: false,
 			wantType:    "ssh",
 		},
@@ -247,10 +247,10 @@ func TestParseConsoleUser(t *testing.T) {
 			name: "standard dictionary with name",
 			input: "<dictionary> {\n" +
 				"  GID : 20\n" +
-				"  Name : jason\n" +
+				"  Name : owner\n" +
 				"  UID : 501\n" +
 				"}\n",
-			expect: "jason",
+			expect: "owner",
 		},
 		{
 			name:   "loginwindow at login screen",

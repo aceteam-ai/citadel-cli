@@ -1,7 +1,7 @@
 # Current-key device binding display
 
 Citadel #1466 consumes the read-only endpoint from Aceteam #12443, implementing
-Jason's D1–D3 decisions on #12328. It suppresses the saved-link warning only for
+Owner's D1–D3 decisions on #12328. It suppresses the saved-link warning only for
 one verified observation. It does not gate workers, job claims, Control Center
 actions or enrollment. There is no local proof marker, persisted confirmation,
 grant repair or credential replacement.

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os/user"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -15,6 +17,38 @@ type fakeProcessReader struct {
 	ids           []int32
 	err           error
 	metadataCalls int
+}
+
+func TestInventoryThreadHomeUsesOSAccount(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "owner")
+	for _, kind := range []string{"valid", "foreign", "relative", "missing", "error"} {
+		t.Run(kind, func(t *testing.T) {
+			got, err := threadHomeForUID(1000, func(id string) (*user.User, error) {
+				if id != "1000" {
+					t.Fatal("wrong account requested")
+				}
+				account := &user.User{Uid: "1000", HomeDir: home}
+				switch kind {
+				case "foreign":
+					account.Uid = "2000"
+				case "relative":
+					account.HomeDir = "relative"
+				case "missing":
+					return nil, nil
+				case "error":
+					return nil, errors.New("private lookup detail")
+				}
+				return account, nil
+			})
+			if kind == "valid" {
+				if err != nil || got != home {
+					t.Fatal("valid account refused")
+				}
+			} else if got != "" || !errors.Is(err, ErrUnavailable) {
+				t.Fatal("uncertain account home selected")
+			}
+		})
+	}
 }
 
 func (p *fakeProcessReader) UidsWithContext(context.Context) ([]int32, error) { return p.ids, p.err }
@@ -70,7 +104,7 @@ func TestInventoryNativeProcessOwnership(t *testing.T) {
 func TestInventoryNativeSeams(t *testing.T) {
 	// Construction is lazy; never invoke these native functions in source tests.
 	c := NewNative("/fixture/not-opened")
-	if c.Deps.Panes == nil || c.Deps.Argv == nil || c.Deps.Git == nil || c.Deps.Declarations == nil {
+	if c.Deps.Panes == nil || c.Deps.Argv == nil || c.Deps.ThreadID == nil || c.Deps.Git == nil || c.Deps.Declarations == nil {
 		t.Fatal("native edge missing")
 	}
 	lookups := []string{}

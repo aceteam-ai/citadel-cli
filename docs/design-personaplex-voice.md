@@ -5,7 +5,7 @@ Status: **UNACCEPTED DESIGN OF RECORD PROPOSAL**, partial source feasibility for
 `dc139d1de01239fc4d432990bef415d59f6b4e33`. No implementation, service, catalog,
 model or image is supplied. No native execution, model/image/package download
 or benchmark was run.
-**BUILD requires a separate Jason green-light**, even after source/design review.
+**BUILD requires a separate Owner green-light**, even after source/design review.
 Implementation children below are proposals in this document only; none are
 filed or authorized. #1216 remains open/WIP while feasibility gates are unmet.
 
@@ -124,7 +124,7 @@ without an applicable term. The exact accepted terms and accompanying notices
 for retrieved pinned artifacts remain unverified: no gated artifacts were fetched.
 
 This corrects the issue's shorthand “clean for resale” into attributed license
-evidence, not a legal/business determination. Jason's named catalog license
+evidence, not a legal/business determination. Owner's named catalog license
 review and any required legal review remain gates; no credentials are requested
 or passed through a conversation. Label unknowns as unverified; build no new
 org block/exclusion mode. Existing signed v2 receipt bytes stay unchanged; any
@@ -255,7 +255,7 @@ Route decisions to automated-citadel / automated-aceteam for named owners:
    voice provenance/import scope. A prompt or raw query field never grants access.
 3. Resolve #1340 all-ingress custody and long-call policy, then approve exact
    artifact/license/image reviewers and performance/quality thresholds.
-4. Explicitly accept a DoR, then separately obtain Jason's build and execution
+4. Explicitly accept a DoR, then separately obtain Owner's build and execution
    green-light. Source review alone satisfies neither approval.
 
 Potential later children, **documented only**: reviewed packaging/offline import;

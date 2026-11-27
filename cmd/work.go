@@ -1304,7 +1304,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	}
 	if nodeName == "" {
 		// Try to get the actual registered hostname from network status
-		// This returns the Headscale-assigned name (e.g., "ubuntu-gpu-8gluaaom") not just the requested name
+		// This returns the Headscale-assigned name (e.g., "linux-node-fixture1") not just the requested name
 		if netStatus, err := network.GetGlobalStatus(ctx); err == nil && netStatus.Connected && netStatus.Hostname != "" {
 			Debug("got hostname from network status: %s", netStatus.Hostname)
 			nodeName = netStatus.Hostname
@@ -2453,6 +2453,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				termConfig.OrgID = orgID
 				termConfig.AuthServiceURL = baseURL
 				termConfig.Version = Version
+				termConfig.PermissionSource = loadNodePermissionsStrict
 
 				// Per-node passcode gate (aceteam#6524). Loaded fresh via the
 				// closure on each connection so a passcode rotated at runtime (via
@@ -2658,6 +2659,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		// Load and apply permissions
 		perms := workAppliedPermissions
 		gw.SetPermissions(perms)
+		gw.SetPermissionSource(loadNodePermissionsStrict)
 
 		// Model swapper (citadel-cli#686, construction-order fix): wired here, at
 		// gateway-construction time, NOT after buildNodeJobHandlers further down —
@@ -3003,6 +3005,9 @@ func runWork(cmd *cobra.Command, args []string) {
 	// Shared with the control-center TUI via registerPrivilegedNodeJobHandlers so a
 	// control-center-only node handles the same privileged set.
 	registerPrivilegedNodeJobHandlers(runner, nodeJobOpts)
+	go runLocalFlowCleanupReconciler(ctx, liveLocalFlowDeps(), time.Minute, func(err error) {
+		Log("local Flow container cleanup pending: %v", err)
+	})
 	// Publish only after every handler is registered so heartbeats expose one
 	// complete immutable set, never a partial capability advertisement.
 	startStatusPublisherAfterRunner(&nodeRunner, runner, startStatusPublisher)

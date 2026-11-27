@@ -31,6 +31,12 @@ So, when adding to this file:
 
 ## Project Overview
 
+`housekeeping.Plan` owns the pure, supplied-metadata dry-run policy receipt.
+`newHousekeepingCommand` exposes only the stdin-driven `housekeeping plan` leaf;
+`isHousekeepingPlanCommand` scopes its startup exemption after profile admission.
+It does not scan, inspect native handles/Git state, delete, install a timer or
+publish remote cleanup authority. See `docs/housekeeping-plan.md` for that boundary.
+
 `status.collectCapacityMetrics` owns additive optional heartbeat placement
 signals and per-source unknown handling. `nativeCapacityProbes` owns the
 build-tagged OS readers; `TestCapacity*` exercises bounded procfs parsing and
@@ -1123,6 +1129,15 @@ not appear in diagnostics. `tests/test_hosted_turn_token.py` and
 
 ### Worker Mode (Redis Streams) - High-Performance Private Cloud
 
+`worker.TmuxSessionHandler` owns `TMUX_SESSION`. Like `LANE_OPERATION`, it
+runs only from this node's exact per-node stream with a matching payload node
+id, checked before the shell gate. `ensure`/`create` (and any other action)
+then pass `jobs.ShellGateReason` with the shared passcode throttle; `list` and
+`has` need only the stream and the live Shell permission. It is advertised only
+while Shell is on, is wired in `buildNodeJobHandlers`, and is not on the
+diagnostic Nexus path or the setup-posture allowlist. `jobs.TmuxSessionHandler`
+still owns name and lease validation.
+
 `worker.LaneOperationHandler` serves aceteam's `lane_capture` and `lane_send`
 (`LANE_OPERATION`, #1659). It accepts only this node's exact per-node stream and
 payload node id. Those checks run before the SHELL_COMMAND shell gate and shared
@@ -1693,7 +1708,7 @@ layer down — through the real `Manager`, a fake `Renderer`, and
 future "log the payload on parse failure" edit to either layer trips one of
 these.
 
-Per Jason's product decision, the console render is unconditional (never
+Per Owner's product decision, the console render is unconditional (never
 refused because the console appears "in use") but always carries an
 explanatory banner ("someone is requesting access to this machine") so a
 person at the physical console understands why their screen changed.
@@ -2202,6 +2217,20 @@ stdout/stderr captures and overflow cancellation without changing audio-mix.
 landscape with silent audio; it does not supply card assets. The proposed contract
 and remaining activation gates are in `docs/run-job-template-contract.md`.
 
+`cmd.registerAttestedTemplateRunner` registers a builtin whose run is bound to
+the node, job and stream organization (`templateRunBinding`; the org comes from
+`worker.templateQueueOrg`, never params). For it, `liveTemplateRunOps.Run`
+preflights the signer before execution and `signAttestedReceipt` signs a
+`run_job_template` receipt whose input_sha256 is the builtin's binding object;
+it ignores `CITADEL_SIGN_AEP_RECEIPTS` and never fails open. `local-flow-run`
+(`cmd.admitLocalFlowRun`, `cmd.runLocalFlowBuiltin`) is the first: every
+refusal precedes the container start, and `localFlowPinnedImage` stays empty
+until a release pins the engine image, so it refuses today. It runs only with
+`--network none` (`buildLocalFlowRunArgs` refuses any other mode); any
+`LocalInference` graph is refused as `llm_unavailable_without_base_url` until
+the engine takes an endpoint and a per-run bridge forwarder exists. See
+`docs/local-flow-run.md` for the engine contract, binding and activation gates.
+
 `cmd/run_job_template_ops.go` remains the workspace/hash/receipt adapter;
 `cmd/template_builtin_papercraft.go`, `template_builtin_audio_mix.go`,
 `template_builtin_papercraft_scene.go` and `template_builtin_papercraft_scene_v2.go`
@@ -2645,20 +2674,6 @@ directory is scoped to the shared project, not to that service, so it lists
 sibling services too. Anything reasoning about "is THIS service up" must filter
 by the service keys declared in its compose file rather than trusting project
 scoping — see #692, which this stale doc helped hide.
-
-**A refreshed citadel template must reach a running container.** Every start
-path short-circuits on an already-running container, so rewriting a compose
-file alone never changes what runs. `compose.RefreshKnownComposeOnDisk` owns
-the start-time refresh (only a file matching `services.KnownComposeHashes`,
-never an operator edit), and its one-shot `compose.StartRefresh` result is the
-only start-path recreate trigger: `cmd.runningStartAction` (local start) and
-`ServiceHandler.serviceStart` (SERVICE_START) apply it once, as the boot
-sweep's `cmd.managedComposeRecreatorUnchecked` does for files the sweep
-rewrote. All honor `CITADEL_COMPOSE_NO_RECREATE_ON_UPGRADE`; the sweep, local
-start and restart skip `desired_status: stopped` (SERVICE_START clears it). `cmd.restartByRecreatingManagedService`
-makes `citadel run --restart` recreate known templates, since `compose restart`
-keeps the old config. A failed recreate restores the previous file so the next
-start retries. The CPU/GPU flavor reconcile does not trigger a recreate.
 
 **The vLLM endpoint has two explicit owners (citadel-cli#1076/#1167/#1186).**
 `services.resolveVLLMHostPort` and `services.resolveVLLMHost`

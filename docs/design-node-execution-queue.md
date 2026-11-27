@@ -710,7 +710,7 @@ unbounded lane's `exec` capacity above 1:**
 of Phase 3. Phase 3 depends on nothing here except a decision to pursue it (§6
 Q1) and is the only phase gated behind new locking.
 
-## 6. Open questions for Jason
+## 6. Open questions for Owner
 
 1. **Is Phase 3 (real concurrent unbounded-job execution) worth building at
    all, or does `exec` capacity 1 (Phase 1) suffice indefinitely?** The #908

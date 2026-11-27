@@ -25,7 +25,7 @@ func TestIsIPAddress(t *testing.T) {
 
 		// Invalid inputs (should be treated as hostnames)
 		{"hostname simple", "aceteamvm", false},
-		{"hostname with dash", "ubuntu-gpu", false},
+		{"hostname with dash", "linux-node", false},
 		{"hostname FQDN", "server.example.com", false},
 		{"hostname with numbers", "server123", false},
 		{"empty string", "", false},

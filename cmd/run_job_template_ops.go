@@ -46,9 +46,46 @@ import (
 // an os.Root anchored at that exact directory.
 type BuiltinTemplateRunner func(ctx context.Context, params json.RawMessage, inputs []string, outDir string) (outputRelPaths []string, err error)
 
+// templateRunBinding is the node-trusted identity of one RUN_JOB_TEMPLATE run.
+// Every field comes from local configuration or the job envelope (the job id
+// and the exact per-node source queue), never from template params.
+type templateRunBinding struct {
+	JobID           string
+	NodeID          string
+	OrgID           string
+	TemplateKey     string
+	TemplateVersion int
+	// ContentHash is the approved manifest hash the worker already recomputed,
+	// normalized to "sha256:<hex>".
+	ContentHash string
+}
+
+// attestedTemplateResult is what an attested builtin returns. Binding is hashed
+// (Python-compatible canonical JSON) into the signed receipt's input_sha256, so
+// it must name every identity the run is bound to. Report and Usage are bounded
+// by the builtin and returned inline.
+type attestedTemplateResult struct {
+	Outputs []string
+	Binding any
+	Report  map[string]any
+	Usage   map[string]any
+}
+
+// attestedTemplateRunner is a compiled-in builtin whose run is bound to the
+// node, job and organization and whose result must carry a signed receipt.
+// liveTemplateRunOps preflights the signer before calling it and fails the run
+// rather than return an unsigned result.
+type attestedTemplateRunner func(ctx context.Context, bind templateRunBinding, params json.RawMessage, inputs []string, outDir string) (*attestedTemplateResult, error)
+
+// registeredTemplateBuiltin holds exactly one of the two builtin shapes.
+type registeredTemplateBuiltin struct {
+	plain    BuiltinTemplateRunner
+	attested attestedTemplateRunner
+}
+
 var (
 	builtinTemplateRunnersMu sync.RWMutex
-	builtinTemplateRunners   = map[string]BuiltinTemplateRunner{}
+	builtinTemplateRunners   = map[string]registeredTemplateBuiltin{}
 )
 
 // RegisterBuiltinTemplateRunner registers a compiled-in builtin under the name a
@@ -57,14 +94,25 @@ var (
 func RegisterBuiltinTemplateRunner(name string, fn BuiltinTemplateRunner) {
 	builtinTemplateRunnersMu.Lock()
 	defer builtinTemplateRunnersMu.Unlock()
-	builtinTemplateRunners[name] = fn
+	builtinTemplateRunners[name] = registeredTemplateBuiltin{plain: fn}
 }
 
-func lookupBuiltinTemplateRunner(name string) (BuiltinTemplateRunner, bool) {
+// registerAttestedTemplateRunner registers a builtin that requires a signed,
+// identity-bound receipt (local-flow-run).
+func registerAttestedTemplateRunner(name string, fn attestedTemplateRunner) {
+	builtinTemplateRunnersMu.Lock()
+	defer builtinTemplateRunnersMu.Unlock()
+	builtinTemplateRunners[name] = registeredTemplateBuiltin{attested: fn}
+}
+
+func lookupBuiltinTemplateRunner(name string) (registeredTemplateBuiltin, bool) {
 	builtinTemplateRunnersMu.RLock()
 	defer builtinTemplateRunnersMu.RUnlock()
-	fn, ok := builtinTemplateRunners[name]
-	return fn, ok
+	entry, ok := builtinTemplateRunners[name]
+	if ok && entry.plain == nil && entry.attested == nil {
+		ok = false
+	}
+	return entry, ok
 }
 
 // errTemplateBuiltinRefused marks a builtin the running profile does not allow.
@@ -83,6 +131,12 @@ type liveTemplateRunOps struct {
 	builtinPolicy func(handler string) string
 	// Per-instance seam for deterministic mutation during output hashing.
 	hashOutput func(context.Context, *os.File, int64) (string, int64, error)
+	// receiptSigner signs attested builtin receipts. nil uses the convergent
+	// node identity, the same key the CSR path registers.
+	receiptSigner aep.Signer
+	// receiptNodeID returns the preferred receipt node_id (the fabric node id).
+	// nil reads the converged device configuration.
+	receiptNodeID func() string
 }
 
 const (
@@ -129,9 +183,21 @@ func (o liveTemplateRunOps) Run(ctx context.Context, req worker.TemplateRunReque
 			return nil, fmt.Errorf("%w: %q: %s", errTemplateBuiltinRefused, runner.Handler, reason)
 		}
 	}
-	fn, ok := lookupBuiltinTemplateRunner(runner.Handler)
+	entry, ok := lookupBuiltinTemplateRunner(runner.Handler)
 	if !ok {
 		return nil, fmt.Errorf("%w: %q", worker.ErrTemplateUnknownHandler, runner.Handler)
+	}
+	var signer aep.Signer
+	if entry.attested != nil {
+		// Dispatched attested work fails closed before anything runs when it
+		// could not sign its receipt (jobs.ErrReceiptSigningUnavailable).
+		signer = o.attestedSigner()
+		if err := (jobs.WorkReceiptConfig{Signer: signer, Dispatched: true}).Preflight(); err != nil {
+			return nil, err
+		}
+		if req.OrgID == "" {
+			return nil, fmt.Errorf("builtin %q refused: the job did not arrive on this node's organization stream", runner.Handler)
+		}
 	}
 	inputFiles, err := jobs.ParseTemplateInputFiles(req.InputFiles, o.nodeID)
 	if err != nil {
@@ -184,7 +250,27 @@ func (o liveTemplateRunOps) Run(ctx context.Context, req worker.TemplateRunReque
 		return nil, errors.Join(fmt.Errorf("open output root: %w", err), cleanupTemplateAttempt(workspaceRoot, inputRoot, nil, relRun))
 	}
 
-	outRels, runErr := fn(ctx, req.Params, inputs, filepath.Join(workspaceRoot.Name(), relOut))
+	var outRels []string
+	var attested *attestedTemplateResult
+	var runErr error
+	if entry.attested != nil {
+		attested, runErr = entry.attested(ctx, templateRunBinding{
+			JobID:           req.JobID,
+			NodeID:          o.nodeID,
+			OrgID:           req.OrgID,
+			TemplateKey:     req.TemplateKey,
+			TemplateVersion: req.TemplateVersion,
+			ContentHash:     "sha256:" + strings.TrimPrefix(strings.ToLower(strings.TrimSpace(req.ContentHash)), "sha256:"),
+		}, req.Params, inputs, filepath.Join(workspaceRoot.Name(), relOut))
+		if runErr == nil && attested == nil {
+			runErr = fmt.Errorf("attested builtin returned no result")
+		}
+		if runErr == nil {
+			outRels = attested.Outputs
+		}
+	} else {
+		outRels, runErr = entry.plain(ctx, req.Params, inputs, filepath.Join(workspaceRoot.Name(), relOut))
+	}
 	if runErr != nil {
 		return nil, errors.Join(fmt.Errorf("builtin %q: %w", runner.Handler, runErr), cleanupTemplateAttempt(workspaceRoot, inputRoot, outRoot, relRun))
 	}
@@ -196,6 +282,15 @@ func (o liveTemplateRunOps) Run(ctx context.Context, req worker.TemplateRunReque
 	if err != nil {
 		return nil, errors.Join(err, cleanupTemplateAttempt(workspaceRoot, inputRoot, outRoot, relRun))
 	}
+	var attestedReceipt, attestedUsage map[string]any
+	if attested != nil {
+		// Sign before the attempt is marked complete, so a signing failure
+		// leaves no retained output that could be read without a receipt.
+		attestedReceipt, attestedUsage, err = o.signAttestedReceipt(signer, req, attested, outputDigests)
+		if err != nil {
+			return nil, errors.Join(err, cleanupTemplateAttempt(workspaceRoot, inputRoot, outRoot, relRun))
+		}
+	}
 	if err := finishTemplateAttempt(workspaceRoot, inputRoot, outRoot, relRun, relInputs); err != nil {
 		return nil, err
 	}
@@ -205,8 +300,84 @@ func (o liveTemplateRunOps) Run(ctx context.Context, req worker.TemplateRunReque
 		DurationMs:  time.Since(start).Milliseconds(),
 		InputHashes: inputHashes,
 	}
+	if attested != nil {
+		res.Receipt = attestedReceipt
+		res.AEPReceipt = attestedReceipt
+		res.WorkReceipts = []map[string]any{attestedReceipt}
+		res.Usage = attestedUsage
+		res.Report = attested.Report
+		return res, nil
+	}
 	res.Receipt = signRunJobTemplateReceipt(req, outputDigests)
 	return res, nil
+}
+
+func (o liveTemplateRunOps) attestedSigner() aep.Signer {
+	if o.receiptSigner != nil {
+		return o.receiptSigner
+	}
+	return nodeidentity.Convergent(network.GetNodeConfigDir())
+}
+
+// signAttestedReceipt signs the run_job_template receipt for an attested
+// builtin. Unlike signRunJobTemplateReceipt it is not gated on an environment
+// flag and never fails open: any error is jobs.ErrReceiptSigningUnavailable.
+// input_sha256 is the hash of the builtin's binding manifest (Python-compatible
+// canonical JSON), so the receipt binds node, job, organization, template and
+// whatever the builtin adds; output_sha256 hashes the ordered output digests
+// exactly as the generic template receipt does.
+func (o liveTemplateRunOps) signAttestedReceipt(signer aep.Signer, req worker.TemplateRunRequest, attested *attestedTemplateResult, outputDigests []string) (map[string]any, map[string]any, error) {
+	bindingSHA, err := canonicalJSONSHA256(attested.Binding)
+	if err != nil {
+		return nil, nil, fmt.Errorf("hash receipt binding: %w", err)
+	}
+	fabricNodeID := ""
+	if o.receiptNodeID != nil {
+		fabricNodeID = o.receiptNodeID()
+	} else {
+		fabricNodeID = config.LoadDeviceCredsConverged().FabricNodeID
+	}
+	if signer == nil {
+		return nil, nil, jobs.ErrReceiptSigningUnavailable
+	}
+	nodeID, err := aep.ResolveNodeID(signer, fabricNodeID)
+	if err != nil {
+		return nil, nil, jobs.ErrReceiptSigningUnavailable
+	}
+	outputSHA := "sha256:" + sha256Hex(strings.Join(outputDigests, "\n"))
+	receipt, err := aep.BuildSignedRunJobTemplateReceipt(signer, nodeID, req.JobID, bindingSHA, outputSHA, time.Now())
+	if err != nil {
+		return nil, nil, jobs.ErrReceiptSigningUnavailable
+	}
+	m, err := receipt.ToMap()
+	if err != nil {
+		return nil, nil, jobs.ErrReceiptSigningUnavailable
+	}
+	usage := make(map[string]any, len(attested.Usage)+6)
+	for k, v := range attested.Usage {
+		usage[k] = v
+	}
+	usage["action"] = aep.RunJobTemplateAction
+	usage["origin"] = jobs.OriginDispatched
+	usage["org_id"] = req.OrgID
+	usage["manifest_sha256"] = bindingSHA
+	usage["signed"] = true
+	return m, usage, nil
+}
+
+// canonicalJSONSHA256 hashes v as Python json.dumps(sort_keys=True,
+// separators=(",", ":")) would serialize it, so a platform verifier can
+// recompute the digest from the reported binding object.
+func canonicalJSONSHA256(v any) (string, error) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return "", err
+	}
+	canonical, err := jobs.NormalizeTemplateParams(raw)
+	if err != nil {
+		return "", err
+	}
+	return "sha256:" + sha256Hex(string(canonical)), nil
 }
 
 // resolveInputs opens every source through the already-open workspace root,

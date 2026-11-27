@@ -278,7 +278,7 @@ This is explicitly a two-repo change; §1.1 already shows the exact seam:
   ingestion per §5. Blocks true end-to-end delivery regardless of how far
   Phases 1-4 get.
 
-## 7. Open questions for Jason
+## 7. Open questions for Owner
 
 1. **Is the pull command (§3.1/Phase 2) sufficient, or is literal
    on-screen rendering (Phase 4) required for the threat model #6975 cares
@@ -496,7 +496,7 @@ Mechanism, precisely:
    clear-screen + a one-line `pairing code cleared/expired` note. The getty
    prompt was overwritten at show time; the next keypress redraws it —
    acceptable for a console, and the reason §13's "how aggressive" question
-   goes to Jason.
+   goes to Owner.
 
 Windows and macOS: build-tagged stubs returning `reason: "unsupported_os"`.
 (macOS `osascript` dialog and a Windows toast are P3 — see §11; they are
@@ -679,7 +679,7 @@ an injected fake `Renderer`.
      Accepted.
 - Reboot: VTs reset; the leftover marker triggers one harmless clear.
 
-## 13. Open questions for Jason (Part II — supersedes §7 where they overlap)
+## 13. Open questions for Owner (Part II — supersedes §7 where they overlap)
 
 1. **Console aggressiveness.** P0 clears the active VT and holds it for up
    to 10 minutes — on a box where someone is logged in at the physical

@@ -13,7 +13,7 @@ import (
 // `sudo citadel`.
 func TestRootRemediationCommand(t *testing.T) {
 	t.Run("resolved exe: absolute path, not a bare sudo citadel", func(t *testing.T) {
-		exe := "/home/jason/.local/bin/citadel"
+		exe := "/home/owner/.local/bin/citadel"
 		got := rootRemediationCommand(exe, "service refresh-unit")
 		if strings.Contains(got, "sudo citadel ") {
 			t.Fatalf("remediation uses a bare `sudo citadel` that secure_path breaks: %q", got)
@@ -46,7 +46,7 @@ func TestRootRemediationCommand(t *testing.T) {
 	// `service refresh-unit`) so cmd/init_service.go can reuse this for its
 	// `service install --system` hint instead of a bare `sudo citadel`.
 	t.Run("generalized subcommand: install --system stays absolute, not bare", func(t *testing.T) {
-		exe := "/home/jason/.local/bin/citadel"
+		exe := "/home/owner/.local/bin/citadel"
 		got := rootRemediationCommand(exe, "service install --system")
 		if strings.Contains(got, "sudo citadel ") {
 			t.Fatalf("remediation uses a bare `sudo citadel`: %q", got)

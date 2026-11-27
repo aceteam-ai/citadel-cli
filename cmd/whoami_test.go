@@ -22,13 +22,13 @@ func registeredOnlineIdentity() NodeIdentity {
 		MeshIPv4:           "100.64.0.5",
 		OrgID:              "org-123",
 		OrgName:            "Acme Inc",
-		UserEmail:          "jason@example.com",
-		UserName:           "Jason",
+		UserEmail:          "owner@example.com",
+		UserName:           "Owner",
 		Registered:         true,
 		CitadelVersion:     "v2.116.0",
 		HeartbeatFreshness: "ok",
 		LastHeartbeatAt:    "2026-08-25T00:00:00Z",
-		NodeConfigDir:      "/home/jason/citadel-node",
+		NodeConfigDir:      "/home/owner/citadel-node",
 	}
 }
 
@@ -64,7 +64,7 @@ func TestRenderIdentity_RegisteredOnline(t *testing.T) {
 		"100.64.0.5",
 		"Acme Inc",
 		"org-123",
-		"jason@example.com",
+		"owner@example.com",
 		"ok",
 		"registered citadel node",
 	} {
@@ -169,9 +169,9 @@ func TestUserDisplayString(t *testing.T) {
 		id   NodeIdentity
 		want string
 	}{
-		{"both", NodeIdentity{UserName: "Jason", UserEmail: "j@x.com"}, "Jason <j@x.com>"},
+		{"both", NodeIdentity{UserName: "Owner", UserEmail: "j@x.com"}, "Owner <j@x.com>"},
 		{"email only", NodeIdentity{UserEmail: "j@x.com"}, "j@x.com"},
-		{"name only", NodeIdentity{UserName: "Jason"}, "Jason"},
+		{"name only", NodeIdentity{UserName: "Owner"}, "Owner"},
 		{"neither", NodeIdentity{}, ""},
 	}
 	for _, c := range cases {

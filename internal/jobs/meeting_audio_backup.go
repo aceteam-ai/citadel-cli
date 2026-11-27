@@ -2,7 +2,7 @@
 //
 // Sovereign meeting-audio backup — the NODE side (aceteam#5097, epic #5097).
 //
-// Product decision (Jason): after a call is recorded, the lossless WAV stays on
+// Product decision (Owner): after a call is recorded, the lossless WAV stays on
 // the user's own Citadel node AND a default-on, Opus-compressed backup is
 // uploaded to the AceTeam backend — a dual copy. This file implements that
 // backup:

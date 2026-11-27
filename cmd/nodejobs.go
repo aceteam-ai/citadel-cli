@@ -134,6 +134,8 @@ type nodeJobHandlerOpts struct {
 // it through themselves; see cmd/work.go's nodeSwapManager/swapStatsFn.
 func buildNodeJobHandlers(opts nodeJobHandlerOpts) ([]worker.JobHandler, *worker.SwapManager) {
 	handlers := worker.CreateLegacyHandlersWithOpts(worker.LegacyHandlerOpts{
+		ServiceOrgID:              opts.OrgID,
+		ServiceNodeID:             opts.NodeID,
 		CobrowseRecoveryNodeID:    opts.NodeID,
 		CobrowseRecoveryOrgID:     opts.OrgID,
 		LogFn:                     opts.LogFn,
@@ -176,6 +178,12 @@ func buildNodeJobHandlers(opts nodeJobHandlerOpts) ([]worker.JobHandler, *worker
 		OrgID: opts.OrgID, NodeID: opts.NodeID, Collect: collectInventory, Enabled: inventoryEnabled,
 	}))
 	handlers = append(handlers, newLaneOperationHandler(opts))
+	handlers = append(handlers, worker.NewTmuxSessionHandler(worker.TmuxSessionConfig{
+		OrgID: opts.OrgID, NodeID: opts.NodeID,
+		Gate:     jobs.ShellGate{Enabled: opts.ShellEnabled, State: opts.ShellPasscodeState, Throttle: opts.PasscodeThrottle},
+		Sessions: nativeTmuxSessions(),
+		LogFn:    opts.LogFn,
+	}))
 	// llm_inference (issue #590): the aceteam python-backend dispatches
 	// job_type="llm_inference" for ALL fabric inference (OpenAI gateway, /fabric
 	// model deploys, mesh chat). Registered unconditionally — like the workflow
@@ -434,6 +442,11 @@ func newLaneOperationHandler(opts nodeJobHandlerOpts) *worker.LaneOperationHandl
 		Available: available,
 	})
 }
+
+// nativeTmuxSessions performs TMUX_SESSION actions against the node's tmux. It
+// is a variable so the cmd package's TestMain can keep every test away from
+// the real tmux binary.
+var nativeTmuxSessions = func() jobs.JobHandler { return jobs.NewTmuxSessionHandler("") }
 
 // nativeLaneExec resolves tmux once, lazily. It is a variable so the cmd
 // package's TestMain can keep every test away from the real tmux binary.

@@ -10,7 +10,7 @@ Example, explicitly authorizing one local subnet and one exact host:
 
 ```yaml
 allow:
-  - cidr: 192.168.2.0/24
+  - cidr: 192.168.50.0/24
   - host: nas.internal
 ```
 

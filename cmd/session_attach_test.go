@@ -289,20 +289,95 @@ func TestSessionAttachRootHookSkipsSharedStartup(t *testing.T) {
 			}
 		}
 		// This is a source boundary, not a live Control Center acceptance test:
-		// only the original offline leaf and explicit viewer return early. Bare
-		// interactive commands retain main's actual startup body below them.
-		for _, statement := range function.Body.List[2:] {
+		// The original two leaves stay first. Only the separately tested
+		// housekeeping-plan predicate is added immediately after profile
+		// admission. Bare and neighboring live commands still reach startup.
+		housekeepingGuardSeen := false
+		for index, statement := range function.Body.List[2:] {
 			if guard, ok := statement.(*ast.IfStmt); ok && len(guard.Body.List) == 1 {
 				if _, returns := guard.Body.List[0].(*ast.ReturnStmt); returns {
-					t.Fatal("a third top-level startup bypass was introduced")
+					if !auditedHousekeepingStartupGuard(guard, index, function.Body.List[2]) {
+						t.Fatal("an unaudited top-level startup bypass was introduced")
+					}
+					housekeepingGuardSeen = true
 				}
 			}
+		}
+		if !housekeepingGuardSeen {
+			t.Fatal("housekeeping guard was not audited")
 		}
 		found = true
 		return false
 	})
 	if !found {
 		t.Fatal("shared startup hook was not audited")
+	}
+}
+
+// This is shared by the real source audit and negative synthetic-source tests.
+// Only one exact predicate immediately after profile admission is accepted.
+func auditedHousekeepingStartupGuard(guard *ast.IfStmt, index int, previous ast.Stmt) bool {
+	call, ok := guard.Cond.(*ast.CallExpr)
+	if !ok || index != 1 || guard.Init != nil || guard.Else != nil || len(call.Args) != 1 || len(guard.Body.List) != 1 {
+		return false
+	}
+	if _, ok := guard.Body.List[0].(*ast.ReturnStmt); !ok {
+		return false
+	}
+	name, named := call.Fun.(*ast.Ident)
+	argument, correctArg := call.Args[0].(*ast.Ident)
+	if !named || name.Name != "isHousekeepingPlanCommand" || !correctArg || argument.Name != "cmd" {
+		return false
+	}
+	profile, ok := previous.(*ast.IfStmt)
+	if !ok {
+		return false
+	}
+	assignment, ok := profile.Init.(*ast.AssignStmt)
+	if !ok || len(assignment.Rhs) != 1 {
+		return false
+	}
+	admission, ok := assignment.Rhs[0].(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	admissionName, ok := admission.Fun.(*ast.Ident)
+	return ok && admissionName.Name == "applyRunProfile"
+}
+
+func TestHousekeepingStartupAuditRefusesOtherBypasses(t *testing.T) {
+	profile := "if handled, err := applyRunProfile(cmd, args); err != nil { panic(err) } else if handled { return }"
+	exact := "if isHousekeepingPlanCommand(cmd) { return }"
+	for _, tc := range []struct {
+		name, guard, admission string
+		index                  int
+		want                   bool
+	}{
+		{"exact", exact, profile, 1, true},
+		{"other-helper", "if newStartupBypass(cmd) { return }", profile, 1, false},
+		{"literal", "if true { return }", profile, 1, false},
+		{"broader", "if isHousekeepingPlanCommand(cmd) || other(cmd) { return }", profile, 1, false},
+		{"other-argument", "if isHousekeepingPlanCommand(other) { return }", profile, 1, false},
+		{"extra-argument", "if isHousekeepingPlanCommand(cmd, args) { return }", profile, 1, false},
+		{"else", "if isHousekeepingPlanCommand(cmd) { return } else { return }", profile, 1, false},
+		{"init", "if x := true; isHousekeepingPlanCommand(cmd) { return }", profile, 1, false},
+		{"side-effect", "if isHousekeepingPlanCommand(cmd) { other(); return }", profile, 1, false},
+		{"no-return", "if isHousekeepingPlanCommand(cmd) { other() }", profile, 1, false},
+		{"before-admission", exact, profile, 0, false},
+		{"additional-bypass", exact, profile, 2, false},
+		{"wrong-admission", exact, "if handled, err := other(cmd, args); err != nil { panic(err) } else if handled { return }", 1, false},
+		{"missing-admission", exact, "if true { return }", 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			file, err := parser.ParseFile(token.NewFileSet(), "fixture.go", "package fixture; func f(){"+tc.admission+";"+tc.guard+"}", 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := file.Decls[0].(*ast.FuncDecl).Body.List
+			if auditedHousekeepingStartupGuard(body[1].(*ast.IfStmt), tc.index, body[0]) != tc.want {
+				t.Fatal("startup source audit admitted an unapproved bypass")
+			}
+		})
 	}
 }
 

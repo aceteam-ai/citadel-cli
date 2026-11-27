@@ -20,7 +20,7 @@ func baseAppInput() AppSpecInput {
 }
 
 func TestParseAppSpec_Valid(t *testing.T) {
-	spec, err := ParseAppSpec(baseAppInput(), 18901, "/home/jason")
+	spec, err := ParseAppSpec(baseAppInput(), 18901, "/home/owner")
 	if err != nil {
 		t.Fatalf("ParseAppSpec: %v", err)
 	}
@@ -61,7 +61,7 @@ func TestParseAppSpec_Valid(t *testing.T) {
 func TestParseAppSpec_ExplicitPortWins(t *testing.T) {
 	in := baseAppInput()
 	in.Env = map[string]string{"PORT": "9000"}
-	spec, err := ParseAppSpec(in, 18901, "/home/jason")
+	spec, err := ParseAppSpec(in, 18901, "/home/owner")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,7 @@ func TestParseAppSpec_SizeDefaultAndTiers(t *testing.T) {
 	} {
 		in := baseAppInput()
 		in.Size = size
-		spec, err := ParseAppSpec(in, 18901, "/home/jason")
+		spec, err := ParseAppSpec(in, 18901, "/home/owner")
 		if err != nil {
 			t.Fatalf("size %q: %v", size, err)
 		}
@@ -94,28 +94,28 @@ func TestParseAppSpec_Rejects(t *testing.T) {
 	t.Run("image not allowlisted", func(t *testing.T) {
 		in := baseAppInput()
 		in.Image = "docker.io/library/nginx:latest"
-		if _, err := ParseAppSpec(in, 18901, "/home/jason"); err == nil {
+		if _, err := ParseAppSpec(in, 18901, "/home/owner"); err == nil {
 			t.Error("accepted a non-allowlisted image")
 		}
 	})
 	t.Run("bad runtime", func(t *testing.T) {
 		in := baseAppInput()
 		in.Runtime = "evil"
-		if _, err := ParseAppSpec(in, 18901, "/home/jason"); err == nil {
+		if _, err := ParseAppSpec(in, 18901, "/home/owner"); err == nil {
 			t.Error("accepted a non-allowlisted runtime")
 		}
 	})
 	t.Run("privileged container port", func(t *testing.T) {
 		in := baseAppInput()
 		in.ContainerPort = 80
-		if _, err := ParseAppSpec(in, 18901, "/home/jason"); err == nil {
+		if _, err := ParseAppSpec(in, 18901, "/home/owner"); err == nil {
 			t.Error("accepted a privileged container port")
 		}
 	})
 	t.Run("payload state_volume_path is ignored, not honored", func(t *testing.T) {
 		in := baseAppInput()
 		in.StateVolumePath = "/etc" // apps derive their own dir; a payload path has no effect
-		spec, err := ParseAppSpec(in, 18901, "/home/jason")
+		spec, err := ParseAppSpec(in, 18901, "/home/owner")
 		if err != nil {
 			t.Fatalf("payload path should be ignored, not error: %v", err)
 		}
@@ -126,14 +126,14 @@ func TestParseAppSpec_Rejects(t *testing.T) {
 	t.Run("short_code path traversal rejected", func(t *testing.T) {
 		in := baseAppInput()
 		in.ShortCode = "../evil"
-		if _, err := ParseAppSpec(in, 18901, "/home/jason"); err == nil {
+		if _, err := ParseAppSpec(in, 18901, "/home/owner"); err == nil {
 			t.Error("accepted a short_code that is not a plain slug")
 		}
 	})
 	t.Run("colon in state_mount_path rejected", func(t *testing.T) {
 		in := baseAppInput()
 		in.StateMountPath = "/data:/evil"
-		if _, err := ParseAppSpec(in, 18901, "/home/jason"); err == nil {
+		if _, err := ParseAppSpec(in, 18901, "/home/owner"); err == nil {
 			t.Error("accepted a state_mount_path containing ':'")
 		}
 	})
@@ -144,7 +144,7 @@ func TestParseAppSpec_IgnoresPayloadStateVolumePath(t *testing.T) {
 	// A payload state_volume_path (here pointing at ANOTHER app's dir) must not be
 	// honored: apps always get their own engine-managed per-app named volume.
 	in.StateVolumePath = "~/citadel-cache/apps/other-app/data"
-	spec, err := ParseAppSpec(in, 18901, "/home/jason")
+	spec, err := ParseAppSpec(in, 18901, "/home/owner")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +225,7 @@ func TestAppPodRunner_DestroyVolumeNotFoundIsSuccess(t *testing.T) {
 }
 
 func TestBuildAppContainerRunArgs_Podman(t *testing.T) {
-	spec, _ := ParseAppSpec(baseAppInput(), 18901, "/home/jason")
+	spec, _ := ParseAppSpec(baseAppInput(), 18901, "/home/owner")
 	args := buildAppContainerRunArgs(spec, true)
 	joined := strings.Join(args, " ")
 	mustContain(t, joined, "--pod aceapp-ac-blue-cat-fox")
@@ -245,7 +245,7 @@ func TestBuildAppContainerRunArgs_Podman(t *testing.T) {
 }
 
 func TestBuildAppContainerRunArgs_Docker(t *testing.T) {
-	spec, _ := ParseAppSpec(baseAppInput(), 18901, "/home/jason")
+	spec, _ := ParseAppSpec(baseAppInput(), 18901, "/home/owner")
 	args := buildAppContainerRunArgs(spec, false)
 	joined := strings.Join(args, " ")
 	mustContain(t, joined, "--name aceapp-ac-blue-cat-fox")
@@ -260,7 +260,7 @@ func TestBuildAppContainerRunArgs_Docker(t *testing.T) {
 }
 
 func TestBuildAppPodCreateArgs(t *testing.T) {
-	spec, _ := ParseAppSpec(baseAppInput(), 18901, "/home/jason")
+	spec, _ := ParseAppSpec(baseAppInput(), 18901, "/home/owner")
 	joined := strings.Join(buildAppPodCreateArgs(spec), " ")
 	mustContain(t, joined, "--name aceapp-ac-blue-cat-fox")
 	mustContain(t, joined, "-p 127.0.0.1:18901:8501")
@@ -312,7 +312,7 @@ func (f *fakeExec) indexOf(sub string) int {
 
 func newRunner(engine string, rootless bool, fe *fakeExec) *AppPodRunner {
 	rt := catalog.ContainerRuntime{EngineBin: engine, Bin: engine, ComposePrefix: []string{"compose"}, Rootless: rootless}
-	return NewAppPodRunner(rt, "/home/jason", nil).WithExec(fe.run)
+	return NewAppPodRunner(rt, "/home/owner", nil).WithExec(fe.run)
 }
 
 func TestAppPodRunner_DeployPodman(t *testing.T) {
@@ -323,7 +323,7 @@ func TestAppPodRunner_DeployPodman(t *testing.T) {
 	// Rootless=false so PreflightLimitControllers is a no-op (hermetic), while
 	// EngineBin=podman still exercises the pod path.
 	r := newRunner("podman", false, fe)
-	spec, _ := ParseAppSpec(baseAppInput(), 18901, "/home/jason")
+	spec, _ := ParseAppSpec(baseAppInput(), 18901, "/home/owner")
 
 	res, err := r.Deploy(context.Background(), spec)
 	if err != nil {
@@ -364,7 +364,7 @@ func TestAppPodRunner_DeployDocker(t *testing.T) {
 		"image inspect": "sha256:cafef00d\n",
 	}}
 	r := newRunner("docker", false, fe)
-	spec, _ := ParseAppSpec(baseAppInput(), 18902, "/home/jason")
+	spec, _ := ParseAppSpec(baseAppInput(), 18902, "/home/owner")
 
 	res, err := r.Deploy(context.Background(), spec)
 	if err != nil {

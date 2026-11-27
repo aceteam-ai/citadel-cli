@@ -299,7 +299,7 @@ additive. (5) is the only item that's genuinely new estimation logic rather
 than infrastructure extension, and could ship after (1)-(3) without blocking
 them.
 
-## 6. Open questions for Jason
+## 6. Open questions for Owner
 
 1. **Reserved-floor sizing policy**: should the RAM/VRAM floor for pinned
    services be "their current measured footprint + a fixed headroom

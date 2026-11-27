@@ -216,7 +216,7 @@ func resolveWorkerQueues(ctx context.Context, p workerQueueParams) workerQueueRe
 
 // resolveDirectRedisQueues is the authority for the Redis Streams queue set a
 // direct-Redis worker (`citadel work` with a config redis_url -- the offline /
-// self-host path, e.g. the asusrog node) subscribes to. It is the direct-Redis
+// self-host path, e.g. the operator-host node) subscribes to. It is the direct-Redis
 // analogue of resolveWorkerQueues, extracted from runWork's inline block so the
 // rule is pure/string-in-string-out and can be pinned by a test.
 //

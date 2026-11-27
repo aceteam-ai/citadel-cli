@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catrust"
@@ -21,19 +20,22 @@ func preparePrivateCATrust(cmd *cobra.Command) error {
 	if !flagChanged(cmd, "nexus") {
 		nexus = network.ResolveControlURL()
 	}
-	authURL := authServiceURL
-	if !flagChanged(cmd, "auth-service") && os.Getenv("CITADEL_AUTH_HOST") == "" {
-		if cfg := deviceConfigForCATrustFn(); cfg != nil && strings.TrimSpace(cfg.APIBaseURL) != "" {
-			authURL = cfg.APIBaseURL
-		} else {
-			storedAuth, err := catrust.AuthOriginForNexus(nodeDir, nexus)
-			if err != nil {
-				return err
-			}
-			if storedAuth != "" {
-				authURL = storedAuth
-			}
+	saved := ""
+	if cfg := deviceConfigForCATrustFn(); cfg != nil {
+		saved = strings.TrimSpace(cfg.APIBaseURL)
+	}
+	if saved == "" {
+		storedAuth, err := catrust.AuthOriginForNexus(nodeDir, nexus)
+		if err != nil {
+			return err
 		}
+		if storedAuth != "" {
+			saved = storedAuth
+		}
+	}
+	authURL, err := resolveInvocationServer(cmd, saved)
+	if err != nil {
+		return err
 	}
 	if _, err := catrust.Bootstrap(caCertPath, nodeDir, authURL, nexus); err != nil {
 		return err

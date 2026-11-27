@@ -65,7 +65,7 @@ find a `fabric_node_certs` row matching a real receipt's
 `public_key_fingerprint`. The cross-repo golden fixture (test key on both sides)
 would pass green while proof-plan item 6 (a real turn on a dev node producing
 `verified: true`) fails. §4 has the mechanism and the options; it is an S3
-prerequisite and Jason-gated (it touches which key is registered).
+prerequisite and Owner-gated (it touches which key is registered).
 
 ---
 
@@ -264,7 +264,7 @@ exists.
 
 S4 (aceteam attaches `policy` to the dispatch payload) and S5 (citadel reads it,
 ports `canonical_json`, hashes the received bytes) have not landed. The canon
-requires a non-empty `policy_hash` regardless. Jason ratified DoR §7.4 on
+requires a non-empty `policy_hash` regardless. Owner ratified DoR §7.4 on
 2026-09-07: *absent policy means still governed at `gate: flag`, with
 `policy_hash` of the explicit empty policy, never omitted.*
 
@@ -502,8 +502,8 @@ G3 explicitly refuses this ("trust-on-first-use key upload is a weaker second
 registration path and the CA already exists"). Out.
 
 **Recommendation: K-A, as an S3 prerequisite PR (or S3's first commit), gated
-on Jason** — the DoR says key material and which key is registered are
-Jason-gated, and this changes which file the registered key is read from even
+on Owner** — the DoR says key material and which key is registered are
+Owner-gated, and this changes which file the registered key is read from even
 though it mints nothing new. Until it lands, S3's receipts verify only in the
 golden fixture, never on a real node, and this doc says so rather than
 letting the green fixture imply otherwise.
@@ -568,7 +568,7 @@ display-side twins of the signed fields, not a stepping stone.
 **Scope boundary with S5:** S3 does NOT read a `policy` key, does NOT port
 `canonical_json` for policy bytes, does NOT honor `gate: block`, and does NOT
 delete the env gates. §3.3's recommendation pulls the Go `canonical_json` port
-forward into S3 *for the verdict preimage only* (open question §11.3); if Jason
+forward into S3 *for the verdict preimage only* (open question §11.3); if Owner
 prefers to keep S3 minimal, the fallback is to ship S3 with S6's Go-json
 preimage plus the `'f' 6` string for `score`, and accept that `verdict_hash`'s
 value changes once more at S5.
@@ -670,8 +670,8 @@ deploys before S4's comparison is enabled, or S4 treats a receipt whose
 explicit, time-boxed special case — open question §11.5).
 
 **Sequencing, in order:**
-1. Jason answers §11 (this doc's PR).
-2. §4 K-A prerequisite PR (citadel; Jason-gated).
+1. Owner answers §11 (this doc's PR).
+2. §4 K-A prerequisite PR (citadel; Owner-gated).
 3. S3 emission PR (citadel, #1002) + Go golden in `internal/aep/testdata/v2/`.
 4. aceteam golden-adoption PR (fixture copied in; hand-built v2 sample retired
    or kept alongside).
@@ -706,7 +706,7 @@ explicit, time-boxed special case — open question §11.5).
 
 ## 11. Open questions for the owner
 
-1. **Key-store reconciliation (§4) — blocking, Jason-gated.** K-A (one
+1. **Key-store reconciliation (§4) — blocking, Owner-gated.** K-A (one
    convergent identity store with a one-time read-through of the legacy
    `ConfigDir()/identity/node.key`; same key bytes, so existing leaves stay
    valid) vs K-B (signer prefers the legacy store; reintroduces invoker-scoping).

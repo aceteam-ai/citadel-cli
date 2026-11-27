@@ -19,7 +19,7 @@ import (
 // path (APPLY_DEVICE_CONFIG) that writes this same persisted value.
 type Meeting struct {
 	// Safety contains optional canonical decimal second overrides. Missing keys
-	// use Jason's #1505 defaults; malformed or expanded limits refuse readiness.
+	// use Owner's #1505 defaults; malformed or expanded limits refuse readiness.
 	Safety          meetingpolicy.Config `yaml:"safety,omitempty" json:"safety,omitempty"`
 	safetyReadError error
 	// MeetingEnabled gates the `meeting` capability. When true (and the node's

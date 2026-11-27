@@ -19,6 +19,10 @@ func loadNodePermissions() *config.Permissions {
 	return config.LoadPermissions(nodePermissionsDir())
 }
 
+func loadNodePermissionsStrict() (*config.Permissions, error) {
+	return config.LoadPermissionsStrict(nodePermissionsDir())
+}
+
 // saveNodePermissions writes p as the whole policy. It refuses when the file
 // on disk cannot be parsed: p was then loaded as the defaults, and saving it
 // would silently drop every setting the file holds (including co-browse

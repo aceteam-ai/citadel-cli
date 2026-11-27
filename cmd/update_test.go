@@ -755,7 +755,7 @@ func TestRefreshManagedServiceUnits_TableDriven(t *testing.T) {
 			name: "needs root (non-root system unit): remediation reported, nothing rewritten",
 			fn: func(logf func(string, ...any)) ([]string, error) {
 				logf("unit-refresh: %s: needs the #444 restart-storm hardening but rewriting a system unit requires root; re-run as root: %s",
-					"/etc/systemd/system/citadel-worker.service", `sudo "/home/jason/.local/bin/citadel" service refresh-unit`)
+					"/etc/systemd/system/citadel-worker.service", `sudo "/home/owner/.local/bin/citadel" service refresh-unit`)
 				return nil, nil
 			},
 			wantRewritten: 0,

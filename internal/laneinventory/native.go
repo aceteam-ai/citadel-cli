@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -52,6 +53,18 @@ type processRef struct {
 
 func ownProcessUID(ids []int32, uid int32) bool {
 	return uid >= 0 && len(ids) >= 2 && ids[0] == uid && ids[1] == uid
+}
+
+func threadHomeForUID(uid int32, lookup func(string) (*user.User, error)) (string, error) {
+	if uid < 0 || lookup == nil {
+		return "", ErrUnavailable
+	}
+	id := strconv.FormatInt(int64(uid), 10)
+	account, err := lookup(id)
+	if err != nil || account == nil || account.Uid != id || !filepath.IsAbs(account.HomeDir) {
+		return "", ErrUnavailable
+	}
+	return filepath.Clean(account.HomeDir), nil
 }
 
 func nativeProcesses(ctx context.Context, uid int32, list func(context.Context) ([]processRef, error)) ([]Process, error) {
@@ -233,7 +246,8 @@ func terminalSessionName(name, base string) bool {
 }
 
 // NewNative does not perform any observation at construction. The caller
-// selects nodeDir once at the CLI/worker boundary; no leaf home/config lookup.
+// selects nodeDir once at the CLI/worker boundary. The optional descriptor
+// fallback resolves default transcript roots lazily for the current user.
 // Unsupported same-user process identity (notably Windows) refuses rather than
 // returning another user's data. No Environ, prompt/rollout/log read exists.
 func NewNative(nodeDir string) Collector {
@@ -302,7 +316,28 @@ func NewNative(nodeDir string) Collector {
 			})
 		},
 		Declarations: func(ctx context.Context) (map[int32]string, error) { return declaredPIDs(ctx, nodeDir) },
-		Git:          func(ctx context.Context, cwd string) (*Worktree, error) { return readGit(ctx, runReadOnly, cwd) },
+		ThreadID: func(ctx context.Context, expected Process, harness string) (string, error) {
+			if runtime.GOOS != "linux" {
+				return "", ErrUnavailable
+			}
+			home, err := threadHomeForUID(uid, user.LookupId)
+			if err != nil {
+				return "", ErrUnavailable
+			}
+			return nativeThreadID(ctx, uid, expected, home, "/proc", harness, func(ctx context.Context) ([]int32, int64, error) {
+				current, err := process.NewProcessWithContext(ctx, expected.PID)
+				if err != nil {
+					return nil, 0, err
+				}
+				ids, err := current.UidsWithContext(ctx)
+				if err != nil {
+					return nil, 0, err
+				}
+				started, err := current.CreateTimeWithContext(ctx)
+				return ids, started, err
+			})
+		},
+		Git: func(ctx context.Context, cwd string) (*Worktree, error) { return readGit(ctx, runReadOnly, cwd) },
 		Capacity: func(ctx context.Context) (Capacity, error) {
 			value := Capacity{NCPU: runtime.NumCPU()}
 			var failures []error

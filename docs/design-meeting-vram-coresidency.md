@@ -8,9 +8,9 @@ and [design-model-exclusivity.md](design-model-exclusivity.md) (#8248/#8249);
 this doc extends the same primitives to two job types that are not
 `SERVICE_START`: `MEETING_JOIN` and `TRANSCRIBE_AUDIO`.
 
-## Implementation status (2026-08-30, Jason's decision)
+## Implementation status (2026-08-30, Owner's decision)
 
-Jason's call: **ship the honest-refusal / diagnosis tier only. Do NOT build
+Owner's call: **ship the honest-refusal / diagnosis tier only. Do NOT build
 the preempt arm.** `CITADEL_MEETING_VRAM_PREEMPT` (§4, §8 P2) and any
 `Reserve`/`Release` wiring are DEFERRED pending a live re-verify on a dev node
 per §7 Q1 — this design's own §1a finding (the shipped transcribe sidecar is
@@ -413,10 +413,10 @@ container's actual state — *whatever* the true mechanism was, VRAM or not.
    cross-repo contract, inert until the backend sends it — same posture as
    #577's original landing).
 
-## 7. Open questions for Jason — RESOLVED 2026-08-30
+## 7. Open questions for Owner — RESOLVED 2026-08-30
 
 1. **Was the dev node's starvation actually VRAM? RESOLVED: unconfirmed, and
-   that uncertainty is exactly why P2 does not ship now.** Jason's decision:
+   that uncertainty is exactly why P2 does not ship now.** Owner's decision:
    ship P0 (diagnosis) + P1 (fail-fast preflight) only; do NOT build the
    preempt arm. `CITADEL_MEETING_VRAM_PREEMPT` and any `Reserve`/`Release`
    wiring are DEFERRED pending a live re-verify on a dev node (vLLM serving +

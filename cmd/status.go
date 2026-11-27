@@ -116,6 +116,7 @@ func runStandardStatus(commandCtx context.Context) {
 	manifest, _, _ := findAndReadManifest()
 
 	headerColor.Fprintf(w, "--- 📊 Citadel Node Status (%s) ---\n", Version)
+	printStatusServer(w, authServiceURL)
 
 	headerColor.Fprintln(w, "\n🛠️ WORKER")
 	printConfiguredWorkerRole(w, getDeviceConfigFromFile())
@@ -154,6 +155,10 @@ func runStandardStatus(commandCtx context.Context) {
 
 	headerColor.Fprintln(w, "\n🚀 MANAGED SERVICES")
 	printServiceInfo(w)
+}
+
+func printStatusServer(w io.Writer, server string) {
+	fmt.Fprintf(w, "Server:\t%s\n", server)
 }
 
 // printWorkerInfo reports whether a `citadel work` worker currently holds the
@@ -460,6 +465,7 @@ func gatherInitialStatusData(commandCtx context.Context) (dashboard.StatusData, 
 func gatherStatusData() (dashboard.StatusData, error) {
 	data := dashboard.StatusData{
 		Version: Version,
+		Server:  authServiceURL,
 	}
 	if role, err := resolveWorkerRole(getDeviceConfigFromFile(), ""); err == nil {
 		data.ConfiguredRole = role.Report()

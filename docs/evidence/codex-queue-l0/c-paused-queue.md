@@ -81,7 +81,7 @@ prove `consumed`, production correlation, or clearing a blocker.
 
 L4 must keep the existing eligibility and human-driving refusals. This result
 does not authorize waking a lane already classified blocked/paused/limited,
-change Jason's D1 second-observation decision, or justify auto-resuming a goal.
+change Owner's D1 second-observation decision, or justify auto-resuming a goal.
 If a permitted queue starts a turn, account for that turn under the normal
 budgets; do not retry it because the goal still says blocked. D6 ignored-wake
 backoff applies only when the receipt actually meets its ignored criteria.

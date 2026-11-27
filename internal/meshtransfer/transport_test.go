@@ -41,7 +41,7 @@ func TestMeshOnlyDial_OnlyDialsThePinnedPeer(t *testing.T) {
 	}{
 		{"different mesh peer", "100.64.0.10:8080"},
 		{"public IP", "8.8.8.8:443"},
-		{"RFC1918 LAN IP", "192.168.2.9:8080"},
+		{"RFC1918 LAN IP", "192.168.50.9:8080"},
 		{"loopback", "127.0.0.1:8080"},
 		{"hostname (would need DNS)", "peer.example.com:443"},
 		{"malformed address", "not-an-address"},

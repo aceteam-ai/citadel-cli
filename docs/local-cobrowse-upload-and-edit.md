@@ -10,9 +10,9 @@ interception), #1723 / PR #1728 (human attach on the node path) and PR #1731
 (`TypeWith`, `KeyWith`, `CheckKeyChord`, still in review). The platform side of
 the edit contract is aceteam#13782.
 
-## Decisions (Jason, 2026-11-17)
+## Decisions (Owner, 2026-11-17)
 
-Where Jason chose differently from the design's first recommendation, that
+Where Owner chose differently from the design's first recommendation, that
 recommendation is kept as the rejected alternative.
 
 1. **File source: both.** The human can use a picker and drop zone in the
@@ -115,7 +115,7 @@ area confirms it with a test before changing it.
 
 ## Constraints
 
-These were decided by Jason and are not reopened here.
+These were decided by Owner and are not reopened here.
 
 - Local mode needs no account, sends no telemetry, makes no egress of its own,
   and needs no admin rights or Docker. `TestLocalMCPStdioMakesNoOutboundCalls`

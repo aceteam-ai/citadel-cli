@@ -141,6 +141,7 @@ func (s *Server) authorizeCacheRequest(w http.ResponseWriter, r *http.Request) b
 	s.mu.RLock()
 	resolver := s.meshResolver
 	perms := s.permissions
+	source := s.permissionSource
 	s.mu.RUnlock()
 
 	// 1. Verified same-owner mesh peer (identity FIRST — never reach the passcode
@@ -152,6 +153,14 @@ func (s *Server) authorizeCacheRequest(w http.ResponseWriter, r *http.Request) b
 	}
 	// 2. Capability, fail CLOSED on nil/disabled (deliberately unlike
 	//    permissionMiddleware's allow-all-on-nil).
+	if source != nil {
+		var err error
+		perms, err = source()
+		if err != nil {
+			exposeDeny(w, http.StatusForbidden, "node policy unavailable")
+			return false
+		}
+	}
 	if perms == nil || !perms.Files {
 		exposeDeny(w, http.StatusForbidden, "cache serving capability disabled by node operator")
 		return false

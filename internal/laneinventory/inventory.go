@@ -95,6 +95,7 @@ type Deps struct {
 	Panes        func(context.Context) ([]RawPane, error)
 	Processes    func(context.Context) ([]Process, error)
 	Argv         func(context.Context, Process) ([]string, error)
+	ThreadID     func(context.Context, Process, string) (string, error)
 	Declarations func(context.Context) (map[int32]string, error)
 	Git          func(context.Context, string) (*Worktree, error)
 	Capacity     func(context.Context) (Capacity, error)
@@ -259,6 +260,7 @@ func (c Collector) Collect(ctx context.Context) (Report, error) {
 	allArgBytes, secretBytes := 0, 0
 	argvCache := map[int32][]string{}
 	gitCache := map[string]*Worktree{}
+	fdProcesses := 0
 	for _, raw := range panes {
 		if ctx.Err() != nil {
 			return Report{}, ErrUnavailable
@@ -278,6 +280,9 @@ func (c Collector) Collect(ctx context.Context) (Report, error) {
 		}
 		queue := []int32{raw.PID}
 		seen := map[int32]bool{}
+		harnessTree := map[int32]bool{}
+		fdThreads := map[string]bool{}
+		fdFailed := false
 		for len(queue) > 0 {
 			if ctx.Err() != nil {
 				return Report{}, ErrUnavailable
@@ -319,8 +324,34 @@ func (c Collector) Collect(ctx context.Context) (Report, error) {
 			harness, thread := Detect(args)
 			if harness != "other" && p.Harness == "other" {
 				p.Harness, p.ThreadID = harness, thread
+				harnessTree[pid] = true
+			} else if harnessTree[observed.Parent] && (harness == "other" || harness == p.Harness) {
+				harnessTree[pid] = true
+			}
+			if d.ThreadID != nil && p.ThreadID == "" && harnessTree[pid] && (p.Harness == "claude" || p.Harness == "codex") {
+				fdProcesses++
+				if fdProcesses > maxThreadProcesses {
+					fdFailed = true
+					r.Truncated = true
+				} else {
+					id, err := d.ThreadID(ctx, observed, p.Harness)
+					if err != nil || (id != "" && !uuid.MatchString(id)) {
+						fdFailed = true
+					} else if id != "" {
+						fdThreads[strings.ToLower(id)] = true
+					}
+				}
 			}
 			queue = append(queue, children[pid]...)
+		}
+		if p.ThreadID == "" {
+			if fdFailed || len(fdThreads) > 1 {
+				r.Unavailable = append(r.Unavailable, "thread_fds")
+			} else {
+				for id := range fdThreads {
+					p.ThreadID = id
+				}
+			}
 		}
 		// A declared holder can be an ancestor of the pane's shell.
 		for pid, depth := raw.PID, 0; pid > 0 && depth < MaxProcesses; depth++ {
@@ -406,7 +437,7 @@ func Encode(r Report) ([]byte, error) {
 	components := []string{}
 	for _, component := range r.Unavailable {
 		switch component {
-		case "processes", "declarations", "capacity", "pane_process", "argv", "git", "terminal_scope":
+		case "processes", "declarations", "capacity", "pane_process", "argv", "git", "terminal_scope", "thread_fds":
 			components = append(components, component)
 		}
 	}

@@ -11,7 +11,7 @@
 //  4. process user (the #1012 fallback)
 //
 // Each Target carries an attributable Signal so a consumer can tell "probed
-// jason's environment" from "probed root's environment on a root-owned node",
+// owner's environment" from "probed root's environment on a root-owned node",
 // the two outcomes that look identical today. This package stays stdlib-only
 // (leaf constraint): the node config dir is passed IN as a string, never resolved
 // via internal/network here.

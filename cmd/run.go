@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/aceteam-ai/citadel-cli/internal/catalog"
-	"github.com/aceteam-ai/citadel-cli/internal/compose"
 	"github.com/aceteam-ai/citadel-cli/internal/nexus"
 	"github.com/aceteam-ai/citadel-cli/internal/platform"
 	internalServices "github.com/aceteam-ai/citadel-cli/internal/services"
@@ -282,12 +281,6 @@ func restartAllServices() {
 	}
 
 	for _, service := range manifest.Services {
-		// `compose restart` also starts a stopped container, so a service the
-		// operator stopped (desired_status: stopped) is skipped, as on boot.
-		if serviceStartDisabled(service) {
-			fmt.Printf("   - Skipping stopped service: %s (desired_status: stopped)\n", service.Name)
-			continue
-		}
 		// Validate that compose file path stays within config directory (prevent path traversal)
 		fullComposePath, err := platform.ValidatePathWithinDir(configDir, service.ComposeFile)
 		if err != nil {
@@ -296,65 +289,22 @@ func restartAllServices() {
 		}
 		fmt.Printf("🔄 Restarting service: %s\n", service.Name)
 
+		restartArgs := append(composeFileArgs(fullComposePath, fullComposePath), "restart")
+		composeCmd := composeCommandFor(rt, restartArgs...)
 		var output []byte
-		recreated := false
 		err = withLocalServiceStartGuard(configDir, service.Name, func() error {
 			var startErr error
-			recreated, startErr = restartByRecreatingManagedService(rt, service, fullComposePath)
-			if recreated || startErr != nil {
-				return startErr
-			}
-			restartArgs := append(composeFileArgs(fullComposePath, fullComposePath), "restart")
-			output, startErr = composeCommandFor(rt, restartArgs...).CombinedOutput()
+			output, startErr = composeCmd.CombinedOutput()
 			return startErr
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "   ❌ Failed to restart service %s: %v %s\n", service.Name, err, string(output))
-		} else if recreated {
-			fmt.Printf("   ✅ Service %s recreated from its current compose.\n", service.Name)
 		} else {
 			fmt.Printf("   ✅ Service %s restarted.\n", service.Name)
 		}
 	}
 
 	fmt.Println("\n🎉 All services have been restarted.")
-}
-
-// restartByRecreatingManagedService restarts an embedded service whose
-// compose is a citadel-managed template by recreating it (`compose up -d
-// --force-recreate`), because `compose restart` keeps a container's old config
-// and would never apply a refreshed template. It first refreshes a known older
-// template (reconcileHostComposeForStart). It reports false, leaving the plain
-// `compose restart` to the caller, when:
-//   - the service is not embedded or its file is not a known citadel template
-//     (an operator-edited file is never recreated);
-//   - no container exists (restart would not create one either);
-//   - a --node-dir override is active (inspecting the bare container name could
-//     read another node's container on a shared engine, citadel#856);
-//   - an external vLLM owns the endpoint.
-//
-// The caller holds the service start guard and has skipped stopped services.
-func restartByRecreatingManagedService(rt catalog.ContainerRuntime, service Service, composePath string) (bool, error) {
-	if !isEmbeddedService(service.Name) || composeProjectOverride() != "" || refuseManagedVLLMStart(service.Name) != nil {
-		return false, nil
-	}
-	refresh, err := reconcileHostComposeForStart(service.Name, composePath, platform.NvidiaGPUCountForCompose)
-	if err != nil {
-		return false, err
-	}
-	if !compose.IsKnownCompose(composePath, service.Name, resolveNodeDirOverride()) {
-		return false, nil
-	}
-	if _, exists := managedCompose.containerState(rt.EngineBin, embeddedContainerName(service.Name)); !exists {
-		return false, nil
-	}
-	if err := runManagedComposeUp(rt, service.Name, composePath, true, composeEnvForServiceValues(service.Name, service)); err != nil {
-		if rbErr := refresh.Rollback(composePath, service.Name); rbErr != nil {
-			fmt.Printf("   ⚠️  could not restore the previous %s compose: %v\n", service.Name, rbErr)
-		}
-		return false, err
-	}
-	return true, nil
 }
 
 // syncSSHKeysIfConfigured attempts to sync SSH keys if configuration exists.

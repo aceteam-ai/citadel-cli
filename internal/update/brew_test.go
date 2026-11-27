@@ -45,8 +45,8 @@ func TestStableDarwinExecPath(t *testing.T) {
 		},
 		{
 			name:     "curl install into user local bin is left unchanged",
-			resolved: "/Users/jason/.local/bin/citadel",
-			wantPath: "/Users/jason/.local/bin/citadel",
+			resolved: "/Users/owner/.local/bin/citadel",
+			wantPath: "/Users/owner/.local/bin/citadel",
 			wantBrew: false,
 		},
 		{
@@ -77,7 +77,7 @@ func TestIsHomebrewManagedPath(t *testing.T) {
 		{"darwin cellar is managed", "/opt/homebrew/Cellar/citadel/2.1.0/bin/citadel", "darwin", true},
 		{"darwin intel cellar is managed", "/usr/local/Cellar/citadel/2.1.0/bin/citadel", "darwin", true},
 		{"darwin curl install not managed", "/usr/local/bin/citadel", "darwin", false},
-		{"darwin user local not managed", "/Users/jason/.local/bin/citadel", "darwin", false},
+		{"darwin user local not managed", "/Users/owner/.local/bin/citadel", "darwin", false},
 		// A linuxbrew Cellar path must NOT be treated as managed: the guard is
 		// macOS-only, so an in-place swap still works on Linux.
 		{"linux cellar path not managed (linuxbrew)", "/home/linuxbrew/.linuxbrew/Cellar/citadel/2.1.0/bin/citadel", "linux", false},

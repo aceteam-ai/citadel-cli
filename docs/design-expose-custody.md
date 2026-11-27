@@ -504,7 +504,7 @@ What the node will honor / return; the aceteam agent owns everything behind it:
   exposure state (key + records + high-water together) is a deliberate
   non-goal here and flagged as follow-up material.
 
-## 9. Open questions for Jason — RESOLVED (2026-08-30)
+## 9. Open questions for Owner — RESOLVED (2026-08-30)
 
 1. **Re-expose semantics under node-owned epoch — RESOLVED: refined option
    (b), preserve-links + explicit rotate.** A plain re-expose PRESERVES the

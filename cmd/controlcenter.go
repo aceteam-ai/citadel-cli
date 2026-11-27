@@ -702,6 +702,7 @@ func startTerminalServer(orgID string, activityFn func(level, msg string)) error
 	termCfg.OrgID = orgID
 	termCfg.AuthServiceURL = authServiceURL
 	termCfg.Port = ccTerminalPort
+	termCfg.PermissionSource = loadNodePermissionsStrict
 
 	// Per-node passcode gate (aceteam#6524), same as the `citadel work` terminal
 	// server: even after a valid token or same-owner mesh identity, a connection
@@ -1662,7 +1663,7 @@ func ccStartServiceForHost(name string, gpuCount func() int) error {
 			// the start.
 			return withLocalServiceStartGuard(configDir, name, func() error {
 				// Keep compose publication under the existing pointer/reservation locks.
-				if _, err := reconcileHostComposeForStart(name, filepath.Join(configDir, service.ComposeFile), gpuCount); err != nil {
+				if err := reconcileHostComposeForStart(name, filepath.Join(configDir, service.ComposeFile), gpuCount); err != nil {
 					return err
 				}
 				_ = setServiceDesiredStatus(configDir, name, "")
@@ -1767,7 +1768,7 @@ func ccRestartServiceForHost(name string, gpuCount func() int) error {
 			// marker so the service also starts on the next boot. Best-effort.
 			return withLocalServiceStartGuard(configDir, name, func() error {
 				// Keep compose publication under the existing pointer/reservation locks.
-				if _, err := reconcileHostComposeForStart(name, filepath.Join(configDir, service.ComposeFile), gpuCount); err != nil {
+				if err := reconcileHostComposeForStart(name, filepath.Join(configDir, service.ComposeFile), gpuCount); err != nil {
 					return err
 				}
 				_ = setServiceDesiredStatus(configDir, name, "")
@@ -2689,6 +2690,9 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	// on the live runner, shared with runWork. This closes the "no handler" hazard for
 	// a control-center-only node.
 	registerPrivilegedNodeJobHandlers(runner, nodeJobOpts)
+	go runLocalFlowCleanupReconciler(ctx, liveLocalFlowDeps(), time.Minute, func(err error) {
+		activity("error", fmt.Sprintf("local Flow container cleanup pending: %v", err))
+	})
 	startStatusPublisherAfterRunner(&ccNodeRunner, runner, startHeartbeatPublisher)
 	activity("success", "Worker started, listening for jobs...")
 

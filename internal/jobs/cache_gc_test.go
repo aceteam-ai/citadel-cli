@@ -349,7 +349,7 @@ func TestRunCacheGCPass_BackfillEntryIsEligible(t *testing.T) {
 	result := runCacheGCPass(store, deps)
 
 	if result.EvictedCount != 1 {
-		t.Fatalf("expected a SourceBackfill entry to be GC-eligible (Jason's 2026-08-25 decision); result=%+v", result)
+		t.Fatalf("expected a SourceBackfill entry to be GC-eligible (Owner's 2026-08-25 decision); result=%+v", result)
 	}
 	if _, ok := store.Snapshot().Lookup(services.HFHubCacheDirName, "org/backfilled"); ok {
 		t.Fatalf("expected the backfill entry to have been evicted")

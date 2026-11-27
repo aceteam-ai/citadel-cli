@@ -341,7 +341,7 @@ func TestOmniVoiceComposeContract(t *testing.T) {
 	if _, ok := ServiceAuxFiles["omnivoice"]; ok {
 		t.Errorf("ServiceAuxFiles should not contain omnivoice; it uses a prebuilt image, not a build context")
 	}
-	// Jason's decision (citadel-cli#1007 §6.2): OmniVoice is a GPU-only engine,
+	// Owner's decision (citadel-cli#1007 §6.2): OmniVoice is a GPU-only engine,
 	// unlike kokoro -- fail loud on a CPU-only node rather than silently degrade
 	// to an unusably slow CPU diffusion loop.
 	if !strings.Contains(content, "driver: nvidia") {
