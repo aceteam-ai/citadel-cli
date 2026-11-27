@@ -500,7 +500,7 @@ hand-built report (the existing `doctor_test.go` pattern).
 **Phase 3 — ollama.** `ServiceNetworks` + `EnsureNetwork` at both sides,
 `ollama.yml` rewrite, `AppManifest.Networks`, `ollama-webui` URL +
 install-time native resolution, allowlist entry removed, hashes regen.
-Verify on node 1297 only with an isolated `CITADEL_NODE_DIR` (never the
+Verify on a dev node only with an isolated `CITADEL_NODE_DIR` (never the
 real node dir — the #853/#856/#860 incident class), and note that `--node-dir`
 as a flag is not visible to `internal/jobs` (only the env var is).
 

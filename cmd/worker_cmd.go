@@ -1,16 +1,19 @@
 // cmd/worker_cmd.go
 //
 // `citadel worker`: control the per-user background worker on Windows
-// (citadel-cli#1867 C3). `autostart` manages the HKCU Run value that starts
+// (citadel-cli#1867 C3) and macOS (citadel-cli#1903 M3, where it is a
+// LaunchAgent: `autostart` writes its plist and `stop` boots it out). `autostart` manages the HKCU Run value that starts
 // `citadel work --background` at logon; `stop` ends the supervisor and its
 // worker. The setup page calls the same functions.
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"time"
 
 	"github.com/aceteam-ai/citadel-cli/internal/service"
@@ -21,18 +24,19 @@ import (
 
 var workerCmd = &cobra.Command{
 	Use:   "worker",
-	Short: "Control the per-user background worker (Windows)",
+	Short: "Control the per-user background worker (Windows and macOS)",
 	Long: `Control the background worker that 'citadel work --background' starts.
 
 On Windows a standard user cannot install the Citadel service. Instead the
 worker runs in the background under a small supervisor that restarts it, and an
-optional per-user autostart entry starts it again when you sign in. On Linux and
-macOS use 'citadel service install'.`,
+optional per-user autostart entry starts it again when you sign in. On macOS the
+worker is a per-user LaunchAgent that launchd keeps running. On Linux use
+'citadel service install'.`,
 }
 
 var workerAutostartCmd = &cobra.Command{
 	Use:   "autostart",
-	Short: "Start the background worker when you sign in (Windows)",
+	Short: "Start the background worker when you sign in (Windows and macOS)",
 }
 
 var workerAutostartEnableCmd = &cobra.Command{
@@ -44,6 +48,13 @@ var workerAutostartEnableCmd = &cobra.Command{
 		exe, err := citadelExecutable()
 		if err != nil {
 			return fmt.Errorf("resolve the citadel executable: %w", err)
+		}
+		if runtime.GOOS == "darwin" {
+			if err := service.EnableUserAutostart(exe); err != nil {
+				return err
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), "Autostart enabled: macOS will start the Citadel worker when you sign in.\nIt does not start now; run 'citadel worker start' to start it.")
+			return nil
 		}
 		if err := enableUserAutostart(exe, autostartExeOwnership, service.EnableUserAutostart); err != nil {
 			return err
@@ -103,12 +114,40 @@ var workerAutostartStatusCmd = &cobra.Command{
 	},
 }
 
+var workerStartCmd = &cobra.Command{
+	Use:          "start",
+	Short:        "Start the background worker (macOS LaunchAgent)",
+	Args:         cobra.NoArgs,
+	SilenceUsage: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if runtime.GOOS != "darwin" {
+			return errors.New("'citadel worker start' is only for the macOS LaunchAgent; on Windows run 'citadel work --background', on Linux use 'citadel service start'")
+		}
+		ctx := cmd.Context()
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if err := service.StartUserWorker(ctx); err != nil {
+			return err
+		}
+		fmt.Fprintln(cmd.OutOrStdout(), "The background worker is running (a LaunchAgent that macOS keeps running).")
+		return nil
+	},
+}
+
 var workerStopCmd = &cobra.Command{
 	Use:          "stop",
 	Short:        "Stop the background worker and its supervisor",
 	Args:         cobra.NoArgs,
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if runtime.GOOS == "darwin" {
+			if err := service.StopUserWorker(); err != nil {
+				return err
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), "The background worker is stopped. It starts again at sign-in unless you run 'citadel worker autostart disable'.")
+			return nil
+		}
 		nodeDir, err := userWorkerNodeDir()
 		if err != nil {
 			return err
@@ -119,7 +158,7 @@ var workerStopCmd = &cobra.Command{
 
 func init() {
 	workerAutostartCmd.AddCommand(workerAutostartEnableCmd, workerAutostartDisableCmd, workerAutostartStatusCmd)
-	workerCmd.AddCommand(workerAutostartCmd, workerStopCmd)
+	workerCmd.AddCommand(workerAutostartCmd, workerStartCmd, workerStopCmd)
 	rootCmd.AddCommand(workerCmd)
 }
 
@@ -185,10 +224,20 @@ type userWorkerState struct {
 	AutostartErr  error
 	Running       bool
 	SupervisorPID int
+	// Agent is set on macOS, where the worker is a LaunchAgent: Running and
+	// SupervisorPID then describe the job, and Autostart the plist.
+	Agent *service.LaunchAgentState
 }
 
 // readUserWorkerState reads the Run value and probes the supervisor lock.
 func readUserWorkerState(exe, nodeDir string) userWorkerState {
+	if runtime.GOOS == "darwin" {
+		st, err := service.ReadUserAgentState(exe)
+		if err != nil {
+			return userWorkerState{AutostartErr: err}
+		}
+		return userWorkerStateFromAgent(st)
+	}
 	st, err := service.UserAutostart(exe)
 	held, pid := userSupervisorHeld(service.SupervisorLockPath(nodeDir))
 	return userWorkerState{Autostart: st, AutostartErr: err, Running: held, SupervisorPID: pid}

@@ -6,8 +6,8 @@
 //
 // The problem: tei.yml pins the CPU image (ghcr.io/huggingface/
 // text-embeddings-inference:cpu-1.6) with single-thread MKL/OMP/RAYON, so even a
-// GPU node embeds ~125x slower than the matching CUDA image (measured on node
-// 1795 / RTX 3090 / sm86: 41k chunks ~25h vs ~30min, identical vectors, cosine
+// GPU node embeds ~125x slower than the matching CUDA image (measured on a
+// dev node, RTX 3090 / sm86: 41k chunks ~25h vs ~30min, identical vectors, cosine
 // 1.000000). The fix keeps the compose template as the single source of truth
 // and injects the GPU image tag via a ${CITADEL_TEI_IMAGE_TAG:-cpu-1.6}
 // substitution, chosen from the node's detected GPU compute capability. The
@@ -83,7 +83,7 @@ func TEICUDATagForComputeCap(computeCap string) string {
 		return "turing-" + teiImageVersion
 	case "8.0": // Ampere 80 (A100, A30) — the bare version tag
 		return teiImageVersion
-	case "8.6": // Ampere 86 (A10, A40, RTX 3090) — the node 1795 verified case
+	case "8.6": // Ampere 86 (A10, A40, RTX 3090) — the dev-node verified case
 		return "86-" + teiImageVersion
 	case "8.9": // Ada Lovelace (RTX 4000 series, L4, L40)
 		return "89-" + teiImageVersion

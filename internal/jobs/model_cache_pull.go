@@ -675,7 +675,7 @@ func hfDownloadArgsFiltered(repo, file, localDir string, allowPatterns, ignorePa
 //
 // PATH first (exec.LookPath), then common install locations, because the systemd
 // worker's PATH often omits the user's pip/uv bin dirs where huggingface_hub
-// installs the CLI (on node 1084 it lives under ~/.uv/python/*/bin). Returns a
+// installs the CLI (on a dev node it lives under ~/.uv/python/*/bin). Returns a
 // clear error if neither binary can be found anywhere.
 func resolveHFDownloader() (string, error) {
 	for _, name := range []string{"hf", "huggingface-cli"} {

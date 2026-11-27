@@ -878,7 +878,7 @@ func TestSaveDeviceConfigToFile_PersistsFabricNodeID(t *testing.T) {
 	token := &nexus.TokenResponse{
 		DeviceAPIToken: "dat_8139",
 		OrgID:          "org-8139",
-		FabricNodeID:   "1297",
+		FabricNodeID:   "4321",
 	}
 	if err := saveDeviceConfigToFile(token); err != nil {
 		t.Fatalf("saveDeviceConfigToFile: %v", err)
@@ -888,8 +888,8 @@ func TestSaveDeviceConfigToFile_PersistsFabricNodeID(t *testing.T) {
 	if dc == nil {
 		t.Fatal("expected a device config, got nil")
 	}
-	if dc.FabricNodeID != "1297" {
-		t.Errorf("FabricNodeID = %q, want 1297", dc.FabricNodeID)
+	if dc.FabricNodeID != "4321" {
+		t.Errorf("FabricNodeID = %q, want 4321", dc.FabricNodeID)
 	}
 	if dc.DeviceAPIToken != "dat_8139" {
 		t.Errorf("DeviceAPIToken = %q, want dat_8139 (other fields must survive the new field)", dc.DeviceAPIToken)

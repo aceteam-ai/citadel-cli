@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -205,6 +206,29 @@ func controlCenterAPIPublisherConfig(client *redisapi.Client, nodeID, headscaleN
 	}
 }
 
+// Keep a live, adoptable external engine visible without advertising a new
+// managed CUDA launch. An isolated node never observes the shared endpoint.
+func controlCenterAvailableServicesForHost(goos string, gpuCount func() int, serving func(context.Context, string, int) ([]string, bool)) []string {
+	count := -1
+	if goos == "linux" && gpuCount != nil {
+		count = gpuCount()
+	}
+	var observed []string
+	if goos == "linux" && count == 0 && composeProjectOverride() == "" && serving != nil {
+		if port, ok := status.AdoptableExternalEnginePort("vllm"); ok {
+			if _, live := serving(context.Background(), "vllm", port); live {
+				observed = append(observed, "vllm")
+			}
+		}
+	}
+	return services.AvailableServicesForHost(goos, func() int { return count }, observed...)
+}
+
+func externalEngineServingForChoices(_ context.Context, name string, _ int) ([]string, bool) {
+	_, live := adoptExternalEngineForStart(name)
+	return nil, live
+}
+
 // runControlCenter launches the unified control center TUI
 func runControlCenter() {
 	if !tui.IsTTY() {
@@ -242,15 +266,17 @@ func runControlCenter() {
 	startDemoServer()
 
 	cfg := controlcenter.Config{
-		Version:            Version,
-		AuthServiceURL:     authServiceURL,
-		NexusURL:           nexusURL,
-		RefreshFn:          gatherControlCenterData,
-		StartServiceFn:     ccStartService,
-		StopServiceFn:      ccStopService,
-		RestartServiceFn:   ccRestartService,
-		AddServiceFn:       ccAddService,
-		GetServicesFn:      services.GetAvailableServices,
+		Version:          Version,
+		AuthServiceURL:   authServiceURL,
+		NexusURL:         nexusURL,
+		RefreshFn:        gatherControlCenterData,
+		StartServiceFn:   ccStartService,
+		StopServiceFn:    ccStopService,
+		RestartServiceFn: ccRestartService,
+		AddServiceFn:     ccAddService,
+		GetServicesFn: func() []string {
+			return controlCenterAvailableServicesForHost(runtime.GOOS, platform.NvidiaGPUCountForCompose, externalEngineServingForChoices)
+		},
 		GetConfiguredFn:    ccGetConfiguredServices,
 		GetServiceDetailFn: ccGetServiceDetail,
 		GetServiceLogsFn:   ccGetServiceLogs,
@@ -699,6 +725,7 @@ func startTerminalServer(orgID string, activityFn func(level, msg string)) error
 	termCfg.OrgID = orgID
 	termCfg.AuthServiceURL = authServiceURL
 	termCfg.Port = ccTerminalPort
+	termCfg.PermissionSource = loadNodePermissionsStrict
 
 	// Per-node passcode gate (aceteam#6524), same as the `citadel work` terminal
 	// server: even after a valid token or same-owner mesh identity, a connection
@@ -1612,8 +1639,30 @@ func extractUptime(status string) string {
 	return ""
 }
 
+// Admission and explicit adoption intent share the existing start guards.
+func admitControlCenterServiceStart(configDir, name string, gpuCount func() int, adopt func(string) (string, bool)) (bool, error) {
+	adopted := false
+	err := withLocalServiceStartGuard(configDir, name, func() error {
+		var err error
+		adopted, err = serviceStartAdmissionForHost(name, gpuCount, adopt)
+		if err != nil || !adopted {
+			return err
+		}
+		return clearAdoptedServiceStoppedMarker(configDir, name)
+	})
+	return adopted, err
+}
+
 // ccStartService starts a service by name
 func ccStartService(name string) error {
+	return ccStartServiceForHost(name, platform.NvidiaGPUCountForCompose)
+}
+
+func ccStartServiceForHost(name string, gpuCount func() int) error {
+	return ccStartServiceForHostWithAdoption(name, gpuCount, adoptExternalEngineForStart)
+}
+
+func ccStartServiceForHostWithAdoption(name string, gpuCount func() int, adopt func(string) (string, bool)) error {
 	manifest, configDir, err := findAndReadManifest()
 	if err != nil {
 		return err
@@ -1621,6 +1670,12 @@ func ccStartService(name string) error {
 
 	for _, service := range manifest.Services {
 		if service.Name == name {
+			// Existing manifest entries need the same host checks as CLI starts.
+			// Refuse unsupported CUDA engines and reconcile CPU-capable compose
+			// before runtime effects or clearing the durable stopped marker.
+			if adopted, err := admitControlCenterServiceStart(configDir, name, gpuCount, adopt); adopted || err != nil {
+				return err
+			}
 			// Preflight (citadel #767): this is the literal repro from the
 			// issue (TUI "Starting ollama..." -> "Failed to start ollama:
 			// exec: \"docker\": executable file not found in $PATH") --
@@ -1648,6 +1703,10 @@ func ccStartService(name string) error {
 			// just found it), so a failure here is unexpected but must not block
 			// the start.
 			return withLocalServiceStartGuard(configDir, name, func() error {
+				// Keep compose publication under the existing pointer/reservation locks.
+				if err := reconcileHostComposeForStart(name, filepath.Join(configDir, service.ComposeFile), gpuCount); err != nil {
+					return err
+				}
 				_ = setServiceDesiredStatus(configDir, name, "")
 				// Transitional (#528): drop any container still under the legacy
 				// "citadel-<name>" project so the no-`-p` up below does not conflict
@@ -1721,6 +1780,14 @@ func ccStopService(name string) error {
 
 // ccRestartService restarts a service by name
 func ccRestartService(name string) error {
+	return ccRestartServiceForHost(name, platform.NvidiaGPUCountForCompose)
+}
+
+func ccRestartServiceForHost(name string, gpuCount func() int) error {
+	return ccRestartServiceForHostWithAdoption(name, gpuCount, adoptExternalEngineForStart)
+}
+
+func ccRestartServiceForHostWithAdoption(name string, gpuCount func() int, adopt func(string) (string, bool)) error {
 	manifest, configDir, err := findAndReadManifest()
 	if err != nil {
 		return err
@@ -1728,6 +1795,12 @@ func ccRestartService(name string) error {
 
 	for _, service := range manifest.Services {
 		if service.Name == name {
+			// Existing manifest entries need the same host checks as CLI starts.
+			// Refuse unsupported CUDA engines and reconcile CPU-capable compose
+			// before runtime effects or clearing the durable stopped marker.
+			if adopted, err := admitControlCenterServiceStart(configDir, name, gpuCount, adopt); adopted || err != nil {
+				return err
+			}
 			// Preflight (citadel #767): same warn-and-proceed rationale as
 			// ccStartService above.
 			rt := catalog.SelectContainerRuntime()
@@ -1739,6 +1812,10 @@ func ccRestartService(name string) error {
 			// A restart expresses "keep this running": clear any durable stopped
 			// marker so the service also starts on the next boot. Best-effort.
 			return withLocalServiceStartGuard(configDir, name, func() error {
+				// Keep compose publication under the existing pointer/reservation locks.
+				if err := reconcileHostComposeForStart(name, filepath.Join(configDir, service.ComposeFile), gpuCount); err != nil {
+					return err
+				}
 				_ = setServiceDesiredStatus(configDir, name, "")
 				// Transitional (#528): a container still under the legacy
 				// "citadel-<name>" project is invisible to a no-`-p` `compose restart`
@@ -2394,6 +2471,10 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 		ConfigDir:           "",
 		Services:            nil,
 		PermissionsProvider: loadNodePermissions,
+		CobrowseJobRecovery: func() bool {
+			runner := ccNodeRunner.Load()
+			return runner != nil && runner.CobrowseJobRecoveryAvailable()
+		},
 		JobTypes: func() []string {
 			runner := ccNodeRunner.Load()
 			if runner == nil {
@@ -2654,6 +2735,9 @@ func runTUIWorker(ctx context.Context, activityFn func(level, msg string)) error
 	// on the live runner, shared with runWork. This closes the "no handler" hazard for
 	// a control-center-only node.
 	registerPrivilegedNodeJobHandlers(runner, nodeJobOpts)
+	go runLocalFlowCleanupReconciler(ctx, liveLocalFlowDeps(), time.Minute, func(err error) {
+		activity("error", fmt.Sprintf("local Flow container cleanup pending: %v", err))
+	})
 	startStatusPublisherAfterRunner(&ccNodeRunner, runner, startHeartbeatPublisher)
 	activity("success", "Worker started, listening for jobs...")
 

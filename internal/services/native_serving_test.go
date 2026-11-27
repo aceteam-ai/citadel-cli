@@ -76,7 +76,7 @@ func TestIsNativeServiceServingUnknownServiceFailsClosed(t *testing.T) {
 }
 
 // TestIsNativeServiceServingFollowsThePort is the end-to-end shape of the bug on
-// node 1297: ollama's port is dead, so ollama is not serving -- regardless of
+// a dev node: ollama's port is dead, so ollama is not serving -- regardless of
 // what the process table says. The suite cannot bind 11434 (it may be in use, and
 // tests must not fight a real engine), so this asserts the negative direction,
 // which is the one the fix exists for. The positive direction is covered by

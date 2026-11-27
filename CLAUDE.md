@@ -47,6 +47,12 @@ metadata handoff: exact identity and snapshot fencing, salted account binding,
 duplicate refusal and preservation of local enable/policy. It is not a probe,
 freshness attestation or launch authorization.
 
+`housekeeping.Plan` owns the pure, supplied-metadata dry-run policy receipt.
+`newHousekeepingCommand` exposes only the stdin-driven `housekeeping plan` leaf;
+`isHousekeepingPlanCommand` scopes its startup exemption after profile admission.
+It does not scan, inspect native handles/Git state, delete, install a timer or
+publish remote cleanup authority. See `docs/housekeeping-plan.md` for that boundary.
+
 `status.collectCapacityMetrics` owns additive optional heartbeat placement
 signals and per-source unknown handling. `nativeCapacityProbes` owns the
 build-tagged OS readers; `TestCapacity*` exercises bounded procfs parsing and
@@ -92,6 +98,12 @@ typed refusal so a revocation after selection is terminal on its first attempt.
 The refusal inventory never advertises or executes a job. Focused coverage is
 in `internal/worker/job_refusal_test.go`.
 
+`cmd.checkCaptureScope` owns which memory scope the SessionEnd transcript-capture hook may write
+(#1916): an explicit one, with `global` needing `--allow-global-capture`; `cmd.wireCaptureHook` installs
+the hook only for `citadel memory install --capture-scope` (otherwise it removes an older unscoped hook),
+and `runMemoryCapture` and `memory.CaptureNote` both refuse an empty scope, since the server would
+default it to `global`. Tests: `cmd/memory_test.go`, `internal/memory/capture_test.go`.
+
 `workflow.LoadLLMPolicy` owns machine-local LLM endpoint grants and fail-closed
 loading; `LLMPolicy.resolveURL` owns exact endpoint and every-answer address
 validation separately from the HTTP node. Both worker entrypoints load once via
@@ -135,6 +147,19 @@ must pass the local image-config check after pulling. Contract and sandbox label
 remain mandatory. Tests in `cobrowse_container_platform_test.go` execute a fake
 `ContainerEngine` process, not a real engine or registry.
 
+The explicit `citadel appliance apply` command (citadel-cli#1890) reuses
+`writeSetupPosture`, with the closed `appliance` audit source, and the existing
+atomic config/update owners. It saves `browser_appliance`, `browser_slots` and
+optional `browser_window_size` in device config, without changing default
+permissions or restarting a worker. `configureBrowserRuntime` reads those
+settings even before enrollment. `doctor_cobrowse.go` owns injected, read-only
+readiness checks; browser/Xvfb absence is fatal for an applied appliance or
+retained co-browse-only posture. Damaged/unreadable device configuration fails
+readiness. Apply refuses node-directory overrides and POSIX elevation/foreign
+ownership before creating locks or writing configuration.
+Unknown namespace policy and missing fonts warn, not claim sandbox proof.
+See `docs/browser-appliance.md`; tests use temporary config and fake probes.
+
 `platform.browserRunner` owns the per-OS half of a co-browse session:
 discovery, launch, owner-lifetime binding and the orphan sweep. The Linux
 `xvfbRunner` is the historical managed-Xvfb path, and its argument list is pinned
@@ -145,6 +170,38 @@ by PID: it removes only dirs whose owner PID plus creation time no longer
 match. The session base dir there requires an owner-only, protected DACL
 (`validateCobrowseBaseDirPerms`), and a launch refuses without one. The
 windows-latest CI job runs the real-browser tests against both browsers.
+`darwinHeadlessRunner` (`cobrowse_runner_darwin.go`, citadel-cli#1635) is the
+macOS runner: local mode uses it, and it is the node-wide manager's host
+fallback behind `selectingRunner`, whose container selection it does not touch.
+`discoverMacBrowser` (`cobrowse_macos_logic.go`) owns the search order (Chrome,
+Edge, Chromium, Canary under `/Applications` then `~/Applications`, then PATH,
+or `CITADEL_COBROWSE_BROWSER`) and lists what it searched on failure. macOS has
+no job object or parent-death signal, so `startHeadless` starts a citadel-owned
+placeholder as the leader of a process group and joins the browser to it
+(`Pgid`). `groupGuard.teardown` is the only signaller: SIGTERM, a grace wait,
+SIGKILL of the group, then the placeholder is reaped last, under one mutex, and
+never signals again, so a group id is never signalled after it could be reused
+(Stop and the exit waiter both call it). The placeholder polls the owner and
+exits with it. A crashed owner's browser lives until the next sweep:
+`sweepMacSessions` removes only dirs whose owner PID plus start time
+(`processStartToken`, sysctl `kern.proc.pid`) no longer match, and
+`killVerifiedBrowserGroup` kills a group only when the recorded PID's command
+line (`ps`) names that session's exact `--user-data-dir` and the PID is in the
+recorded group (the pidfile's third slot holds the leader); nothing is killed
+by bare PID. A browser it cannot verify or kill keeps its dir and pidfile for a
+later retry, and `killOrphanSessionProcs` returns that error so the
+persistent-profile cleanup never reports "cleaned". On darwin the shared
+`reapProfileUsers` reads `ps` (`listMacReapProcs`) instead of /proc, so a
+surviving helper fails persistence and cleanup.
+`validatePrivateSessionDir` refuses a non-0700, foreign-owned or symlinked
+session dir before launch; the default base is `~/Library/Caches/Citadel`
+(`macDefaultBaseDir`), and with no home dir the launch is refused rather than
+falling back to a shared temp parent. `--use-mock-keychain` (`mockKeychain`)
+keeps a hidden browser off the Keychain prompt: during a session the decrypted
+working copy uses Chromium's mock key (the Linux basic-password-store posture),
+while the at-rest sealed profile is unchanged. The
+decision logic is untagged and tested on Linux (`cobrowse_macos_logic_test.go`);
+the real-browser macOS acceptance is manual until CI has a macOS job.
 
 Browser account sign-in and sync are disabled per launch with
 `--allow-browser-signin=false` and `--disable-sync` in `buildChromeArgs` and
@@ -1088,6 +1145,31 @@ not appear in diagnostics. `tests/test_hosted_turn_token.py` and
 
 ### Worker Mode (Redis Streams) - High-Performance Private Cloud
 
+`worker.TmuxSessionHandler` owns `TMUX_SESSION`. Like `LANE_OPERATION`, it
+runs only from this node's exact per-node stream with a matching payload node
+id, checked before the shell gate. `ensure`/`create` (and any other action)
+then pass `jobs.ShellGateReason` with the shared passcode throttle; `list` and
+`has` need only the stream and the live Shell permission. It is advertised only
+while Shell is on, is wired in `buildNodeJobHandlers`, and is not on the
+diagnostic Nexus path or the setup-posture allowlist. `jobs.TmuxSessionHandler`
+still owns name and lease validation.
+
+`worker.LaneOperationHandler` serves aceteam's `lane_capture` and `lane_send`
+(`LANE_OPERATION`, #1659). It accepts only this node's exact per-node stream and
+payload node id. Those checks run before the SHELL_COMMAND shell gate and shared
+passcode throttle, so a misrouted job never counts as a wrong passcode. It is
+advertised only while tmux accepts `-N`, the gates are wired and shell is on.
+`laneop.Service.Send` owns once-per-offer submission. The `laneop.Ledger` record
+is written before any paste, and a redelivered offer replays it without calling
+tmux. The message reaches tmux only on stdin, through a bracketed paste. Enter
+is pressed only when `laneop.ReadScreen` shows an empty, framed input box before
+the paste and exactly the message after it. Unrecognized screens refuse.
+A send refusal is a successful result with `status: rejected`, because the
+server reads send status only from an end event. `jobprivacy.Retained` drops
+the message from every retained rendering. The recognizer fixtures are
+synthetic, so acceptance against a live harness happens after merge. Nothing
+writes `mcp:lane:binding` yet: the server has no authenticated binding verb.
+
 `laneinventory.Collector` owns the read-only #1699 metadata projection and its
 bounded redaction. `worker.LaneInventoryHandler` requires the exact configured
 own-node stream; paired platform key-bound session-read admission is #14139,
@@ -1642,7 +1724,7 @@ layer down — through the real `Manager`, a fake `Renderer`, and
 future "log the payload on parse failure" edit to either layer trips one of
 these.
 
-Per Jason's product decision, the console render is unconditional (never
+Per Owner's product decision, the console render is unconditional (never
 refused because the console appears "in use") but always carries an
 explanatory banner ("someone is requesting access to this machine") so a
 person at the physical console understands why their screen changed.
@@ -1820,15 +1902,28 @@ and reverse-proxies to `http://127.0.0.1:<port>/v1/chat/completions` — streami
 SSE included (`ReverseProxy.FlushInterval=-1`). Model matching mirrors
 `mesh.FindModel` (exact case-insensitive → substring); an unknown model returns a
 404 OpenAI-shaped `model_not_found`. Because these routes sit on the same gateway
-mux, they ride the LAN listener AND the tsnet VPN listener, so `mesh.Client.
-ChatCompletion(ip, gatewayPort, body)` reaches them over the mesh. `mesh chat`
+mux, they ride the primary (loopback by default) listener AND the tsnet VPN
+listener, so `mesh.Client.ChatCompletion(ip, gatewayPort, body)` reaches them over the mesh. `mesh chat`
 now works end-to-end (target the node's gateway port, not the engine port).
 
-Auth posture: `categoryForPath` returns `""` for `/v1/chat/completions`, so it is
-always-allowed — same as `/v1/embeddings`. TLS + mesh membership are the only
-gate; the gateway does NOT currently wire `SetMetering`, so chat is neither
-metered nor authenticated per-request. A single chat response is bounded by the
-gateway `http.Server` `WriteTimeout` (120s), a pre-existing server-wide cap.
+Auth posture: `categoryForPath` still returns `""` for `/v1/*` (not a permission
+category); `gateway.v1AuthMiddleware` (`internal/gateway/v1_auth.go`) is the sole
+caller gate for every `/v1/*` route, including the `/v1/embeddings` upstream. It
+admits a loopback `RemoteAddr` (same-host processes are trusted as for the status
+server's loopback routes) and otherwise requires a verified mesh peer: the
+injected `MeshIdentityResolver` (`gatewayMeshResolver` -> `network.WhoIsPeer`)
+plus `serviceborrow.Decide` (stable and owner id present, same-owner OR a login on
+the operator's `platformAllowedLogins` allowlist (behind `cachedAllowedLogins`, keyed on device, inode, mtime, ctime and size via `statFileStamp`, with a racy-window guard; a loader error is never cached and platforms without a stamp do not cache), wired through
+`Server.SetV1AllowedLogins`). The source address range is never a credential, a
+forwarding header is never read, and a nil resolver, resolver error or
+allowlist-loader error is refused (the loader error narrows to same-owner only).
+`Server.Start` binds loopback unless `Config.ListenAddress` names another host:
+`cmd.defaultGatewayBind` is the `--gateway-bind` / `serve --bind` default, the mesh
+listener is added separately, and a non-loopback value is the explicit LAN opt-in,
+announced by `cmd.warnGatewayLANBind` and `Server.Start` (the notice says plainly that loopback-proxied routes are LAN-reachable on such a bind). `citadel gateway` (the metering proxy) follows the same rule through `cmd.gatewayListenAddr`. The gateway does NOT
+wire `SetMetering`, so chat is not metered. A single chat response is bounded by
+the gateway `http.Server` `WriteTimeout` (120s), a pre-existing server-wide cap.
+Tests: `internal/gateway/v1_auth_test.go`, `cmd/gateway_bind_test.go`.
 
 ```bash
 citadel mesh models                 # list model -> node/engine/addr across the mesh
@@ -2138,6 +2233,20 @@ stdout/stderr captures and overflow cancellation without changing audio-mix.
 landscape with silent audio; it does not supply card assets. The proposed contract
 and remaining activation gates are in `docs/run-job-template-contract.md`.
 
+`cmd.registerAttestedTemplateRunner` registers a builtin whose run is bound to
+the node, job and stream organization (`templateRunBinding`; the org comes from
+`worker.templateQueueOrg`, never params). For it, `liveTemplateRunOps.Run`
+preflights the signer before execution and `signAttestedReceipt` signs a
+`run_job_template` receipt whose input_sha256 is the builtin's binding object;
+it ignores `CITADEL_SIGN_AEP_RECEIPTS` and never fails open. `local-flow-run`
+(`cmd.admitLocalFlowRun`, `cmd.runLocalFlowBuiltin`) is the first: every
+refusal precedes the container start, and `localFlowPinnedImage` stays empty
+until a release pins the engine image, so it refuses today. It runs only with
+`--network none` (`buildLocalFlowRunArgs` refuses any other mode); any
+`LocalInference` graph is refused as `llm_unavailable_without_base_url` until
+the engine takes an endpoint and a per-run bridge forwarder exists. See
+`docs/local-flow-run.md` for the engine contract, binding and activation gates.
+
 `cmd/run_job_template_ops.go` remains the workspace/hash/receipt adapter;
 `cmd/template_builtin_papercraft.go`, `template_builtin_audio_mix.go`,
 `template_builtin_papercraft_scene.go` and `template_builtin_papercraft_scene_v2.go`
@@ -2329,12 +2438,29 @@ the intended fail-closed direction. (Constructing it also needs the verifier
 and the control server cert.) Check callers before moving a route, in aceteam
 as well as in this repo's own CLI commands. Wire both sides with
 `cmd.registerControlOnlyAPI`, whose test pins which listener each side lands on.
+
 A coordinator cert does not override the operator's permission toggles: a
 control route for a toggled surface also takes that permission, read strictly
 per request, as its extra gate (`registerRAGControlAPI` and
 `registerProvisionControlAPI` own this for `/rag` and provisioning), and
 `/ssh/authorized-keys` takes it through `status.ServerConfig.SSHDeployAllowed`,
 where nil refuses.
+
+`status.Server.bindAddr` owns the plaintext listener's bind: loopback by default,
+all interfaces only on the explicit `cmd.statusBindLAN` opt-in (logged loudly at
+start); mesh reachability comes only from the `AddListener` VPN listener. The
+`/agent/*` table is `status.Server.agentRoutes`: its `sensitive` routes (logs,
+config, log level, resubscribe, worker restart) answer a flat fail-closed 403
+on the plaintext listener (`agentMovedToControl`) and are served for real by
+`registerAgentControlRoutes` behind `requireCoordinator`; the read-only routes
+use `requireAgentCaller`, which admits only a mesh peer that
+`cmd.meshPeerVerifier` (WhoIs: same owner, stable device and owner id) vouches
+for, or a valid org token. Neither a CGNAT source nor loopback is an identity
+(the exposure relay and the gateway dial loopback for remote callers), and a
+forwarding header voids the mesh branch. `cmd.platformTarget` refuses a
+platform exposure that would forward to loopback on the node's own status or
+control port. Change a route's class in that table, not at the registration
+sites.
 
 `status.Server.ControlTLS` reports the public certificate held by the active
 control listener, using the same immutable DER snapshot as its TLS config.
@@ -5475,6 +5601,44 @@ graceful stop is CTRL_BREAK, and `citadel worker stop` asks through
 own the Run value (local drive paths only, no UNC); only `citadel worker
 autostart enable` writes it, and `cmd.enableUserAutostart` refuses an exe this
 user does not own (`update.ExecutableOwnership`).
+
+### Per-user worker on macOS: a LaunchAgent (citadel-cli#1903 M3)
+
+launchd is the supervisor, so none of the Windows `--background` supervisor is
+ported. `service.LaunchAgent` owns the per-user agent (label and plist shape
+shared with the `init` agent through `renderLaunchdPlist`, so an earlier init
+agent is adopted and rewritten only when its content differs). Every side effect
+is a field (`Run` launchctl runner, `StatExe`, `Home`, `Euid`), so
+`launchagent_test.go` and `cmd/local_setup_worker_mac_test.go` run on Linux
+with a fake runner and a temp home; `NewUserLaunchAgent` (`user_darwin.go`) is
+the only production wiring. What each method decides: `Enable` writes the plist
+(refuses root, and a binary this user does not own or others can write,
+`checkExe`) and boots out a job loaded from older content; `Start` is a no-op
+for a running job, refuses a Login Items switch-off (`print-disabled`), empties
+a log past `LaunchAgentLogMaxBytes` (through an `O_NOFOLLOW` descriptor), then
+bootstraps into `gui/<uid>`. There is no legacy `load`/`unload` fallback: those
+verbs act on the caller's session domain (an SSH login has another), so a
+failed bootstrap or bootout fails closed and says to use the desktop session.
+`Stop` boots out by service target (`gui/<uid>/<label>`) and returns nil only
+once `launchctl print` exits 113 ("service not found", the only absent signal;
+any other exit is an error, as is a missing launchctl), so a failed bootout
+that left the job loaded is an error. `checkExe` also refuses a binary whose
+folder (or symlink-target folder) group or other can write, or another user
+owns. `Remove` deletes the plist, and Disconnect keeps it when the stop failed.
+`citadel worker start` is the macOS start command (`citadel service start`
+still has `launchdManager`'s load fallback for the `init` agent and can place
+the label outside `gui/<uid>`, so no macOS copy points at it). Never a LaunchDaemon, never `SUDO_UID`.
+`cmd.darwinSetupWorkerDeps` maps the setup page's three worker steps onto
+`Enable`/`Start` (`startSetupWorker` still refuses unless this page connected
+the PC and `setupPostureHolds`, exactly as on Windows). `cmd.darwinDisconnectDeps`
+swaps `stopWorker` and `disableAutostart` for `Stop` and `Remove`;
+`disconnectThisPC` already skips the logout and key removal when either fails,
+so a KeepAlive worker cannot restart against deleted credentials.
+`cmd.agentChecks` (via `userWorkerStateFromAgent`) is the doctor's and setup
+page's Autostart/Worker/Worker-log lines on macOS; they read launchd only and
+show no log content. `citadel worker autostart enable|disable` and `worker stop`
+map to the same methods on macOS. Native acceptance on Apple Silicon is
+post-merge (checklist in the PR).
 
 ### Known Limitations on Windows
 

@@ -112,7 +112,7 @@ func evaluateWindows(procSession, consoleSession uint32) *DesktopInfo {
 //
 //	<dictionary> {
 //	  GID : 20
-//	  Name : jason
+//	  Name : owner
 //	  UID : 501
 //	}
 //

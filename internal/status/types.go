@@ -503,19 +503,23 @@ type AppInfo struct {
 // collector always populates all four on every heartbeat, so live nodes always
 // emit concrete true/false values.
 type NodeCapabilities struct {
+	// CobrowseJobRecovery is the scoped durable-start protocol, advertised only
+	// by a live, configured COBROWSE_SESSION adapter. Absence means unsupported.
+	CobrowseJobRecovery *bool `json:"cobrowse_job_recovery,omitempty"`
+
 	GPUs       []GPUCapability `json:"gpus,omitempty"`
 	Engines    []string        `json:"engines,omitempty"`
 	Tags       []string        `json:"tags,omitempty"`
 	Hypervisor *HypervisorInfo `json:"hypervisor,omitempty"`
 
 	// AvailableServices lists the serving services/engines this build knows how
-	// to deploy: the keys of the embedded services.ServiceMap (vllm, ollama,
-	// whisper, diffusers, ...). The fabric scheduler uses it to route
+	// to deploy after OS and proven hardware-absence filtering. The fabric scheduler uses it to route
 	// engine-specific deploys only to capable nodes (aceteam#4483).
 	//
 	// This is distinct from Engines above:
-	//   - AvailableServices = what this binary version CAN run (static per build,
-	//     from the embedded compose registry). Sorted for deterministic output.
+	//   - AvailableServices = embedded services runnable under host policy,
+	//     including unknown GPU evidence and an already-serving adoptable vLLM.
+	//     Sorted for deterministic output.
 	//   - Engines = engines currently detected/running on the node.
 	// Both can overlap in value (e.g. "vllm"); they answer different questions.
 	// Emitted under the "available_services" key so it never collides with the

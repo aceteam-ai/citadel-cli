@@ -710,7 +710,7 @@ func TestAllKnownJobTypesCoversRegisteredHandlers(t *testing.T) {
 	// allKnownJobTypes.
 	for _, jt := range []string{
 		JobTypeShellCommand, JobTypeCobrowse, JobTypeVNCActions,
-		JobTypeVNCScreenshot, JobTypeTmuxSession, JobTypeEmbedding,
+		JobTypeVNCScreenshot, JobTypeEmbedding,
 	} {
 		if _, ok := covered[jt]; !ok {
 			t.Errorf("expected base job type %q to be covered by allKnownJobTypes + registry", jt)

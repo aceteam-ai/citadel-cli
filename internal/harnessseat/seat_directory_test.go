@@ -94,6 +94,9 @@ func TestLocalSeatDirectoryRejectsUnsafePathsWithoutRepair(t *testing.T) {
 				if err := os.Mkdir(i.ConfigDir, 0o755); err != nil {
 					t.Fatal(err)
 				}
+				if err := os.Chmod(i.ConfigDir, 0o755); err != nil {
+					t.Fatal(err)
+				}
 			case "file-leaf":
 				if err := os.WriteFile(i.ConfigDir, []byte("unchanged"), 0o600); err != nil {
 					t.Fatal(err)
@@ -124,6 +127,9 @@ func TestLocalSeatDirectoryAllowsSafeSharedParentButNotPublicLeaf(t *testing.T) 
 	i := fixtureIdentity(t, Muse)
 	parent := filepath.Join(i.HomeDir, "config")
 	if err := os.Mkdir(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(parent, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	i.ConfigDir = filepath.Join(parent, "isolated")

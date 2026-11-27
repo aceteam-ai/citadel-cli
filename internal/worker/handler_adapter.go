@@ -29,6 +29,7 @@ type LegacyHandlerAdapter struct {
 	// before the handler runs. On such an adapter the payload passcode key is
 	// removed, so the handler never sees it.
 	passcodeGate func(presented string) error
+	jobGate      func(*Job) error
 }
 
 // newGatedLegacyHandlerAdapter creates an adapter whose dispatchability follows
@@ -102,6 +103,11 @@ func (a *LegacyHandlerAdapter) RunBackground(ctx context.Context) {
 // Execute processes the job using the wrapped legacy handler.
 func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream StreamWriter) (*JobResult, error) {
 	start := time.Now()
+	if a.jobGate != nil {
+		if err := a.jobGate(job); err != nil {
+			return &JobResult{Status: JobStatusFailure, Error: err, Duration: time.Since(start)}, err
+		}
+	}
 	if a.enabled != nil && !a.enabled() {
 		err := legacyPermissionRefusal(a.jobType)
 		if a.refusal != nil {
@@ -114,8 +120,9 @@ func (a *LegacyHandlerAdapter) Execute(ctx context.Context, job *Job, stream Str
 
 	// Convert worker.Job to nexus.Job for the legacy handler
 	nexusJob := &nexus.Job{
-		ID:   job.ID,
-		Type: job.Type,
+		SourceQueue: job.SourceQueue,
+		ID:          job.ID,
+		Type:        job.Type,
 	}
 
 	// Convert payload map[string]any to map[string]string for nexus.Job.
@@ -235,6 +242,13 @@ var _ JobHandler = (*LegacyHandlerAdapter)(nil)
 
 // LegacyHandlerOpts configures optional behaviour for CreateLegacyHandlers.
 type LegacyHandlerOpts struct {
+	// ServiceOrgID and ServiceNodeID identify the node's service control stream.
+	ServiceOrgID  string
+	ServiceNodeID string
+	// CobrowseRecoveryNodeID and CobrowseRecoveryOrgID bind recovery jobs to
+	// this configured control node's exact per-node stream.
+	CobrowseRecoveryNodeID string
+	CobrowseRecoveryOrgID  string
 	// LogFn routes job log output through a callback instead of stdout.
 	LogFn func(level, msg string)
 	// WorkspaceDir is the sandbox root for file-operation handlers.
@@ -256,7 +270,7 @@ type LegacyHandlerOpts struct {
 	IndexesDir string
 	// WorkReceiptSigner signs the dispatched-work receipts for FILE_INDEX and
 	// embedding (aceteam#10876 C7). Injected explicitly (NOT resolved inside this
-	// package) so a test never signs with node 1795's real convergent identity:
+	// package) so a test never signs with the dev node's real convergent identity:
 	// cmd/work.go passes nodeidentity.Convergent(network.GetNodeConfigDir()). When
 	// non-nil, those handlers run as fail-closed DISPATCHED work — a job that
 	// cannot sign fails with ErrReceiptSigningUnavailable. nil leaves them unsigned
@@ -402,7 +416,6 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	}
 
 	handlers := []*LegacyHandlerAdapter{
-		NewLegacyHandlerAdapter(JobTypeTmuxSession, jobs.NewTmuxSessionHandler("")),
 		NewLegacyHandlerAdapter(JobTypeDownloadModel, &jobs.DownloadModelHandler{}),
 		NewLegacyHandlerAdapter(JobTypeOllamaPull, &jobs.OllamaPullHandler{}),
 		NewLegacyHandlerAdapter(JobTypeLlamaCppInference, &jobs.LlamaCppInferenceHandler{}),
@@ -647,9 +660,9 @@ func CreateLegacyHandlersWithOpts(opts LegacyHandlerOpts) []JobHandler {
 	if opts.ConfigDir != "" {
 		svcHandler := jobs.NewServiceHandlerWithWorkspace(opts.ConfigDir, opts.WorkspaceDir)
 		handlers = append(handlers,
-			NewLegacyHandlerAdapter(JobTypeServiceStart, svcHandler),
-			NewLegacyHandlerAdapter(JobTypeServiceStop, svcHandler),
-			NewLegacyHandlerAdapter(JobTypeServiceStatus, svcHandler),
+			newServiceLegacyHandlerAdapter(JobTypeServiceStart, svcHandler, opts),
+			newServiceLegacyHandlerAdapter(JobTypeServiceStop, svcHandler, opts),
+			newServiceLegacyHandlerAdapter(JobTypeServiceStatus, svcHandler, opts),
 		)
 	}
 
@@ -711,7 +724,7 @@ func newMeetingJoinHandler(opts LegacyHandlerOpts) *jobs.MeetingJoinHandler {
 // handler, so file staging and set_file_input follow the same switch as
 // FILE_WRITE_BYTES (citadel-cli#1721).
 func cobrowseSessionHandlerFor(opts LegacyHandlerOpts) *jobs.CobrowseSessionHandler {
-	h := jobs.NewCobrowseSessionHandler()
+	h := jobs.NewCobrowseSessionHandlerForNode(opts.CobrowseRecoveryNodeID, opts.CobrowseRecoveryOrgID)
 	h.Enabled = opts.FilesEnabled
 	return h
 }

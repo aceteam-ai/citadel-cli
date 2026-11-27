@@ -4,6 +4,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -154,7 +155,20 @@ func cacheBaseDirectory() (string, error) {
 }
 
 // startService starts a docker-based service using docker compose.
-func startService(serviceName, composeFilePath string) error {
+func startService(serviceName, composeFilePath string, gpuCount ...func() int) error {
+	probe := platform.NvidiaGPUCountForCompose
+	if len(gpuCount) > 0 {
+		probe = gpuCount[0]
+	}
+	return startServiceForHost(serviceName, composeFilePath, probe, adoptExternalEngineForStart)
+}
+
+// launched is notified only after a successful compose-up, never for adoption
+// or an already-running shortcut. Boot uses it to record teardown ownership.
+func startServiceForHost(serviceName, composeFilePath string, probe func() int, adopt func(string) (string, bool), launched ...func()) error {
+	if adopted, err := serviceStartAdmissionForHost(serviceName, probe, adopt); adopted || err != nil {
+		return err
+	}
 	if err := refuseManagedVLLMStart(serviceName); err != nil {
 		return err
 	}
@@ -231,13 +245,8 @@ func startService(serviceName, composeFilePath string) error {
 	// Skipped under a --node-dir/CITADEL_NODE_DIR override (containerName is
 	// namespaced there; keep this off the shared-port probe to avoid surprising an
 	// isolated target), matching the inspect block's own override caution below.
-	if composeProjectOverride() == "" {
-		runtimeAvailable := func() bool { _, err := exec.LookPath(rt.EngineBin); return err == nil }()
-		if msg, adopt := maybeAdoptExternalEngineOnStart(
-			context.Background(), serviceName, runtimeAvailable,
-			func() bool { return managedContainerRunningForStart(rt.EngineBin, containerName) },
-			status.OpenAICompatServing,
-		); adopt {
+	if composeProjectOverride() == "" && adopt != nil {
+		if msg, adopted := adopt(serviceName); adopted {
 			fmt.Printf("   ✅ %s; not launching a citadel container\n", msg)
 			return nil
 		}
@@ -398,8 +407,101 @@ func startService(serviceName, composeFilePath string) error {
 	if err != nil {
 		return fmt.Errorf("%s compose failed: %s", rt.Bin, composeFailureMessage(serviceName, output))
 	}
+	for _, notify := range launched {
+		if notify != nil {
+			notify()
+		}
+	}
 	startOllamaPreload(serviceName, manifestSvc)
 	return nil
+}
+
+type cudaServiceUnavailableError struct{ reason string }
+
+func (e *cudaServiceUnavailableError) Error() string { return "cannot start " + e.reason }
+
+// Admission is shared by the CLI, boot and Control Center paths. A validated
+// adopted record permits observation, not a competing managed launch; detached
+// or malformed records refuse. Unknown hardware never becomes proven absence.
+func serviceStartAdmissionForHost(serviceName string, probe func() int, adopt func(string) (string, bool)) (bool, error) {
+	reason := svcports.CUDAStartRefusal(serviceName, runtime.GOOS, probe)
+	if _, allow := status.AdoptableExternalEnginePort(serviceName); allow && composeProjectOverride() == "" {
+		record, err := externalengine.Load(network.GetNodeConfigDir())
+		if err != nil {
+			return false, fmt.Errorf("cannot inspect external vllm ownership: %w", err)
+		}
+		if record != nil && record.Mode == "detached" {
+			return false, fmt.Errorf("cannot start managed vllm: external detached ownership record exists")
+		}
+		if reason != "" || record != nil {
+			service, _ := manifestServiceFor(serviceName)
+			if _, err := serviceBindEnvMap(serviceName, service.Bind); err != nil {
+				return false, fmt.Errorf("cannot start %s: %w", serviceName, err)
+			}
+			if adopt != nil {
+				if msg, ok := adopt(serviceName); ok {
+					fmt.Printf("   ✅ %s; not launching a citadel container\n", msg)
+					return true, nil
+				}
+			}
+			if record != nil {
+				return false, fmt.Errorf("cannot start managed vllm: adopted external engine is not serving")
+			}
+		}
+	}
+	if reason != "" {
+		return false, &cudaServiceUnavailableError{reason: reason}
+	}
+	return false, nil
+}
+
+// Explicit Start/Restart may clear an existing stopped marker after successful
+// adoption. Never create a managed manifest or compose just to observe an engine.
+// Caller holds the existing pointer and reservation guards.
+func clearAdoptedServiceStoppedMarker(configDir, name string) error {
+	manifest, err := readManifestAt(configDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, service := range manifest.Services {
+		if service.Name == name && service.DesiredStatus == "stopped" {
+			return setServiceDesiredStatus(configDir, name, "")
+		}
+	}
+	return nil
+}
+
+// Only observe the shared adoption endpoint for the canonical, non-isolated
+// target, retaining the same allowlist and managed-container ownership check.
+func adoptExternalEngineForStart(serviceName string) (string, bool) {
+	return adoptExternalEngineForStartWithProbe(serviceName, externalengine.Probe)
+}
+
+func adoptExternalEngineForStartWithProbe(serviceName string, probe func(context.Context, externalengine.Endpoint, string) error) (string, bool) {
+	if composeProjectOverride() != "" {
+		return "", false
+	}
+	if _, ok := status.AdoptableExternalEnginePort(serviceName); !ok {
+		return "", false
+	}
+	record, err := externalengine.Load(network.GetNodeConfigDir())
+	if err != nil {
+		return "", false
+	}
+	if record != nil {
+		if record.Mode != "adopted" || probe == nil || probe(context.Background(), record.Endpoint, record.Model) != nil {
+			return "", false
+		}
+		return "Adopted external vllm is already serving", true
+	}
+	rt := catalog.SelectContainerRuntime()
+	_, err = exec.LookPath(rt.EngineBin)
+	return maybeAdoptExternalEngineOnStart(context.Background(), serviceName, err == nil,
+		func() bool { return managedContainerRunningForStart(rt.EngineBin, "citadel-"+serviceName) },
+		status.OpenAICompatServing)
 }
 
 func refuseManagedVLLMStart(serviceName string) error {
@@ -683,26 +785,33 @@ func macServiceWarning(serviceName string) string {
 
 // startNativeService starts a service using its native binary.
 func startNativeService(serviceName, configDir string) error {
+	_, err := startNativeServiceWithOwnership(serviceName, configDir)
+	return err
+}
+
+// A successful already-serving shortcut does not transfer process ownership to
+// the caller. Report a launch only after our new process becomes ready.
+func startNativeServiceWithOwnership(serviceName, configDir string) (bool, error) {
 	// Check if it is already SERVING, not merely that a matching process exists
 	// (issue #649). A dead engine with a lingering process match used to take
 	// this branch and report success, leaving the node advertising an engine
 	// that answered nothing.
 	if services.IsNativeServiceServing(serviceName) {
 		fmt.Printf("   ✅ Service %s is already running.\n", serviceName)
-		return nil
+		return false, nil
 	}
 
 	// Get log directory
 	homeDir, err := platform.HomeDir("")
 	if err != nil {
-		return fmt.Errorf("could not find home directory: %w", err)
+		return false, fmt.Errorf("could not find home directory: %w", err)
 	}
 	logDir := filepath.Join(homeDir, "citadel-node", "logs")
 
 	// Start the service
 	process, err := services.StartNativeService(serviceName, logDir)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	// Wait for service to be ready (max 30 seconds)
@@ -712,8 +821,8 @@ func startNativeService(serviceName, configDir string) error {
 		if process.Cmd.Process != nil {
 			process.Cmd.Process.Kill()
 		}
-		return err
+		return false, err
 	}
 
-	return nil
+	return true, nil
 }

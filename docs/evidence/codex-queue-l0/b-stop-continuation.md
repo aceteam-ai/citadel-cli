@@ -33,7 +33,7 @@ a second UserPromptSubmit event. The fixture was intentionally one-shot; this
 does not establish a native bound on an always-blocking hook.
 
 L3 consequence: do not count Stop continuations solely through
-UserPromptSubmit. L7 must explicitly account for them, enforce Jason's two
+UserPromptSubmit. L7 must explicitly account for them, enforce Owner's two
 consecutive-continuation cap and charge the lane turn budget. L4 consequence:
 the Stop sequence is now observed on both private stdio and the native private
 Unix daemon, but this does not clear interactive pause or composer acceptance.

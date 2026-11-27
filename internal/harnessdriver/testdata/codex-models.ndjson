@@ -1,0 +1,2 @@
+{"id":"list-1","result":{"data":[{"id":"catalog-a","model":"fixture-a","hidden":false,"displayName":"Fixture A","isDefault":true}],"nextCursor":"page-two"}}
+{"id":"list-2","result":{"data":[{"id":"catalog-b","model":"fixture-b","hidden":false},{"id":"catalog-hidden","model":"fixture-hidden","hidden":true}],"nextCursor":null}}

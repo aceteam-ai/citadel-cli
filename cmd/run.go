@@ -178,7 +178,7 @@ func runSingleService(serviceName string) {
 		fmt.Fprintf(os.Stderr, "❌ Failed to resolve configuration: %v\n", err)
 		os.Exit(1)
 	}
-	if err := runSingleServiceApply(configDir, serviceName, startService); err != nil {
+	if err := runSingleServiceApply(configDir, serviceName, func(name, path string) error { return startService(name, path) }); err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Failed to start service '%s': %v\n", serviceName, err)
 		os.Exit(1)
 	}
@@ -193,15 +193,39 @@ func runSingleService(serviceName string) {
 // Admission covers the initial bootstrap, embedded compose materialization,
 // registration, desired-status write, and actual start. The old split path
 // wrote the first three before checking an active fine-tune hold.
-func runSingleServiceApply(configDir, serviceName string, startFn func(string, string) error) error {
+func runSingleServiceApply(configDir, serviceName string, startFn func(string, string) error, gpuCount ...func() int) error {
+	probe := platform.NvidiaGPUCountForCompose
+	if len(gpuCount) > 0 {
+		probe = gpuCount[0]
+	}
+	return runSingleServiceApplyForHost(configDir, serviceName, startFn, probe, adoptExternalEngineForStart)
+}
+
+func runSingleServiceApplyForHost(configDir, serviceName string, startFn func(string, string) error, probe func() int, adopt func(string) (string, bool)) error {
 	return withLocalServiceStartGuardSource(configDir, serviceName, func(source nodeDirSource) error {
-		return runSingleServiceApplyLocked(configDir, source, serviceName, startFn)
+		return runSingleServiceApplyLockedForHost(configDir, source, serviceName, startFn, probe, adopt)
 	})
 }
 
 // Caller holds the global pointer lock followed by this node's reservation
 // lock. Every read and write stays on the captured node directory.
-func runSingleServiceApplyLocked(configDir string, source nodeDirSource, serviceName string, startFn func(string, string) error) error {
+func runSingleServiceApplyLocked(configDir string, source nodeDirSource, serviceName string, startFn func(string, string) error, gpuCount ...func() int) error {
+	probe := platform.NvidiaGPUCountForCompose
+	if len(gpuCount) > 0 {
+		probe = gpuCount[0]
+	}
+	return runSingleServiceApplyLockedForHost(configDir, source, serviceName, startFn, probe, adoptExternalEngineForStart)
+}
+
+func runSingleServiceApplyLockedForHost(configDir string, source nodeDirSource, serviceName string, startFn func(string, string) error, probe func() int, adopt func(string) (string, bool)) error {
+	// Refuse before bootstrap, compose publication, registration or clearing a
+	// durable stopped marker. The pointer and reservation guards are still held.
+	if adopted, err := serviceStartAdmissionForHost(serviceName, probe, adopt); err != nil || adopted {
+		if err != nil {
+			return err
+		}
+		return clearAdoptedServiceStoppedMarker(configDir, serviceName)
+	}
 	manifest, _, err := findOrCreateManifestLockedAt(configDir, source)
 	if err != nil {
 		return fmt.Errorf("initialize configuration: %w", err)

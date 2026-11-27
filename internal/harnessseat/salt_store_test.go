@@ -145,6 +145,11 @@ func TestSaltStoreRefusesUnsafeStateWithoutRepairOrOverwrite(t *testing.T) {
 				} else if err := os.WriteFile(lock, []byte("unchanged"), 0o644); err != nil {
 					t.Fatal(err)
 				}
+				if kind == "lock-public" {
+					if err := os.Chmod(lock, 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
 			}
 			if _, err := s.InitializeSalt(context.Background()); err == nil {
 				t.Fatal("unsafe state accepted")

@@ -128,6 +128,9 @@ keys to the session once `claude` is installed).
 Sessions can also be pre-created, listed, or checked out-of-band through the
 `TMUX_SESSION` job type (payload `action`: `ensure`|`create`|`list`|`has`,
 `name`, optional `shell`), dispatched through the standard worker mechanism.
+The worker accepts it only from the node's own per-node stream with a matching
+`node_id`, and only while Shell is on. `ensure`/`create` also need the node
+passcode in the payload `passcode` field, like `SHELL_COMMAND`.
 Ensure/create uses the same validated `CITADEL_TERMINAL_SESSION_TTL` value as
 WebSocket sessions, including literal `0` for a non-expiring lease. Malformed,
 negative, and non-zero values below `1m` fail instead of silently weakening the
@@ -225,10 +228,10 @@ ordinary tmux sessions.
    systemctl --user restart citadel.service
    ```
 
-3. Dispatch this job to the test node through the normal job path:
+3. Dispatch this job to the test node's own per-node stream, with Shell on:
 
    ```json
-   {"type":"TMUX_SESSION","payload":{"action":"ensure","name":"citadel1166proof"}}
+   {"type":"TMUX_SESSION","payload":{"action":"ensure","name":"citadel1166proof","node_id":"<node id>","passcode":"<node passcode>"}}
    ```
 
 4. Confirm the private session and its separate scope exist:

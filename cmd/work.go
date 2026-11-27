@@ -75,10 +75,11 @@ var (
 	workMaxRetries int
 
 	// Status server flags
-	workStatusPort int
-	workBaseURL    string
-	workAPIKey     string
-	workNodeName   string
+	workStatusPort    int
+	workStatusBindLAN bool
+	workBaseURL       string
+	workAPIKey        string
+	workNodeName      string
 
 	// SSH key sync flags
 	workSSHSync     bool
@@ -1303,7 +1304,7 @@ func runWork(cmd *cobra.Command, args []string) {
 	}
 	if nodeName == "" {
 		// Try to get the actual registered hostname from network status
-		// This returns the Headscale-assigned name (e.g., "ubuntu-gpu-8gluaaom") not just the requested name
+		// This returns the Headscale-assigned name (e.g., "linux-node-fixture1") not just the requested name
 		if netStatus, err := network.GetGlobalStatus(ctx); err == nil && netStatus.Connected && netStatus.Hostname != "" {
 			Debug("got hostname from network status: %s", netStatus.Hostname)
 			nodeName = netStatus.Hostname
@@ -1630,6 +1631,10 @@ func runWork(cmd *cobra.Command, args []string) {
 		return reservationsFrom(list)
 	}
 
+	cobrowseRecoveryFn := func() bool {
+		rn := nodeRunner.Load()
+		return rn != nil && rn.CobrowseJobRecoveryAvailable()
+	}
 	jobTypesFn := func() []string {
 		rn := nodeRunner.Load()
 		if rn == nil {
@@ -1718,22 +1723,23 @@ func runWork(cmd *cobra.Command, args []string) {
 			// ConfigDir is normally "" on the heartbeat path (engines are probed,
 			// not read from the manifest). Model hotswap (#632) needs it to
 			// enumerate installed-but-stopped engines, so pass it only when enabled.
-			ConfigDir:        hotswapConfigDir(workConfigDir),
-			Services:         nil,
-			Capabilities:     statusCaps,
-			WorkerLiveness:   workerLivenessFn,
-			SwapStats:        swapStatsFn,
-			ReconcileHealth:  reconcileHealthFn,
-			PinnedServices:   manifestPinnedServices(workManifest),
-			ModelHotswap:     status.ModelHotswapEnabled(),
-			Reservations:     reservationsFn,
-			LaneActivity:     laneActivityFn,
-			PairingDisplay:   pairingDisplayFn,
-			CacheReport:      cacheReportFn,
-			JobTypes:         jobTypesFn,
-			AppPods:          appPodListings,
-			SandboxedModules: sandboxedModuleCapability,
-			NVRHealth:        nvrHealthFn,
+			ConfigDir:           hotswapConfigDir(workConfigDir),
+			Services:            nil,
+			Capabilities:        statusCaps,
+			WorkerLiveness:      workerLivenessFn,
+			SwapStats:           swapStatsFn,
+			ReconcileHealth:     reconcileHealthFn,
+			PinnedServices:      manifestPinnedServices(workManifest),
+			ModelHotswap:        status.ModelHotswapEnabled(),
+			Reservations:        reservationsFn,
+			LaneActivity:        laneActivityFn,
+			PairingDisplay:      pairingDisplayFn,
+			CacheReport:         cacheReportFn,
+			JobTypes:            jobTypesFn,
+			CobrowseJobRecovery: cobrowseRecoveryFn,
+			AppPods:             appPodListings,
+			SandboxedModules:    sandboxedModuleCapability,
+			NVRHealth:           nvrHealthFn,
 			// The status process may run as a different user than an interactive
 			// invoker. Advertise the same machine-level policy the worker enforces.
 			PermissionsProvider: loadNodePermissions,
@@ -1796,6 +1802,10 @@ func runWork(cmd *cobra.Command, args []string) {
 			// The control listener's SSH-key deployment honors the operator's
 			// live SSH permission, read strictly per request.
 			SSHDeployAllowed: nodeSSHDeployAllowed,
+			// Loopback + mesh by default; a LAN bind is an explicit opt-in.
+			BindLAN: statusBindLAN(workStatusBindLAN),
+			// Read-only /agent/* routes admit only a verified same-owner peer.
+			PeerVerifier: meshPeerVerifier(network.WhoIsPeer),
 		}
 
 		// Publish the gateway's self-signed leaf cert at GET /gateway-cert.pem so
@@ -1899,12 +1909,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				if certErr != nil {
 					fmt.Fprintf(os.Stderr, "   - ⚠️ Coordinator mTLS control listener NOT enabled (server cert: %v)\n", certErr)
 				} else {
-					controlPort := status.DefaultControlPort
-					if p := strings.TrimSpace(os.Getenv("CITADEL_CONTROL_PORT")); p != "" {
-						if parsed, perr := strconv.Atoi(p); perr == nil && parsed > 0 {
-							controlPort = parsed
-						}
-					}
+					controlPort := resolveControlPort()
 					serverCfg.CAVerifier = verifier
 					serverCfg.ControlServerCert = &ctrlCert
 					serverCfg.ControlPort = controlPort
@@ -2085,6 +2090,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				PairingDisplay:      pairingDisplayFn,
 				CacheReport:         cacheReportFn,
 				JobTypes:            jobTypesFn,
+				CobrowseJobRecovery: cobrowseRecoveryFn,
 				AppPods:             appPodListings,
 				SandboxedModules:    sandboxedModuleCapability,
 				NVRHealth:           nvrHealthFn,
@@ -2201,7 +2207,7 @@ func runWork(cmd *cobra.Command, args []string) {
 							// logf (see newReconcileLoop) -- printing it again here on
 							// every single pass would reproduce the exact noise
 							// citadel-cli#742 exists to fix (4574 identical WARNs over
-							// 5 days on node 1297). Any OTHER pass-level error (fetch
+							// 5 days on a dev node). Any OTHER pass-level error (fetch
 							// failure, list failure, ...) still prints every time, same
 							// as before.
 							if passErr != nil && !errors.Is(passErr, reconcile.ErrFullWipeRefused) {
@@ -2447,6 +2453,7 @@ func runWork(cmd *cobra.Command, args []string) {
 				termConfig.OrgID = orgID
 				termConfig.AuthServiceURL = baseURL
 				termConfig.Version = Version
+				termConfig.PermissionSource = loadNodePermissionsStrict
 
 				// Per-node passcode gate (aceteam#6524). Loaded fresh via the
 				// closure on each connection so a passcode rotated at runtime (via
@@ -2652,6 +2659,7 @@ func runWork(cmd *cobra.Command, args []string) {
 		// Load and apply permissions
 		perms := workAppliedPermissions
 		gw.SetPermissions(perms)
+		gw.SetPermissionSource(loadNodePermissionsStrict)
 
 		// Model swapper (citadel-cli#686, construction-order fix): wired here, at
 		// gateway-construction time, NOT after buildNodeJobHandlers further down —
@@ -2671,6 +2679,11 @@ func runWork(cmd *cobra.Command, args []string) {
 		// exposed service under /expose/<name>/ can be gated by mesh identity or a
 		// signed link token. Harmless when nothing is exposed.
 		gw.SetMeshResolver(gatewayMeshResolver{})
+		// /v1/* callers: same-host (loopback) or a verified same-owner mesh peer;
+		// the operator's platform-infra allowlist (platform-exposure.json) adds
+		// named platform logins. See internal/gateway/v1_auth.go.
+		gw.SetV1AllowedLogins(platformAllowedLoginsCached())
+		warnGatewayLANBind("--gateway-bind", workGatewayBind)
 		if key, err := config.LoadOrCreateExposeSigningKey(platform.ConfigDir()); err != nil {
 			Log("warning: gateway link-token signing disabled: %v", err)
 		} else {
@@ -2992,6 +3005,9 @@ func runWork(cmd *cobra.Command, args []string) {
 	// Shared with the control-center TUI via registerPrivilegedNodeJobHandlers so a
 	// control-center-only node handles the same privileged set.
 	registerPrivilegedNodeJobHandlers(runner, nodeJobOpts)
+	go runLocalFlowCleanupReconciler(ctx, liveLocalFlowDeps(), time.Minute, func(err error) {
+		Log("local Flow container cleanup pending: %v", err)
+	})
 	// Publish only after every handler is registered so heartbeats expose one
 	// complete immutable set, never a partial capability advertisement.
 	startStatusPublisherAfterRunner(&nodeRunner, runner, startStatusPublisher)
@@ -3058,7 +3074,31 @@ type startedService struct {
 // that must not gate job-stream subscription on service readiness should invoke
 // it from a background goroutine (see runWork). The old blocking behavior is
 // still available via --wait-services.
-func startManagedServices(ctx context.Context) []startedService {
+func startManagedServices(ctx context.Context, gpuCount ...func() int) []startedService {
+	probe := platform.NvidiaGPUCountForCompose
+	if len(gpuCount) > 0 {
+		probe = gpuCount[0]
+	}
+	return startManagedServicesForHost(ctx, probe, internalServices.IsNativeServiceServing, startNativeServiceWithOwnership)
+}
+
+// Native observations and launch are injected together so boot admission can
+// be tested without probing an endpoint or starting an engine.
+func startManagedServicesForHost(ctx context.Context, probe func() int, nativeServing func(string) bool, nativeStart func(string, string) (bool, error), adoption ...func(string) (string, bool)) []startedService {
+	adopt := adoptExternalEngineForStart
+	if len(adoption) > 0 {
+		adopt = adoption[0]
+	}
+	sampled, count := false, -1
+	once := func() int {
+		if !sampled {
+			if probe != nil {
+				count = probe()
+			}
+			sampled = true
+		}
+		return count
+	}
 	manifest, configDir, err := findAndReadManifest()
 	if err != nil {
 		// No manifest found - this is fine, just skip service startup
@@ -3105,17 +3145,58 @@ func startManagedServices(ctx context.Context) []startedService {
 			continue
 		}
 
+		if serviceType == internalServices.ServiceTypeDocker {
+			if reason := services.CUDAStartRefusal(service.Name, runtime.GOOS, once); reason != "" {
+				if _, allow := status.AdoptableExternalEnginePort(service.Name); !allow || composeProjectOverride() != "" {
+					skipped++
+					fmt.Printf("   - %s\n", reason)
+					continue
+				}
+				fullComposePath, err := platform.ValidatePathWithinDir(configDir, service.ComposeFile)
+				if err == nil {
+					err = withLocalServiceStartGuard(configDir, service.Name, func() error {
+						return startServiceForHost(service.Name, fullComposePath, once, adopt)
+					})
+				}
+				var unavailable *cudaServiceUnavailableError
+				switch {
+				case errors.As(err, &unavailable):
+					skipped++
+					fmt.Printf("   - %s\n", reason)
+				case err != nil:
+					failed++
+					fmt.Fprintf(os.Stderr, "     Error: %s: %v\n", service.Name, err)
+				default:
+					// Adoption observes an existing engine; this worker does not
+					// own its lifetime and must not add it to managed teardown.
+					fmt.Printf("   - %s is already running\n", service.Name)
+				}
+				continue
+			}
+		}
+
 		if serviceType == internalServices.ServiceTypeNative {
+			launched := false
 			fmt.Printf("   - Starting %s (native)...\n", service.Name)
 			warnIfOllamaPolicyIgnoredNative(service)
 			if err := withLocalServiceStartGuard(configDir, service.Name, func() error {
-				return startNativeService(service.Name, configDir)
+				if nativeServing(service.Name) {
+					return nil
+				}
+				if reason := services.CUDAStartRefusal(service.Name, runtime.GOOS, once); reason != "" {
+					return fmt.Errorf("cannot start %s", reason)
+				}
+				var err error
+				launched, err = nativeStart(service.Name, configDir)
+				return err
 			}); err != nil {
 				failed++
 				fmt.Fprintf(os.Stderr, "     Error: %s: %v\n", service.Name, err)
 				continue
 			}
-			started = append(started, startedService{name: service.Name, native: true})
+			if launched {
+				started = append(started, startedService{name: service.Name, native: true})
+			}
 		} else {
 			// Validate that compose file path stays within config directory (prevent path traversal)
 			fullComposePath, err := platform.ValidatePathWithinDir(configDir, service.ComposeFile)
@@ -3125,14 +3206,17 @@ func startManagedServices(ctx context.Context) []startedService {
 				continue
 			}
 			fmt.Printf("   - Starting %s...\n", service.Name)
+			launched := false
 			if err := withLocalServiceStartGuard(configDir, service.Name, func() error {
-				return startService(service.Name, fullComposePath)
+				return startServiceForHost(service.Name, fullComposePath, once, adopt, func() { launched = true })
 			}); err != nil {
 				failed++
 				fmt.Fprintf(os.Stderr, "     Error: %s: %v\n", service.Name, err)
 				continue
 			}
-			started = append(started, startedService{name: service.Name, composePath: fullComposePath})
+			if launched {
+				started = append(started, startedService{name: service.Name, composePath: fullComposePath})
+			}
 		}
 		fmt.Printf("   - %s is running\n", service.Name)
 	}
@@ -3349,6 +3433,12 @@ func sensitiveCapabilityPasscodeWarning(perms *config.Permissions) string {
 // volumes; native stops leave any on-disk state). Services that were already
 // running when the worker booted are not in the list and are left untouched.
 func stopManagedServices(started []startedService) {
+	stopManagedServicesWith(started, internalServices.StopNativeService, stopServiceByCompose)
+}
+
+// Inject only the final stop operations so lifetime ownership can be exercised
+// from boot through shutdown without touching an actual engine.
+func stopManagedServicesWith(started []startedService, stopNative func(string) error, stopCompose func(string, bool) error) {
 	if len(started) == 0 {
 		return
 	}
@@ -3357,12 +3447,12 @@ func stopManagedServices(started []startedService) {
 	for i := len(started) - 1; i >= 0; i-- {
 		svc := started[i]
 		if svc.native {
-			if err := internalServices.StopNativeService(svc.name); err != nil {
+			if err := stopNative(svc.name); err != nil {
 				fmt.Fprintf(os.Stderr, "   - Warning: stop %s: %v\n", svc.name, err)
 			}
 			continue
 		}
-		if err := stopServiceByCompose(svc.composePath, false); err != nil {
+		if err := stopCompose(svc.composePath, false); err != nil {
 			fmt.Fprintf(os.Stderr, "   - Warning: stop %s: %v\n", svc.name, err)
 		}
 	}
@@ -3974,7 +4064,9 @@ type DeviceConfig struct {
 	// BrowserSlots is the shared concurrent browser-session count for this node
 	// (citadel-cli#1760). 0 keeps the default; CITADEL_COBROWSE_MAX_SESSIONS
 	// still overrides it.
-	BrowserSlots int `yaml:"browser_slots"`
+	BrowserSlots      int    `yaml:"browser_slots"`
+	BrowserAppliance  bool   `yaml:"browser_appliance"`
+	BrowserWindowSize string `yaml:"browser_window_size"`
 }
 
 // getDeviceConfigFromFile reads device authentication config from the
@@ -4305,6 +4397,7 @@ func init() {
 
 	// Status flags
 	workCmd.Flags().IntVar(&workStatusPort, "status-port", 0, "Enable status HTTP server on port (0 = disabled)")
+	workCmd.Flags().BoolVar(&workStatusBindLAN, "status-bind-lan", false, "Serve the plaintext status server on ALL interfaces (default: loopback plus the mesh listener only; or set CITADEL_STATUS_BIND_LAN=1)")
 	workCmd.Flags().StringVar(&workBaseURL, "base-url", "", "AceTeam API base URL (default: https://aceteam.ai, or set ACETEAM_URL env)")
 	workCmd.Flags().StringVar(&workAPIKey, "api-key", "", "API key for authentication (or set CITADEL_API_KEY env)")
 	workCmd.Flags().StringVar(&workNodeName, "node-name", "", "Node name for status reporting (default: hostname)")
@@ -4361,7 +4454,7 @@ func init() {
 	workCmd.Flags().BoolVar(&workGateway, "gateway", true, "Start the HTTPS gateway in-process (enabled by default; use --no-gateway to disable)")
 	workCmd.Flags().BoolVar(&workNoGateway, "no-gateway", false, "Disable the HTTPS gateway")
 	workCmd.Flags().IntVar(&workGatewayPort, "gateway-port", 8443, "HTTPS gateway port (default: 8443)")
-	workCmd.Flags().StringVar(&workGatewayBind, "gateway-bind", "0.0.0.0", "Gateway bind address")
+	workCmd.Flags().StringVar(&workGatewayBind, "gateway-bind", defaultGatewayBind, "Gateway bind host. Default is loopback; the mesh listener is always added. A non-loopback value is an explicit LAN opt-in and is logged loudly")
 	workCmd.Flags().IntVar(&workGatewayVNC, "gateway-vnc-port", 6080, "VNC websockify port for gateway proxy")
 	workCmd.Flags().IntVar(&workGatewayEmbedding, "gateway-embedding-port", 8102, "Local TEI embedding service port (/v1/embeddings upstream)")
 	workCmd.Flags().BoolVar(&workGatewayNoTLS, "gateway-no-tls", false, "Disable TLS on the gateway (for testing only)")

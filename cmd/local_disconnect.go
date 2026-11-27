@@ -54,22 +54,26 @@ const (
 
 // Fixed copy for each step outcome.
 const (
-	disconnectStopOKCopy      = "The background worker is stopped (or was not running)."
-	disconnectStopNACopy      = "This system has no per-user background worker. If Citadel runs as a service here, stop it with \"citadel service stop\"."
-	disconnectStopFailedCopy  = "Citadel could not stop the background worker. End it in Task Manager, then press Disconnect again."
-	disconnectAutoOKCopy      = "Citadel no longer starts when you sign in."
-	disconnectAutoNACopy      = "This system has no sign-in autostart entry for Citadel."
-	disconnectAutoFailedCopy  = "Citadel could not remove its sign-in autostart entry. Run \"citadel worker autostart disable\" in a terminal."
-	disconnectLogoutSkipCopy  = "Skipped, because the worker may still be running or start again at sign-in. Fix the step above, then press Disconnect again."
-	disconnectLogoutNoneCopy  = "This PC was not connected to the AceTeam Network."
-	disconnectLogoutOKCopy    = "Logged out. AceTeam removed this PC from your account."
-	disconnectLogoutLocalCopy = "Logged out on this PC. AceTeam was not asked to remove it from your account, so it may still be listed there; you can remove it in your AceTeam account."
-	disconnectLogoutHeldCopy  = "Another Citadel program on this PC still uses its AceTeam connection (a worker, a service or \"citadel up\"). Stop it, then press Disconnect again."
-	disconnectLogoutFailCopy  = "Citadel could not log out. Run \"citadel logout\" in a terminal."
-	disconnectCredsOKCopy     = "The device key AceTeam gave this PC is removed, so a later worker cannot take AceTeam jobs."
-	disconnectCredsNoneCopy   = "This PC had no saved AceTeam device key."
-	disconnectCredsFailCopy   = "Citadel could not remove this PC's AceTeam device key. Run \"citadel logout\" in a terminal, then remove this PC from your AceTeam account."
-	disconnectCredsSkipCopy   = "Skipped, because the logout did not finish."
+	disconnectStopOKCopy     = "The background worker is stopped (or was not running)."
+	disconnectStopNACopy     = "This system has no per-user background worker. If Citadel runs as a service here, stop it with \"citadel service stop\"."
+	disconnectStopFailedCopy = "Citadel could not stop the background worker. End it in Task Manager, then press Disconnect again."
+	// macOS: the worker is a LaunchAgent. A bootout that fails stops the
+	// disconnect here, so a KeepAlive worker never outlives its credentials.
+	disconnectStopFailedMacCopy = "Citadel could not stop its macOS background worker (a LaunchAgent), so nothing else was changed. Run \"citadel worker stop\" in Terminal to see why, then press Disconnect again."
+	disconnectStopOKMacCopy     = "The background worker is stopped (or was not running), and macOS will not restart it."
+	disconnectAutoOKCopy        = "Citadel no longer starts when you sign in."
+	disconnectAutoNACopy        = "This system has no sign-in autostart entry for Citadel."
+	disconnectAutoFailedCopy    = "Citadel could not remove its sign-in autostart entry. Run \"citadel worker autostart disable\" in a terminal."
+	disconnectLogoutSkipCopy    = "Skipped, because the worker may still be running or start again at sign-in. Fix the step above, then press Disconnect again."
+	disconnectLogoutNoneCopy    = "This PC was not connected to the AceTeam Network."
+	disconnectLogoutOKCopy      = "Logged out. AceTeam removed this PC from your account."
+	disconnectLogoutLocalCopy   = "Logged out on this PC. AceTeam was not asked to remove it from your account, so it may still be listed there; you can remove it in your AceTeam account."
+	disconnectLogoutHeldCopy    = "Another Citadel program on this PC still uses its AceTeam connection (a worker, a service or \"citadel up\"). Stop it, then press Disconnect again."
+	disconnectLogoutFailCopy    = "Citadel could not log out. Run \"citadel logout\" in a terminal."
+	disconnectCredsOKCopy       = "The device key AceTeam gave this PC is removed, so a later worker cannot take AceTeam jobs."
+	disconnectCredsNoneCopy     = "This PC had no saved AceTeam device key."
+	disconnectCredsFailCopy     = "Citadel could not remove this PC's AceTeam device key. Run \"citadel logout\" in a terminal, then remove this PC from your AceTeam account."
+	disconnectCredsSkipCopy     = "Skipped, because the logout did not finish."
 
 	disconnectDoneCopy = "This PC is disconnected from AceTeam. Local mode keeps working, and your saved logins were not touched."
 	// disconnectPostureNote is added when the co-browse-only marker stays.
@@ -97,6 +101,8 @@ var errLogoutHeld = errors.New("another process holds this node's network state"
 // disconnectDeps are Disconnect's side effects, as seams. stopWorker and
 // disableAutostart return applicable=false where this OS has no such thing.
 type disconnectDeps struct {
+	// goos selects the copy ("" and "windows" are the Windows copy).
+	goos             string
 	stopWorker       func() (applicable bool, err error)
 	disableAutostart func() (applicable bool, err error)
 	logout           func() (logoutOutcome, error)
@@ -125,9 +131,15 @@ func disconnectThisPC(d disconnectDeps) localviewer.SetupActionResult {
 	case err != nil:
 		log.Printf("[setup] disconnect: stop worker: %v", err)
 		stopped = false
-		add(disconnectStepStop, stepFailed, disconnectStopFailedCopy)
+		if d.goos == "darwin" {
+			add(disconnectStepStop, stepFailed, disconnectStopFailedMacCopy)
+		} else {
+			add(disconnectStepStop, stepFailed, disconnectStopFailedCopy)
+		}
 	case !applicable:
 		add(disconnectStepStop, stepNotApplicable, disconnectStopNACopy)
+	case d.goos == "darwin":
+		add(disconnectStepStop, stepOK, disconnectStopOKMacCopy)
 	default:
 		add(disconnectStepStop, stepOK, disconnectStopOKCopy)
 	}
@@ -305,6 +317,15 @@ func hasNodeRegistration() bool {
 
 // productionDisconnectDeps are the real side effects.
 func productionDisconnectDeps() disconnectDeps {
+	d := productionDisconnectDepsBase()
+	if runtime.GOOS == "darwin" {
+		a, err := service.NewUserLaunchAgent()
+		d = darwinDisconnectDeps(d, a, err)
+	}
+	return d
+}
+
+func productionDisconnectDepsBase() disconnectDeps {
 	return disconnectDeps{
 		stopWorker: func() (bool, error) {
 			if runtime.GOOS != "windows" {
@@ -346,6 +367,37 @@ func productionDisconnectDeps() disconnectDeps {
 			})
 		},
 	}
+}
+
+// darwinDisconnectDeps is Disconnect on macOS: stopWorker boots the
+// LaunchAgent out of launchd (success only once the job is no longer loaded)
+// and disableAutostart removes its plist, both before the logout and the
+// credential removal that disconnectThisPC runs after them. agentErr is a
+// failure to build the agent; it fails both steps, so nothing is cleared.
+func darwinDisconnectDeps(d disconnectDeps, a *service.LaunchAgent, agentErr error) disconnectDeps {
+	d.goos = "darwin"
+	// The plist stays while the stop failed: it is what a retry, and a worker
+	// that is somehow still running, are tied to.
+	stopFailed := false
+	d.stopWorker = func() (bool, error) {
+		if agentErr != nil {
+			stopFailed = true
+			return true, agentErr
+		}
+		err := a.Stop()
+		stopFailed = err != nil
+		return true, err
+	}
+	d.disableAutostart = func() (bool, error) {
+		if agentErr != nil {
+			return true, agentErr
+		}
+		if stopFailed {
+			return true, errors.New("the worker was not stopped, so its LaunchAgent file was kept")
+		}
+		return true, a.Remove()
+	}
+	return d
 }
 
 var localDisconnectYes bool

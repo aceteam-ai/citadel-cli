@@ -2,6 +2,7 @@ package harnessseat
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,6 +11,9 @@ import (
 func fixtureIdentity(t *testing.T, harness Harness) Identity {
 	t.Helper()
 	home := t.TempDir()
+	if err := os.Chmod(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	return Identity{ID: "fixture-seat", Harness: harness, Owner: "fixture-user", HomeDir: home, ConfigDir: filepath.Join(home, "isolated-seat")}
 }
 

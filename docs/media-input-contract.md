@@ -84,7 +84,7 @@ envelope bound, capability advertisement and shared fixture to joint ratificatio
 by automated-aceteam and automated-citadel. An earlier local **v2** proposal was
 not a settled contract choice. Do not implement either spelling from this doc.
 
-That DoR and [Jason's recorded input/lifecycle decisions](https://github.com/aceteam-ai/aceteam/issues/11260#issuecomment-6290189919)
+That DoR and [Owner's recorded input/lifecycle decisions](https://github.com/aceteam-ai/aceteam/issues/11260#issuecomment-6290189919)
 already settle the relevant bounds: one source for `image-to-video`, ordered
 1..8 references for `ref-to-video`, 16 MiB and 16,777,216 pixels per image,
 128 MiB total reference bytes, a 176 MiB reference sidecar request cap and one

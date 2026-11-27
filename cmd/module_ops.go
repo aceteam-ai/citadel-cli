@@ -47,7 +47,7 @@ import (
 // converge loop is not idempotent telemetry, and two loops on one node would
 // double-apply install/uninstall.
 //
-// nodeID MUST be the Headscale numeric node ID (e.g. "1084"), NOT the hostname
+// nodeID MUST be the Headscale numeric node ID (e.g. "4321"), NOT the hostname
 // (aceteam#535). The desired-state serve endpoint matches rows by a raw
 // `.eq("node_id", <path param>)` against `fabric_node_status.node_id` (the
 // Headscale numeric ID the backend upserts from heartbeats); a hostname never
@@ -108,10 +108,10 @@ func newLiveModuleOps(log func(format string, args ...any)) *liveModuleOps {
 	}
 	return &liveModuleOps{
 		log:                   log,
-		startFn:               startService,                   // cmd/service.go: docker compose up -d
-		composeDown:           stopServiceByCompose,           // cmd/stop.go: docker compose down
-		isRunning:             containerIsRunning,             // docker inspect state
-		composeServiceRunning: composeServiceContainerRunning, // docker compose -p <project> ps <service>
+		startFn:               func(name, path string) error { return startService(name, path) }, // cmd/service.go: docker compose up -d
+		composeDown:           stopServiceByCompose,                                              // cmd/stop.go: docker compose down
+		isRunning:             containerIsRunning,                                                // docker inspect state
+		composeServiceRunning: composeServiceContainerRunning,                                    // docker compose -p <project> ps <service>
 	}
 }
 

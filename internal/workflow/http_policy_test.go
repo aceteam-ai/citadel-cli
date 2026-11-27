@@ -131,7 +131,7 @@ func TestHTTPPolicyResolutionFailure(t *testing.T) {
 }
 
 func TestHTTPPolicyAllowlistNeverOverridesHardDeny(t *testing.T) {
-	p, err := parseHTTPPolicy([]byte("allow:\n  - cidr: 192.168.2.0/24\n  - cidr: 100.64.0.0/10\n  - host: nas.internal\n"))
+	p, err := parseHTTPPolicy([]byte("allow:\n  - cidr: 192.168.50.0/24\n  - cidr: 100.64.0.0/10\n  - host: nas.internal\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestHTTPPolicyAllowlistNeverOverridesHardDeny(t *testing.T) {
 	}{
 		{"nas.internal", "10.2.3.4", true},
 		{"NAS.INTERNAL.", "fd00::1", true},
-		{"other.internal", "192.168.2.23", true},
+		{"other.internal", "192.168.50.23", true},
 		{"other.internal", "192.168.3.23", false},
 		{"other.internal", "100.64.0.8", true},
 		{"other.internal", "100.100.100.100", false},
@@ -177,7 +177,7 @@ func TestHTTPPolicyStrictConfig(t *testing.T) {
 			t.Errorf("accepted invalid policy: %q", raw)
 		}
 	}
-	for _, raw := range []string{"allow: []", "allow:\n  - cidr: 10.0.0.0/8", "allow:\n  - cidr: ::ffff:192.168.2.0/120", "allow:\n  - host: nas.internal"} {
+	for _, raw := range []string{"allow: []", "allow:\n  - cidr: 10.0.0.0/8", "allow:\n  - cidr: ::ffff:192.168.50.0/120", "allow:\n  - host: nas.internal"} {
 		if _, err := parseHTTPPolicy([]byte(raw)); err != nil {
 			t.Errorf("refused valid policy %q: %v", raw, err)
 		}

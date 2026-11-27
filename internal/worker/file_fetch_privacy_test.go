@@ -197,6 +197,46 @@ func TestFileFetchDirectRedisRetentionLifecycle(t *testing.T) {
 	}
 }
 
+func TestLaneOperationAckPurgesOriginalStreamEntry(t *testing.T) {
+	for _, terminal := range []string{"ack", "fail"} {
+		t.Run(terminal, func(t *testing.T) {
+			raw, url := fileFetchDisposableRedis(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			queue := laneQueue
+			source := NewRedisSource(RedisSourceConfig{URL: url, QueueName: queue, ConsumerGroup: "workers", BlockMs: 1, LogFn: func(string, string) {}})
+			if err := source.Connect(ctx); err != nil {
+				t.Fatal(err)
+			}
+			defer source.Close()
+			payload, _ := json.Marshal(laneJob(sendPayload()).Payload)
+			id := enqueueTestJob(t, raw, queue, map[string]any{"jobId": "lane-job", "type": JobTypeLaneOperation, "payload": string(payload)})
+			job, err := source.Next(ctx)
+			if err != nil || job == nil {
+				t.Fatalf("read lane job: %v", err)
+			}
+			if terminal == "ack" {
+				tmux := &laneFakeTmux{}
+				handler := newLaneHandler(t, &laneEnv{shell: true, set: true, available: true}, tmux)
+				result, sendErr := handler.Execute(ctx, job, nil)
+				if sendErr != nil || result.Output["status"] != "submitted" || tmux.sent != 1 {
+					t.Fatalf("lane send did not submit: %+v %v", result, sendErr)
+				}
+				err = source.Ack(ctx, job)
+			} else {
+				err = source.Fail(ctx, job, errors.New("synthetic failure"), nil)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			entries, err := raw.XRange(ctx, queue, id, id).Result()
+			if err != nil || len(entries) != 0 {
+				t.Fatalf("terminal lane delivery retained source literal: %v %v", err, entries)
+			}
+		})
+	}
+}
+
 func TestFileFetchDirectRedisAckScope(t *testing.T) {
 	raw, url := fileFetchDisposableRedis(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

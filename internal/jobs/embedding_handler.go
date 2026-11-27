@@ -51,7 +51,16 @@ const (
 	teiHealthRequestTimeout   = 3 * time.Second
 	teiEmbeddingResponseLimit = 16 << 20 // 16 MiB across at most one sub-batch
 	teiErrorResponseLimit     = 4 << 10  // bounded drain; bodies never enter errors
+	// Bound flattened job inputs before readiness, requests, or receipt work.
+	embeddingMaxInputCount = 1024
+	embeddingMaxTextBytes  = 64 << 10
+	embeddingMaxInputBytes = 4 << 20
+	// A JSON string can encode each byte with six bytes (\uXXXX), plus
+	// quotes/commas. Bound encoded input before decoding or allocating texts.
+	embeddingMaxEncodedInputBytes = 6*embeddingMaxInputBytes + 3*embeddingMaxInputCount + 2
 )
+
+var errEmbeddingInputLimit = errors.New("embedding input exceeds count or byte limits")
 
 // EmbeddingHandler handles JobTypeEmbedding ("embedding") jobs by routing them
 // to the local TEI service's OpenAI-compatible /v1/embeddings endpoint.
@@ -92,6 +101,9 @@ type EmbeddingHandler struct {
 	Origin string
 	// nowFn is a test seam for the receipt issued_at; nil uses time.Now.
 	nowFn func() time.Time
+	// native is set only by the explicit, currently unwired protocol adapter.
+	// The zero-value production handler retains the existing TEI behavior.
+	native *nativeEmbeddingBinding
 }
 
 // Capabilities declares the embedding lifecycle contract (citadel-cli#1287). The
@@ -185,7 +197,13 @@ func (h *EmbeddingHandler) Execute(ctx JobContext, job *nexus.Job) ([]byte, erro
 	}
 
 	ctx.Log("info", "     - [Job %s] Waiting for TEI embedding service to become ready...", job.ID)
-	op := newTEIEmbeddingOperation(teiBaseURL())
+	op, err := h.embeddingOperation(req)
+	if err != nil {
+		return nil, err
+	}
+	if h.native != nil {
+		defer op.client.CloseIdleConnections()
+	}
 	if err := op.initialize(ctx.Context()); err != nil {
 		return nil, err
 	}
@@ -281,6 +299,7 @@ type teiEmbeddingOperation struct {
 	client         *http.Client
 	requestTimeout time.Duration
 	readyTimeout   time.Duration
+	native         *nativeEmbeddingBinding
 
 	initOnce  sync.Once
 	initErr   error
@@ -379,11 +398,11 @@ func (o *teiEmbeddingOperation) embed(ctx context.Context, req *EmbeddingRequest
 		if end > len(req.Input) {
 			end = len(req.Input)
 		}
-		batch, err := callTEIEmbeddingBatch(ctx, o.client, o.baseURL, o.requestTimeout, &EmbeddingRequest{
+		batch, err := callBoundEmbeddingBatch(ctx, o.client, o.baseURL, o.requestTimeout, &EmbeddingRequest{
 			Model:      req.Model,
 			Input:      req.Input[start:end],
 			Dimensions: req.Dimensions,
-		})
+		}, o.native)
 		if err != nil {
 			return nil, fmt.Errorf("embedding batch %d-%d: %w", start, end-1, err)
 		}
@@ -425,11 +444,9 @@ func parseEmbeddingPayload(payload map[string]string) (*EmbeddingRequest, error)
 		return nil, fmt.Errorf("input is required")
 	}
 
-	var input []string
-	// Prefer JSON array decoding (the canonical wire form for []string).
-	if err := json.Unmarshal([]byte(rawInput), &input); err != nil {
-		// Fall back: treat the whole value as a single text to embed.
-		input = []string{rawInput}
+	input, err := boundedEmbeddingInputs(rawInput)
+	if err != nil {
+		return nil, err
 	}
 	if len(input) == 0 {
 		return nil, fmt.Errorf("input must contain at least one text")
@@ -443,7 +460,7 @@ func parseEmbeddingPayload(payload map[string]string) (*EmbeddingRequest, error)
 	if dimStr, ok := payload["dimensions"]; ok && dimStr != "" {
 		dim, err := strconv.Atoi(dimStr)
 		if err != nil {
-			return nil, fmt.Errorf("dimensions must be an integer: %w", err)
+			return nil, errors.New("dimensions must be an integer")
 		}
 		if dim < 0 {
 			return nil, fmt.Errorf("dimensions must be non-negative")
@@ -452,6 +469,59 @@ func parseEmbeddingPayload(payload map[string]string) (*EmbeddingRequest, error)
 	}
 
 	return req, nil
+}
+
+// Decode arrays incrementally so a dense array cannot allocate an unbounded
+// slice before its item limit is checked. Preserve the existing scalar fallback
+// for non-array/malformed text, subject to the same per-text byte bound.
+func boundedEmbeddingInputs(raw string) ([]string, error) {
+	if len(raw) > embeddingMaxEncodedInputBytes {
+		return nil, errEmbeddingInputLimit
+	}
+	scalar := func() ([]string, error) {
+		if len(raw) > embeddingMaxTextBytes {
+			return nil, errEmbeddingInputLimit
+		}
+		return []string{raw}, nil
+	}
+	d := json.NewDecoder(strings.NewReader(raw))
+	start, err := d.Token()
+	if err != nil {
+		return scalar()
+	}
+	if start == nil {
+		// json.Unmarshal("null", &[]string) previously produced no texts.
+		if _, err := d.Token(); err == io.EOF {
+			return nil, nil
+		}
+		return scalar()
+	}
+	if start != json.Delim('[') {
+		return scalar()
+	}
+	var input []string
+	total := 0
+	for d.More() {
+		if len(input) >= embeddingMaxInputCount {
+			return nil, errEmbeddingInputLimit
+		}
+		var text string
+		if err := d.Decode(&text); err != nil {
+			return scalar()
+		}
+		if len(text) > embeddingMaxTextBytes || len(text) > embeddingMaxInputBytes-total {
+			return nil, errEmbeddingInputLimit
+		}
+		total += len(text)
+		input = append(input, text)
+	}
+	if end, err := d.Token(); err != nil || end != json.Delim(']') {
+		return scalar()
+	}
+	if _, err := d.Token(); err != io.EOF {
+		return scalar()
+	}
+	return input, nil
 }
 
 // callTEIEmbeddings is retained as a test-facing convenience for one complete
@@ -464,6 +534,10 @@ func callTEIEmbeddings(baseURL string, req *EmbeddingRequest) (*EmbeddingResult,
 // /v1/embeddings endpoint and strictly validates cardinality, indices, and
 // vector dimensions before returning it to the operation-level aggregator.
 func callTEIEmbeddingBatch(ctx context.Context, client *http.Client, baseURL string, timeout time.Duration, req *EmbeddingRequest) (*EmbeddingResult, error) {
+	return callBoundEmbeddingBatch(ctx, client, baseURL, timeout, req, nil)
+}
+
+func callBoundEmbeddingBatch(ctx context.Context, client *http.Client, baseURL string, timeout time.Duration, req *EmbeddingRequest, native *nativeEmbeddingBinding) (*EmbeddingResult, error) {
 	requestCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -516,6 +590,9 @@ func callTEIEmbeddingBatch(ctx context.Context, client *http.Client, baseURL str
 	}
 	if len(teiResp.Data) != len(req.Input) {
 		return nil, fmt.Errorf("TEI returned %d embeddings for %d inputs", len(teiResp.Data), len(req.Input))
+	}
+	if native != nil && teiResp.Model != native.model {
+		return nil, errors.New("embedding response does not match the native model")
 	}
 
 	result := &EmbeddingResult{

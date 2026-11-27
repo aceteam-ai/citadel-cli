@@ -184,12 +184,12 @@ func TestStatusMessageHeadscaleNodeID(t *testing.T) {
 	msg := StatusMessage{
 		Version:         "1.0",
 		Timestamp:       "2024-01-15T12:00:00Z",
-		NodeID:          "ubuntu-gpu-8gluaaom",
+		NodeID:          "linux-node-fixture1",
 		HeadscaleNodeID: "758",
 		Status: &status.NodeStatus{
 			Version: "1.0",
 			Node: status.NodeInfo{
-				Name: "ubuntu-gpu-8gluaaom",
+				Name: "linux-node-fixture1",
 			},
 			VNCPort: 5900,
 		},
@@ -228,7 +228,7 @@ func TestStatusMessageHeadscaleNodeIDIncludedWhenSet(t *testing.T) {
 	msg := StatusMessage{
 		Version:         "1.0",
 		Timestamp:       "2024-01-15T12:00:00Z",
-		NodeID:          "ubuntu-gpu",
+		NodeID:          "linux-node",
 		HeadscaleNodeID: "758",
 		Status:          &status.NodeStatus{Version: "1.0"},
 	}
@@ -272,7 +272,7 @@ func TestRedisPublisherHeadscaleNodeID(t *testing.T) {
 
 	pub, err := NewRedisPublisher(RedisPublisherConfig{
 		RedisURL:        "redis://localhost:6379",
-		NodeID:          "ubuntu-gpu",
+		NodeID:          "linux-node",
 		HeadscaleNodeID: "758",
 	}, collector)
 	if err != nil {

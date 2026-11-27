@@ -305,3 +305,19 @@ func jobErrText(res *JobResult) string {
 	}
 	return ""
 }
+
+func TestTemplateQueueOrgParsesOnlyTheExactNodeStream(t *testing.T) {
+	for _, tc := range []struct{ queue, node, want string }{
+		{"jobs:v1:shell:org_org-test-1:node:node-test-1", "node-test-1", "org-test-1"},
+		{"jobs:v1:shell:org_org-test-1:node:node-test-2", "node-test-1", ""},
+		{"jobs:v1:shell:org_org-test-1", "node-test-1", ""},
+		{"jobs:v1:shell:org_:node:node-test-1", "node-test-1", ""},
+		{"jobs:v1:shell:org_a:b:node:node-test-1", "node-test-1", ""},
+		{"jobs:v1:tag:org_org-test-1:node:node-test-1", "node-test-1", ""},
+		{"jobs:v1:shell:org_org-test-1:node:node-test-1", "", ""},
+	} {
+		if got := templateQueueOrg(tc.queue, tc.node); got != tc.want {
+			t.Errorf("templateQueueOrg(%q, %q) = %q, want %q", tc.queue, tc.node, got, tc.want)
+		}
+	}
+}

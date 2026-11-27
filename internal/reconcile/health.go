@@ -45,7 +45,7 @@ type HealthState struct {
 // loud once on the false->true (becomes refused) transition, a periodic
 // summary while the refusal persists, loud once again on the true->false
 // (clears) transition -- instead of an identical WARN on every single pass.
-// Node 1297 logged 4574 of the old identical warning over 5+ days, which at
+// A dev node logged 4574 of the old identical warning over 5+ days, which at
 // that volume is indistinguishable from background noise (citadel-cli#742).
 //
 // Safe for concurrent use: Observe is called from the single reconcile-pass

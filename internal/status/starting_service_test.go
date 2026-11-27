@@ -10,9 +10,9 @@ import (
 // starting_service_test.go: a container that is UP but not answering yet must be
 // REPORTED, with its readiness on Health (aceteam#7148).
 //
-// The production repro: a deploy of gte-multilingual-base to node 1314 started
-// TEI, `service_status(1314, "tei")` said "tei is running (docker)", and
-// `fabric_node_status(1314)` said "Running Services: none" for the whole time
+// The production repro: a deploy of gte-multilingual-base to a node started
+// TEI, `service_status` said "tei is running (docker)", and
+// `fabric_node_status` said "Running Services: none" for the whole time
 // the model was downloading. The heartbeat dropped any service that failed its
 // probe, so the two views disagreed and the operator saw an empty node right
 // after a deploy that had worked.

@@ -206,7 +206,7 @@ func TestFixStatePermissions_NoOpWhenNotRoot(t *testing.T) {
 // a different, empty state dir -> fresh machine key -> a SECOND node registered
 // for one machine.
 func TestResolveStateDirDivergesWithoutPointerUnderService(t *testing.T) {
-	const userHome = "/Users/jason"
+	const userHome = "/Users/owner"
 	const rootHome = "/var/root"
 
 	// Interactive `sudo citadel up`: SUDO_USER resolves the owner's home.
@@ -229,7 +229,7 @@ func TestResolveStateDirDivergesWithoutPointerUnderService(t *testing.T) {
 
 	// ...and that the pointer is what reconciles them. This is the property
 	// EnsureMachineStatePointer exists to establish.
-	pointer := "/Users/jason/citadel-node"
+	pointer := "/Users/owner/citadel-node"
 	reconciled := resolveStateDir(stateDirInputs{
 		pointerDir:        pointer,
 		ownerHome:         rootHome, // still the service context

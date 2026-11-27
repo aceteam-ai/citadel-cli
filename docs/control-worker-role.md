@@ -41,4 +41,4 @@ Source tests use private paths, synthetic GPU facts and a fake Redis broker.
 The broker proof delivers a config job through the real source and legacy
 adapter to a fixture-only applier, leaving shared jobs untouched. It does not
 run the native config handler, services or a live worker. Native acceptance and
-changing hp/node 1915 require separate operator authorization after review.
+changing a production node requires separate operator authorization after review.

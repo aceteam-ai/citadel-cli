@@ -5,6 +5,36 @@ import "strings"
 
 const FileFetch = "FILE_FETCH"
 
+// LaneOperation's send payload carries literal text for an agent pane
+// (citadel-cli#1659). It is user content, so it is dropped from every retained
+// copy of that job type, like a credential.
+const LaneOperation = "LANE_OPERATION"
+
+// LaneMessageKey is the LANE_OPERATION field holding that text.
+const LaneMessageKey = "message"
+
+// Retained returns the payload a retained rendering (DLQ, logs, Job JSON and
+// fmt output) may keep, and whether anything was dropped. When changed is
+// true the caller must also drop the raw stream bytes, which hold the same
+// fields. FILE_FETCH is handled separately: its whole payload is withheld.
+func Retained(kind string, payload map[string]any) (map[string]any, bool) {
+	if kind == LaneOperation {
+		if _, ok := payload[LaneMessageKey]; ok {
+			out := make(map[string]any, len(payload))
+			for k, v := range WithoutPasscode(payload) {
+				if k != LaneMessageKey {
+					out[k] = v
+				}
+			}
+			return out, true
+		}
+	}
+	if HasPasscode(payload) {
+		return WithoutPasscode(payload), true
+	}
+	return payload, false
+}
+
 // Payload is for retention/diagnostics only, never execution or redispatch.
 // It drops a FILE_FETCH payload entirely and removes the node passcode field
 // from every other job type.
@@ -12,7 +42,8 @@ func Payload(kind string, payload map[string]any) map[string]any {
 	if kind == FileFetch {
 		return nil
 	}
-	return WithoutPasscode(payload)
+	retained, _ := Retained(kind, payload)
+	return retained
 }
 
 // Text removes a reflected delivery credential or node passcode while
@@ -21,6 +52,11 @@ func Text(kind string, payload map[string]any, text string) string {
 	if kind == FileFetch {
 		if token, ok := payload["capability"].(string); ok && token != "" {
 			text = replaceAll(text, token)
+		}
+	}
+	if kind == LaneOperation {
+		if message, ok := payload[LaneMessageKey].(string); ok && message != "" {
+			text = replaceAll(text, message)
 		}
 	}
 	return redactPasscode(payload, text)

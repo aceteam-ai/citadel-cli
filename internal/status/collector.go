@@ -3,6 +3,7 @@ package status
 import (
 	"context"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,6 +48,7 @@ type Collector struct {
 	laneActivity     func() []LaneActivity             // live bounded-execution-lane activity (citadel #908), optional
 	pairingDisplay   func() *PairingDisplayCapability  // live pairing-display capability probe (citadel #659), optional
 	cacheReport      func() *CacheReport               // live cache-index attribution (citadel #682 P3), optional
+	browseRecovery   func() bool                       // live scoped co-browse job-recovery support, optional
 	jobTypes         func() []string                   // live registered worker job types (aceteam #9962), optional
 	permissions      func() *config.Permissions        // authoritative node permission policy, optional
 	visibleGPUs      []string                          // nil = all devices
@@ -126,6 +128,8 @@ type CollectorConfig struct {
 	// capability-aware dispatch. nil or an empty result leaves job_types omitted
 	// until the live runner is fully registered.
 	JobTypes func() []string
+	// CobrowseJobRecovery reads the live configured recovery adapter.
+	CobrowseJobRecovery func() bool
 	// VisibleGPUs, when non-nil, limits GPU metrics to these device indexes
 	// (CUDA_VISIBLE_DEVICES entries). A batch allocation reports only the GPUs
 	// its scheduler gave it; an empty non-nil slice reports none. nil (every
@@ -183,6 +187,7 @@ func NewCollector(cfg CollectorConfig) *Collector {
 		pairingDisplay:   cfg.PairingDisplay,
 		cacheReport:      cfg.CacheReport,
 		jobTypes:         cfg.JobTypes,
+		browseRecovery:   cfg.CobrowseJobRecovery,
 		permissions:      cfg.PermissionsProvider,
 		visibleGPUs:      cfg.VisibleGPUs,
 		appPods:          cfg.AppPods,
@@ -547,7 +552,7 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	// Advertise the serving services this build can deploy (embedded ServiceMap
 	// keys) so the fabric can schedule engine-specific deploys only to capable
 	// nodes (aceteam#4483).
-	populateServices(status.Capabilities)
+	populateServices(status.Capabilities, runtime.GOOS, platform.NvidiaGPUCountForCompose, status.Services...)
 
 	// Advertise the live registered handler set rather than a static version or
 	// platform matrix. The provider is wired only after permission/configuration
@@ -555,6 +560,12 @@ func (c *Collector) Collect() (*NodeStatus, error) {
 	// surfaces never appear dispatchable.
 	if c.jobTypes != nil {
 		status.Capabilities.JobTypes = c.jobTypes()
+	}
+	// Clear a cached value too: unsupported/disabled is never a stale true.
+	status.Capabilities.CobrowseJobRecovery = nil
+	if c.browseRecovery != nil {
+		enabled := c.browseRecovery()
+		status.Capabilities.CobrowseJobRecovery = &enabled
 	}
 
 	// Advertise the generic sandboxed-module runtime availability (citadel-cli
@@ -640,12 +651,18 @@ func (c *Collector) WorkerLivenessSnapshot() *WorkerLiveness {
 	return c.workerLiveness()
 }
 
-// populateServices sets AvailableServices to the sorted list of serving
-// services this build knows how to deploy (the embedded services.ServiceMap
-// keys). It advertises what the binary CAN run, not what is currently
-// configured/running, matching the backend's tolerant matching (aceteam#4483).
-func populateServices(caps *NodeCapabilities) {
-	caps.AvailableServices = services.GetAvailableServices()
+// populateServices advertises the runnable host set without confusing unknown
+// GPU evidence with absence. It does not limit the set to configured services.
+func populateServices(caps *NodeCapabilities, goos string, gpuCount func() int, observed ...ServiceInfo) {
+	var serving []string
+	for _, svc := range observed {
+		// Reuse this heartbeat's successful readiness observation. Cached
+		// Engines/configuration and an unready container are not adoption proof.
+		if svc.Name == "vllm" && svc.Status == ServiceStatusRunning && svc.Health == HealthStatusOK && svc.Port > 0 {
+			serving = append(serving, svc.Name)
+		}
+	}
+	caps.AvailableServices = services.AvailableServicesForHost(goos, gpuCount, serving...)
 }
 
 // CollectCompact returns a minimal status suitable for heartbeats.

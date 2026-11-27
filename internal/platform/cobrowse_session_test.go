@@ -289,6 +289,9 @@ func trustedBaseDir(t *testing.T) string {
 // check to match so the kill path (not the identity check itself, covered separately
 // below) is what's under test here.
 func TestCobrowseSession_SweepReapsOrphans(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("pins the Linux pidfile sweep; the macOS sweep is covered by TestSweepMacSessions")
+	}
 	base := trustedBaseDir(t)
 	orphan := filepath.Join(base, "cb-orphan")
 	if err := os.MkdirAll(orphan, 0o700); err != nil {

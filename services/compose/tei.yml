@@ -9,8 +9,8 @@
 # citadel gateway (/v1/embeddings upstream), never this host port directly.
 #
 # Image tag is GPU-aware (aceteam-ai/citadel-cli#1269). The CPU image embeds
-# ~125x slower than the matching CUDA image on a GPU node (measured on node 1795
-# / RTX 3090: a 41k-chunk index went from ~25h to ~30min, identical vectors,
+# ~125x slower than the matching CUDA image on a GPU node (measured on an
+# RTX 3090: a 41k-chunk index went from ~25h to ~30min, identical vectors,
 # cosine 1.000000). Citadel resolves the node's GPU compute capability and
 # injects CITADEL_TEI_IMAGE_TAG (e.g. 86-1.6 on sm86) at `docker compose up`;
 # with no usable GPU the substitution defaults to cpu-1.6. `--dtype float32` is
@@ -45,7 +45,10 @@ services:
   tei:
     image: ghcr.io/huggingface/text-embeddings-inference:${CITADEL_TEI_IMAGE_TAG:-cpu-1.6}
     container_name: citadel-tei
-    command: ["--model-id", "Alibaba-NLP/gte-multilingual-base", "--dtype", "float32"]
+    # The model revision is pinned. Upstream's 2026-11-21 config change lists a
+    # token-classification architecture without id2label, which TEI 1.6 refuses
+    # to load, so an unpinned "main" crash-loops on every fresh start.
+    command: ["--model-id", "Alibaba-NLP/gte-multilingual-base", "--revision", "9bbca17d9273fd0d03d5725c7a4b0f6b45142062", "--dtype", "float32"]
     ports:
       - "127.0.0.1:8102:80"
     environment:

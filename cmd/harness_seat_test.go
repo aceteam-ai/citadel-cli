@@ -32,6 +32,9 @@ func seatCLIForTest(t *testing.T, owner seatCLIOwner, args ...string) (string, e
 func seatCLIState(t *testing.T) (string, seatCLIOwner) {
 	t.Helper()
 	home := t.TempDir()
+	if err := os.Chmod(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	registry := filepath.Join(home, "registry")
 	if err := os.Mkdir(registry, 0o700); err != nil {
 		t.Fatal(err)

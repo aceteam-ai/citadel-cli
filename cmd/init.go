@@ -12,6 +12,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -686,8 +687,11 @@ and system user configuration (requires sudo).`,
 }
 
 func getSelectedService() (string, error) {
+	if initService == "none" {
+		return "none", nil
+	}
 	if initService != "" {
-		validServices := append(services.GetAvailableServices(), "none")
+		validServices := append(controlCenterAvailableServicesForHost(runtime.GOOS, platform.NvidiaGPUCountForCompose, externalEngineServingForChoices), "none")
 		for _, s := range validServices {
 			if initService == s {
 				return initService, nil
@@ -706,19 +710,29 @@ func getSelectedService() (string, error) {
 
 	selection, err := ui.AskSelect(
 		"Which primary service should this node run?",
-		[]string{
-			"none (Connect to network only)",
-			"vllm (High-throughput OpenAI-compatible API)",
-			"ollama (General purpose, easy to use)",
-			"llamacpp (Versatile GGUF server)",
-			"extraction (Entity/relation extraction, CPU-only)",
-			"diffusers (Text-to-image generation, GPU)",
-		},
+		initialServiceOptionsForHost(runtime.GOOS, platform.NvidiaGPUCountForCompose, externalEngineServingForChoices),
 	)
 	if err != nil {
 		return "", err
 	}
 	return strings.Fields(selection)[0], nil
+}
+
+func initialServiceOptionsForHost(goos string, gpuCount func() int, serving func(context.Context, string, int) ([]string, bool)) []string {
+	available := controlCenterAvailableServicesForHost(goos, gpuCount, serving)
+	options := []string{"none (Connect to network only)"}
+	for _, option := range []string{
+		"vllm (High-throughput OpenAI-compatible API)",
+		"ollama (General purpose, easy to use)",
+		"llamacpp (Versatile GGUF server)",
+		"extraction (Entity/relation extraction, CPU-only)",
+		"diffusers (Text-to-image generation, GPU)",
+	} {
+		if slices.Contains(available, strings.Fields(option)[0]) {
+			options = append(options, option)
+		}
+	}
+	return options
 }
 
 func getNodeName() (string, error) {
@@ -2065,7 +2079,7 @@ func ensureNodeIdentity(baseURL string) {
 
 // ensureNodeIdentityWithStore is the store-injected core of ensureNodeIdentity,
 // split out so tests can drive a hermetic temp-dir store rather than the real
-// machine-convergent (and, on this dev box, node-1297-pinned) directory.
+// machine-convergent (and, on this dev box, dev-node-pinned) directory.
 func ensureNodeIdentityWithStore(store *nodeidentity.Store, baseURL string) {
 	if _, err := store.GetOrCreateKey(); err != nil {
 		// Non-fatal: a node without an identity key simply pairs with an authkey

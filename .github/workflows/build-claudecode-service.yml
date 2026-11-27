@@ -5,7 +5,7 @@ name: Build claudecode-service image
 # (services/compose/claudecode.yml and services/claudecode-service/compose.yml)
 # pull this image when a node provisions the "claudecode" runtime (Child C of the
 # BYOC agent-hosting epic aceteam-ai/aceteam#4588), so the image MUST exist in the
-# registry for every node other than the node-1054 live-proof box (which carries
+# registry for every node other than a live-proof dev box (which carries
 # a local claudecode-service:local image). See aceteam-ai/citadel-cli#442.
 #
 # Triggers only when the service source changes on main (or manually), so

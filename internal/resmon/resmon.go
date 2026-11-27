@@ -2,7 +2,7 @@
 // of a node — every GPU compute process, not just the citadel-managed ones that
 // #421's footprint collector sees.
 //
-// Motivation (citadel #427): during a live cleanup on node 1054 (RTX 3090) a
+// Motivation (citadel #427): during a live cleanup on an RTX 3090 node a
 // leftover `tei-gte` embedding container plus other non-citadel GPU users
 // (`docker-model-runner`, `open-webui`) were pinning VRAM completely invisibly
 // to citadel. Finding them meant doing by hand exactly what citadel should do

@@ -3,7 +3,8 @@
 // The permission posture of a PC connected to AceTeam from the setup page
 // (citadel-cli#1867 C5), and the human-only Files and Shell grant.
 //
-// writeSetupPosture runs only after a successful setup-page enrollment and
+// writeSetupPosture runs after successful setup-page enrollment or an explicit
+// local appliance-profile command and
 // writes an explicit permissions file: the console, desktop, files and shell
 // surfaces off, services, SSH key sync and provisioning off, and remote
 // co-browse limited to public addresses (cobrowse_public_only). Co-browse has
@@ -52,12 +53,21 @@ const setupPostureFailedCopy = "Connected, but Citadel could not save this PC's 
 // capability off, because the meeting bot's browser has no egress guard. It
 // keeps a passcode hash already in the file and refuses a file it cannot
 // read or parse. It is safe to run again: a retry writes the full posture.
-func writeSetupPosture(permissionsDir, meetingDir string) error {
+// The optional source is a closed, local-only audit tag for appliance apply.
+func writeSetupPosture(permissionsDir, meetingDir string, source ...string) error {
+	via := "setup_page"
+	if len(source) > 1 || (len(source) == 1 && source[0] != "appliance") {
+		return errors.New("unknown co-browse posture source")
+	}
+	if len(source) == 1 {
+		via = source[0]
+	}
 	p, err := config.LoadPermissionsStrict(permissionsDir)
 	if err != nil {
 		return fmt.Errorf("the node permissions file must be readable before the co-browse-only setting is saved: %w", err)
 	}
 	p.Console, p.Desktop, p.Files, p.Shell = false, false, false, false
+	p.Harness = false
 	p.Services, p.SSH, p.Provision = false, false, false
 	p.CobrowsePublicOnly = true
 	p.SetupPosture = config.SetupPostureCobrowseOnly
@@ -69,7 +79,7 @@ func writeSetupPosture(permissionsDir, meetingDir string) error {
 	if err := config.SaveMeeting(meetingDir, m); err != nil {
 		return fmt.Errorf("turn off the meeting capability: %w", err)
 	}
-	log.Printf("[permission] audit posture=cobrowse_only actor=human via=setup_page")
+	log.Printf("[permission] audit posture=cobrowse_only actor=human via=%s", via)
 	return nil
 }
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,6 +13,9 @@ import (
 func registryFixture(t *testing.T) ([]byte, func(string) (string, error)) {
 	t.Helper()
 	home := t.TempDir()
+	if err := os.Chmod(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	raw := fmt.Sprintf("profiles: {fixture-profile: {enabled: false, roots: [fixture-root]}}\nseats:\n  - id: fixture-seat\n    harness: codex\n    os_user: fixture-user\n    config_dir: %q\n    label: Personal\n    entitlement: consumer\n    roots: [%q]\n    data_ceiling: public\n    enabled: false\n", filepath.Join(home, "seat"), filepath.Join(home, "checkout"))
 	return []byte(raw), func(owner string) (string, error) {
 		if owner != "fixture-user" {

@@ -116,6 +116,7 @@ func runStandardStatus(commandCtx context.Context) {
 	manifest, _, _ := findAndReadManifest()
 
 	headerColor.Fprintf(w, "--- 📊 Citadel Node Status (%s) ---\n", Version)
+	printStatusServer(w, authServiceURL)
 
 	headerColor.Fprintln(w, "\n🛠️ WORKER")
 	printConfiguredWorkerRole(w, getDeviceConfigFromFile())
@@ -154,6 +155,10 @@ func runStandardStatus(commandCtx context.Context) {
 
 	headerColor.Fprintln(w, "\n🚀 MANAGED SERVICES")
 	printServiceInfo(w)
+}
+
+func printStatusServer(w io.Writer, server string) {
+	fmt.Fprintf(w, "Server:\t%s\n", server)
 }
 
 // printWorkerInfo reports whether a `citadel work` worker currently holds the
@@ -460,6 +465,7 @@ func gatherInitialStatusData(commandCtx context.Context) (dashboard.StatusData, 
 func gatherStatusData() (dashboard.StatusData, error) {
 	data := dashboard.StatusData{
 		Version: Version,
+		Server:  authServiceURL,
 	}
 	if role, err := resolveWorkerRole(getDeviceConfigFromFile(), ""); err == nil {
 		data.ConfiguredRole = role.Report()
@@ -869,7 +875,7 @@ func printGPUInfo(w *tabwriter.Writer) {
 // unmanaged alike — with its owner and a reclaimable flag (issue #427). This is
 // the operator-facing view of the same snapshot the fabric pulls via /resources
 // and the RESOURCE_SNAPSHOT job: leftover test/dev services that silently pin
-// the GPU (the tei-gte leftover found on node 1054) show up here labeled "not
+// the GPU (as a leftover embedding service once did) show up here labeled "not
 // managed by citadel", so an operator can free them by hand.
 func printResourcesInfo(w *tabwriter.Writer) {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)

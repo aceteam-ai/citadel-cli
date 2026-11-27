@@ -65,7 +65,9 @@ type Config struct {
 	Port int
 
 	// ListenAddress overrides the listen address.
-	// If empty, listens on all interfaces (0.0.0.0).
+	// If empty, listens on loopback only (127.0.0.1); the mesh listener is added
+	// separately via AddListener. A non-loopback host is an explicit operator
+	// opt-in to a LAN bind and is logged loudly by Start.
 	ListenAddress string
 
 	// TLSConfig is the TLS configuration with certificates.
@@ -153,7 +155,8 @@ type Server struct {
 
 	// permissions controls which capabilities are exposed. When nil, all
 	// routes are allowed (backwards-compatible with existing callers).
-	permissions *config.Permissions
+	permissions      *config.Permissions
+	permissionSource config.PermissionSource
 
 	// metering optionally wraps the handler chain with ACET token metering.
 	// When non-nil, OpenAI-compatible API requests (/v1/chat/completions,
@@ -255,6 +258,10 @@ type Server struct {
 	// proxy-to-loopback read surface. Registered from Start alongside the cache
 	// routes.
 	borrowCfg *BorrowServeConfig
+
+	// v1Allowed is the optional platform-infra allowlist for /v1/* callers
+	// (SetV1AllowedLogins). Nil means same-owner mesh peers only.
+	v1Allowed V1AllowedLogins
 }
 
 // NewServer creates a new gateway server.
@@ -360,6 +367,13 @@ func (s *Server) SetPermissions(p *config.Permissions) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.permissions = p
+}
+
+// SetPermissionSource selects the live local policy for routed capabilities.
+func (s *Server) SetPermissionSource(source config.PermissionSource) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.permissionSource = source
 }
 
 // SetProvisionedRegistry wires the resolver the permission layer uses to gate
@@ -507,28 +521,21 @@ func (s *Server) permissionMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.mu.RLock()
 		perms := s.permissions
+		source := s.permissionSource
 		resolver := s.provisionedResolver
 		s.mu.RUnlock()
+		category := categoryForRequest(r.URL.Path, resolver)
+		if source != nil && category != "" {
+			var err error
+			perms, err = source()
+			if err != nil || perms == nil {
+				http.Error(w, "node policy unavailable", http.StatusForbidden)
+				return
+			}
+		}
 
 		if perms != nil {
-			category := categoryForRequest(r.URL.Path, resolver)
-			blocked := false
-			switch category {
-			case "console":
-				blocked = !perms.Console
-			case "desktop":
-				blocked = !perms.Desktop
-			case "files":
-				blocked = !perms.Files
-			case "services":
-				blocked = !perms.Services
-			case "ssh":
-				blocked = !perms.SSH
-			case "provision":
-				blocked = !perms.Provision
-			case "shell":
-				blocked = !perms.Shell
-			}
+			blocked := !config.CapabilityEnabled(perms, category)
 			if blocked {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusForbidden)
@@ -551,6 +558,16 @@ func (s *Server) permissionMiddleware(next http.Handler) http.Handler {
 					return
 				}
 			}
+		}
+		if source != nil && category != "" {
+			ctx, cancel := context.WithCancel(r.Context())
+			defer cancel()
+			if !source.StillPermitted(category, perms.PasscodeHash) {
+				http.Error(w, "node policy changed", http.StatusForbidden)
+				return
+			}
+			go source.Watch(ctx, category, perms.PasscodeHash, cancel)
+			r = r.WithContext(ctx)
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -601,7 +618,10 @@ func (s *Server) Start(ctx context.Context) error {
 
 	listenAddr := s.config.ListenAddress
 	if listenAddr == "" {
-		listenAddr = fmt.Sprintf("0.0.0.0:%d", s.config.Port)
+		listenAddr = fmt.Sprintf("127.0.0.1:%d", s.config.Port)
+	}
+	if !listenAddrIsLoopback(listenAddr) {
+		log.Printf("[Gateway] WARNING: listening on %s, which is reachable beyond this host. routes proxied to loopback upstreams (status, services, screenshot and others) are reachable by LAN callers; only /v1/* requires a verified mesh identity. Prefer the default loopback+mesh bind.", listenAddr)
 	}
 
 	s.httpServer = &http.Server{
@@ -785,12 +805,18 @@ func (s *Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, target *
 	defer clientConn.Close()
 
 	// Dial the upstream
-	upstreamConn, err := net.DialTimeout("tcp", target.Host, 10*time.Second)
+	dialer := net.Dialer{Timeout: 10 * time.Second}
+	upstreamConn, err := dialer.DialContext(r.Context(), "tcp", target.Host)
 	if err != nil {
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
 	defer upstreamConn.Close()
+	stopClose := context.AfterFunc(r.Context(), func() {
+		clientConn.Close()
+		upstreamConn.Close()
+	})
+	defer stopClose()
 
 	// Reconstruct the request to send to upstream
 	path := r.URL.Path
@@ -810,6 +836,10 @@ func (s *Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, target *
 	// Forward the original request headers
 	upstreamConn.Write([]byte(reqLine))
 	r.Header.Set("Host", target.Host)
+	// Overwrite, never trust, a client-supplied value: the upstream treats
+	// X-Forwarded-For as a statement by this gateway (same as the HTTP
+	// ReverseProxy Director above).
+	r.Header.Set("X-Forwarded-For", r.RemoteAddr)
 	r.Header.Write(upstreamConn)
 	upstreamConn.Write([]byte("\r\n"))
 
@@ -841,7 +871,10 @@ func (s *Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, target *
 		}
 		done <- struct{}{}
 	}()
-	<-done
+	select {
+	case <-done:
+	case <-r.Context().Done():
+	}
 }
 
 // isWebSocketUpgrade checks if the request is a WebSocket upgrade.
@@ -865,7 +898,23 @@ func (s *Server) BuildHandler() http.Handler {
 	if s.metering != nil {
 		handler = s.metering.WrapHandler(handler)
 	}
-	return s.loggingMiddleware(s.permissionMiddleware(handler))
+	// v1AuthMiddleware is outermost after logging so an unauthenticated /v1
+	// caller is refused before any capability, passcode or metering work.
+	return s.loggingMiddleware(s.v1AuthMiddleware(s.permissionMiddleware(handler)))
+}
+
+// listenAddrIsLoopback reports whether a host:port listen address binds
+// loopback only. An empty host or an unspecified address (0.0.0.0, ::) is not.
+func listenAddrIsLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // loggingMiddleware logs all requests.

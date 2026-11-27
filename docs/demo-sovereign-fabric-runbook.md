@@ -1,5 +1,7 @@
 # Demo runbook — The Sovereign Compute Fabric, in four acts
 
+Machine names and addresses in examples are synthetic, not deployment inventory.
+
 **Audience:** a technical prospect/partner (e.g. an investor or design-partner engineer).
 **Duration:** ~12–15 minutes.
 **Thesis:** *You can run real AI on hardware you own — join it in minutes, chat with
@@ -72,12 +74,12 @@ CITADEL_GROUNDING_GUARDRAIL=1 CITADEL_SIGN_AEP_RECEIPTS=1 citadel work
 **Captured fallback:**
 ```
 $ citadel init
-  → Device code: WDJF-2098
+  → Device code: TEST-0000
   → Open https://aceteam.ai/device and enter the code to authorize this node.
   ✓ Authorized. Joining the AceTeam Network...
-  ✓ Connected. Network IP: 100.64.0.61
+  ✓ Connected. Network IP: 100.64.100.60
 $ citadel status
-  AceTeam Network:   connected (100.64.0.61)
+  AceTeam Network:   connected (100.64.100.60)
   Node:              demo-node
   Services:          (none yet)
 ```
@@ -104,8 +106,8 @@ node with `--node <name-or-network-ip>`.)
 ```
 $ citadel mesh models
 MODEL                               NODE         ENGINE          ADDRESS
-llama3.1:8b                         demo-node    ollama          100.64.0.61:11434
-qwen3.8:27b                         demo-node    ollama          100.64.0.61:11434
+llama3.1:8b                         demo-node    ollama          100.64.100.60:11434
+qwen3.8:27b                         demo-node    ollama          100.64.100.60:11434
 2 model(s) across 1 reachable node(s).
 
 $ citadel mesh chat --model llama3.1:8b "Explain sovereign compute in one sentence."
@@ -197,12 +199,12 @@ The apparent egress IP moves to the relay's. The relay only accepts **same-org
 verified peers** over the mesh, and denies LAN/mesh destinations by default — it's
 a sovereign exit, not an open proxy.
 
-**Captured fallback (this is the real result from validation on a dual-uplink host):**
+**Captured fallback (sanitized addresses, retaining the observed dual-uplink result):**
 ```
 # client direct (its own ISP)
-142.181.124.149
+198.51.100.10
 # client through the relay (the exit node's ISP)
-24.141.120.77
+203.0.113.20
 ```
 
 ---
@@ -233,7 +235,7 @@ a sovereign exit, not an open proxy.
 ## Appendix B — The dual-uplink test scaffolding (validated 2026-09-11)
 
 Act 4 was validated end to end on a Proxmox host with two independent uplinks
-(Bell Fiber `142.181.124.149` and Cogeco Cable `24.141.120.77`) using two Ubuntu
+(illustrated here by documentation addresses `198.51.100.10` and `203.0.113.20`) using two Ubuntu
 LXCs. Full setup notes (VMIDs, per-uplink bridges, the DNS gotcha, the
 non-ephemeral-key and `systemd-run`-persistence lessons) live in the maintenance
 memory for this work. Relay port is `services.EgressRelayPort` (7861). Before
