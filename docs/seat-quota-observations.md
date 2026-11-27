@@ -34,6 +34,26 @@ a jittered 15-minute idle interval. A future collector must independently prove
 idle state, serialize reads, bind a trusted seat, preserve every attempt including
 failures and provide a trustworthy clock. This function does none of those.
 
+`ReadCadence` adds an in-memory model for one supplied seat/provider binding.
+Concurrent `Begin` calls issue at most one opaque local attempt. Failed or
+canceled attempts complete with no observation, but retain their attempt time
+and its 60-second floor. A still-active attempt stays held until its matching
+completion; no timer, automatic retry or expiry launches another read. Idle
+reads follow the jittered 15-minute cadence, while on-demand proposals require
+an observation older than 120 seconds. Turn-only providers cannot reserve reads.
+Successful completions accept a receipt within that attempt and never replace
+a newer push receipt. Duplicate, stale, foreign and invalid completions cannot
+release another attempt. Clock rollback is refused, and snapshots own no mutable
+internal pointers. These timestamps track supplied observations, not allowance.
+
+This model has no production caller, transport, scheduler, persistent state or
+native process. It is not a seat-identity proof or permission to probe. A future
+collector must retain exactly one instance for each trusted seat binding, prove
+idle state, durably record every attempt before I/O, and arrange completion on
+failure/cancellation. Creating a new instance loses the in-memory floor; it is
+not restart-safe cadence ownership. Native integration and its existing holds
+remain unchanged.
+
 `Consumption` copies bounded caller-supplied counts and the actual reported
 model. Unknown remains null; consumption is not a plan percentage or entitlement.
 `EstimateTurns` accepts at most sixteen supplied turn brackets for the same seat,
