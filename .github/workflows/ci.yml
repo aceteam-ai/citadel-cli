@@ -220,7 +220,7 @@ jobs:
         run: go test ./cmd/ -count=1 -run '^(TestHarnessPaths|TestRenderBlocks|TestMerge|TestRunLocalConfig|TestDetectHarness|TestLocalDoctor|TestLocalAudit|TestLocalMCP|TestLocalMode|TestLocalStartOpens|TestLocalViewer|TestCollisionList|TestNewLocalMCPTools|TestLocalToolNamesDoNotCollide|TestNoLocalMCPToolCanApprove|TestLocalCommitPrompts|TestLocalPassphrase|TestLocalProfileStore|TestSecretReader|TestPassphraseWithSpaces|TestLocalStoreDirsArePrivate|TestSignalDuringClose|TestForget)'
 
       - name: Self-update recovery and swap (Windows-only paths)
-        run: go test ./internal/update/ -count=1 -v -run '^(TestRecoverInterruptedSwap_NoLockNoArtifactsIsSilent|TestRecoverInterruptedSwap_RefusesMissingValidatedLock|TestRecoverInterruptedSwap_ExposedWrapperIsWindowsScoped|TestRecoveryOwnerAuthority)$'
+        run: go test ./internal/update/ -count=1 -v -run '^(TestRecoverInterruptedSwap|TestAtomicReplaceWindows|TestRecoveryOwnerAuthority)'
 
       # #1867 setup-page enrollment and the per-user worker (#1873, #1876):
       # the node-dir trust check, the HKCU Run value, the supervisor and the
