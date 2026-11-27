@@ -46,6 +46,9 @@ func savePermissionsChecked(dir string, p *config.Permissions) error {
 	next := *p
 	next.CobrowsePublicOnly = cur.CobrowsePublicOnly
 	next.SetupPosture = cur.SetupPosture
+	// The existing whole-policy UI does not edit the local harness setting.
+	// A stale snapshot must not enable it or undo a later local disable.
+	next.Harness = cur.Harness
 	return config.SavePermissions(dir, &next)
 }
 

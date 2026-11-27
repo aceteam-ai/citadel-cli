@@ -312,6 +312,7 @@ func TestNodePermissionGrantHasNoMCPPath(t *testing.T) {
 	allowed := map[string][]string{
 		"setNodeSurface(":              {"local_setup_posture.go", "permission.go"},
 		"setShellPermission(":          {"permission.go"},
+		"setHarnessPermission(":        {"permission_harness.go"},
 		"removeEnrollmentCredentials(": {"local_disconnect.go"},
 		"retryPosture":                 {"local_setup.go", "local_setup_enroll.go"},
 		"clearSetupPosture(":           {"local_setup_posture.go", "permission.go"},
