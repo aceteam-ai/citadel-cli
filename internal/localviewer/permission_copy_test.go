@@ -111,6 +111,11 @@ const assertShared = () => assert.equal(element("enroll-posture").textContent, s
   assert.match(summary(), /read, create and overwrite files/);
   assert.equal(element("node-perms-message").textContent, "Synthetic refusal");
   refuse = false;
+  element("perm-files").checked = false;
+  await element("perm-files").onchange();
+  assertShared();
+  assert.match(summary(), /can't open files/);
+  assert.equal(element("perm-files").checked, false);
   // Exercise every combination, including permission changes from elsewhere
   // observed by the ordinary GET poll. Console/desktop are display-only here.
   for (let mask = 0; mask < 16; mask++) {
@@ -134,7 +139,7 @@ const assertShared = () => assert.equal(element("enroll-posture").textContent, s
   assert.equal(element("node-perms").hidden, true);
   assert.equal(summary(), "");
   assert.doesNotMatch(element("enroll-posture").textContent, /can't open files|read, create and overwrite/);
-  assert.equal(writes.length, 2, "display refresh must never submit a permission change");
+  assert.equal(writes.length, 3, "display refresh must never submit a permission change");
 })().catch(e => { console.error(e); process.exitCode = 1; });`
 	if out, err := exec.Command(node, "-e", script).CombinedOutput(); err != nil {
 		t.Fatalf("permission copy: %v\n%s", err, out)
