@@ -13,6 +13,17 @@ the model and dimensions through the existing signed hashes. Loopback endpoints
 must use literal addresses and an explicit port; redirects and proxy environment
 are not used. A healthy socket is not proof of verified runtime/model custody.
 
+Flattened embedding jobs, for both TEI and the explicit native adapter, now
+admit at most 1,024 texts, 64 KiB of UTF-8 bytes per text, and 4 MiB of decoded
+text overall. Encoded JSON is bounded before decoding (allowing six-byte string
+escapes and array punctuation). Arrays are decoded incrementally so the item
+limit applies before accumulating an arbitrary slice. Existing scalar fallback
+and valid array behavior are retained within those bounds. Oversized jobs fail
+before readiness, inference or receipt signing; callers must split larger jobs.
+Malformed dimension values return fixed error text without quoting the supplied
+value. These limits apply to flattened job payloads; internal request builders
+retain their existing separate contracts.
+
 The [upstream server documentation](https://github.com/ggml-org/llama.cpp/tree/master/tools/server)
 describes the health and embedding API paths and the model-alias option. Those
 docs are protocol background, not a release pin or native compatibility proof.

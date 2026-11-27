@@ -51,7 +51,16 @@ const (
 	teiHealthRequestTimeout   = 3 * time.Second
 	teiEmbeddingResponseLimit = 16 << 20 // 16 MiB across at most one sub-batch
 	teiErrorResponseLimit     = 4 << 10  // bounded drain; bodies never enter errors
+	// Bound flattened job inputs before readiness, requests, or receipt work.
+	embeddingMaxInputCount = 1024
+	embeddingMaxTextBytes  = 64 << 10
+	embeddingMaxInputBytes = 4 << 20
+	// A JSON string can encode each byte with six bytes (\uXXXX), plus
+	// quotes/commas. Bound encoded input before decoding or allocating texts.
+	embeddingMaxEncodedInputBytes = 6*embeddingMaxInputBytes + 3*embeddingMaxInputCount + 2
 )
+
+var errEmbeddingInputLimit = errors.New("embedding input exceeds count or byte limits")
 
 // EmbeddingHandler handles JobTypeEmbedding ("embedding") jobs by routing them
 // to the local TEI service's OpenAI-compatible /v1/embeddings endpoint.
@@ -435,11 +444,9 @@ func parseEmbeddingPayload(payload map[string]string) (*EmbeddingRequest, error)
 		return nil, fmt.Errorf("input is required")
 	}
 
-	var input []string
-	// Prefer JSON array decoding (the canonical wire form for []string).
-	if err := json.Unmarshal([]byte(rawInput), &input); err != nil {
-		// Fall back: treat the whole value as a single text to embed.
-		input = []string{rawInput}
+	input, err := boundedEmbeddingInputs(rawInput)
+	if err != nil {
+		return nil, err
 	}
 	if len(input) == 0 {
 		return nil, fmt.Errorf("input must contain at least one text")
@@ -453,7 +460,7 @@ func parseEmbeddingPayload(payload map[string]string) (*EmbeddingRequest, error)
 	if dimStr, ok := payload["dimensions"]; ok && dimStr != "" {
 		dim, err := strconv.Atoi(dimStr)
 		if err != nil {
-			return nil, fmt.Errorf("dimensions must be an integer: %w", err)
+			return nil, errors.New("dimensions must be an integer")
 		}
 		if dim < 0 {
 			return nil, fmt.Errorf("dimensions must be non-negative")
@@ -462,6 +469,59 @@ func parseEmbeddingPayload(payload map[string]string) (*EmbeddingRequest, error)
 	}
 
 	return req, nil
+}
+
+// Decode arrays incrementally so a dense array cannot allocate an unbounded
+// slice before its item limit is checked. Preserve the existing scalar fallback
+// for non-array/malformed text, subject to the same per-text byte bound.
+func boundedEmbeddingInputs(raw string) ([]string, error) {
+	if len(raw) > embeddingMaxEncodedInputBytes {
+		return nil, errEmbeddingInputLimit
+	}
+	scalar := func() ([]string, error) {
+		if len(raw) > embeddingMaxTextBytes {
+			return nil, errEmbeddingInputLimit
+		}
+		return []string{raw}, nil
+	}
+	d := json.NewDecoder(strings.NewReader(raw))
+	start, err := d.Token()
+	if err != nil {
+		return scalar()
+	}
+	if start == nil {
+		// json.Unmarshal("null", &[]string) previously produced no texts.
+		if _, err := d.Token(); err == io.EOF {
+			return nil, nil
+		}
+		return scalar()
+	}
+	if start != json.Delim('[') {
+		return scalar()
+	}
+	var input []string
+	total := 0
+	for d.More() {
+		if len(input) >= embeddingMaxInputCount {
+			return nil, errEmbeddingInputLimit
+		}
+		var text string
+		if err := d.Decode(&text); err != nil {
+			return scalar()
+		}
+		if len(text) > embeddingMaxTextBytes || len(text) > embeddingMaxInputBytes-total {
+			return nil, errEmbeddingInputLimit
+		}
+		total += len(text)
+		input = append(input, text)
+	}
+	if end, err := d.Token(); err != nil || end != json.Delim(']') {
+		return scalar()
+	}
+	if _, err := d.Token(); err != io.EOF {
+		return scalar()
+	}
+	return input, nil
 }
 
 // callTEIEmbeddings is retained as a test-facing convenience for one complete
