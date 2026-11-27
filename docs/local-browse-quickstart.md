@@ -157,12 +157,16 @@ or a picker that grants access to every folder on the PC.
 2. Open `citadel.exe local setup` and choose **Connect this PC to AceTeam**.
    Approve the displayed code in the intended account and organization.
    Connecting through this page initially leaves Files off.
+   Windows Defender Firewall may show an alert for the unsigned program.
+   As a standard user, choose **Cancel** rather than entering administrator
+   credentials or changing firewall rules. The tested setup continued with
+   the node online after Cancel; this does not grant inbound firewall access.
 3. On the setup page, enable **Allow agents to read and upload files in**.
    The path beside that checkbox is the workspace to use. Leave commands and
    other permissions off unless you separately need them. Put a disposable
    test file in that folder using File Explorer (create the folder if needed);
-   do not use sensitive files
-   for the first check. Copying a file here creates a separate copy, not a
+   do not use sensitive files for the first check. Copying a file here creates
+   a separate copy, not a
    live link to its original location. A custom worker `--workspace` or
    `CITADEL_WORKSPACE` setting can change the root, so do not assume the
    default if the worker was configured separately.
@@ -171,10 +175,9 @@ or a picker that grants access to every folder on the PC.
    keep the node online; the worker must be running. If a step fails, keep
    its error message and stop rather than treating the node as ready.
 5. Select this node in your flow and try `NodeFileList`, then `NodeFileWrite`
-   with a new test filename. Through the account-connected MCP, try
-   `code_list`, `code_read`, `code_write` and `code_search` against the same
-   node and workspace. Read back the written contents before using real
-   files. Writes can overwrite an existing file; use backups. Files outside
+   with a new test filename, completing any run approval the platform asks
+   for. Read back the written contents before using real files. Writes can
+   overwrite an existing file; use backups. Files outside
    the workspace are not granted by this checkbox; do not widen access to
    work around a refused path.
 6. Sign out and back in, or reboot and sign in again. Confirm the node returns
@@ -182,6 +185,14 @@ or a picker that grants access to every folder on the PC.
    before anyone signs in. Turn Files off on the setup page when no longer
    needed. To disconnect, choose **Disconnect this PC** and check that every
    cleanup step succeeds; a partial result needs attention before retrying.
+
+**MCP limitation:** OAuth connected-app sessions currently refuse `code_list`,
+`code_read`, `code_write` and `code_search` for node files without a
+repository-bound workspace. Turning Files on does not satisfy that platform
+requirement. The setup above is not proof that your MCP connection supports
+linked-folder access. If refused, keep the error and follow the
+[acceptance tracking issue](https://github.com/aceteam-ai/citadel-cli/issues/1957);
+do not broaden permissions or switch credentials to work around it.
 
 These are setup and verification steps, not a claim of completed Windows
 end-to-end acceptance. A successful install or local browser check alone does
