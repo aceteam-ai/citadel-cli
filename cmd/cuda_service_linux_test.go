@@ -30,7 +30,7 @@ func TestBootNativeCUDAAdmission(t *testing.T) {
 			{name: "absent", gpu: 0},
 			{name: "unknown", gpu: -1, wantStarts: 1},
 			{name: "present", gpu: 1, wantStarts: 1},
-			{name: "already serving", gpu: 0, serving: true, wantRunning: 1},
+			{name: "already serving", gpu: 0, serving: true},
 		} {
 			t.Run(kind+"/"+tc.name, func(t *testing.T) {
 				dir := writeManifestWithServices(t, []Service{{Name: "vllm", Type: kind}})
@@ -46,13 +46,20 @@ func TestBootNativeCUDAAdmission(t *testing.T) {
 					t.Fatal(err)
 				}
 				starts := 0
-				running := startManagedServicesForHost(context.Background(), func() int { return tc.gpu }, func(name string) bool { return tc.serving }, func(name, configDir string) error {
+				running := startManagedServicesForHost(context.Background(), func() int { return tc.gpu }, func(name string) bool { return tc.serving }, func(name, configDir string) (bool, error) {
 					starts++
-					return fmt.Errorf("synthetic native launch refused")
+					return false, fmt.Errorf("synthetic native launch refused")
 				})
 				if starts != tc.wantStarts || len(running) != tc.wantRunning {
 					t.Fatalf("starts=%d running=%d; want %d/%d", starts, len(running), tc.wantStarts, tc.wantRunning)
 				}
+				stopManagedServicesWith(running, func(string) error {
+					t.Fatal("shutdown stopped an engine the worker did not launch")
+					return nil
+				}, func(string, bool) error {
+					t.Fatal("native boot attempted compose teardown")
+					return nil
+				})
 				after, err := os.ReadFile(filepath.Join(dir, "citadel.yaml"))
 				if err != nil || string(after) != string(before) {
 					t.Fatal("native admission changed manifest", err)
@@ -70,9 +77,9 @@ func TestBootNativeCPUDoesNotProbeGPU(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			writeManifestWithServices(t, []Service{{Name: name, Type: "native"}})
 			starts := 0
-			startManagedServicesForHost(context.Background(), func() int { t.Fatal("CPU engine probed for CUDA admission"); return 0 }, func(string) bool { return false }, func(string, string) error {
+			startManagedServicesForHost(context.Background(), func() int { t.Fatal("CPU engine probed for CUDA admission"); return 0 }, func(string) bool { return false }, func(string, string) (bool, error) {
 				starts++
-				return fmt.Errorf("synthetic native launch refused")
+				return false, fmt.Errorf("synthetic native launch refused")
 			})
 			if starts != 1 {
 				t.Fatalf("CPU launch attempts=%d", starts)
@@ -141,19 +148,123 @@ func TestCLIStartCUDAAbsenceAdoptsServingExternalEngine(t *testing.T) {
 }
 
 func TestBootCUDAAbsenceAdoptsServingExternalEngine(t *testing.T) {
-	t.Setenv("CITADEL_NODE_DIR", "")
-	dir := writeManifestWithServices(t, []Service{{Name: "vllm", Type: "docker", ComposeFile: "services/vllm.yml"}})
-	t.Setenv("PATH", t.TempDir())
-	probed := false
-	started := startManagedServicesForHost(context.Background(), func() int { return 0 }, func(string) bool { t.Fatal("native probe"); return false }, func(string, string) error { t.Fatal("native launch"); return nil }, func(name string) (string, bool) {
-		probed = true
-		return "Adopted external vllm", true
-	})
-	if !probed || len(started) != 1 || started[0].name != "vllm" {
-		t.Fatalf("adoption=%v started=%v", probed, started)
+	for _, gpu := range []int{0, -1, 1} {
+		t.Run(fmt.Sprint(gpu), func(t *testing.T) {
+			t.Setenv("CITADEL_NODE_DIR", "")
+			dir := writeManifestWithServices(t, []Service{{Name: "vllm", Type: "docker", ComposeFile: "services/vllm.yml"}})
+			path := filepath.Join(dir, "services/vllm.yml")
+			compose := "services:\n  vllm:\n    image: synthetic/engine\n"
+			if err := os.WriteFile(path, []byte(compose), 0600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", t.TempDir())
+			t.Setenv("CITADEL_CONTAINER_RUNTIME", "docker")
+			probed := false
+			started := startManagedServicesForHost(context.Background(), func() int { return gpu }, func(string) bool { t.Fatal("native probe"); return false }, func(string, string) (bool, error) { t.Fatal("native launch"); return false, nil }, func(name string) (string, bool) {
+				probed = true
+				return "Adopted external vllm", true
+			})
+			if !probed || len(started) != 0 {
+				t.Fatalf("adoption=%v managed teardown=%v", probed, started)
+			}
+			// A compose file may be present, or used by a later independent
+			// start. Neither gives this worker ownership of that lifetime.
+			stopManagedServicesWith(started, func(string) error {
+				t.Fatal("adoption attempted native teardown")
+				return nil
+			}, func(string, bool) error {
+				t.Fatal("adoption attempted compose teardown")
+				return nil
+			})
+			if got, err := os.ReadFile(path); err != nil || string(got) != compose {
+				t.Fatal("boot/shutdown adoption changed existing compose", err)
+			}
+		})
 	}
-	if _, err := os.Stat(filepath.Join(dir, "services/vllm.yml")); !os.IsNotExist(err) {
-		t.Fatal("boot adoption created compose", err)
+}
+
+func TestBootNativeLifetimeOwnership(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		serving    bool
+		launched   bool
+		wantStarts int
+	}{
+		{name: "new launch", launched: true, wantStarts: 1},
+		{name: "serving at boot", serving: true},
+		{name: "serving at launcher recheck", wantStarts: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeManifestWithServices(t, []Service{{Name: "ollama", Type: "native"}})
+			starts, stops := 0, 0
+			owned := startManagedServicesForHost(context.Background(), func() int { t.Fatal("CPU engine probed GPU"); return 0 }, func(string) bool { return tc.serving }, func(string, string) (bool, error) {
+				starts++
+				return tc.launched, nil
+			})
+			stopManagedServicesWith(owned, func(name string) error {
+				if name != "ollama" {
+					t.Fatal(name)
+				}
+				stops++
+				return nil
+			}, func(string, bool) error { t.Fatal("native engine used compose teardown"); return nil })
+			want := 0
+			if tc.launched {
+				want = 1
+			}
+			if starts != tc.wantStarts || len(owned) != want || stops != want {
+				t.Fatalf("starts=%d owned=%d stops=%d; want %d/%d/%d", starts, len(owned), stops, tc.wantStarts, want, want)
+			}
+		})
+	}
+}
+
+func TestBootComposeLifetimeOwnership(t *testing.T) {
+	for _, state := range []string{"running", "missing", "launch-fails"} {
+		t.Run(state, func(t *testing.T) {
+			t.Setenv("CITADEL_NODE_DIR", "")
+			dir := writeManifestWithServices(t, []Service{{Name: "synthetic", Type: "docker", ComposeFile: "services/synthetic.yml"}})
+			path := filepath.Join(dir, "services/synthetic.yml")
+			if err := os.WriteFile(path, []byte("services:\n  synthetic:\n    image: synthetic/engine\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			bin := t.TempDir()
+			// This executable only records fake compose calls and supplies
+			// fixture inspection results. It never contacts a runtime.
+			fake := "#!/bin/sh\ncase \"$1\" in\ninfo) exit 0;;\ninspect) if [ \"$SYNTHETIC_CONTAINER_STATE\" = running ]; then printf 'running\\n'; exit 0; fi; exit 1;;\ncompose) printf 'compose\\n' >> \"$SYNTHETIC_COMPOSE_LOG\"; if [ \"$SYNTHETIC_CONTAINER_STATE\" = launch-fails ]; then exit 37; fi; exit 0;;\n*) exit 97;;\nesac\n"
+			if err := os.WriteFile(filepath.Join(bin, "docker"), []byte(fake), 0700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", bin)
+			t.Setenv("CITADEL_CONTAINER_RUNTIME", "docker")
+			t.Setenv("SYNTHETIC_CONTAINER_STATE", state)
+			log := filepath.Join(dir, "compose-calls")
+			t.Setenv("SYNTHETIC_COMPOSE_LOG", log)
+			owned := startManagedServicesForHost(context.Background(), func() int { return 0 }, func(string) bool { t.Fatal("native probe"); return false }, func(string, string) (bool, error) { t.Fatal("native start"); return false, nil }, func(string) (string, bool) { return "", false })
+			stops := 0
+			stopManagedServicesWith(owned, func(string) error { t.Fatal("compose engine used native teardown"); return nil }, func(got string, remove bool) error {
+				if got != path || remove {
+					t.Fatalf("unexpected teardown: %s remove=%v", got, remove)
+				}
+				stops++
+				return nil
+			})
+			want := 0
+			if state == "missing" {
+				want = 1
+			}
+			if len(owned) != want || stops != want {
+				t.Fatalf("owned=%d stops=%d; want %d", len(owned), stops, want)
+			}
+			calls, err := os.ReadFile(log)
+			if state == "running" {
+				if !os.IsNotExist(err) {
+					t.Fatalf("already-running engine attempted compose: %q %v", calls, err)
+				}
+			} else if err != nil || string(calls) != "compose\n" {
+				t.Fatalf("expected one synthetic launch, got %q %v", calls, err)
+			}
+		})
 	}
 }
 

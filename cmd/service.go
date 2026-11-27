@@ -163,7 +163,9 @@ func startService(serviceName, composeFilePath string, gpuCount ...func() int) e
 	return startServiceForHost(serviceName, composeFilePath, probe, adoptExternalEngineForStart)
 }
 
-func startServiceForHost(serviceName, composeFilePath string, probe func() int, adopt func(string) (string, bool)) error {
+// launched is notified only after a successful compose-up, never for adoption
+// or an already-running shortcut. Boot uses it to record teardown ownership.
+func startServiceForHost(serviceName, composeFilePath string, probe func() int, adopt func(string) (string, bool), launched ...func()) error {
 	if adopted, err := serviceStartAdmissionForHost(serviceName, probe, adopt); adopted || err != nil {
 		return err
 	}
@@ -243,13 +245,8 @@ func startServiceForHost(serviceName, composeFilePath string, probe func() int, 
 	// Skipped under a --node-dir/CITADEL_NODE_DIR override (containerName is
 	// namespaced there; keep this off the shared-port probe to avoid surprising an
 	// isolated target), matching the inspect block's own override caution below.
-	if composeProjectOverride() == "" {
-		runtimeAvailable := func() bool { _, err := exec.LookPath(rt.EngineBin); return err == nil }()
-		if msg, adopt := maybeAdoptExternalEngineOnStart(
-			context.Background(), serviceName, runtimeAvailable,
-			func() bool { return managedContainerRunningForStart(rt.EngineBin, containerName) },
-			status.OpenAICompatServing,
-		); adopt {
+	if composeProjectOverride() == "" && adopt != nil {
+		if msg, adopted := adopt(serviceName); adopted {
 			fmt.Printf("   ✅ %s; not launching a citadel container\n", msg)
 			return nil
 		}
@@ -409,6 +406,11 @@ func startServiceForHost(serviceName, composeFilePath string, probe func() int, 
 	output, err := composeCmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s compose failed: %s", rt.Bin, composeFailureMessage(serviceName, output))
+	}
+	for _, notify := range launched {
+		if notify != nil {
+			notify()
+		}
 	}
 	startOllamaPreload(serviceName, manifestSvc)
 	return nil
@@ -783,26 +785,33 @@ func macServiceWarning(serviceName string) string {
 
 // startNativeService starts a service using its native binary.
 func startNativeService(serviceName, configDir string) error {
+	_, err := startNativeServiceWithOwnership(serviceName, configDir)
+	return err
+}
+
+// A successful already-serving shortcut does not transfer process ownership to
+// the caller. Report a launch only after our new process becomes ready.
+func startNativeServiceWithOwnership(serviceName, configDir string) (bool, error) {
 	// Check if it is already SERVING, not merely that a matching process exists
 	// (issue #649). A dead engine with a lingering process match used to take
 	// this branch and report success, leaving the node advertising an engine
 	// that answered nothing.
 	if services.IsNativeServiceServing(serviceName) {
 		fmt.Printf("   ✅ Service %s is already running.\n", serviceName)
-		return nil
+		return false, nil
 	}
 
 	// Get log directory
 	homeDir, err := platform.HomeDir("")
 	if err != nil {
-		return fmt.Errorf("could not find home directory: %w", err)
+		return false, fmt.Errorf("could not find home directory: %w", err)
 	}
 	logDir := filepath.Join(homeDir, "citadel-node", "logs")
 
 	// Start the service
 	process, err := services.StartNativeService(serviceName, logDir)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	// Wait for service to be ready (max 30 seconds)
@@ -812,8 +821,8 @@ func startNativeService(serviceName, configDir string) error {
 		if process.Cmd.Process != nil {
 			process.Cmd.Process.Kill()
 		}
-		return err
+		return false, err
 	}
 
-	return nil
+	return true, nil
 }
