@@ -141,6 +141,52 @@ own, such as `start citadel` or `Start-Process citadel`, not only a double-click
 Keep the console window open while you use the page; closing it stops the page.
 The steps below do the same things from a terminal.
 
+## Link a folder on Windows
+
+This is the account-connected file path, not local-only browsing. It requires
+an AceTeam account, a connected node and a running worker. The default folder
+is `%USERPROFILE%\citadel-node\workspace`; this is not a folder-sync service
+or a picker that grants access to every folder on the PC.
+
+1. Install the current Windows x64 release using [Install](#1-install).
+   Releases are unsigned: verify the download came from the linked release
+   page before handling a SmartScreen warning yourself. If Windows or an
+   organizational policy blocks it, stop and ask your administrator; do not
+   disable protection or ask an agent to bypass it. Administrator rights are
+   not required for the per-user installer.
+2. Open `citadel.exe local setup` and choose **Connect this PC to AceTeam**.
+   Approve the displayed code in the intended account and organization.
+   Connecting through this page initially leaves Files off.
+3. On the setup page, enable **Allow agents to read and upload files in**.
+   The path beside that checkbox is the workspace to use. Leave commands and
+   other permissions off unless you separately need them. Put a disposable
+   test file in that folder using File Explorer (create the folder if needed);
+   do not use sensitive files
+   for the first check. Copying a file here creates a separate copy, not a
+   live link to its original location. A custom worker `--workspace` or
+   `CITADEL_WORKSPACE` setting can change the root, so do not assume the
+   default if the worker was configured separately.
+4. Choose **Keep this PC available to AceTeam**. Check that both the sign-in
+   entry and background-worker steps succeed. Registration alone does not
+   keep the node online; the worker must be running. If a step fails, keep
+   its error message and stop rather than treating the node as ready.
+5. Select this node in your flow and try `NodeFileList`, then `NodeFileWrite`
+   with a new test filename. Through the account-connected MCP, try
+   `code_list`, `code_read`, `code_write` and `code_search` against the same
+   node and workspace. Read back the written contents before using real
+   files. Writes can overwrite an existing file; use backups. Files outside
+   the workspace are not granted by this checkbox; do not widen access to
+   work around a refused path.
+6. Sign out and back in, or reboot and sign in again. Confirm the node returns
+   online and repeat the test. **Start at sign-in** does not mean it runs
+   before anyone signs in. Turn Files off on the setup page when no longer
+   needed. To disconnect, choose **Disconnect this PC** and check that every
+   cleanup step succeeds; a partial result needs attention before retrying.
+
+These are setup and verification steps, not a claim of completed Windows
+end-to-end acceptance. A successful install or local browser check alone does
+not verify a flow/MCP round trip or persistence after sign-in.
+
 ## 2. Check
 
 ```powershell

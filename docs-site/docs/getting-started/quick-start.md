@@ -54,6 +54,7 @@ Your node is now part of the Sovereign Compute Fabric, running AI workloads on y
 
 ## Next steps
 
+- [Link a folder on Windows](https://github.com/aceteam-ai/citadel-cli/blob/main/docs/local-browse-quickstart.md#link-a-folder-on-windows) -- account-connected Files access, worker setup and verification
 - [Full Provisioning](./provisioning.md) -- install Docker and GPU drivers on a fresh server
 - [Managing Services](/guides/managing-services) -- configure which AI inference engines to run
 - [Monitoring](/guides/monitoring) -- set up alerts and health monitoring
